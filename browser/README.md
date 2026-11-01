@@ -5,6 +5,11 @@ an initial harness and fixture export, not browser parity signoff. The browser
 executor and its debug artifact recipe belong to Wasmer B2; B8 supplies the
 fixture embedding adapter. No executor or syscall is implemented here.
 
+The reusable `serve` helper removes JSPI from every JavaScript module by default.
+An explicit optional driver gate may pass `{ disableJSPI: false }` to preserve
+the engine's APIs while retaining isolation headers and asset confinement. The
+ordinary runner and its mandatory no-JSPI lane keep the default.
+
 ## Run
 
 Use Node 22 or newer. `npm ci` pins Playwright and its Chromium revision via

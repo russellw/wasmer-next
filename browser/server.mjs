@@ -10,7 +10,7 @@ const headers = {
 };
 const mime = { ".wasm": "application/wasm", ".js": "text/javascript", ".mjs": "text/javascript", ".html": "text/html", ".json": "application/json" };
 
-export async function serve(mounts, { isolated = true } = {}) {
+export async function serve(mounts, { isolated = true, disableJSPI = true } = {}) {
     const roots = await Promise.all(Object.entries(mounts).map(async ([prefix, directory]) => [prefix, await realpath(directory)]));
     const server = createServer(async (request, response) => {
         if (isolated) for (const [key, value] of Object.entries(headers)) response.setHeader(key, value);
@@ -25,7 +25,7 @@ export async function serve(mounts, { isolated = true } = {}) {
             const actual = await realpath(path);
             if (!actual.startsWith(root + sep)) { response.writeHead(403).end(); return; }
             let bytes = await readFile(actual);
-            if ([".js", ".mjs"].includes(extname(actual))) {
+            if (disableJSPI && [".js", ".mjs"].includes(extname(actual))) {
                 // Apply before *every* module, including coordinator/task/service workers.
                 // V8 flags for shipped JSPI have changed across Chromium versions. Probes
                 // verify the actual API absence in both agents rather than trusting flags.
