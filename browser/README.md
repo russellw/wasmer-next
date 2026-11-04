@@ -37,7 +37,7 @@ Build B2's runtime using **its** Wasmer recipe, then reuse its assets unchanged:
 ```sh
 # In Wasmer (after B2 merges); requires its pinned nightly + rust-src and a
 # wasm-bindgen CLI matching Wasmer's Cargo.lock. The recipe is debug only.
-CARGO_TARGET_DIR=/absolute/task-target bash lib/wasixv2/host/tests/browser/build.sh
+CARGO_TARGET_DIR=/absolute/task-target bash lib/wasix/host/tests/browser/build.sh
 # In this repository:
 CHROME=/usr/bin/google-chrome node browser/run.mjs --smoke --b2-smoke \
   --runtime /absolute/task-target/browser --artifacts /absolute/new-b2-results
@@ -166,7 +166,7 @@ An empty run never passes; startup failure records every selected test as failed
 ## CI integration
 
 Wasmer's B8 facade now supplies `fixture-adapter.js` through
-`lib/wasixv2/api/tests/browser/build.sh`, which reuses the B2 debug/std/TLS recipe.
+`lib/wasix/api/tests/browser/build.sh`, which reuses the B2 debug/std/TLS recipe.
 The runtime bundle also includes B4's timer event worker and C1's pure-JS copy
 worker. The adapter waits for final kernel exit, descendant shutdown, bounded
 stdio drain and normal worker/TLS retirement. It uses byte-backed module sources,
@@ -394,7 +394,7 @@ for real worker failure injection; only the named injected error plus complete
 worker reclamation counts as success. `throttled` delays timer callbacks by
 50 ms and must pass normal deadline/no-early-completion assertions.
 
-The embedding repository's `lib/wasixv2/api/tests/browser/relay-lifetime.mjs`
+The embedding repository's `lib/wasix/api/tests/browser/relay-lifetime.mjs`
 reuses its existing deterministic relay fixture with this runner's `relay_smoke`
 entry and explicit arguments. It checks 50 repeated connections/sends in one
 runtime, exact empty process outputs and zero workers after I/O retirement.

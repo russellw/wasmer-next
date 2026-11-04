@@ -5,7 +5,7 @@
 //
 // Loads there read zeros for now, unlike Linux: clang's wasm32 backend passes a null va_list
 // buffer to variadic calls without variadic arguments, which musl reads anyway (fcntl(fd,
-// F_GETFD), posix_spawn's clone). The follow-up in wasmer's lib/wasixv2/DESIGN.md, "Guard page
+// F_GETFD), posix_spawn's clone). The follow-up in wasmer's lib/wasix/DESIGN.md, "Guard page
 // at 0", makes them fault too; the read cases below then expect SIGSEGV.
 //#MappedDirectory: .:/t
 //#ExpectedStdout: write-null: signaled=1 sig=11
