@@ -22,10 +22,10 @@ pub struct Streams {
 }
 
 /// Runtime owner of a run's streams. Use the returned Stdio in ProcessConfig. After all
-/// tasks sharing the streams stop and `console_wait_until_sent` completes, call `finish`
-/// and keep consuming both outputs
-/// until EOF before publishing the final process result. Dropping this owner alone does
-/// not revoke streams still held by a process; use `abort` for infrastructure failure.
+/// tasks sharing the streams stop and `console_wait_until_sent` completes, call `seal`
+/// to close producers while keeping a consumer owner for unread output. Call `finish`
+/// when completion must also wait for both outputs to drain. Dropping this owner alone
+/// does not revoke streams still held by a process; use `abort` for infrastructure failure.
 pub struct Session {
     input: Arc<Source>,
     output: Arc<Sink>,
@@ -68,13 +68,20 @@ impl Session {
         }
     }
 
+    /// Seal streams after all producers and console output quiesce. Queued output
+    /// stays readable through EOF; the consumer owner must remain alive until drained.
+    /// This does not wait for consumers or discard unread output.
+    pub fn seal(&self) {
+        self.input.cancel();
+        self.output.close();
+        self.error.close();
+    }
+
     /// Seal outputs after their producers quiesce, then wait for both to drain. This is
     /// transport drain: bytes have reached the coordinator consumer, not necessarily the
     /// terminal display. The SDK must also await its Web Stream writes before returning.
     pub async fn finish(&self) -> io::Result<()> {
-        self.input.cancel();
-        self.output.close();
-        self.error.close();
+        self.seal();
         let (out, err) =
             futures_util::future::join(self.output.drained(), self.error.drained()).await;
         out.and(err)

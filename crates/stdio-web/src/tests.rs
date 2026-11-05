@@ -254,6 +254,35 @@ fn finish_waits_for_both_outputs_with_independent_backpressure() {
 }
 
 #[test]
+fn seal_preserves_unread_outputs_and_rejects_further_input() {
+    let (session, stdio, streams) = Session::new(2).unwrap();
+    assert_eq!(block_on(stdio.stdout.write(b"ab")).unwrap(), 2);
+    assert_eq!(block_on(stdio.stderr.write(b"!")).unwrap(), 1);
+    session.seal();
+    session.seal();
+    kind(
+        streams.stdin.try_write(b"x"),
+        io::ErrorKind::ConnectionAborted,
+    );
+    kind(
+        block_on(stdio.stdout.write(b"x")),
+        io::ErrorKind::BrokenPipe,
+    );
+    kind(
+        block_on(stdio.stderr.write(b"x")),
+        io::ErrorKind::BrokenPipe,
+    );
+    let mut bytes = [0; 2];
+    assert_eq!(streams.stdout.try_read(&mut bytes).unwrap(), 2);
+    assert_eq!(&bytes, b"ab");
+    assert_eq!(streams.stderr.try_read(&mut bytes).unwrap(), 1);
+    assert_eq!(bytes[0], b'!');
+    assert_eq!(streams.stdout.try_read(&mut bytes).unwrap(), 0);
+    assert_eq!(streams.stderr.try_read(&mut bytes).unwrap(), 0);
+    block_on(session.finish()).unwrap();
+}
+
+#[test]
 fn abort_releases_every_stream_and_finish_reports_failure() {
     let (session, stdio, streams) = Session::new(1).unwrap();
     block_on(stdio.stdout.write(b"a")).unwrap();
