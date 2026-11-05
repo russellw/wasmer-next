@@ -70,7 +70,9 @@ runtime disposal. An already aborted signal creates no worker. Later cancellatio
 requests the existing whole-heap abort path, including admitted task/service and
 memory-copy workers; it does not kill one Machine within a shared heap. Bootstrap
 ignores racing readiness after abort and rejects with the original signal reason
-when the coordinator reports the discard. If that report never arrives, the existing
+when the coordinator attributes the discard with `ownerAbort: true`. Unrelated
+worker failures keep their infrastructure error even if cancellation was requested.
+If the attributed report never arrives, the existing
 bootstrap deadline remains an infrastructure failure. The abort notification proves
 termination requests were issued, not native worker join or memory reclamation.
 The signal is not cloned into workers and its listener is removed during disposal.

@@ -789,6 +789,7 @@ test("owner abort discards busy workers and ignores late initialization", async 
     assert(h.instances.every(worker => worker.terminated));
     assert.equal(h.output.at(-1).type, "fatal");
     assert.equal(h.output.at(-1).error, "process killed");
+    assert.equal(h.output.at(-1).ownerAbort, true);
     assert.equal(vm.runInContext("workers.size + admissions.size + wordWaiters.size", h.context), 0);
     assert.equal(vm.runInContext("options", h.context), null);
     assert(h.control.closed);
@@ -858,10 +859,50 @@ for (const stage of ["before", "booting", "ready"]) {
             assert.equal(settled, false, "late readiness cannot publish canceled bootstrap");
             assert.equal(notices.length, 0);
         }
-        worker.onmessage({ data: { type: "fatal", error: "runtime aborted by its owner" } });
+        worker.onmessage({ data: { type: "fatal", error: "runtime aborted by its owner", ownerAbort: true } });
         if (stage === "booting") await assert.rejects(pending, error => error === reason);
         assert.equal(worker.terminations, 1);
         assert.equal(worker.onmessage, null);
         assert.equal(notices.at(-1).type, "fatal");
     });
 }
+
+
+for (const failure of ["fatal", "deadline"]) {
+    test(`bootstrap abort preserves unrelated ${failure} failure`, async () => {
+        const bootstrap = await readFile(new URL("../../src/browser/bootstrap.js", import.meta.url), "utf8");
+        const instances = [];
+        class Module {}
+        class Memory { constructor() { this.buffer = new SharedArrayBuffer(4); } }
+        class Worker {
+            constructor() { instances.push(this); }
+            postMessage() {}
+            terminate() { this.terminated = true; }
+        }
+        const context = vm.createContext({ Worker, WebAssembly: { Module, Memory },
+            SharedArrayBuffer, URL, location: { href: "https://example.test/" }, isSecureContext: true,
+            crossOriginIsolated: true, setTimeout, clearTimeout });
+        vm.runInContext(bootstrap.replace("export async function", "async function")
+            .replaceAll("import.meta.url", '"https://example.test/bootstrap.js"'), context);
+        const controller = new AbortController();
+        const reason = { original: "requested cancellation" };
+        const pending = context.startCoordinator({ module: new Module(), memory: new Memory(),
+            bindingsUrl: "https://example.test/runtime.js", signal: controller.signal,
+            admissionTimeout: 20 });
+        const expected = failure === "fatal" ? "timer worker died" : "coordinator bootstrap timed out";
+        const rejected = assert.rejects(pending, error => error !== reason && error.message === expected);
+        controller.abort(reason);
+        if (failure === "fatal") instances[0].onmessage({ data: { type: "fatal", error: expected } });
+        await rejected;
+        assert(instances[0].terminated);
+        assert.equal(instances[0].onmessage, null);
+    });
+}
+
+test("worker failure cannot claim owner abort attribution", async () => {
+    const h = await busyTask();
+    h.task.send({ type: "fatal", error: "worker died", ownerAbort: true });
+    assert.equal(h.output.at(-1).type, "fatal");
+    assert.equal(h.output.at(-1).ownerAbort, undefined);
+    assert(h.instances.every(worker => worker.terminated));
+});

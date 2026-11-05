@@ -73,7 +73,7 @@ export async function startCoordinator(options, onMessage = () => {}) {
                 if (disposed || (abortRequested && data.type === "ready")) return;
                 if (data.type === "fatal" || data.type === "stopped") dispose();
                 if (data.type === "ready") { clearTimeout(timer); resolve(); }
-                if (data.type === "fatal") { clearTimeout(timer); reject(abortRequested ? signal.reason : new Error(data.error)); }
+                if (data.type === "fatal") { clearTimeout(timer); reject(abortRequested && data.ownerAbort === true ? signal.reason : new Error(data.error)); }
                 if (data.type === "stopped") reject(new Error("coordinator stopped during bootstrap"));
                 onMessage(data);
             };

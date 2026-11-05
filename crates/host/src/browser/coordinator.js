@@ -107,7 +107,7 @@ function createMemoryCopies() {
     return worker;
 }
 
-function fail(error) {
+function fail(error, ownerAbort = false) {
     if (poisoned) return;
     poisoned = true;
     for (const request of admissions.values()) reply(request, 2);
@@ -125,7 +125,7 @@ function fail(error) {
     stopMemoryCopies();
     root = timerWorker = ioWorker = null;
     options = null;
-    postMessage({ type: "fatal", error: String(error) });
+    postMessage({ type: "fatal", error: String(error), ...(ownerAbort ? { ownerAbort: true } : {}) });
     close();
 }
 
@@ -405,7 +405,7 @@ globalThis.onmessage = async ({ data }) => {
             case "abort":
                 // Explicit heap discard uses accepted-worker failure custody. This
                 // notification confirms termination requests, not a native join.
-                fail(data.error ?? "runtime aborted by its owner");
+                fail(data.error ?? "runtime aborted by its owner", true);
                 break;
             case "shutdown":
                 if (admissions.size || [...workers.values()].some((state) => state.status !== "idle")) {
