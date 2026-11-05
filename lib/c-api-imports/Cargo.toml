@@ -20,7 +20,10 @@ wasmer-wasix = { version = "=0.705.0", path = "../wasix-legacy", optional = true
   "sys",
 ], default-features = false }
 
+wasixv2-exec = { path = "../wasix/exec", default-features = false, optional = true }
+
 [dev-dependencies]
+wasixv2 = { path = "../wasix/api" }
 tokio = { workspace = true, features = [
   "rt",
   "rt-multi-thread",
@@ -38,7 +41,7 @@ wat.workspace = true
 default = ["wat", "sys-default", "cranelift", "compiler"]
 wat = ["wasmer-api/wat"]
 
-sys = ["wasmer-api/sys"]
+sys = ["wasmer-api/sys", "wasixv2-exec?/sys"]
 singlepass = ["wasmer-api/singlepass", "compiler"]
 cranelift = ["wasmer-api/cranelift", "compiler"]
 llvm = ["wasmer-api/llvm", "compiler"]
@@ -48,6 +51,8 @@ sys-default = ["sys", "wasmer-api/sys-default"]
 v8-default = ["v8", "wasmer-api/v8-default"]
 # Implements the WASIX runtime's `InstantiationHook` for `WasmCapiRuntimeHooks`.
 wasix = ["dep:wasmer-wasix"]
+# Implements the v2 hook without removing the published legacy hook.
+wasixv2 = ["dep:wasixv2-exec"]
 # Runs the WASIX guest integration tests.
 wasi = ["wasix"]
 

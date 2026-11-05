@@ -7735,6 +7735,8 @@ version = "7.5.0"
 dependencies = [
  "anyhow",
  "tokio",
+ "wasixv2",
+ "wasixv2-exec",
  "wasmer",
  "wasmer-types",
  "wasmer-wasix",
