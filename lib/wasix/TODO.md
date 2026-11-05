@@ -31,7 +31,7 @@ Large designs require independent review. Validation runs serially against the
 integrated source tuple; a compile or placeholder is not a completed parity item.
 
 Delivered checkpoints: shared resolver/HTTP/downloader and resolved-command/package
-metadata are integrated; package tests pass (66). Configured-provider controls are
+metadata are integrated; acquisition/progress tests pass (75). Configured-provider controls are
 integrated at runtime `6a216cca2d6` with WLK `2a99684cd671`: 228 component behavior
 tests and strict lint passed, followed by the integrated CLI journal check,
 22 compatibility net tests and 13 original-reference codec/relay tests. Generic
@@ -46,9 +46,10 @@ establish full parity or an integrated release result.
 | Work | Private source | Remaining gate |
 | --- | --- | --- |
 | Contexts/closures | [Runtime](https://github.com/wasmerio/wasmer-next/tree/wasixv2/native-contexts-recovery), [WLK](https://github.com/wasmerio/wlk/tree/parity/contexts-core) | Native consumers and physical cleanup tests pass; canonical generation, complete JS companions and startup/cancellation integration remain. |
-| Shared resolved installer | [Runtime `2d6f404f2c4`](https://github.com/wasmerio/wasmer-next/tree/wasixv2/parity-cli-resolved-install) | Reviewed common constructor and error-custody fixture correction; rerun combined validation. |
-| Download progress | [Runtime `00a4094fa19`](https://github.com/wasmerio/wasmer-next/tree/wasixv2/parity-cli-package-progress) | Reviewed streaming observer interface; validate and connect SDK subscribers. |
-| Browser isolation | [SDK `a5be3a955f9`](https://github.com/wasmerio/wasmer-next/tree/parity/sdk-isolation-20261105) | Real Chromium/Firefox busy-module, sibling, live-directory and empty-worker-inventory checks pass on WLK `8bce49d4`; coherent current public API assembly and Node remain. |
+| Shared resolved installer | Integrated on `main`; [component source](https://github.com/wasmerio/wasmer-next/tree/wasixv2/parity-cli-resolved-install) | Combined installer tests pass (15); remaining consumer integration is tracked separately. |
+| Download progress | Integrated on `main`; [component source](https://github.com/wasmerio/wasmer-next/tree/wasixv2/parity-cli-package-progress) | Acquisition/progress tests pass (75); SDK subscriber integration remains. |
+| Browser isolation | [SDK `a5be3a955f9`](https://github.com/wasmerio/wasmer-next/tree/parity/sdk-isolation-20261105) | One Chromium/Firefox busy-module and live-directory batch passed on WLK `8bce49d4`; a later repeated teardown probe retained two coordinators. Stable retirement, current public API assembly and Node remain. |
+| WebC v1 resolved packages | Integrated as `6ed9af0925b`; [component source](https://github.com/wasmerio/wasmer-next/tree/wasixv2/parity-cli-package-v1) | Installer tests (13), resolver tests (50) and CLI check pass; SDK adoption remains. |
 | Original-source coredumps | [Runtime `18df6357995`](https://github.com/wasmerio/wasmer-next/tree/wasixv2/parity-coredump-next), [CLI `6e082fdaf85`](https://github.com/wasmerio/wasmer-next/tree/wasixv2/parity-cli-coredump-wiring) | Type-level tests pass; compiler/artifact, original guest, observer/cache and CLI integration validation remain. |
 | Cross-sandbox network endpoints | [WLK `4dc0bab536c`](https://github.com/wasmerio/wlk/tree/parity/endpoint-selection-20261105) | Reviewed optional API only; routing and SDK provider integration remain. |
 
@@ -57,6 +58,10 @@ Proposed macOS pathname-observation and configured-CPU contracts are documented 
 The user approved the macOS observation/capability separation and deferred the
 configured-CPU proposal. Native NAPI/V8 stack integration and its supported macOS
 profile remain mandatory work.
+
+Terminal sizing: ordinary resize and real-zero handling remain required. Exact
+SDK dimensions above 65535 are a nonblocking follow-up: retain public u32 input
+and use one documented low-16-bit Linux projection, without separate size state.
 
 ## Scope and snapshot
 
