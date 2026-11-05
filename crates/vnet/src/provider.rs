@@ -57,10 +57,10 @@ impl Request {
         !matches!(self, Self::Addresses | Self::Mac | Self::Routes)
     }
     pub fn validate(&self) -> Result<(), Errno> {
-        if let Self::Bridge { network, token, .. } = self {
-            if network.len().saturating_add(token.len()) > MAX_MESSAGE - 64 {
-                return Err(Errno::EMSGSIZE);
-            }
+        if let Self::Bridge { network, token, .. } = self
+            && network.len().saturating_add(token.len()) > MAX_MESSAGE - 64
+        {
+            return Err(Errno::EMSGSIZE);
         }
         let cidr = match self {
             Self::AddAddress(a) => Some(a),
@@ -164,12 +164,11 @@ impl Provider for NamespaceProvider {
         self.provider.start(
             request,
             Box::new(move |mut completion| {
-                if completion.result.is_ok() || completion.reconciliation.is_some() {
-                    if let Err(error) =
+                if (completion.result.is_ok() || completion.reconciliation.is_some())
+                    && let Err(error) =
                         net.publish_provider(&completion.snapshot, completion.reconciliation)
-                    {
-                        completion.reconciliation = Some(error);
-                    }
+                {
+                    completion.reconciliation = Some(error);
                 }
                 if let Some(error) = completion.reconciliation {
                     completion.result = Err(error);
