@@ -30,7 +30,7 @@ impl WaitEntry for DriverWake {
 /// before polling. The transport itself stays local to that worker. Dropping this driver
 /// cancels every pending operation of this session and wakes all affected socket waiters.
 pub struct Driver {
-    shared: Arc<Shared>,
+    pub(crate) shared: Arc<Shared>,
     generation: u64,
     pending: BTreeMap<u64, Pending>,
     command: Option<Command>,
@@ -182,6 +182,15 @@ impl Driver {
         // point is retained by AtomicWaker; no kernel/backend lock spans a transport call.
         self.shared.wake.register(cx.waker());
         let mut inner = self.shared.inner.lock().unwrap();
+        if let Some(control) = inner.controls.front_mut()
+            && !control.sent
+        {
+            control.sent = true;
+            return Ok(Some(Command::Provider {
+                request: control.id,
+                operation: control.command.clone(),
+            }));
+        }
         if let Some((&request, query)) = inner.lookups.iter_mut().find(|(_, q)| !q.sent) {
             query.sent = true;
             return Ok(Some(Command::Lookup {
@@ -529,6 +538,10 @@ impl Driver {
     }
 
     fn event(&mut self, event: Event) -> Result<(), Errno> {
+        if self.provider_event(&event)? {
+            return Ok(());
+        }
+
         let mut binding_wakes = Vec::new();
         let mut address_query = None;
         let mut wakes = Vec::new();
@@ -536,6 +549,7 @@ impl Driver {
         let mut incoming = None;
         let mut inner = self.shared.inner.lock().unwrap();
         match event {
+            Event::Provider { .. } => return Err(Errno::EPROTO),
             Event::Complete { request, result } => {
                 if let Some(query) = inner.lookups.remove(&request) {
                     complete = Some((
@@ -959,6 +973,7 @@ impl Driver {
             }
         }
         let queries = std::mem::take(&mut inner.lookups);
+        let controls = std::mem::take(&mut inner.controls);
         drop(inner);
         drop(listeners);
         for waker in binding_wakes {
@@ -966,6 +981,16 @@ impl Driver {
         }
         for wq in queues {
             wq.wake(PollMask::ERR | PollMask::HUP | PollMask::READABLE | PollMask::WRITABLE);
+        }
+        for control in controls {
+            let reconciliation = control
+                .needs_reconciliation()
+                .then_some(Errno::ECONNABORTED);
+            (control.done)(wasixv2_vnet::provider::Completion {
+                result: Err(Errno::ECONNABORTED),
+                snapshot: control.snapshot,
+                reconciliation,
+            });
         }
         for (_, query) in queries {
             (query.done)(Err(LookupError::Failed));

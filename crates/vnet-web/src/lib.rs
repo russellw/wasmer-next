@@ -8,6 +8,7 @@ mod backend;
 pub mod codec;
 mod driver;
 mod publication;
+mod provider;
 pub mod transport;
 
 pub use backend::{Config, WebBackend};

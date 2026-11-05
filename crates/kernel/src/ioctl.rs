@@ -73,6 +73,13 @@ impl Kernel {
         {
             return self.clone_fuse(caller, device, arg).await;
         }
+        if matches!(
+            request.0,
+            wasixv2_vnet::provider::PROBE | wasixv2_vnet::provider::CALL
+        ) && let Some(socket) = file.downcast::<crate::netlink::NetlinkSocket>()
+        {
+            return self.provider_ioctl(caller, socket, request, arg).await;
+        }
         // Regular files answer FIONREAD generically; other files ask their object.
         if request == IoctlRequest::FIONREAD
             && let Backing::Inode(inode) = &file.backing

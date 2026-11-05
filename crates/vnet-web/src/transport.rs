@@ -9,6 +9,8 @@ use wasixv2_vnet::{Found, Lookup, LookupError, Shutdown};
 /// Capabilities of the actual provider, not of the browser or the guest socket layer.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Capabilities {
+    /// Explicit configured-provider controls and promised readbacks on this transport.
+    pub provider: Option<wasixv2_vnet::provider::Readback>,
     pub tcp: bool,
     pub udp: bool,
     pub ipv6: bool,
@@ -67,6 +69,10 @@ impl Capabilities {
 /// One ordered request. IDs are never reused within a backend, including across reconnects.
 #[derive(Clone, Debug)]
 pub enum Command {
+    Provider {
+        request: u64,
+        operation: wasixv2_vnet::provider::Request,
+    },
     Connect {
         request: u64,
         socket: u64,
@@ -128,6 +134,10 @@ pub enum Command {
 /// An asynchronous completion produced by the owning I/O worker.
 #[derive(Clone, Debug)]
 pub enum Event {
+    Provider {
+        request: u64,
+        reply: wasixv2_vnet::provider::Reply,
+    },
     LocalAddr {
         request: u64,
         addr: SocketAddr,
@@ -248,6 +258,9 @@ impl<T: FrameTransport> Transport for Classic<T> {
         self.capabilities
     }
     fn poll_send(&mut self, cx: &mut Context<'_>, command: &Command) -> Poll<Result<(), Errno>> {
+        if matches!(command, Command::Provider { .. }) && self.capabilities.provider.is_none() {
+            return Poll::Ready(Err(Errno::EOPNOTSUPP));
+        }
         if !self.capabilities.fidelity
             && matches!(
                 command,

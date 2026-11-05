@@ -107,3 +107,46 @@ actual ICMP port unreachable. It matches the current connected peer, reports
 ECONNREFUSED once on the next send/recv, and supports bounded RECVERR quotes.
 Local `DatagramError` remains separate. See RELAY-FIDELITY.md for exact stock
 server/provider and WISP follow-ups; no production relay deployment is changed.
+
+## Configured provider controls
+
+`Capabilities::provider = Some(Readback { ... })` explicitly enables classic bridge,
+unbridge, DHCP, address/MAC and route controls on the **same** relay session that
+carries socket traffic. The default profiles leave this capability absent. The
+records are the original classic interface records, with `Some(req_id)` selecting
+the original server's supported success/error response even for mutations that
+its old client submitted without waiting. No new relay wire extension is used.
+
+Controls are bounded by `Config::max_lookups`. The driver serializes each entire
+operation, its advertised readbacks, and namespace publication before starting
+the next control. A caller dropping its wait does not cancel or replay an accepted
+mutation: the driver retains its completion and publishes its result exactly once.
+The callback runs outside backend locks. Driver loss fails queued calls and marks
+an acknowledged mutation whose readback was incomplete as unreconciled.
+
+`Readback` promises only getters the configured provider actually supports. No
+incidental getter is required: a DHCP-only provider can return the original bare
+address vector without inventing CIDR prefixes. Promised addresses/MAC/routes are
+published together under the namespace's existing configuration lock, using an
+uplink in `NetConfig`. A failed promised readback after remote success reports its
+errno as a **partial commit**, retains `Completion::reconciliation`, and takes that
+uplink down so old routing is unavailable. It does not roll back the remote side.
+A later successful transaction repeats every promised getter and atomically
+restores availability (unless the provider was explicitly unbridged). Unpromised
+fields are unchanged; embedders must advertise the readbacks needed to reflect
+that provider's configuration in the local namespace.
+
+Route deadlines remain exact optional `u64` nanosecond values on the v1 surface
+and original `Duration` records on the wire. Their interpretation and expiration
+belong to the configured provider. WLK does not invent a clock or expire projected
+routes independently of the external transport. Configured v1 lists and all
+mutations use that provider; an operation's `EOPNOTSUPP` never selects a different
+local route table. Without a provider the v1 adapter keeps its Linux netlink path
+and explicitly rejects route deadlines that path cannot represent.
+
+The private AF_NETLINK/NETLINK_ROUTE ioctl envelope in `vnet::provider` pins each
+call to its socket's namespace. Mutations check the caller's and socket opener's
+`CAP_NET_ADMIN` over that namespace before looking up the capability; read-only
+queries have the same access policy as ordinary route/address dumps. These Rust
+controls and native original-relay tests do not establish browser worker/endpoint
+validation or any guarantee about a remote provider's own expiry policy.

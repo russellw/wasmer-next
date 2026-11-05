@@ -352,6 +352,11 @@ pub enum NewLinkKind {
 
 /// A network namespace: what the kernel's `socket` and the network pseudo files use.
 pub trait Network: Send + Sync {
+    /// Controls of the configured transport in this exact namespace; absent by default.
+    fn provider(&self) -> Option<Arc<dyn crate::provider::Provider>> {
+        None
+    }
+
     /// Linux's `inet_create`/`inet6_create`: a new, unbound socket. `protocol` is the guest's
     /// third `socket` argument: 0 picks the default; an unsupported value is
     /// `EPROTONOSUPPORT`, an unsupported kind/protocol pair `ESOCKTNOSUPPORT` or
@@ -735,6 +740,11 @@ pub trait NetworkPolicy: std::fmt::Debug + Send + Sync {
 /// Implementations do their I/O off the guest's thread. A backend object wakes the guest
 /// socket's original wait queue, including when the object was created after registration.
 pub trait Backend: Send + Sync {
+    /// Optional controls for this same transport, never a different network session.
+    fn provider(&self) -> Option<Arc<dyn crate::provider::Provider>> {
+        None
+    }
+
     /// An in-runtime peer reached by the uplink, if any. The namespace finishes routing
     /// after releasing its own lock, through its ordinary cross-namespace socket path.
     /// This preserves guest source ports and per-namespace bind/accept/UDP semantics;

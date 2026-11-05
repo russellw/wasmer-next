@@ -2130,3 +2130,141 @@ fn recvmmsg_validates_timeout_before_socket_lookup() {
         Errno::EFAULT
     );
 }
+
+/// Provider lookup itself is observable, so permission checks must happen first.
+#[derive(Default)]
+struct ControlledNet {
+    lookups: std::sync::atomic::AtomicUsize,
+    controls: Arc<DeferredControls>,
+}
+#[derive(Default)]
+struct DeferredControls(Mutex<Vec<wasixv2_vnet::provider::Done>>);
+impl wasixv2_vnet::provider::Provider for DeferredControls {
+    fn start(&self, _: wasixv2_vnet::provider::Request, done: wasixv2_vnet::provider::Done) {
+        self.0.lock().unwrap().push(done);
+    }
+}
+impl Network for ControlledNet {
+    fn provider(&self) -> Option<Arc<dyn wasixv2_vnet::provider::Provider>> {
+        self.lookups
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Some(self.controls.clone())
+    }
+    fn socket(&self, _: Domain, _: SocketKind, _: i32, _: u32) -> Result<Arc<dyn Socket>, Errno> {
+        Err(Errno::EOPNOTSUPP)
+    }
+}
+fn provider_header(memory: &FlatMemory, request: &wasixv2_vnet::provider::Request) {
+    let bytes = wasixv2_vnet::provider::encode(request).unwrap();
+    put(memory, 0x200, &bytes);
+    let mut header = Vec::new();
+    for value in [0x200u32, bytes.len() as u32, 0x2000, 0x1000] {
+        header.extend_from_slice(&value.to_le_bytes());
+    }
+    put(memory, 0x100, &header);
+}
+#[test]
+fn provider_ioctl_denies_before_lookup_and_retains_socket_namespace() {
+    use std::sync::atomic::Ordering;
+    use wasixv2_abi::{CloneFlags, IoctlRequest};
+    use wasixv2_vnet::provider::{self, Request};
+    let network = Arc::new(ControlledNet::default());
+    let (kernel, task, memory) = super::cred::machine_with(|kernel| {
+        kernel
+            .with_credentials(Credentials::new(0, 0))
+            .with_network(network.clone())
+    });
+    let caller = Caller::new(task, &memory);
+    let fd = block_on(kernel.socket(&caller, AddressFamily::AF_NETLINK, DGRAM, 0)).unwrap();
+    // An old descriptor stays bound to its original provider after unshare.
+    assert_eq!(
+        block_on(kernel.unshare(&caller, CloneFlags::CLONE_NEWNET.0)),
+        Ok(0)
+    );
+    assert_eq!(
+        block_on(kernel.ioctl(&caller, fd, IoctlRequest(provider::PROBE), 1)),
+        Ok(1)
+    );
+    let fresh = block_on(kernel.socket(&caller, AddressFamily::AF_NETLINK, DGRAM, 0)).unwrap();
+    assert_eq!(
+        block_on(kernel.ioctl(&caller, fresh, IoctlRequest(provider::PROBE), 1)),
+        Ok(0)
+    );
+    provider_header(&memory, &Request::Unbridge);
+    let mut waiting = Box::pin(kernel.ioctl(&caller, fd, IoctlRequest(provider::CALL), 0x100));
+    assert!(
+        std::future::Future::poll(
+            waiting.as_mut(),
+            &mut std::task::Context::from_waker(futures::task::noop_waker_ref())
+        )
+        .is_pending()
+    );
+    assert_eq!(network.controls.0.lock().unwrap().len(), 1);
+    drop(waiting);
+    // The canceled waiter's provider completion is still owned and callable exactly once.
+    let done = network.controls.0.lock().unwrap().pop().unwrap();
+    done(provider::Completion {
+        result: Ok(provider::Reply::None),
+        snapshot: provider::Snapshot::default(),
+        reconciliation: None,
+    });
+    assert!(network.controls.0.lock().unwrap().is_empty());
+    assert_eq!(block_on(kernel.setresuid(&caller, 1, 1, 1)), Ok(0));
+    let lookups = network.lookups.load(Ordering::SeqCst);
+    assert_eq!(
+        errno(block_on(kernel.ioctl(
+            &caller,
+            fd,
+            IoctlRequest(provider::PROBE),
+            1
+        ))),
+        Errno::EPERM
+    );
+    assert_eq!(
+        errno(block_on(kernel.ioctl(
+            &caller,
+            fd,
+            IoctlRequest(provider::CALL),
+            0x100
+        ))),
+        Errno::EPERM
+    );
+    assert_eq!(network.lookups.load(Ordering::SeqCst), lookups);
+    // Read queries remain readable, just as ordinary route/address dumps do.
+    assert_eq!(
+        block_on(kernel.ioctl(&caller, fd, IoctlRequest(provider::PROBE), 0)),
+        Ok(1)
+    );
+}
+#[test]
+fn provider_ioctl_checks_unprivileged_socket_opener_after_sender_gains_privilege() {
+    use wasixv2_abi::IoctlRequest;
+    use wasixv2_vnet::provider::{self, Request};
+    let network = Arc::new(ControlledNet::default());
+    let (kernel, task, memory) = super::cred::machine_with(|kernel| {
+        kernel
+            .with_credentials(Credentials::new(0, 0))
+            .with_network(network.clone())
+    });
+    let caller = Caller::new(task, &memory);
+    assert_eq!(
+        block_on(kernel.setresuid(&caller, u32::MAX, 1, u32::MAX)),
+        Ok(0)
+    );
+    let fd = block_on(kernel.socket(&caller, AddressFamily::AF_NETLINK, DGRAM, 0)).unwrap();
+    assert_eq!(
+        block_on(kernel.setresuid(&caller, u32::MAX, 0, u32::MAX)),
+        Ok(0)
+    );
+    provider_header(&memory, &Request::Unbridge);
+    assert_eq!(
+        errno(block_on(kernel.ioctl(
+            &caller,
+            fd,
+            IoctlRequest(provider::CALL),
+            0x100
+        ))),
+        Errno::EPERM
+    );
+    assert_eq!(network.lookups.load(std::sync::atomic::Ordering::SeqCst), 0);
+}

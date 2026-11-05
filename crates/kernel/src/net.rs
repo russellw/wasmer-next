@@ -26,6 +26,7 @@ use wasixv2_wait::PollMask;
 
 mod if_ioctl;
 mod packet;
+mod provider;
 mod sctp;
 pub(crate) mod vsock;
 

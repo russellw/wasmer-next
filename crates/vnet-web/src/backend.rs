@@ -47,6 +47,7 @@ pub(crate) struct Inner {
     pub flows: BTreeMap<u64, Flow>,
     pub listeners: BTreeMap<u64, Listener>,
     pub lookups: BTreeMap<u64, Query>,
+    pub controls: VecDeque<crate::provider::Transaction>,
 }
 impl Inner {
     pub fn id(&mut self) -> Result<u64, Errno> {
@@ -231,6 +232,7 @@ impl WebBackend {
                 flows: BTreeMap::new(),
                 listeners: BTreeMap::new(),
                 lookups: BTreeMap::new(),
+                controls: VecDeque::new(),
             }),
             wake: AtomicWaker::new(),
             failures: Mutex::new(VecDeque::new()),
@@ -272,6 +274,12 @@ fn family_allowed(capabilities: Capabilities, addr: SocketAddr) -> Result<(), Er
     }
 }
 impl Backend for WebBackend {
+    fn provider(&self) -> Option<Arc<dyn wasixv2_vnet::provider::Provider>> {
+        self.shared.inner.lock().unwrap().capabilities.provider?;
+        Some(Arc::new(Self {
+            shared: self.shared.clone(),
+        }))
+    }
     fn connect(&self, peer: SocketAddr, wq: WaitQueue) -> Result<Arc<dyn BackendStream>, Errno> {
         let mut inner = self.shared.inner.lock().unwrap();
         inner.room(self.shared.config)?;

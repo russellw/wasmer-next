@@ -212,6 +212,8 @@ pub(crate) struct NetState {
     pub udp: PortTable<Weak<UdpSocket>>,
     pub udp_pubs: Vec<UdpPublication>,
     pub ifaces: Interfaces,
+    pub provider_active: bool,
+    pub provider_reconciliation: Option<Errno>,
     pub rng: PortRng,
     /// The ids this namespace knows other namespaces by (`netns_ids`).
     pub nsids: Vec<(i32, Weak<Net>)>,
@@ -372,6 +374,8 @@ impl Net {
                 udp: PortTable::new(Proto::Udp),
                 udp_pubs: Vec::new(),
                 ifaces,
+                provider_active: true,
+                provider_reconciliation: None,
                 rng: PortRng::new(seed),
                 nsids: Vec::new(),
                 icmp: IcmpTables::default(),
@@ -382,6 +386,34 @@ impl Net {
             next_id: AtomicU64::new(1),
             me: me.clone(),
         })
+    }
+
+    /// Publishes one complete provider readback atomically, before its waiter is woken.
+    pub(crate) fn publish_provider(
+        &self,
+        snapshot: &crate::provider::Snapshot,
+        error: Option<Errno>,
+    ) -> NetResult<()> {
+        let lock = rtnl();
+        let mut st = self.configure(&lock);
+        if let Some(active) = snapshot.active {
+            st.provider_active = active;
+        }
+        match st
+            .ifaces
+            .provider_snapshot(snapshot, error.is_some() || !st.provider_active)
+        {
+            Ok(next) => {
+                st.ifaces = next;
+                st.provider_reconciliation = error;
+                Ok(())
+            }
+            Err(error) => {
+                st.ifaces.provider_unavailable();
+                st.provider_reconciliation = Some(error);
+                Err(error)
+            }
+        }
     }
 
     /// The policy inherited by network namespaces the machine creates.
@@ -424,7 +456,11 @@ impl Net {
     }
 
     pub(crate) fn state(&self) -> MutexGuard<'_, NetState> {
-        self.state.lock_or_recover()
+        let mut state = self.state.lock_or_recover();
+        if state.provider_reconciliation.is_some() || !state.provider_active {
+            state.ifaces.provider_unavailable();
+        }
+        state
     }
 
     /// The namespace's state for a configuration change, which `_rtnl` serialises, without
@@ -1094,6 +1130,14 @@ pub(crate) enum UdpRoute {
 }
 
 impl Network for Net {
+    fn provider(&self) -> Option<Arc<dyn crate::provider::Provider>> {
+        let provider = self.backend.as_ref()?.provider()?;
+        Some(Arc::new(crate::provider::NamespaceProvider {
+            net: self.arc(),
+            provider,
+        }))
+    }
+
     fn socket(
         &self,
         domain: Domain,

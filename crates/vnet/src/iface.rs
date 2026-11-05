@@ -783,6 +783,77 @@ impl Interfaces {
         this
     }
 
+    pub(crate) fn provider_unavailable(&mut self) {
+        for link in &mut self.links {
+            if matches!(link.kind, LinkKind::Uplink) {
+                link.flags &= !(flags::IFF_UP | flags::IFF_RUNNING | flags::IFF_LOWER_UP);
+            }
+        }
+    }
+
+    pub(crate) fn provider_snapshot(
+        &self,
+        snapshot: &crate::provider::Snapshot,
+        unavailable: bool,
+    ) -> NetResult<Self> {
+        let mut next = self.clone();
+        let index = next
+            .links
+            .iter()
+            .find(|l| matches!(l.kind, LinkKind::Uplink))
+            .map(|l| l.index)
+            .ok_or(Errno::ENODEV)?;
+        if let Some(addresses) = &snapshot.addresses {
+            while let Some(addr) = next.link(index).and_then(|l| l.addrs.first()).cloned() {
+                next.del_addr(
+                    index,
+                    &AddrMatch {
+                        v6: addr.addr.is_ipv6(),
+                        local: Some(addr.addr),
+                        address: None,
+                        prefix_len: addr.prefix_len,
+                        label: None,
+                    },
+                )?;
+            }
+            for addr in addresses {
+                if addr.prefix > if addr.ip.is_ipv4() { 32 } else { 128 } {
+                    return Err(Errno::EINVAL);
+                }
+                // The provider's vector may contain duplicates; the Linux projection need not.
+                if !next
+                    .link(index)
+                    .unwrap()
+                    .addrs
+                    .iter()
+                    .any(|a| a.addr == addr.ip && a.prefix_len == addr.prefix)
+                {
+                    next.add_addr(index, IfAddr::new(addr.ip, addr.prefix), AddMode::ADD)?;
+                }
+            }
+        }
+        if let Some(mac) = snapshot.mac {
+            next.link_mut(index)?.mac = mac;
+        }
+        if let Some(routes) = &snapshot.routes {
+            next.routes
+                .retain(|r| r.oif != index || r.table != rt::RT_TABLE_MAIN);
+            for route in routes {
+                crate::provider::Request::AddRoute(route.clone()).validate()?;
+                let gateway = (!route.via_router.is_unspecified()).then_some(route.via_router);
+                // The remote provider owns nexthop reachability and opaque deadlines.
+                next.routes.push(Route::unicast(
+                    route.cidr.ip,
+                    route.cidr.prefix,
+                    gateway,
+                    index,
+                ));
+            }
+        }
+        next.set_up(index, !unavailable)?;
+        Ok(next)
+    }
+
     pub fn links(&self) -> &[Link] {
         &self.links
     }

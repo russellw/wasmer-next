@@ -1607,3 +1607,233 @@ fn recverr_retains_bounded_icmp_quotes_and_attach_drops_them() {
         "new socket inherits neither RECVERR nor connection"
     );
 }
+
+fn provider_command(h: &Harness) -> (u64, wasixv2_vnet::provider::Request) {
+    match h.transport.commands.last().unwrap() {
+        Command::Provider { request, operation } => (*request, operation.clone()),
+        other => panic!("expected provider command, got {other:?}"),
+    }
+}
+fn provider_harness(
+    readback: wasixv2_vnet::provider::Readback,
+) -> (Harness, Arc<wasixv2_vnet::Net>) {
+    let mut capabilities = Capabilities::classic(true);
+    capabilities.provider = Some(readback);
+    let h = Harness::with_capabilities(capabilities);
+    let net = wasixv2_vnet::Net::new(
+        wasixv2_vnet::NetConfig::host_default(),
+        Some(h.backend.clone()),
+    );
+    (h, net)
+}
+#[test]
+fn provider_serializes_ack_readbacks_and_atomic_publication() {
+    use wasixv2_vnet::{
+        Network,
+        provider::{Cidr, Readback, Reply, Request},
+    };
+    let (mut h, net) = provider_harness(Readback {
+        addresses: true,
+        routes: true,
+        mac: false,
+    });
+    let provider = net.provider().unwrap();
+    let completed = Arc::new(AtomicUsize::new(0));
+    let count = completed.clone();
+    let view = net.clone();
+    provider.start(
+        Request::Dhcp,
+        Box::new(move |done| {
+            assert!(matches!(done.result, Ok(Reply::Acquired(_))));
+            assert!(
+                view.interfaces()
+                    .iter()
+                    .flat_map(|i| &i.addresses)
+                    .any(|a| a.addr == "192.0.2.4".parse::<std::net::IpAddr>().unwrap())
+            );
+            assert!(
+                view.routes()
+                    .iter()
+                    .all(|r| r.gateway != Some("10.0.2.2".parse().unwrap()))
+            );
+            count.fetch_add(1, Ordering::SeqCst);
+        }),
+    );
+    provider.start(Request::ClearRoutes, Box::new(|_| {}));
+    assert!(h.pump().is_pending());
+    let (id, request) = provider_command(&h);
+    assert_eq!(request, Request::Dhcp);
+    assert_eq!(h.transport.commands.len(), 1);
+    h.event(Event::Provider {
+        request: id,
+        reply: Reply::Acquired(vec!["192.0.2.4".parse().unwrap()]),
+    });
+    let (id, request) = provider_command(&h);
+    assert_eq!(request, Request::Addresses);
+    h.event(Event::Provider {
+        request: id,
+        reply: Reply::Addresses(vec![Cidr {
+            ip: "192.0.2.4".parse().unwrap(),
+            prefix: 24,
+        }]),
+    });
+    // No half-published address before the promised routes reply.
+    assert!(
+        !net.interfaces()
+            .iter()
+            .flat_map(|i| &i.addresses)
+            .any(|a| a.addr == "192.0.2.4".parse::<std::net::IpAddr>().unwrap())
+    );
+    let (id, request) = provider_command(&h);
+    assert_eq!(request, Request::Routes);
+    assert_eq!(completed.load(Ordering::SeqCst), 0);
+    h.event(Event::Provider {
+        request: id,
+        reply: Reply::Routes(vec![]),
+    });
+    assert_eq!(completed.load(Ordering::SeqCst), 1);
+    assert_eq!(provider_command(&h).1, Request::ClearRoutes);
+}
+#[test]
+fn provider_postcommit_readback_failure_disables_uplink_and_full_retry_recovers() {
+    use wasixv2_vnet::{
+        Network,
+        provider::{Cidr, Readback, Reply, Request, Security},
+    };
+    let (mut h, net) = provider_harness(Readback {
+        addresses: true,
+        ..Readback::default()
+    });
+    let provider = net.provider().unwrap();
+    let result = Arc::new(Mutex::new(None));
+    let output = result.clone();
+    provider.start(
+        Request::Bridge {
+            network: "tenant".into(),
+            token: "secret".into(),
+            security: Security::AnyEncryption,
+        },
+        Box::new(move |done| *output.lock().unwrap() = Some((done.result, done.reconciliation))),
+    );
+    assert!(h.pump().is_pending());
+    let (id, _) = provider_command(&h);
+    h.event(Event::Complete {
+        request: id,
+        result: Ok(()),
+    });
+    let (id, request) = provider_command(&h);
+    assert_eq!(request, Request::Addresses);
+    h.event(Event::Complete {
+        request: id,
+        result: Err(Errno::EIO),
+    });
+    assert_eq!(
+        *result.lock().unwrap(),
+        Some((Err(Errno::EIO), Some(Errno::EIO)))
+    );
+    assert!(
+        net.interfaces()
+            .iter()
+            .filter(|i| i.name == "eth0")
+            .all(|i| i.flags & 1 == 0)
+    );
+    let result = Arc::new(Mutex::new(None));
+    let output = result.clone();
+    provider.start(
+        Request::Addresses,
+        Box::new(move |done| *output.lock().unwrap() = Some(done.result)),
+    );
+    assert!(h.pump().is_pending());
+    let (id, _) = provider_command(&h);
+    h.event(Event::Provider {
+        request: id,
+        reply: Reply::Addresses(vec![Cidr {
+            ip: "192.0.2.7".parse().unwrap(),
+            prefix: 24,
+        }]),
+    });
+    assert!(result.lock().unwrap().as_ref().unwrap().is_ok());
+    assert!(
+        net.interfaces()
+            .iter()
+            .filter(|i| i.name == "eth0")
+            .all(|i| i.flags & 1 != 0)
+    );
+}
+#[test]
+fn provider_does_not_require_unadvertised_getters_or_fallback_on_refusal() {
+    use wasixv2_vnet::{
+        Network,
+        provider::{Readback, Request},
+    };
+    let (mut h, net) = provider_harness(Readback::default());
+    let provider = net.provider().unwrap();
+    let result = Arc::new(Mutex::new(None));
+    let output = result.clone();
+    provider.start(
+        Request::Unbridge,
+        Box::new(move |done| *output.lock().unwrap() = Some(done.result)),
+    );
+    assert!(h.pump().is_pending());
+    let (id, _) = provider_command(&h);
+    h.event(Event::Complete {
+        request: id,
+        result: Err(Errno::EOPNOTSUPP),
+    });
+    assert_eq!(*result.lock().unwrap(), Some(Err(Errno::EOPNOTSUPP)));
+    assert_eq!(h.transport.commands.len(), 1);
+    let result = Arc::new(Mutex::new(None));
+    let output = result.clone();
+    provider.start(
+        Request::Unbridge,
+        Box::new(move |done| *output.lock().unwrap() = Some(done.result)),
+    );
+    assert!(h.pump().is_pending());
+    let (id, _) = provider_command(&h);
+    h.event(Event::Complete {
+        request: id,
+        result: Ok(()),
+    });
+    assert!(result.lock().unwrap().as_ref().unwrap().is_ok());
+    assert_eq!(h.transport.commands.len(), 2);
+    assert!(
+        net.interfaces()
+            .iter()
+            .filter(|i| i.name == "eth0")
+            .all(|i| i.flags & 1 == 0)
+    );
+}
+#[test]
+fn provider_disconnect_after_commit_preserves_reconciliation_custody() {
+    use wasixv2_vnet::{
+        Network,
+        provider::{Readback, Request},
+    };
+    let (mut h, net) = provider_harness(Readback {
+        addresses: true,
+        ..Readback::default()
+    });
+    let result = Arc::new(Mutex::new(None));
+    let output = result.clone();
+    net.provider().unwrap().start(
+        Request::ClearAddresses,
+        Box::new(move |done| *output.lock().unwrap() = Some((done.result, done.reconciliation))),
+    );
+    assert!(h.pump().is_pending());
+    let (id, _) = provider_command(&h);
+    h.event(Event::Complete {
+        request: id,
+        result: Ok(()),
+    });
+    drop(h.driver);
+    assert_eq!(
+        *result.lock().unwrap(),
+        Some((Err(Errno::ECONNABORTED), Some(Errno::ECONNABORTED)))
+    );
+    assert!(
+        net.interfaces()
+            .iter()
+            .filter(|i| i.name == "eth0")
+            .all(|i| i.flags & 1 == 0)
+    );
+}

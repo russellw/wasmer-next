@@ -16,6 +16,7 @@ mod mcast;
 mod net;
 pub mod opts;
 pub mod ports;
+pub mod provider;
 mod ratelimit;
 mod raw;
 mod recvq;

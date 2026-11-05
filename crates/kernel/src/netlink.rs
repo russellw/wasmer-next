@@ -133,6 +133,10 @@ struct Header {
 }
 
 impl NetlinkSocket {
+    pub(crate) fn supports_provider_control(&self) -> bool {
+        self.protocol == NETLINK_ROUTE
+    }
+
     fn queue(&self) -> MutexGuard<'_, Queue> {
         self.queue.lock_or_recover()
     }

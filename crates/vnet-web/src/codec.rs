@@ -9,7 +9,10 @@ use std::{
     time::Duration,
 };
 use wasixv2_abi::Errno;
-use wasixv2_vnet::{Answer, Found, Lookup, LookupError, Shutdown};
+use wasixv2_vnet::{
+    Answer, Found, Lookup, LookupError, Shutdown,
+    provider::{Cidr, Reply, Request, Route},
+};
 
 /// Maximum complete websocket message, checked before decoding any variable-length field.
 pub const MAX_FRAME: usize = 1024 * 1024;
@@ -22,6 +25,33 @@ fn pack(value: impl Serialize) -> Result<Vec<u8>, Errno> {
 /// configured resolver provider (e.g. DoH); the classic Resolve record only names a host.
 pub fn encode(command: &Command) -> Result<Vec<u8>, Errno> {
     let out = match command {
+        Command::Provider { request, operation } => match operation {
+            Request::Bridge {
+                network,
+                token,
+                security,
+            } => pack((0u32, 0u32, network, token, *security as u32, Some(request)))?,
+            Request::Unbridge => pack((0u32, 2u32, Some(request)))?,
+            Request::Dhcp => pack((0u32, 3u32, Some(request)))?,
+            Request::AddAddress(a) => pack((0u32, 4u32, a.ip, a.prefix, Some(request)))?,
+            Request::RemoveAddress(ip) => pack((0u32, 5u32, ip, Some(request)))?,
+            Request::ClearAddresses => pack((0u32, 6u32, Some(request)))?,
+            Request::Addresses => pack((0u32, 7u32, Some(request)))?,
+            Request::Mac => pack((0u32, 8u32, Some(request)))?,
+            Request::Gateway(ip) => pack((0u32, 9u32, ip, Some(request)))?,
+            Request::AddRoute(r) => pack((
+                0u32,
+                10u32,
+                &r.cidr,
+                r.via_router,
+                r.preferred_until.map(Duration::from_nanos),
+                r.expires_at.map(Duration::from_nanos),
+                Some(request),
+            ))?,
+            Request::RemoveRoute(ip) => pack((0u32, 11u32, ip, Some(request)))?,
+            Request::ClearRoutes => pack((0u32, 12u32, Some(request)))?,
+            Request::Routes => pack((0u32, 13u32, Some(request)))?,
+        },
         Command::Connect {
             request,
             socket,
@@ -144,6 +174,41 @@ pub fn decode(frame: &[u8]) -> Result<Event, Errno> {
                     request,
                     result: Err(network_error(r.get()?)?),
                 },
+                9 => Event::Provider {
+                    request,
+                    reply: Reply::Mac(r.get()?),
+                },
+                10 => Event::Provider {
+                    request,
+                    reply: Reply::Addresses(r.get::<Vec<Cidr>>()?),
+                },
+                11 => {
+                    #[derive(serde::Deserialize)]
+                    struct ClassicRoute {
+                        cidr: Cidr,
+                        via_router: IpAddr,
+                        preferred_until: Option<Duration>,
+                        expires_at: Option<Duration>,
+                    }
+                    let nanos =
+                        |d: Duration| u64::try_from(d.as_nanos()).map_err(|_| Errno::EPROTO);
+                    let routes = r
+                        .get::<Vec<ClassicRoute>>()?
+                        .into_iter()
+                        .map(|r| {
+                            Ok(Route {
+                                cidr: r.cidr,
+                                via_router: r.via_router,
+                                preferred_until: r.preferred_until.map(nanos).transpose()?,
+                                expires_at: r.expires_at.map(nanos).transpose()?,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, Errno>>()?;
+                    Event::Provider {
+                        request,
+                        reply: Reply::Routes(routes),
+                    }
+                }
                 8 => Event::LocalAddr {
                     request,
                     addr: r.get()?,
