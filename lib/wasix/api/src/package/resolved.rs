@@ -127,14 +127,13 @@ impl ResolvedLayout {
                     mapping.package
                 ))
             })?;
-            // V1/V2 mappings select a subtree of the named volume. The legacy
-            // V3 mapping selects the whole volume; raw Package keeps its own policy.
-            let source_path =
-                if matches!(container.version(), webc::Version::V1 | webc::Version::V2) {
-                    mapping.original_path.as_deref()
-                } else {
-                    None
-                };
+            // V2 mappings select a subtree of the atom volume. The legacy resolved
+            // V3 mapping selects the whole named volume; raw Package keeps its own policy.
+            let source_path = if container.version() == webc::Version::V2 {
+                mapping.original_path.as_deref()
+            } else {
+                None
+            };
             let supplied = match provider {
                 Some(provider) => provider(ResolvedVolumeRequest {
                     package: &mapping.package,
@@ -289,7 +288,6 @@ pub fn preflight_resolved_filesystem(
     if package.filesystem.is_empty() {
         return Ok(());
     }
-    let mut v1 = false;
     let mut v2 = None;
     let mut v3 = None;
     for ResolvedFileSystemMapping { package: id, .. } in &package.filesystem {
@@ -300,7 +298,6 @@ pub fn preflight_resolved_filesystem(
             ))
         })?;
         match container.version() {
-            webc::Version::V1 => v1 = true,
             webc::Version::V2 => {
                 if v2.is_none() {
                     v2 = Some(id);
@@ -324,9 +321,7 @@ pub fn preflight_resolved_filesystem(
                 "Mix of webc v2 and v3 in the same dependency tree is not supported; v2: {v2}, v3: {v3}"
             )));
         }
-        (None, None) if !v1 => {
-            return Err(super::invalid("Internal error: no packages found in tree"));
-        }
+        (None, None) => return Err(super::invalid("Internal error: no packages found in tree")),
         _ => {}
     }
     let mut volumes: HashMap<&PackageId, BTreeMap<String, Volume>> = HashMap::new();
@@ -526,15 +521,10 @@ mod tests {
             )
             .await
             .unwrap();
-        let mut bytes = Vec::new();
-        loop {
-            let mut chunk = [0; 1024];
-            let count = file.read_at(&mut chunk, bytes.len() as u64).await.unwrap();
-            if count == 0 {
-                return bytes;
-            }
-            bytes.extend_from_slice(&chunk[..count]);
-        }
+        let mut bytes = vec![0; 32];
+        let count = file.read_at(&mut bytes, 0).await.unwrap();
+        bytes.truncate(count);
+        bytes
     }
 
     #[tokio::test]
@@ -623,297 +613,6 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(read(&machine, b"/msg").await, b"contents");
-    }
-
-    // Match webc's tests/v1.rs serializer: these are original V1 bytes, with a
-    // filesystem volume named "atom" separate from the executable atom table.
-    fn v1_archive(fs: Option<serde_json::Value>) -> OwnedBuffer {
-        use webc::v1::{DirOrFile, GenerateChecksum, Volume as V1Volume, WebC};
-        let command = wat::parse_str(
-            r#"(module
-            (import "wasixv2" "exit_group" (func $exit (param i32)))
-            (memory (export "memory") 1)
-            (func (export "_start") (call $exit (i32.const 37)) unreachable))"#,
-        )
-        .unwrap();
-        let signature = webc::metadata::AtomSignature::Sha256(
-            wasmer_package::resolver::WebcHash::sha256(&command).as_bytes(),
-        )
-        .to_string();
-        let mut manifest = serde_json::json!({
-            "atoms": {"main": {"kind": "https://webc.org/kind/wasm", "signature": signature}},
-            "commands": {"hello": {"runner": "https://webc.org/runner/wasi", "annotations": {"wasi": {"atom": "main"}}}},
-            "entrypoint": "hello"
-        });
-        if let Some(fs) = fs {
-            manifest["package"] = serde_json::json!({"fs": fs});
-        }
-        let atoms =
-            V1Volume::serialize_atoms(BTreeMap::from([(DirOrFile::File("main".into()), command)]));
-        let files = V1Volume::serialize_files(BTreeMap::from([
-            (DirOrFile::Dir("nested/".into()), Vec::new()),
-            (DirOrFile::File("nested/msg".into()), b"selected".to_vec()),
-            (DirOrFile::File("msg".into()), b"filesystem atom".to_vec()),
-            (DirOrFile::File("decoy".into()), b"outside subtree".to_vec()),
-        ]));
-        let webc = WebC {
-            version: 1,
-            checksum: None,
-            signature: None,
-            manifest: serde_json::from_value(manifest).unwrap(),
-            atoms: V1Volume::parse(&atoms).unwrap(),
-            volumes: [("atom".to_owned(), V1Volume::parse(&files).unwrap())]
-                .into_iter()
-                .collect(),
-        };
-        OwnedBuffer::from_bytes(webc.into_bytes(GenerateChecksum::Sha256).unwrap())
-    }
-
-    async fn assert_missing(machine: &Machine, path: &[u8]) {
-        let root = machine.vfs().root();
-        let cred = Cred::root();
-        let cx = Ctx {
-            cred: &cred,
-            root: &root,
-            umask: 0,
-            task: 0,
-            leases: None,
-        };
-        assert!(
-            machine
-                .vfs()
-                .lookup(&cx, &root, path, LookupFlags::follow())
-                .await
-                .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn v1_original_path_selects_subtrees_at_nested_and_root_mounts() {
-        for mount in ["/data", "/"] {
-            let bytes = v1_archive(Some(serde_json::json!([
-                {"volume_name": "atom", "original_path": "/nested", "mount_path": mount}
-            ])));
-            // The classic SDK passes incoming bytes directly to this constructor.
-            let original = webc::Container::from_bytes_and_version(
-                bytes.as_ref().to_vec().into(),
-                webc::Version::V1,
-            )
-            .unwrap();
-            assert_eq!(original.version(), webc::Version::V1);
-            drop(original);
-            let package = loaded(bytes.clone()).await;
-            assert_eq!(package.webc_version, webc::Version::V1);
-            let container = &package.containers[&package.resolution.package.root_package];
-            assert_eq!(container.version(), webc::Version::V1);
-            preflight_resolved_filesystem(&package.containers, &package.resolution.package, false)
-                .unwrap();
-            let layout = ResolvedLayout::new(&package, false, None).unwrap();
-            let mut machine = Machine::new();
-            crate::install_package_sources(
-                &mut machine,
-                &[super::super::PackageInstallSource::Resolved(&layout)],
-            )
-            .await
-            .unwrap();
-            let command = package.get_command("hello").unwrap().atom();
-            assert_eq!(read(&machine, b"/bin/hello").await, command.as_ref());
-            drop(command);
-            drop(layout);
-            drop(package);
-            drop(bytes);
-            let prefix = if mount == "/" { "" } else { mount };
-            assert_eq!(
-                read(&machine, format!("{prefix}/msg").as_bytes()).await,
-                b"selected"
-            );
-            assert_missing(&machine, format!("{prefix}/decoy").as_bytes()).await;
-            assert_missing(&machine, format!("{prefix}/nested").as_bytes()).await;
-        }
-    }
-
-    #[tokio::test]
-    async fn v1_without_fs_mounts_filesystem_atom_and_executes_the_separate_command_atom() {
-        tokio::task::LocalSet::new()
-            .run_until(async {
-                let package = loaded(v1_archive(None)).await;
-                preflight_resolved_filesystem(
-                    &package.containers,
-                    &package.resolution.package,
-                    false,
-                )
-                .unwrap();
-                let layout = ResolvedLayout::new(&package, false, None).unwrap();
-                let mut machine = Machine::new();
-                crate::install_package_sources(
-                    &mut machine,
-                    &[super::super::PackageInstallSource::Resolved(&layout)],
-                )
-                .await
-                .unwrap();
-                drop(layout);
-                drop(package);
-                assert_eq!(read(&machine, b"/msg").await, b"filesystem atom");
-                assert_eq!(
-                    machine
-                        .run_file(
-                            &crate::Engine::default(),
-                            "/bin/hello",
-                            crate::ProcessConfig {
-                                args: vec!["hello".into()],
-                                env: vec![],
-                                stdio: crate::Stdio::from_fns(|_| {}, |_| {}),
-                            }
-                        )
-                        .await
-                        .unwrap(),
-                    37
-                );
-                machine.shutdown().await;
-            })
-            .await;
-    }
-
-    #[tokio::test]
-    async fn v1_missing_volume_is_rejected_before_invalid_command_selection() {
-        let bytes = v1_archive(Some(serde_json::json!([
-            {"volume_name": "missing", "mount_path": "/data"}
-        ])));
-        let container = wasmer_package::utils::from_bytes(bytes.as_ref().to_vec()).unwrap();
-        let id = PackageId::Hash(PackageHash::from_sha256_bytes([0; 32]));
-        let info =
-            PackageInfo::from_manifest(id.clone(), container.manifest(), container.version())
-                .unwrap();
-        let mut resolution = resolve(&id, &info, &InMemorySource::new()).await.unwrap();
-        // Deliberately invalid command lookup must remain later than filesystem validation.
-        resolution.package.commands.get_mut("hello").unwrap().name = "absent".into();
-        let containers = HashMap::from([(id, container)]);
-        let error =
-            preflight_resolved_filesystem(&containers, &resolution.package, false).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("doesn't have a \"missing\" volume")
-        );
-        assert!(
-            LoadedPackage::from_containers(resolution, containers)
-                .unwrap_err()
-                .to_string()
-                .contains("command metadata")
-        );
-    }
-
-    #[tokio::test]
-    async fn v1_dependency_mapping_keeps_alias_subtree_and_local_root_skip() {
-        use wasmer_package::resolver::{Dependency, DistributionInfo, PackageSummary};
-        let dep = wasmer_package::utils::from_bytes(
-            v1_archive(Some(serde_json::json!([]))).as_ref().to_vec(),
-        )
-        .unwrap();
-        let dep_id = PackageId::new_named("demo/assets", "1.0.0".parse().unwrap());
-        let dep_info =
-            PackageInfo::from_manifest(dep_id.clone(), dep.manifest(), dep.version()).unwrap();
-        let mut source = InMemorySource::new();
-        source.add(PackageSummary {
-            pkg: dep_info,
-            dist: DistributionInfo {
-                webc: "https://example.invalid/assets.webc".parse().unwrap(),
-                webc_sha256: [1; 32].into(),
-            },
-        });
-        let root = wasmer_package::utils::from_bytes(v1_archive(Some(serde_json::json!([
-            {"from": "assets", "volume_name": "atom", "original_path": "/nested", "mount_path": "/data"},
-            {"volume_name": "atom", "mount_path": "/local"}
-        ]))).as_ref().to_vec()).unwrap();
-        let root_id = PackageId::Hash(PackageHash::from_sha256_bytes([0; 32]));
-        let mut info =
-            PackageInfo::from_manifest(root_id.clone(), root.manifest(), root.version()).unwrap();
-        info.dependencies.push(Dependency {
-            alias: "assets".into(),
-            pkg: "demo/assets@1.0.0".parse().unwrap(),
-        });
-        let resolution = resolve(&root_id, &info, &source).await.unwrap();
-        let package = LoadedPackage::from_containers(
-            resolution,
-            HashMap::from([(root_id, root), (dep_id.clone(), dep)]),
-        )
-        .unwrap();
-        preflight_resolved_filesystem(&package.containers, &package.resolution.package, true)
-            .unwrap();
-        let calls = Cell::new(0);
-        let provider =
-            |request: ResolvedVolumeRequest<'_>| -> io::Result<Option<ResolvedReaderVolume>> {
-                assert_eq!(request.package, &dep_id);
-                assert_eq!(request.source_path, Some("/nested"));
-                calls.set(calls.get() + 1);
-                Ok(None)
-            };
-        let layout = ResolvedLayout::new(&package, true, Some(&provider)).unwrap();
-        assert_eq!(calls.get(), 1);
-        let mut machine = Machine::new();
-        crate::install_package_sources(
-            &mut machine,
-            &[super::super::PackageInstallSource::Resolved(&layout)],
-        )
-        .await
-        .unwrap();
-        assert_eq!(read(&machine, b"/data/msg").await, b"selected");
-        assert_missing(&machine, b"/data/decoy").await;
-        assert_missing(&machine, b"/local").await;
-    }
-
-    #[tokio::test]
-    async fn v1_preflight_does_not_change_the_v2_v3_mixing_policy() {
-        use webc::v2::write::{Directory as V2Directory, Writer as V2Writer};
-        let v2_bytes = V2Writer::default()
-            .write_manifest(&webc::metadata::Manifest::default())
-            .unwrap()
-            .write_atoms(BTreeMap::new())
-            .unwrap()
-            .with_volume(
-                "atom",
-                V2Directory {
-                    children: BTreeMap::new(),
-                },
-            )
-            .unwrap()
-            .finish(webc::v2::SignatureAlgorithm::None)
-            .unwrap();
-        let v2 = wasmer_package::utils::from_bytes(v2_bytes.to_vec()).unwrap();
-        let v3 = wasmer_package::utils::from_bytes(archive(true).as_ref().to_vec()).unwrap();
-        let mut package = loaded(v1_archive(None)).await;
-        let v1_mapping = package.resolution.package.filesystem[0].clone();
-        for (index, container) in [v2, v3].into_iter().enumerate() {
-            let id = PackageId::Hash(PackageHash::from_sha256_bytes([index as u8 + 1; 32]));
-            let mut mapping = v1_mapping.clone();
-            mapping.package = id.clone();
-            package.containers.insert(id, container);
-            package.resolution.package.filesystem.push(mapping);
-            // A V1/V2 or V1/V3 tree is not an actual V2/V3 mixture.
-            if index == 0 {
-                preflight_resolved_filesystem(
-                    &package.containers,
-                    &package.resolution.package,
-                    false,
-                )
-                .unwrap();
-            } else {
-                let error = preflight_resolved_filesystem(
-                    &package.containers,
-                    &package.resolution.package,
-                    false,
-                )
-                .unwrap_err();
-                assert!(error.to_string().starts_with("Mix of webc v2 and v3"));
-                package.resolution.package.filesystem.remove(1);
-                preflight_resolved_filesystem(
-                    &package.containers,
-                    &package.resolution.package,
-                    false,
-                )
-                .unwrap();
-            }
-        }
     }
 
     #[derive(Debug)]

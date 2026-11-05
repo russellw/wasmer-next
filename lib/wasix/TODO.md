@@ -21,6 +21,8 @@ on the v2 kernel. Original fixtures and behavior evidence remain removal gates.
 | Browser SDK | Current/classic public APIs, packages, streams/mounts/transports, termination and resource retirement. |
 | Providers and coredumps | Optional configured-provider controls and compositional original-source trap coordinates. |
 
+WebC v1 container compatibility is excluded; do not add a legacy container port.
+
 Journaling, journal commands and compatibility with old journal formats are
 explicitly excluded by the user. Do not port their formats or retain them as a
 parity gate. Remove their CLI hooks and retire old journal dependencies with the
@@ -49,7 +51,6 @@ establish full parity or an integrated release result.
 | Shared resolved installer | Integrated on `main`; [component source](https://github.com/wasmerio/wasmer-next/tree/wasixv2/parity-cli-resolved-install) | Combined installer tests pass (15); remaining consumer integration is tracked separately. |
 | Download progress | Integrated on `main`; [component source](https://github.com/wasmerio/wasmer-next/tree/wasixv2/parity-cli-package-progress) | Acquisition/progress tests pass (75); SDK subscriber integration remains. |
 | Browser isolation | [SDK `a5be3a955f9`](https://github.com/wasmerio/wasmer-next/tree/parity/sdk-isolation-20261105) | One Chromium/Firefox busy-module and live-directory batch passed on WLK `8bce49d4`; a later repeated teardown probe retained two coordinators. Stable retirement, current public API assembly and Node remain. |
-| WebC v1 resolved packages | Integrated as `6ed9af0925b`; [component source](https://github.com/wasmerio/wasmer-next/tree/wasixv2/parity-cli-package-v1) | Installer tests (13), resolver tests (50) and CLI check pass; SDK adoption remains. |
 | Original-source coredumps | [Runtime `18df6357995`](https://github.com/wasmerio/wasmer-next/tree/wasixv2/parity-coredump-next), [CLI `6e082fdaf85`](https://github.com/wasmerio/wasmer-next/tree/wasixv2/parity-cli-coredump-wiring) | Type-level tests pass; compiler/artifact, original guest, observer/cache and CLI integration validation remain. |
 | Cross-sandbox network endpoints | [WLK `4dc0bab536c`](https://github.com/wasmerio/wlk/tree/parity/endpoint-selection-20261105) | Reviewed optional API only; routing and SDK provider integration remain. |
 
