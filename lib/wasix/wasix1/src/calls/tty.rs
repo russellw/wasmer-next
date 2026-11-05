@@ -3,7 +3,9 @@
 //!
 //! The state comes from Linux's terminal ioctls on descriptors 0, 1 and 2: `TIOCGWINSZ` says
 //! whether each is a terminal and how big the first one is, and `TCGETS`/`TCSETS` on the first
-//! one carry `ECHO` and `ICANON`. Without a terminal, those modes are compat state that
+//! one carry `ECHO` and `ICANON`. `tty_set` sends dimensions to that same terminal through
+//! `TIOCSWINSZ`, using the shared Linux-size projection. Real zero dimensions remain zero.
+//! Without a terminal, those modes are compat state that
 //! `tty_set` keeps, starting at v1's defaults, and the size is v1's default 80x25.
 //!
 //! "Line feeds" is always compat state: wasix-libc derives it from `c_lflag & IGNCR`, an input
@@ -13,6 +15,7 @@
 use std::sync::Mutex;
 
 use wasixv2_abi::{Fd, IoctlRequest, Termios, TermiosLflag, Winsize};
+use wasixv2_host::WindowSize;
 use wasixv2_syscalls::{Control, SysErr, Syscalls};
 use wasmer::RuntimeError;
 
@@ -127,22 +130,14 @@ fn apply(termios: &mut Termios, modes: Modes) {
     );
 }
 
-/// A pixel size, or the default when the terminal does not know it.
-fn or_default(value: u16, default: u32) -> u32 {
-    match value {
-        0 => default,
-        value => u32::from(value),
-    }
-}
-
 /// The v1 terminal state for `ttys`, the first terminal's window size, and `modes`.
 fn tty_state(ttys: [bool; 3], winsize: Option<&Winsize>, modes: Modes) -> Tty {
     let (cols, rows, width, height) = match winsize {
         Some(ws) => (
-            or_default(ws.ws_col, DEFAULT_COLS),
-            or_default(ws.ws_row, DEFAULT_ROWS),
-            or_default(ws.ws_xpixel, DEFAULT_WIDTH),
-            or_default(ws.ws_ypixel, DEFAULT_HEIGHT),
+            u32::from(ws.ws_col),
+            u32::from(ws.ws_row),
+            u32::from(ws.ws_xpixel),
+            u32::from(ws.ws_ypixel),
         ),
         None => (DEFAULT_COLS, DEFAULT_ROWS, DEFAULT_WIDTH, DEFAULT_HEIGHT),
     };
@@ -209,6 +204,23 @@ pub(crate) async fn tty_set<S: Syscalls + Control + 'static>(
                     .lock()
                     .unwrap()
                     .line_feeds = modes.line_feeds;
+                let size = WindowSize::from_u32(tty.rows, tty.cols, tty.width, tty.height);
+                let winsize = Winsize {
+                    ws_row: size.rows,
+                    ws_col: size.cols,
+                    ws_xpixel: size.xpixel,
+                    ws_ypixel: size.ypixel,
+                };
+                let winsize = frame.mem.alloc(&winsize)?;
+                frame
+                    .syscalls
+                    .ioctl(
+                        &frame.caller(),
+                        fd,
+                        IoctlRequest::TIOCSWINSZ,
+                        winsize.addr(),
+                    )
+                    .await?;
             }
             None => *frame.proc().await?.proc.tty.modes.lock().unwrap() = modes,
         }
@@ -259,6 +271,7 @@ mod tests {
     fn no_terminal_is_v1_defaults() {
         let tty = tty_state([false; 3], None, Modes::default());
         assert_eq!((tty.cols, tty.rows), (80, 25));
+        assert_eq!((tty.width, tty.height), (800, 600));
         assert_eq!(tty.stdout_tty, Bool::FALSE);
         assert_eq!(tty.line_feeds, Bool::TRUE);
         let ws = Winsize {
@@ -268,7 +281,22 @@ mod tests {
             ws_ypixel: 0,
         };
         let tty = tty_state([false, true, false], Some(&ws), Modes::default());
-        assert_eq!((tty.cols, tty.rows, tty.width), (132, 50, 800));
+        assert_eq!((tty.cols, tty.rows, tty.width, tty.height), (132, 50, 0, 0));
         assert_eq!(tty.stdout_tty, Bool::TRUE);
+    }
+
+    #[test]
+    fn a_real_terminal_preserves_zero_dimensions() {
+        let ws = Winsize {
+            ws_row: 0,
+            ws_col: 0,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let tty = tty_state([true; 3], Some(&ws), Modes::default());
+        assert_eq!((tty.cols, tty.rows, tty.width, tty.height), (0, 0, 0, 0));
+        assert_eq!(tty.stdin_tty, Bool::TRUE);
+        assert_eq!(tty.stdout_tty, Bool::TRUE);
+        assert_eq!(tty.stderr_tty, Bool::TRUE);
     }
 }
