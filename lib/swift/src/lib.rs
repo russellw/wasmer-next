@@ -312,8 +312,16 @@ mod tests {
     }
 
     #[test]
-    fn a_single_command_without_an_entrypoint_keeps_the_original_message() {
-        let bytes = archive(manifest(false), Some(&printing(b"must not run", "")), false);
+    fn a_single_command_without_an_explicit_entrypoint_runs_the_inferred_command() {
+        let bytes = archive(manifest(false), Some(&printing(b"inferred\n", "")), false);
+        assert_eq!(run_package(bytes, vec![]).unwrap(), "inferred\n");
+    }
+
+    #[test]
+    fn multiple_commands_without_an_entrypoint_keep_the_original_message() {
+        let mut meta = manifest(false);
+        meta["commands"]["other"] = meta["commands"]["hello"].clone();
+        let bytes = archive(meta, Some(&printing(b"must not run", "")), false);
         assert_eq!(
             run_package(bytes, vec![]).unwrap(),
             "This WEBC (swift/test@1.0.0) has no entrypoint!"
