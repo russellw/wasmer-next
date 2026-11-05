@@ -2,7 +2,9 @@
 //!
 //! Handles own their descriptors, so closing or replacing standard input cannot redirect a
 //! later restore. Leases on one terminal share its first saved settings; the last lease
-//! restores them. Linux identifies terminals with `TIOCGDEV`, including `/dev/tty` aliases.
+//! restores them. Acquiring a lease does not install a panic hook or change an embedder's
+//! panic policy; a caught panic leaves retained leases in force until their owners release
+//! them after cleanup. Linux identifies terminals with `TIOCGDEV`, including `/dev/tty` aliases.
 //! This is the inherited-terminal profile: independently mounted devpts instances can reuse
 //! device numbers and are not a supported identity domain for this process-wide registry.
 
@@ -10,7 +12,7 @@ use std::{
     collections::HashMap,
     io,
     os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd},
-    sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, Once, TryLockError},
+    sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard},
 };
 
 use crate::WindowSize;
@@ -209,7 +211,6 @@ struct State {
     entries: HashMap<TerminalKey, Entry>,
     generation: u64,
     suspended: bool,
-    panic_restored: bool,
 }
 enum Entry {
     // The tombstone stays visible until the out-of-lock syscall and descriptor close finish.
@@ -247,7 +248,7 @@ impl Registry {
         let mut attempted = None;
         loop {
             let mut state = self.lock();
-            let cooked = state.suspended || state.panic_restored;
+            let cooked = state.suspended;
             if active.cooked == Some(cooked) || attempted == Some(cooked) {
                 state.entries.insert(key, Entry::Active(active));
                 self.changed.notify_all();
@@ -283,9 +284,6 @@ impl Registry {
         {
             state.entries.remove(&key);
         }
-        if state.entries.is_empty() {
-            state.panic_restored = false;
-        }
         self.changed.notify_all();
     }
 }
@@ -296,7 +294,6 @@ pub struct RawMode(Option<(TerminalKey, u64)>);
 
 impl RawMode {
     fn acquire(key: TerminalKey, fd: OwnedFd) -> io::Result<Self> {
-        install_panic_hook();
         let generation = loop {
             let mut state = REGISTRY.lock();
             match state.entries.get_mut(&key) {
@@ -324,9 +321,6 @@ impl RawMode {
                 drop(fd);
                 let mut state = REGISTRY.lock();
                 state.entries.remove(&key);
-                if state.entries.is_empty() {
-                    state.panic_restored = false;
-                }
                 REGISTRY.changed.notify_all();
                 return Err(err);
             }
@@ -397,47 +391,24 @@ impl Drop for RawMode {
 
 /// Restores active terminals before the host process stops, retaining their lease counts.
 pub fn suspend() {
-    change_mode(true, false);
+    change_mode(true);
 }
 
 /// Reapplies raw mode after the host process continues.
 pub fn resume() {
-    change_mode(false, false);
+    change_mode(false);
 }
 
-fn change_mode(cooked: bool, panic: bool) {
-    let mut state = if panic {
-        match REGISTRY.state.try_lock() {
-            Ok(state) => state,
-            Err(TryLockError::Poisoned(state)) => state.into_inner(),
-            Err(TryLockError::WouldBlock) => return,
-        }
-    } else {
-        REGISTRY.lock()
-    };
-    if panic {
-        state.panic_restored = !state.entries.is_empty();
-    } else {
-        state.suspended = cooked;
-        if !cooked {
-            state.panic_restored = false;
-        }
-    }
+fn change_mode(cooked: bool) {
+    let mut state = REGISTRY.lock();
+    state.suspended = cooked;
     let keys: Vec<_> = state.entries.keys().copied().collect();
     drop(state);
     for key in keys {
         let active = loop {
-            let mut state = if panic {
-                match REGISTRY.state.try_lock() {
-                    Ok(state) => state,
-                    Err(TryLockError::Poisoned(state)) => state.into_inner(),
-                    Err(TryLockError::WouldBlock) => break None,
-                }
-            } else {
-                REGISTRY.lock()
-            };
+            let mut state = REGISTRY.lock();
             match state.entries.get(&key) {
-                Some(Entry::Transition(_)) if !panic => {
+                Some(Entry::Transition(_)) => {
                     drop(REGISTRY.wait(state));
                 }
                 Some(Entry::Active(active)) => {
@@ -488,17 +459,6 @@ fn set(fd: RawFd, termios: &libc::termios, when: libc::c_int) -> io::Result<()> 
         }
     }
 }
-fn install_panic_hook() {
-    static INSTALL: Once = Once::new();
-    INSTALL.call_once(|| {
-        let previous = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            change_mode(true, true);
-            previous(info);
-        }));
-    });
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -508,7 +468,7 @@ mod tests {
     pub(super) static WAITS: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
 
-    /// Process-wide panic/suspend hooks must not affect unrelated parallel host tests.
+    /// Process-wide suspend/resume must not affect unrelated parallel host tests.
     fn isolated(name: &str) -> bool {
         const CHILD: &str = "WASIX_TERMINAL_TEST";
         if std::env::var(CHILD).as_deref() == Ok(name) {
@@ -571,8 +531,7 @@ mod tests {
             && termios.c_oflag & libc::OPOST == 0
     }
 
-    /// One test, as raw mode is process-wide state: the guard, a stop, and a panic each give
-    /// the terminal its settings back.
+    /// Normal completion, explicit job control and unwinding release the terminal.
     #[test]
     fn the_terminal_is_restored_on_every_way_out() {
         if !isolated("the_terminal_is_restored_on_every_way_out") {
@@ -591,16 +550,15 @@ mod tests {
         drop(raw);
         assert!(same(&get(pty.slave).unwrap(), &cooked), "dropped: restored");
 
-        let raw = RawMode::enter(pty.slave).unwrap();
-        let panicked = std::panic::catch_unwind(|| panic!("the panic path"));
+        // Unwinding through the scope releases its owned lease.
+        // The former process-wide before-report hook is preserved as a reference fixture.
+        let panicked = std::panic::catch_unwind(|| {
+            let _raw = RawMode::enter(pty.slave).unwrap();
+            assert!(is_raw(&get(pty.slave).unwrap()));
+            panic!("the panic path");
+        });
         assert!(panicked.is_err());
-        assert!(
-            same(&get(pty.slave).unwrap(), &cooked),
-            "the panic hook restored"
-        );
-        // The hook retains the original settings until the final guard releases them.
-        drop(raw);
-        assert!(same(&get(pty.slave).unwrap(), &cooked));
+        assert!(same(&get(pty.slave).unwrap(), &cooked), "unwound: restored");
 
         let raw = RawMode::enter(pty.slave).unwrap();
         assert!(
@@ -761,14 +719,113 @@ mod tests {
 
         let first = RawMode::enter(pty.slave).unwrap();
         let second = RawMode::enter(pty.slave).unwrap();
-        assert!(std::panic::catch_unwind(|| panic!("shared panic path")).is_err());
-        assert!(same(&get(pty.slave).unwrap(), &cooked));
-        resume();
-        assert!(is_raw(&get(pty.slave).unwrap()));
-        drop(second);
-        assert!(is_raw(&get(pty.slave).unwrap()));
+        let panicked = std::panic::catch_unwind(move || {
+            let _failed_run = second;
+            panic!("shared panic path");
+        });
+        assert!(panicked.is_err());
+        assert!(
+            is_raw(&get(pty.slave).unwrap()),
+            "unwinding released only the failed run"
+        );
         drop(first);
         assert!(same(&get(pty.slave).unwrap(), &cooked));
+    }
+
+    #[test]
+    fn caught_panic_retains_raw_mode_through_cleanup_without_cooking_a_sibling() {
+        if !isolated("caught_panic_retains_raw_mode_through_cleanup_without_cooking_a_sibling") {
+            return;
+        }
+        use std::cell::Cell;
+        struct Cleanup<'a> {
+            fd: RawFd,
+            observed_raw: &'a Cell<Option<bool>>,
+        }
+        impl Drop for Cleanup<'_> {
+            fn drop(&mut self) {
+                self.observed_raw
+                    .set(Some(get(self.fd).is_ok_and(|settings| is_raw(&settings))));
+            }
+        }
+        let pty = Pty::open();
+        let cooked = get(pty.slave).unwrap();
+        let sibling = RawMode::enter(pty.slave).unwrap();
+        let failed_run = RawMode::enter(pty.slave).unwrap();
+        let cleanup_mode = Cell::new(None);
+        let cleanup = Cleanup {
+            fd: pty.slave,
+            observed_raw: &cleanup_mode,
+        };
+        let panicked = std::panic::catch_unwind(|| panic!("caught guest panic"));
+        assert!(panicked.is_err());
+        assert!(
+            is_raw(&get(pty.slave).unwrap()),
+            "catching did not change retained leases"
+        );
+        drop(cleanup);
+        assert_eq!(
+            cleanup_mode.get(),
+            Some(true),
+            "raw lease retained through cleanup"
+        );
+        drop(failed_run);
+        assert!(
+            is_raw(&get(pty.slave).unwrap()),
+            "retiring the failed run leaves its sibling raw"
+        );
+        drop(sibling);
+        assert!(same(&get(pty.slave).unwrap(), &cooked));
+    }
+
+    #[test]
+    fn an_unwound_run_restores_its_terminal_without_changing_another_terminal() {
+        if !isolated("an_unwound_run_restores_its_terminal_without_changing_another_terminal") {
+            return;
+        }
+        let first = Pty::open();
+        let second = Pty::open();
+        let cooked = get(first.slave).unwrap();
+        let other_cooked = get(second.slave).unwrap();
+        let sibling = RawMode::enter(first.slave).unwrap();
+        let failed_run = RawMode::enter(second.slave).unwrap();
+        let panicked = std::panic::catch_unwind(move || {
+            let _owned = failed_run;
+            panic!("unwound guest panic");
+        });
+        assert!(panicked.is_err());
+        assert!(same(&get(second.slave).unwrap(), &other_cooked));
+        assert!(
+            is_raw(&get(first.slave).unwrap()),
+            "unrelated terminal remains raw"
+        );
+        drop(sibling);
+        assert!(same(&get(first.slave).unwrap(), &cooked));
+    }
+
+    #[test]
+    fn an_unrelated_joined_thread_panic_does_not_change_live_terminals() {
+        if !isolated("an_unrelated_joined_thread_panic_does_not_change_live_terminals") {
+            return;
+        }
+        let first = Pty::open();
+        let second = Pty::open();
+        let cooked = get(first.slave).unwrap();
+        let other_cooked = get(second.slave).unwrap();
+        let a = RawMode::enter(first.slave).unwrap();
+        let b = RawMode::enter(second.slave).unwrap();
+        assert!(
+            std::thread::spawn(|| panic!("unrelated host thread"))
+                .join()
+                .is_err()
+        );
+        assert!(is_raw(&get(first.slave).unwrap()));
+        assert!(is_raw(&get(second.slave).unwrap()));
+        drop(a);
+        assert!(same(&get(first.slave).unwrap(), &cooked));
+        assert!(is_raw(&get(second.slave).unwrap()));
+        drop(b);
+        assert!(same(&get(second.slave).unwrap(), &other_cooked));
     }
 
     #[test]
