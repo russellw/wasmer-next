@@ -329,14 +329,54 @@ where
         let Some(entry) = entry(module, import.name()) else {
             continue;
         };
-        let function = match entry.stub {
-            Shim => shim(store, env, module, entry.name)
-                .unwrap_or_else(|| panic!("`{}` is marked as a shim but has none", entry.name)),
-            stub => stub_function(store, entry, stub),
-        };
-        imports.define(module.name(), entry.name, function);
+        imports.define(
+            module.name(),
+            entry.name,
+            function(store, env, module, entry),
+        );
     }
     imports
+}
+
+/// Every function in a v1 namespace, bound to `env` in its store.
+///
+/// This uses the same canonical signatures and shim/stub constructors as the requested-import
+/// path. It adds no memory import and performs no module preflight: an incompatible guest
+/// signature is reported by Wasmer when the instance is linked.
+pub fn namespace<S>(
+    store: &mut StoreMut<'_>,
+    env: &FunctionEnv<ExecEnv<S>>,
+    module: Module,
+) -> Imports
+where
+    S: Syscalls + Control + Send + Sync + 'static,
+{
+    let mut imports = Imports::new();
+    for entry in TABLE.iter().filter(|entry| entry.modules.contains(&module)) {
+        imports.define(
+            module.name(),
+            entry.name,
+            function(store, env, module, entry),
+        );
+    }
+    imports
+}
+
+/// Constructs the canonical function used by both import collection paths.
+fn function<S>(
+    store: &mut StoreMut<'_>,
+    env: &FunctionEnv<ExecEnv<S>>,
+    module: Module,
+    entry: &'static Entry,
+) -> Function
+where
+    S: Syscalls + Control + Send + Sync + 'static,
+{
+    match entry.stub {
+        Shim => shim(store, env, module, entry.name)
+            .unwrap_or_else(|| panic!("`{}` is marked as a shim but has none", entry.name)),
+        stub => stub_function(store, entry, stub),
+    }
 }
 
 /// The shim serving `name` in `module`, if there is one.
@@ -573,6 +613,122 @@ mod tests {
             (func (export "canonical_abi_realloc") (param i32 i32 i32 i32) (result i32) i32.const 0))"#;
         let module = wasmer::Module::new(&store, wat::parse_str(source).unwrap()).unwrap();
         validate(&module).unwrap();
+    }
+
+    // Like api/tests/custom_bindings.rs, inspect a real store-local ExecEnv through its
+    // instantiation hook. No second environment or replacement Store is needed for the factory.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn namespace_factory_preserves_canonical_types_and_link_error_phase() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use wasixv2::{
+            InstanceAttachment, InstantiationHook, Machine, MachineSyscalls, ProcessConfig, Stdio,
+        };
+
+        struct Inspect(Arc<AtomicUsize>);
+        impl InstantiationHook<MachineSyscalls> for Inspect {
+            fn prepare_imports(
+                &self,
+                _: &wasmer::Module,
+                store: &mut StoreMut<'_>,
+                env: &FunctionEnv<ExecEnv<MachineSyscalls>>,
+                _: &mut Imports,
+            ) -> Result<Option<Box<dyn InstanceAttachment>>, RuntimeError> {
+                for module in Module::ALL {
+                    let all = namespace(store, env, module);
+                    let expected = TABLE.iter().filter(|entry| entry.modules.contains(&module));
+                    assert_eq!(all.iter().count(), expected.clone().count());
+                    for entry in expected {
+                        let export = all.get_export(module.name(), entry.name).unwrap();
+                        assert_eq!(
+                            export.ty(&*store),
+                            wasmer::ExternType::Function(FunctionType::new(
+                                entry.params,
+                                entry.results
+                            )),
+                            "{}.{}",
+                            module.name(),
+                            entry.name,
+                        );
+                    }
+                    assert!(all.iter().all(|(name, _, export)| name == module.name()
+                        && matches!(export, wasmer::Extern::Function(_))));
+                    assert!(all.get_export("env", "memory").is_none());
+                }
+
+                // Collection succeeds and supplies the canonical function even when the
+                // guest declares the wrong type. Linking remains the error boundary.
+                let wrong = wasmer::Module::new(
+                    &*store,
+                    wat::parse_str(
+                        r#"(module
+                        (import "wasi_snapshot_preview1" "proc_exit" (func)))"#,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                let requested = imports(store, env, &wrong);
+                assert_eq!(requested.iter().count(), 1);
+                assert_eq!(
+                    requested
+                        .get_export("wasi_snapshot_preview1", "proc_exit")
+                        .unwrap()
+                        .ty(&*store),
+                    wasmer::ExternType::Function(FunctionType::new([Type::I32], [])),
+                );
+                let error = wasmer::Instance::new(store, &wrong, &requested).unwrap_err();
+                assert!(matches!(error, wasmer::InstantiationError::Link(_)));
+
+                let unknown = wasmer::Module::new(
+                    &*store,
+                    wat::parse_str(
+                        r#"(module
+                        (import "wasi_snapshot_preview1" "unknown" (func))
+                        (import "other" "proc_exit" (func (param i32))))"#,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(imports(store, env, &unknown).iter().count(), 0);
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(None)
+            }
+        }
+
+        let inspected = Arc::new(AtomicUsize::new(0));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&runtime, async {
+            let machine = Machine::builder()
+                .instantiation_hook(Arc::new(Inspect(inspected.clone())))
+                .build();
+            let wasm = wat::parse_str(
+                r#"(module
+                (import "wasi_snapshot_preview1" "proc_exit" (func $exit (param i32)))
+                (memory (export "memory") 1)
+                (func (export "_start") i32.const 0 call $exit))"#,
+            )
+            .unwrap();
+            let result = machine
+                .run_process(
+                    &wasm,
+                    ProcessConfig {
+                        args: vec!["namespace-factory".into()],
+                        env: Vec::new(),
+                        stdio: Stdio::from_fns(|_| {}, |_| {}),
+                    },
+                )
+                .await;
+            machine.shutdown().await;
+            assert_eq!(result.unwrap(), 0);
+        });
+        assert_eq!(inspected.load(Ordering::SeqCst), 1);
     }
 
     #[test]
