@@ -452,6 +452,9 @@ fn resizing_signals_sigwinch() {
     assert!(!c.pending(c.leader, Signal::SIGWINCH));
     c.kernel.console_resize(WindowSize { rows: 50, ..size });
     assert!(c.pending(c.leader, Signal::SIGWINCH));
+    assert_eq!(c.ioctl(&caller, 0, IoctlRequest::TIOCGWINSZ, 0x20), Ok(0));
+    let from_host: Winsize = block_on(read_value(caller.memory(), GuestPtr::new(0x20))).unwrap();
+    assert_eq!((from_host.ws_row, from_host.ws_col), (50, COLS));
     // Unblocked, its default action drops it.
     let signals = c.kernel.task_signals(c.leader);
     signals.replace_blocked(0);
@@ -473,6 +476,22 @@ fn resizing_signals_sigwinch() {
     .unwrap();
     assert_eq!(c.ioctl(&caller, 0, IoctlRequest::TIOCSWINSZ, 0x20), Ok(0));
     assert!(c.pending(c.leader, Signal::SIGWINCH));
+    assert_eq!(c.ioctl(&caller, 2, IoctlRequest::TIOCGWINSZ, 0x30), Ok(0));
+    let from_guest: Winsize = block_on(read_value(caller.memory(), GuestPtr::new(0x30))).unwrap();
+    assert_eq!(from_guest, winsize);
+    signals.replace_blocked(0);
+    assert_eq!(c.kernel.take_pending(c.leader), None);
+    signals.replace_blocked(blocked(Signal::SIGWINCH));
+    c.kernel.console_resize(WindowSize::from_u32(10, 20, 0, 0));
+    assert!(
+        !c.pending(c.leader, Signal::SIGWINCH),
+        "host sees the guest's current size"
+    );
+    assert_eq!(c.ioctl(&caller, 0, IoctlRequest::TIOCSWINSZ, 0x20), Ok(0));
+    assert!(
+        !c.pending(c.leader, Signal::SIGWINCH),
+        "same guest size changes nothing"
+    );
 }
 
 /// `/dev/tty` is the caller's controlling terminal; a new session has none.
