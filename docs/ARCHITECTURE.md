@@ -28,7 +28,7 @@ for the legacy crates that still need replacements before removal.
 
 ## Submodules
 
-Five submodules: `tests/wast/spec`, `lib/napi`, `wasmer-test-files`,
+Five submodules: `tests/wast/spec`, `lib/napi/quickjs/deps/quickjs`, `wasmer-test-files`,
 `tests/wasixv2` ([wasixv2-tests](https://github.com/wasix-org/wasixv2-tests), the
 wasixv2 test suite, run with `make test-wasixv2`), and `lib/wasix/codegen`.
 The last is
@@ -50,3 +50,6 @@ remain in `lib/wasix`. The generator checks for both repositories run from
 `cargo test -p wasixv2-exec --test generated`; `WLK_ROOT` selects a writable kernel
 checkout when intentionally blessing generated kernel outputs. Kernel behavior tests
 run in WLK; actual engine/guest and v1 reference-protocol tests remain here.
+
+The NAPI binding is maintained directly under `lib/napi`; its source provenance
+and retained QuickJS pin are recorded in [`SOURCE.md`](../lib/napi/SOURCE.md).
