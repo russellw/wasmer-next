@@ -36,7 +36,9 @@ pub enum RemoteArtifactProgress {
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct DownloadProgress {
+    /// Total response size reported by the source.
     pub total_bytes: u64,
+    /// Bytes received so far, when the source reports progress.
     pub downloaded_bytes: Option<u64>,
 }
 
@@ -57,6 +59,7 @@ pub struct ProgressError {
 }
 
 impl ProgressError {
+    /// Retain a progress failure message.
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),

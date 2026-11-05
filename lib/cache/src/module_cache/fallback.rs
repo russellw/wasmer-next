@@ -1,6 +1,6 @@
 use wasmer::{Engine, Module};
 
-use crate::runtime::module_cache::{CacheError, ModuleCache, ModuleHash};
+use crate::module_cache::{CacheError, ModuleCache, ModuleHash};
 
 /// [`FallbackCache`] is a combinator for the [`ModuleCache`] trait that enables
 /// the chaining of two caching strategies together, typically via
@@ -34,22 +34,27 @@ impl<Primary, Fallback> FallbackCache<Primary, Fallback> {
         FallbackCache { primary, fallback }
     }
 
+    /// Read the primary cache.
     pub fn primary(&self) -> &Primary {
         &self.primary
     }
 
+    /// Mutably access the primary cache.
     pub fn primary_mut(&mut self) -> &mut Primary {
         &mut self.primary
     }
 
+    /// Read the fallback cache.
     pub fn fallback(&self) -> &Fallback {
         &self.fallback
     }
 
+    /// Mutably access the fallback cache.
     pub fn fallback_mut(&mut self) -> &mut Fallback {
         &mut self.fallback
     }
 
+    /// Take both cache implementations.
     pub fn into_inner(self) -> (Primary, Fallback) {
         let FallbackCache { primary, fallback } = self;
         (primary, fallback)
@@ -72,7 +77,7 @@ where
             // Now we've got a module, let's make sure it is promoted to the
             // primary cache.
             if let Err(e) = self.primary.save(key, engine, &m).await {
-                tracing::warn!(
+                tracing::event!(target: "wasmer_wasix::runtime::module_cache::fallback", tracing::Level::WARN,
                     %key,
                     error = &e as &dyn std::error::Error,
                     "Unable to promote a module to the primary cache",
@@ -112,7 +117,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use crate::runtime::module_cache::SharedCache;
+    use crate::module_cache::SharedCache;
 
     const ADD_WAT: &[u8] = br#"(
         module

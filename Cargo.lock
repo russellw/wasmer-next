@@ -7793,18 +7793,25 @@ dependencies = [
 name = "wasmer-cache"
 version = "7.5.0"
 dependencies = [
+ "async-trait",
  "blake3",
  "clap",
  "clap_builder",
  "clap_derive",
  "clap_lex",
  "criterion",
+ "dashmap",
+ "futures",
  "hex",
  "rand 0.10.3",
+ "shared-buffer",
  "tempfile",
  "thiserror 2.0.21",
+ "tokio",
+ "tracing",
  "wasmer",
  "wasmer-compiler-singlepass",
+ "wasmer-types",
 ]
 
 [[package]]
@@ -8401,6 +8408,7 @@ dependencies = [
  "wasm-bindgen-test",
  "wasm-encoder 0.259.0",
  "wasmer",
+ "wasmer-cache",
  "wasmer-config",
  "wasmer-journal",
  "wasmer-package",

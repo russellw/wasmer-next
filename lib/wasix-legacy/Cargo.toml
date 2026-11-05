@@ -21,6 +21,7 @@ required-features = ["sys-thread"]
 
 [dependencies]
 wasmer-package = { workspace = true, features = ["execution", "acquisition"] }
+wasmer-cache = { path = "../cache", version = "=7.5.0", default-features = false, features = ["module-cache"] }
 wasmer-wasix-types = { path = "../wasi-types", version = "0.705.0", features = [
   "enable-serde",
 ] }
@@ -206,6 +207,7 @@ ctrlc = ["tokio/signal"]
 # the minimal sys implementation
 sys-minimal = ["wasmer/sys", "sys-thread", "tokio/fs"]
 sys = [
+  "wasmer-cache/module-cache-sys",
   "package-authoring",
   "webc/mmap",
   "time",
@@ -230,7 +232,7 @@ package-authoring = ["wasmer-package/authoring"]
 sys-default = ["sys"]
 sys-poll = []
 extra-logging = []
-sys-thread = ["tokio/rt", "tokio/time", "tokio/rt-multi-thread", "rusty_pool", "wasmer-package/acquisition-thread"]
+sys-thread = ["tokio/rt", "tokio/time", "tokio/rt-multi-thread", "rusty_pool", "wasmer-package/acquisition-thread", "wasmer-cache/module-cache-filesystem"]
 journal = ["tokio/fs", "wasmer-journal/log-file"]
 
 # Deprecated. Kept it for compatibility

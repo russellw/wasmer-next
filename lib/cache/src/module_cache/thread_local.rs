@@ -2,7 +2,7 @@ use std::{cell::RefCell, collections::HashMap};
 
 use wasmer::{Engine, Module};
 
-use crate::runtime::module_cache::{CacheError, ModuleCache};
+use crate::module_cache::{CacheError, ModuleCache};
 use wasmer_types::ModuleHash;
 
 std::thread_local! {
@@ -29,11 +29,11 @@ impl ThreadLocalCache {
 
 #[async_trait::async_trait]
 impl ModuleCache for ThreadLocalCache {
-    #[tracing::instrument(level = "debug", skip_all, fields(%key))]
+    #[tracing::instrument(target = "wasmer_wasix::runtime::module_cache::thread_local", level = "debug", skip_all, fields(%key))]
     async fn load(&self, key: ModuleHash, engine: &Engine) -> Result<Module, CacheError> {
         match self.lookup(key, &engine.deterministic_id()) {
             Some(m) => {
-                tracing::debug!("Cache hit!");
+                tracing::event!(target: "wasmer_wasix::runtime::module_cache::thread_local", tracing::Level::DEBUG, "Cache hit!");
                 Ok(m)
             }
             None => Err(CacheError::NotFound),
@@ -45,7 +45,7 @@ impl ModuleCache for ThreadLocalCache {
         Ok(exists)
     }
 
-    #[tracing::instrument(level = "debug", skip_all, fields(%key))]
+    #[tracing::instrument(target = "wasmer_wasix::runtime::module_cache::thread_local", level = "debug", skip_all, fields(%key))]
     async fn save(
         &self,
         key: ModuleHash,

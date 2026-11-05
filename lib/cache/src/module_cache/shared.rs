@@ -1,7 +1,7 @@
 use dashmap::DashMap;
 use wasmer::{Engine, Module};
 
-use crate::runtime::module_cache::{CacheError, ModuleCache};
+use crate::module_cache::{CacheError, ModuleCache};
 use wasmer_types::ModuleHash;
 
 /// A [`ModuleCache`] based on a <code>[DashMap]</code> keyed by module hash, engine ID, and format.
@@ -18,6 +18,7 @@ struct SharedCacheKey {
 }
 
 impl SharedCache {
+    /// Create an empty cache shared across threads.
     pub fn new() -> SharedCache {
         SharedCache::default()
     }
@@ -33,13 +34,13 @@ impl SharedCache {
 
 #[async_trait::async_trait]
 impl ModuleCache for SharedCache {
-    #[tracing::instrument(level = "debug", skip_all, fields(%key))]
+    #[tracing::instrument(target = "wasmer_wasix::runtime::module_cache::shared", level = "debug", skip_all, fields(%key))]
     async fn load(&self, key: ModuleHash, engine: &Engine) -> Result<Module, CacheError> {
         let key = Self::cache_key(key, engine);
 
         match self.modules.get(&key) {
             Some(m) => {
-                tracing::debug!("Cache hit!");
+                tracing::event!(target: "wasmer_wasix::runtime::module_cache::shared", tracing::Level::DEBUG, "Cache hit!");
                 Ok(m.value().clone())
             }
 
@@ -52,7 +53,7 @@ impl ModuleCache for SharedCache {
         Ok(self.modules.contains_key(&key))
     }
 
-    #[tracing::instrument(level = "debug", skip_all, fields(%key))]
+    #[tracing::instrument(target = "wasmer_wasix::runtime::module_cache::shared", level = "debug", skip_all, fields(%key))]
     async fn save(
         &self,
         key: ModuleHash,

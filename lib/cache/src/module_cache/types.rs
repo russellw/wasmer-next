@@ -3,7 +3,7 @@ use std::{fmt::Debug, ops::Deref, path::PathBuf};
 use wasmer::{Engine, Module};
 use wasmer_types::ModuleHash;
 
-use crate::runtime::module_cache::{FallbackCache, progress::ModuleLoadProgressReporter};
+use crate::module_cache::{FallbackCache, progress::ModuleLoadProgressReporter};
 
 /// A cache for compiled WebAssembly modules.
 ///
@@ -65,19 +65,17 @@ pub trait ModuleCache: Debug {
     /// be significantly slower than the previous one.
     ///
     /// ```rust
-    /// # #[cfg(feature = "sys-thread")]
+    /// # #[cfg(feature = "module-cache-filesystem")]
     /// # {
-    /// use wasmer_wasix::runtime::module_cache::{
+    /// use wasmer_cache::module_cache::{
     ///     ModuleCache, ThreadLocalCache, FileSystemCache, SharedCache,
     /// };
-    /// use wasmer_wasix::runtime::task_manager::tokio::{RuntimeOrHandle, TokioTaskManager};
     ///
     /// let runtime = tokio::runtime::Runtime::new().unwrap();
-    /// let rt_handle = RuntimeOrHandle::from(runtime);
-    /// let task_manager = std::sync::Arc::new(TokioTaskManager::new(rt_handle));
+    /// let handle = runtime.handle().clone();
     ///
     /// let cache = SharedCache::default()
-    ///     .with_fallback(FileSystemCache::new("~/.local/cache", task_manager));
+    ///     .with_fallback(FileSystemCache::new("~/.local/cache", handle));
     /// # }
     /// ```
     fn with_fallback<C>(self, other: C) -> FallbackCache<Self, C>
@@ -116,19 +114,27 @@ where
 /// Possible errors that may occur during [`ModuleCache`] operations.
 #[derive(Debug, thiserror::Error)]
 pub enum CacheError {
+    /// The module could not be serialized.
     #[error("Unable to serialize the module")]
     Serialize(#[from] wasmer::SerializeError),
+    /// The module artifact could not be deserialized.
     #[error("Unable to deserialize the module")]
     Deserialize(#[from] wasmer::DeserializeError),
+    /// The cache file could not be read.
     #[error("Unable to read from \"{}\"", path.display())]
     FileRead {
+        /// Cache artifact path.
         path: PathBuf,
+        /// Original filesystem failure.
         #[source]
         error: std::io::Error,
     },
+    /// The cache file could not be written.
     #[error("Unable to write to \"{}\"", path.display())]
     FileWrite {
+        /// Cache artifact path.
         path: PathBuf,
+        /// Original filesystem failure.
         #[source]
         error: std::io::Error,
     },
@@ -141,6 +147,7 @@ pub enum CacheError {
 }
 
 impl CacheError {
+    /// Preserve a custom cache failure.
     pub fn other(error: impl std::error::Error + Send + Sync + 'static) -> Self {
         CacheError::Other(Box::new(error))
     }
