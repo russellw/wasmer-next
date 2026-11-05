@@ -6,7 +6,7 @@ use petgraph::{
 };
 use wasmer_config::package::PackageId;
 
-use crate::runtime::resolver::{DistributionInfo, PackageInfo};
+use crate::resolver::{DistributionInfo, PackageInfo};
 
 #[derive(Debug, Clone)]
 pub struct Resolution {

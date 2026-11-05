@@ -20,7 +20,7 @@ harness = false
 required-features = ["sys-thread"]
 
 [dependencies]
-wasmer-package = { workspace = true, features = ["execution"] }
+wasmer-package = { workspace = true, features = ["execution", "acquisition"] }
 wasmer-wasix-types = { path = "../wasi-types", version = "0.705.0", features = [
   "enable-serde",
 ] }
@@ -242,7 +242,7 @@ package-authoring = ["wasmer-package/authoring"]
 sys-default = ["sys"]
 sys-poll = []
 extra-logging = []
-sys-thread = ["tokio/rt", "tokio/time", "tokio/rt-multi-thread", "rusty_pool"]
+sys-thread = ["tokio/rt", "tokio/time", "tokio/rt-multi-thread", "rusty_pool", "wasmer-package/acquisition-thread"]
 journal = ["tokio/fs", "wasmer-journal/log-file"]
 
 # Deprecated. Kept it for compatibility

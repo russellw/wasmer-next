@@ -5,12 +5,12 @@ use std::{
     path::Path,
 };
 
+use crate::utils::from_disk;
 use anyhow::Error;
 use semver::VersionReq;
 use sha2::{Digest, Sha256};
 use url::Url;
 use wasmer_config::package::{NamedPackageId, PackageHash, PackageId, PackageSource};
-use wasmer_package::utils::from_disk;
 use webc::metadata::{Manifest, UrlOrManifest, annotations::Wapm as WapmAnnotations};
 
 /// A dependency constraint.
@@ -37,7 +37,7 @@ impl Dependency {
 /// Some metadata a [`Source`][source] can provide about a package without
 /// needing to download the entire `*.webc` file.
 ///
-/// [source]: crate::runtime::resolver::Source
+/// [source]: crate::resolver::Source
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageSummary {
     pub pkg: PackageInfo,
@@ -53,7 +53,7 @@ impl PackageSummary {
         let path = path.as_ref().canonicalize()?;
         let container = from_disk(&path)?;
         let webc_sha256 = WebcHash::for_file(&path)?;
-        let url = crate::runtime::resolver::utils::url_from_file_path(&path).ok_or_else(|| {
+        let url = crate::resolver::utils::url_from_file_path(&path).ok_or_else(|| {
             anyhow::anyhow!("Unable to turn \"{}\" into a file:// URL", path.display())
         })?;
 
@@ -158,7 +158,7 @@ impl PackageInfo {
         let commands = manifest
             .commands
             .iter()
-            .map(|(name, _value)| crate::runtime::resolver::Command {
+            .map(|(name, _value)| crate::resolver::Command {
                 name: name.to_string(),
             })
             .collect();
@@ -199,7 +199,7 @@ fn filesystem_mapping_from_manifest(
         }
         None => {
             if webc_version == webc::Version::V2 {
-                tracing::debug!(
+                tracing::debug!(target: "wasmer_wasix::runtime::resolver::inputs",
                     "No \"fs\" package annotations found. Mounting the \"atom\" volume to \"/\" for compatibility."
                 );
                 Ok(vec![FileSystemMapping {

@@ -5,7 +5,7 @@ use std::{
 
 use wasmer_config::package::{PackageIdent, PackageSource};
 
-use crate::runtime::resolver::{PackageSummary, utils::cmp_version_precedence};
+use crate::resolver::{PackageSummary, utils::cmp_version_precedence};
 
 /// Something that packages can be downloaded from.
 #[async_trait::async_trait]
@@ -19,7 +19,7 @@ pub trait Source: Sync + Debug {
     /// will be at least one [`PackageSummary`], otherwise implementations
     /// should return [`QueryError::NotFound`] or [`QueryError::NoMatches`].
     ///
-    /// [dep]: crate::runtime::resolver::Dependency
+    /// [dep]: crate::resolver::Dependency
     async fn query(&self, package: &PackageSource) -> Result<Vec<PackageSummary>, QueryError>;
 
     /// Run [`Source::query()`] and get the [`PackageSummary`] for the latest

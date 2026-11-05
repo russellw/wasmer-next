@@ -7,7 +7,7 @@ use wasmer_config::package::{
     NamedPackageId, NamedPackageIdent, PackageHash, PackageId, PackageIdent, PackageSource,
 };
 
-use crate::runtime::resolver::{PackageSummary, QueryError, Source, WebcHash};
+use crate::resolver::{PackageSummary, QueryError, Source, WebcHash};
 
 /// A [`Source`] backed by a directory tree laid out like a registry:
 /// `<root>/<namespace>/<name>/<version>.webc`, or `<root>/<name>/<version>.webc`
@@ -152,14 +152,14 @@ impl LocalRegistrySource {
 
 #[async_trait::async_trait]
 impl Source for LocalRegistrySource {
-    #[tracing::instrument(level = "debug", skip_all, fields(%package))]
+    #[tracing::instrument(target = "wasmer_wasix::runtime::resolver::local_registry_source", level = "debug", skip_all, fields(%package))]
     async fn query(&self, package: &PackageSource) -> Result<Vec<PackageSummary>, QueryError> {
         match package {
             PackageSource::Ident(PackageIdent::Named(named)) => {
-                crate::block_in_place(|| self.query_named(named, package))
+                crate::resolver::block_in_place(|| self.query_named(named, package))
             }
             PackageSource::Ident(PackageIdent::Hash(hash)) => {
-                crate::block_in_place(|| self.query_hash(hash, package))
+                crate::resolver::block_in_place(|| self.query_hash(hash, package))
             }
             PackageSource::Url(_) | PackageSource::Path(_) => Err(QueryError::Unsupported {
                 query: package.clone(),

@@ -5,19 +5,17 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use crate::utils::from_disk;
 use anyhow::{Context, Error};
 use http::Method;
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use url::Url;
 use wasmer_config::package::{PackageHash, PackageId, PackageSource};
-use wasmer_package::utils::from_disk;
 
 use crate::{
     http::{HttpClient, HttpRequest},
-    runtime::resolver::{
-        DistributionInfo, PackageInfo, PackageSummary, QueryError, Source, WebcHash,
-    },
+    resolver::{DistributionInfo, PackageInfo, PackageSummary, QueryError, Source, WebcHash},
 };
 
 /// A [`Source`] which can query arbitrary packages on the internet.
@@ -62,7 +60,7 @@ impl WebSource {
     }
 
     /// Download a package and cache it locally.
-    #[tracing::instrument(level = "debug", skip_all, fields(%url))]
+    #[tracing::instrument(target = "wasmer_wasix::runtime::resolver::web_source", level = "debug", skip_all, fields(%url))]
     async fn get_locally_cached_file(&self, url: &Url) -> Result<PathBuf, Error> {
         // This function is a bit tricky because we go to great lengths to avoid
         // unnecessary downloads.
@@ -75,7 +73,7 @@ impl WebSource {
         // Next we check if we definitely got a cache hit
         let state = match classify_cache_using_mtime(cache_info, self.retry_period) {
             Ok(path) => {
-                tracing::debug!(path=%path.display(), "Cache hit!");
+                tracing::debug!(target: "wasmer_wasix::runtime::resolver::web_source", path=%path.display(), "Cache hit!");
                 return Ok(path);
             }
             Err(s) => s,
@@ -88,7 +86,7 @@ impl WebSource {
                     return Ok(path.clone());
                 }
                 Ok(different_etag) => {
-                    tracing::debug!(
+                    tracing::debug!(target: "wasmer_wasix::runtime::resolver::web_source",
                         original_etag=%etag,
                         new_etag=%different_etag,
                         path=%path.display(),
@@ -96,7 +94,7 @@ impl WebSource {
                     );
                 }
                 Err(e) => {
-                    tracing::debug!(
+                    tracing::debug!(target: "wasmer_wasix::runtime::resolver::web_source",
                         error=&*e,
                         path=%path.display(),
                         original_etag=%etag,
@@ -110,10 +108,10 @@ impl WebSource {
         let (bytes, etag) = match self.fetch(url).await {
             Ok((bytes, etag)) => (bytes, etag),
             Err(e) => {
-                tracing::warn!(error = &*e, "Download failed");
+                tracing::warn!(target: "wasmer_wasix::runtime::resolver::web_source", error = &*e, "Download failed");
                 match state.take_path() {
                     Some(path) => {
-                        tracing::debug!(
+                        tracing::debug!(target: "wasmer_wasix::runtime::resolver::web_source",
                             path=%path.display(),
                             "Using a possibly stale cached file",
                         );
@@ -141,7 +139,7 @@ impl WebSource {
                 .atomically_save_file(path.with_extension("etag"), etag.as_bytes())
                 .await
         {
-            tracing::warn!(
+            tracing::warn!(target: "wasmer_wasix::runtime::resolver::web_source",
                 error=&*e,
                 %etag,
                 %url,
@@ -229,12 +227,12 @@ impl WebSource {
             .await
             .context("Unable to get the locally cached file")?;
 
-        let webc_sha256 = crate::block_in_place(|| WebcHash::for_file(&local_path))
+        let webc_sha256 = crate::resolver::block_in_place(|| WebcHash::for_file(&local_path))
             .with_context(|| format!("Unable to hash \"{}\"", local_path.display()))?;
 
         // Note: We want to use Container::from_disk() rather than the bytes
         // our HTTP client gave us because then we can use memory-mapped files
-        let container = crate::block_in_place(|| from_disk(&local_path))
+        let container = crate::resolver::block_in_place(|| from_disk(&local_path))
             .with_context(|| format!("Unable to load \"{}\"", local_path.display()))?;
 
         let id = PackageInfo::package_id_from_manifest(container.manifest())?
@@ -254,7 +252,7 @@ impl WebSource {
 
 #[async_trait::async_trait]
 impl Source for WebSource {
-    #[tracing::instrument(level = "debug", skip_all, fields(%package))]
+    #[tracing::instrument(target = "wasmer_wasix::runtime::resolver::web_source", level = "debug", skip_all, fields(%package))]
     async fn query(&self, package: &PackageSource) -> Result<Vec<PackageSummary>, QueryError> {
         let url = match package {
             PackageSource::Url(url) => url,

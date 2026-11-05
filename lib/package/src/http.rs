@@ -1,3 +1,4 @@
+//! HTTP request/response contracts for package acquisition and embedder providers.
 use std::{collections::BTreeSet, ops::Deref, sync::Arc};
 
 use futures::future::BoxFuture;
@@ -188,3 +189,6 @@ where
 }
 
 pub type DynHttpClient = Arc<dyn HttpClient + Send + Sync + 'static>;
+
+// Keep registry and download request identity stable while acquisition moves crates.
+pub(crate) const USER_AGENT: &str = concat!("wasmer-wasix-", env!("CARGO_PKG_VERSION"));

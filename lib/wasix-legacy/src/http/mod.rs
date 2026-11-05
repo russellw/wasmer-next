@@ -1,5 +1,3 @@
-mod client;
-
 #[cfg(feature = "host-reqwest")]
 pub mod reqwest;
 
@@ -9,7 +7,7 @@ mod web_http_client;
 #[cfg(feature = "js")]
 pub use self::web_http_client::WebHttpClient;
 
-pub use self::client::*;
+pub use wasmer_package::http::*;
 
 pub(crate) const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "-", env!("CARGO_PKG_VERSION"));
 

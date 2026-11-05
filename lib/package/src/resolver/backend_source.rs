@@ -11,9 +11,7 @@ use webc::metadata::Manifest;
 
 use crate::{
     http::{HttpClient, HttpRequest, USER_AGENT},
-    runtime::resolver::{
-        DistributionInfo, PackageInfo, PackageSummary, QueryError, Source, WebcHash,
-    },
+    resolver::{DistributionInfo, PackageInfo, PackageSummary, QueryError, Source, WebcHash},
 };
 
 /// A [`Source`] which will resolve dependencies by pinging a Wasmer-like GraphQL
@@ -72,7 +70,11 @@ impl BackendSource {
         &self.registry_endpoint
     }
 
-    #[tracing::instrument(level = "debug", skip_all)]
+    #[tracing::instrument(
+        target = "wasmer_wasix::runtime::resolver::backend_source",
+        level = "debug",
+        skip_all
+    )]
     async fn query_graphql_named(&self, package_name: &str) -> Result<WebQuery, Error> {
         #[derive(serde::Serialize)]
         struct Body {
@@ -91,8 +93,8 @@ impl BackendSource {
             options: Default::default(),
         };
 
-        tracing::debug!(%request.url, %request.method, "Querying the GraphQL API");
-        tracing::trace!(?request.headers, request.body=body.query.as_str());
+        tracing::debug!(target: "wasmer_wasix::runtime::resolver::backend_source", { %request.url, %request.method }, "Querying the GraphQL API");
+        tracing::event!(target: "wasmer_wasix::runtime::resolver::backend_source", tracing::Level::TRACE, { ?request.headers, request.body=body.query.as_str() });
 
         let response = self.client.request(request).await?;
 
@@ -106,7 +108,7 @@ impl BackendSource {
                 "<no body>".to_string()
             };
 
-            tracing::warn!(
+            tracing::warn!(target: "wasmer_wasix::runtime::resolver::backend_source",
                 %url,
                 %status,
                 package=%package_name,
@@ -118,10 +120,8 @@ impl BackendSource {
         }
 
         let body = response.body.unwrap_or_default();
-        tracing::trace!(
-            %response.status,
-            %response.redirected,
-            ?response.headers,
+        tracing::trace!(target: "wasmer_wasix::runtime::resolver::backend_source",
+            { %response.status, %response.redirected, ?response.headers },
             "Received a response from GraphQL",
         );
 
@@ -131,7 +131,11 @@ impl BackendSource {
         Ok(response)
     }
 
-    #[tracing::instrument(level = "debug", skip_all)]
+    #[tracing::instrument(
+        target = "wasmer_wasix::runtime::resolver::backend_source",
+        level = "debug",
+        skip_all
+    )]
     async fn query_graphql_by_hash(
         &self,
         hash: &PackageHash,
@@ -153,8 +157,8 @@ impl BackendSource {
             options: Default::default(),
         };
 
-        tracing::debug!(%request.url, %request.method, "Querying the GraphQL API");
-        tracing::trace!(?request.headers, request.body=body.query.as_str());
+        tracing::debug!(target: "wasmer_wasix::runtime::resolver::backend_source", { %request.url, %request.method }, "Querying the GraphQL API");
+        tracing::event!(target: "wasmer_wasix::runtime::resolver::backend_source", tracing::Level::TRACE, { ?request.headers, request.body=body.query.as_str() });
 
         let response = self.client.request(request).await?;
 
@@ -168,7 +172,7 @@ impl BackendSource {
                 "<no body>".to_string()
             };
 
-            tracing::warn!(
+            tracing::warn!(target: "wasmer_wasix::runtime::resolver::backend_source",
                 %url,
                 %status,
                 %hash,
@@ -180,10 +184,8 @@ impl BackendSource {
         }
 
         let body = response.body.unwrap_or_default();
-        tracing::trace!(
-            %response.status,
-            %response.redirected,
-            ?response.headers,
+        tracing::trace!(target: "wasmer_wasix::runtime::resolver::backend_source",
+            { %response.status, %response.redirected, ?response.headers },
             "Received a response from GraphQL",
         );
 
@@ -206,7 +208,7 @@ impl BackendSource {
                     headers.insert(http::header::AUTHORIZATION, header);
                 }
                 Err(e) => {
-                    tracing::warn!(
+                    tracing::warn!(target: "wasmer_wasix::runtime::resolver::backend_source",
                         error = &e as &dyn std::error::Error,
                         "Unable to parse the token into a header",
                     );
@@ -235,7 +237,7 @@ impl BackendSource {
 
 #[async_trait::async_trait]
 impl Source for BackendSource {
-    #[tracing::instrument(level = "debug", skip_all, fields(%package))]
+    #[tracing::instrument(target = "wasmer_wasix::runtime::resolver::backend_source", level = "debug", skip_all, fields(%package))]
     async fn query(&self, package: &PackageSource) -> Result<Vec<PackageSummary>, QueryError> {
         let (package_name, version_constraint) = match package {
             PackageSource::Ident(PackageIdent::Named(n)) => (
@@ -273,13 +275,13 @@ impl Source for BackendSource {
                         &version_constraint,
                         self.preferred_webc_version,
                     ) {
-                        tracing::debug!("Cache hit!");
+                        tracing::debug!(target: "wasmer_wasix::runtime::resolver::backend_source", "Cache hit!");
                         return Ok(cached);
                     }
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    tracing::warn!(
+                    tracing::warn!(target: "wasmer_wasix::runtime::resolver::backend_source",
                         package_name,
                         error = &*e,
                         "An unexpected error occurred while checking the local query cache",
@@ -296,7 +298,7 @@ impl Source for BackendSource {
         if let Some(cache) = &self.cache
             && let Err(e) = update_cached_query(cache, &package_name, &response).await
         {
-            tracing::warn!(
+            tracing::warn!(target: "wasmer_wasix::runtime::resolver::backend_source",
                 package_name,
                 error = &*e,
                 "An error occurred while caching the GraphQL response",
@@ -338,9 +340,8 @@ fn matching_package_summaries(
         let version = match Version::parse(&pkg_version.version) {
             Ok(v) => v,
             Err(e) => {
-                tracing::debug!(
-                    pkg.version = pkg_version.version.as_str(),
-                    error = &e as &dyn std::error::Error,
+                tracing::debug!(target: "wasmer_wasix::runtime::resolver::backend_source",
+                    { pkg.version = pkg_version.version.as_str(), error = &e as &dyn std::error::Error },
                     "Skipping a version because it doesn't have a valid version number",
                 );
                 continue;
@@ -348,8 +349,8 @@ fn matching_package_summaries(
         };
 
         if pkg_version.is_archived {
-            tracing::debug!(
-                pkg.version=%version,
+            tracing::debug!(target: "wasmer_wasix::runtime::resolver::backend_source",
+                { pkg.version=%version },
                 "Skipping an archived version",
             );
             archived_versions.push(version);
@@ -365,7 +366,7 @@ fn matching_package_summaries(
             ) {
                 Ok(summary) => summaries.push(summary),
                 Err(e) => {
-                    tracing::debug!(
+                    tracing::debug!(target: "wasmer_wasix::runtime::resolver::backend_source",
                         version=%version,
                         error=&*e,
                         "Skipping version because its metadata couldn't be parsed"
@@ -489,8 +490,8 @@ impl QueryCache for FileSystemQueryCache {
     async fn load(&self, package_name: &str) -> Result<Option<Bytes>, Error> {
         let filename = self.path(package_name);
 
-        tracing::trace!(filename=%filename.display(), "Reading cached entry from disk");
-        let result = crate::spawn_blocking(move || match std::fs::read(&filename) {
+        tracing::trace!(target: "wasmer_wasix::runtime::resolver::backend_source", filename=%filename.display(), "Reading cached entry from disk");
+        let result = crate::resolver::spawn_blocking(move || match std::fs::read(&filename) {
             Ok(json) => Ok(Some(Bytes::from(json))),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => {
@@ -500,7 +501,7 @@ impl QueryCache for FileSystemQueryCache {
         .await
         .context("Unable to run the cache read task")??;
         if result.is_none() {
-            tracing::debug!("Cache miss");
+            tracing::debug!(target: "wasmer_wasix::runtime::resolver::backend_source", "Cache miss");
         }
         Ok(result)
     }
@@ -508,13 +509,13 @@ impl QueryCache for FileSystemQueryCache {
     async fn save(&self, package_name: &str, bytes: Bytes) -> Result<(), Error> {
         let cache_dir = self.cache_dir.clone();
         let filename = self.path(package_name);
-        tracing::debug!(
+        tracing::debug!(target: "wasmer_wasix::runtime::resolver::backend_source",
             filename=%filename.display(),
             package_name,
             "Saving the query to disk",
         );
 
-        crate::spawn_blocking(move || -> Result<(), Error> {
+        crate::resolver::spawn_blocking(move || -> Result<(), Error> {
             let _ = std::fs::create_dir_all(&cache_dir);
 
             let mut temp = tempfile::NamedTempFile::new_in(&cache_dir)
@@ -545,7 +546,7 @@ impl QueryCache for FileSystemQueryCache {
 
     async fn remove(&self, package_name: &str) -> Result<(), Error> {
         let filename = self.path(package_name);
-        crate::spawn_blocking(move || match std::fs::remove_file(filename) {
+        crate::resolver::spawn_blocking(move || match std::fs::remove_file(filename) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error.into()),
@@ -572,7 +573,7 @@ async fn lookup_cached_query(
     };
 
     if !entry.is_still_valid(cache.timeout) {
-        tracing::debug!(timestamp = entry.unix_timestamp, "Cached entry is stale");
+        tracing::debug!(target: "wasmer_wasix::runtime::resolver::backend_source", timestamp = entry.unix_timestamp, "Cached entry is stale");
         let _ = cache.cache.remove(package_name).await;
         return Ok(None);
     }
@@ -779,7 +780,7 @@ mod tests {
 
     use crate::{
         http::HttpResponse,
-        runtime::resolver::inputs::{DistributionInfo, PackageInfo},
+        resolver::inputs::{DistributionInfo, PackageInfo},
     };
 
     use super::*;
@@ -973,7 +974,7 @@ mod tests {
                 pkg: PackageInfo {
                     id: PackageId::new_named("wasmer/wasmer-pack-cli", Version::new(0, 6, 0)),
                     dependencies: Vec::new(),
-                    commands: vec![crate::runtime::resolver::Command {
+                    commands: vec![crate::resolver::Command {
                         name: "wasmer-pack".to_string(),
                     },],
                     entrypoint: Some("wasmer-pack".to_string()),

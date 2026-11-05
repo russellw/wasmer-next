@@ -7,7 +7,7 @@ use std::{
 use anyhow::{Context, Error};
 use wasmer_config::package::{NamedPackageId, PackageHash, PackageId, PackageIdent, PackageSource};
 
-use crate::runtime::resolver::{PackageSummary, QueryError, Source};
+use crate::resolver::{PackageSummary, QueryError, Source};
 
 /// A [`Source`] that tracks packages in memory.
 ///
@@ -134,7 +134,7 @@ impl InMemorySource {
 
 #[async_trait::async_trait]
 impl Source for InMemorySource {
-    #[tracing::instrument(level = "debug", skip_all, fields(%package))]
+    #[tracing::instrument(target = "wasmer_wasix::runtime::resolver::in_memory_source", level = "debug", skip_all, fields(%package))]
     async fn query(&self, package: &PackageSource) -> Result<Vec<PackageSummary>, QueryError> {
         match package {
             PackageSource::Ident(PackageIdent::Named(named)) => {
@@ -148,7 +148,7 @@ impl Source for InMemorySource {
                             .map(|n| n.summary.clone())
                             .collect();
 
-                        tracing::trace!(
+                        tracing::trace!(target: "wasmer_wasix::runtime::resolver::in_memory_source",
                             matches = ?matches
                                 .iter()
                                 .map(|summary| summary.pkg.id.to_string())
@@ -189,7 +189,7 @@ impl Source for InMemorySource {
 mod tests {
     use tempfile::TempDir;
 
-    use crate::runtime::resolver::{
+    use crate::resolver::{
         Dependency,
         inputs::{DistributionInfo, PackageInfo},
     };
@@ -236,19 +236,18 @@ mod tests {
         assert!(source.named_packages.is_empty());
         assert_eq!(source.len(), fixtures.len());
         for (path, bytes) in fixtures {
-            let webc_hash = crate::runtime::resolver::WebcHash::sha256(bytes);
+            let webc_hash = crate::resolver::WebcHash::sha256(bytes);
             let package_hash = PackageHash::from_sha256_bytes(webc_hash.0);
             let summary = source.get(&PackageId::Hash(package_hash)).unwrap();
 
             assert_eq!(summary.dist.webc_sha256, webc_hash);
             assert_eq!(
                 summary.dist.webc,
-                crate::runtime::resolver::utils::url_from_file_path(path.canonicalize().unwrap())
-                    .unwrap(),
+                crate::resolver::utils::url_from_file_path(path.canonicalize().unwrap()).unwrap(),
             );
         }
 
-        let bash_hash = crate::runtime::resolver::WebcHash::parse_hex(
+        let bash_hash = crate::resolver::WebcHash::parse_hex(
             "059606d132e2e6bc1afe3b432ee64dcb1b1b059815c8bb213cf3b24798ef21e1",
         )
         .unwrap();
@@ -263,10 +262,10 @@ mod tests {
                         pkg: "wasmer/coreutils@^1.0.19".parse().unwrap(),
                     }],
                     commands: vec![
-                        crate::runtime::resolver::Command {
+                        crate::resolver::Command {
                             name: "bash".to_string(),
                         },
-                        crate::runtime::resolver::Command {
+                        crate::resolver::Command {
                             name: "sh".to_string(),
                         },
                     ],
@@ -274,10 +273,8 @@ mod tests {
                     filesystem: vec![],
                 },
                 dist: DistributionInfo {
-                    webc: crate::runtime::resolver::utils::url_from_file_path(
-                        bash.canonicalize().unwrap(),
-                    )
-                    .unwrap(),
+                    webc: crate::resolver::utils::url_from_file_path(bash.canonicalize().unwrap(),)
+                        .unwrap(),
                     webc_sha256: bash_hash,
                 },
             },

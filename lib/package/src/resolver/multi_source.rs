@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use wasmer_config::package::PackageSource;
 
-use crate::runtime::resolver::{PackageSummary, QueryError, Source};
+use crate::resolver::{PackageSummary, QueryError, Source};
 
 /// A [`Source`] that works by querying multiple [`Source`]s in succession.
 ///
@@ -17,7 +17,7 @@ use crate::runtime::resolver::{PackageSummary, QueryError, Source};
 /// will be treated as the canonical source for that [`Dependency`][dep] and no
 /// further [`Source`]s will be queried.
 ///
-/// [dep]: crate::runtime::resolver::Dependency
+/// [dep]: crate::resolver::Dependency
 #[derive(Debug, Clone)]
 pub struct MultiSource {
     sources: Vec<Arc<dyn Source + Send + Sync>>,
@@ -55,7 +55,7 @@ impl MultiSource {
 
 #[async_trait::async_trait]
 impl Source for MultiSource {
-    #[tracing::instrument(level = "debug", skip_all, fields(%package))]
+    #[tracing::instrument(target = "wasmer_wasix::runtime::resolver::multi_source", level = "debug", skip_all, fields(%package))]
     async fn query(&self, package: &PackageSource) -> Result<Vec<PackageSummary>, QueryError> {
         let mut output = Vec::<PackageSummary>::new();
 
@@ -147,8 +147,8 @@ impl Default for MultiSourceStrategy {
 mod tests {
     use wasmer_config::package::PackageId;
 
-    use super::super::{DistributionInfo, InMemorySource, PackageInfo, WebcHash};
     use super::*;
+    use crate::resolver::{DistributionInfo, InMemorySource, PackageInfo, WebcHash};
 
     /// Test that the `MultiSource` can merge results from multiple sources.
     #[tokio::test]

@@ -10,7 +10,7 @@ use petgraph::{
 use semver::Version;
 use wasmer_config::package::{NamedPackageIdent, PackageId, PackageSource};
 
-use crate::runtime::resolver::{
+use crate::resolver::{
     Dependency, DependencyGraph, ItemLocation, PackageInfo, PackageSummary, QueryError, Resolution,
     ResolvedPackage, Source,
     outputs::{Edge, Node},
@@ -25,7 +25,11 @@ const MAX_BACKTRACK_STATES: usize = 10_000;
 
 /// Given the [`PackageInfo`] for a root package, resolve its dependency graph
 /// and figure out how it could be executed.
-#[tracing::instrument(level = "debug", skip_all)]
+#[tracing::instrument(
+    target = "wasmer_wasix::runtime::resolver::resolve",
+    level = "debug",
+    skip_all
+)]
 pub async fn resolve(
     root_id: &PackageId,
     root: &PackageInfo,
@@ -97,7 +101,11 @@ fn print_cycle(packages: &[PackageId]) -> String {
 ///
 /// Unlike [`resolve()`], this only queries and links packages. It does not apply
 /// runtime compatibility checks such as rejecting duplicate package versions.
-#[tracing::instrument(level = "debug", skip_all)]
+#[tracing::instrument(
+    target = "wasmer_wasix::runtime::resolver::resolve",
+    level = "debug",
+    skip_all
+)]
 pub async fn resolve_dependency_graph(
     root_id: &PackageId,
     root: &PackageInfo,
@@ -728,15 +736,21 @@ impl PendingDependency {
     }
 }
 
-#[tracing::instrument(level = "debug", name = "dependencies", skip_all)]
+#[tracing::instrument(
+    target = "wasmer_wasix::runtime::resolver::resolve",
+    level = "debug",
+    name = "dependencies",
+    skip_all
+)]
 fn log_dependencies(graph: &DiGraph<Node, Edge>, root: NodeIndex) {
-    tracing::debug!(
+    tracing::debug!(target: "wasmer_wasix::runtime::resolver::resolve",
         root = root.index(),
         dependency_count = graph.node_count(),
         "Resolved dependencies",
     );
 
-    if tracing::enabled!(tracing::Level::TRACE) {
+    if tracing::enabled!(target: "wasmer_wasix::runtime::resolver::resolve", tracing::Level::TRACE)
+    {
         petgraph::visit::depth_first_search(graph, [root], |event| {
             if let petgraph::visit::DfsEvent::Discover(n, _) = event {
                 let package = &graph[n].id;
@@ -745,7 +759,7 @@ fn log_dependencies(graph: &DiGraph<Node, Edge>, root: NodeIndex) {
                     .map(|edge_ref| (&edge_ref.weight().alias, &graph[edge_ref.target()].id))
                     .collect();
 
-                tracing::trace!(%package, ?dependencies);
+                tracing::trace!(target: "wasmer_wasix::runtime::resolver::resolve", %package, ?dependencies);
             }
         });
     }
@@ -790,7 +804,7 @@ where
 fn resolve_package(dependency_graph: &DependencyGraph) -> Result<ResolvedPackage, ResolveError> {
     // FIXME: This code is all super naive and will break the moment there
     // are any conflicts or duplicate names.
-    tracing::trace!("Resolving the package");
+    tracing::trace!(target: "wasmer_wasix::runtime::resolver::resolve", "Resolving the package");
 
     let mut commands = BTreeMap::new();
     let mut filesystem = Vec::new();
@@ -814,7 +828,7 @@ fn resolve_package(dependency_graph: &DependencyGraph) -> Result<ResolvedPackage
             && may_inherit_entrypoint
             && let Some(entry) = &pkg.entrypoint
         {
-            tracing::trace!(
+            tracing::trace!(target: "wasmer_wasix::runtime::resolver::resolve",
                 entrypoint = entry.as_str(),
                 parent=%id,
                 "Inheriting the entrypoint",
@@ -835,16 +849,14 @@ fn resolve_package(dependency_graph: &DependencyGraph) -> Result<ResolvedPackage
                         package: id.clone(),
                     };
                     entry.insert(resolved);
-                    tracing::trace!(
-                        command.name=cmd.name.as_str(),
-                        pkg=%id,
+                    tracing::trace!(target: "wasmer_wasix::runtime::resolver::resolve",
+                        { command.name=cmd.name.as_str(), pkg=%id },
                         "Discovered command",
                     );
                 }
                 std::collections::btree_map::Entry::Occupied(_) => {
-                    tracing::trace!(
-                        command.name=cmd.name.as_str(),
-                        pkg=%id,
+                    tracing::trace!(target: "wasmer_wasix::runtime::resolver::resolve",
+                        { command.name=cmd.name.as_str(), pkg=%id },
                         "Ignoring duplicate command",
                     );
                 }
@@ -881,7 +893,7 @@ fn resolve_package(dependency_graph: &DependencyGraph) -> Result<ResolvedPackage
         // This works around packages like saghul/quickjs and syrusakbary/cowsay
         // which don't specify their entrypoints explicitly.
         if let [cmd] = dependency_graph.root_info().commands.as_slice() {
-            tracing::debug!(
+            tracing::debug!(target: "wasmer_wasix::runtime::resolver::resolve",
                 command = cmd.name.as_str(),
                 "No entrypoint specified. Falling back to the root package's only command.",
             );
@@ -889,7 +901,7 @@ fn resolve_package(dependency_graph: &DependencyGraph) -> Result<ResolvedPackage
         }
     }
 
-    tracing::debug!("resolved filesystem: {:?}", &filesystem);
+    tracing::debug!(target: "wasmer_wasix::runtime::resolver::resolve", "resolved filesystem: {:?}", &filesystem);
 
     Ok(ResolvedPackage {
         root_package: dependency_graph.id().clone(),
@@ -905,7 +917,7 @@ mod tests {
 
     use wasmer_config::package::{NamedPackageIdent, PackageIdent, Tag};
 
-    use crate::runtime::resolver::{
+    use crate::resolver::{
         Dependency, InMemorySource, MultiSource,
         inputs::{DistributionInfo, FileSystemMapping, PackageInfo},
     };
@@ -1018,12 +1030,9 @@ mod tests {
         }
 
         fn with_command(&mut self, name: &str) -> &mut Self {
-            self.summary
-                .pkg
-                .commands
-                .push(crate::runtime::resolver::Command {
-                    name: name.to_string(),
-                });
+            self.summary.pkg.commands.push(crate::resolver::Command {
+                name: name.to_string(),
+            });
             self
         }
 

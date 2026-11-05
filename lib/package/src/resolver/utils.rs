@@ -50,7 +50,7 @@ pub(crate) fn webc_headers() -> HeaderMap {
     headers
 }
 
-pub(crate) fn http_error(response: &HttpResponse) -> Error {
+pub fn http_error(response: &HttpResponse) -> Error {
     let status = response.status;
 
     if status == StatusCode::SERVICE_UNAVAILABLE
@@ -59,7 +59,7 @@ pub(crate) fn http_error(response: &HttpResponse) -> Error {
             .get("Retry-After")
             .and_then(|retry_after| retry_after.to_str().ok())
     {
-        tracing::debug!(
+        tracing::debug!(target: "wasmer_wasix::runtime::resolver::utils",
             %retry_after,
             "Received 503 Service Unavailable while looking up a package. The backend may still be generating the *.webc file.",
         );
@@ -69,7 +69,7 @@ pub(crate) fn http_error(response: &HttpResponse) -> Error {
     Error::msg(status)
 }
 
-pub(crate) fn file_path_from_url(url: &Url) -> Result<PathBuf, Error> {
+pub fn file_path_from_url(url: &Url) -> Result<PathBuf, Error> {
     debug_assert_eq!(url.scheme(), "file");
 
     // Note: The Url::to_file_path() method is platform-specific
