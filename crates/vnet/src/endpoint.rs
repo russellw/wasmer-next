@@ -6,7 +6,13 @@
 //! byte streams/datagrams; they do not receive another namespace's `Net`.
 //!
 //! Control calls (namespace factory, selection, transport factories, publication,
-//! configuration and lease management) run without WLK Net/socket locks. Returned transport
+//! configuration and lease methods) run without WLK Net/socket locks. ALL provider-owned
+//! handle destructors (provider, lease, target and transport) are bounded/nonblocking, never
+//! synchronously enter ANY WLK Net/socket/ingress, and queue real cleanup on their driver.
+//! Cascading WLK destruction only retires local gates/membership and releases handles; it
+//! cannot invoke reentrant state/poll/backlog callbacks merely after releasing its own lock.
+//! Such dirty control refresh waits for an explicit or driver entry without WLK locks.
+//! Returned transport
 //! data-plane methods and destructors follow the existing nonblocking transport contract:
 //! they may run under a socket lock and MUST NOT synchronously enter ANY WLK Net, socket or
 //! endpoint ingress, including a peer namespace. Queue peer delivery and cleanup on the
@@ -170,8 +176,10 @@ impl Pollable for PublicationReporter {
 }
 
 /// Accepted registration custody. Even Pending work has a lease; Drop withdraws exactly
-/// this attempt. WLK retires its callback gate before dropping/retrying a lease, outside
-/// Net/socket locks. Backlog/state/poll/Drop are unlocked control calls, not data-plane calls.
+/// this attempt. WLK retires its callback gate before releasing/retrying a lease. Explicit
+/// backlog/state/poll methods are unlocked control calls. A final Arc may be released by
+/// cascading destruction while another WLK lock remains held: Drop must be bounded,
+/// nonblocking, never enter ANY WLK Net/socket/ingress, and queue withdrawal on the driver.
 ///
 /// `Pollable::poll` and `state` delegate to the SAME reporter, never a second state cell.
 /// Failed is terminal for this attempt. A provider queues driver cleanup and does not invoke
