@@ -33,6 +33,25 @@ tests and strict lint passed, followed by the integrated CLI journal check,
 package-volume mounting also passed 20 component tests. Full CLI/SDK consumer
 migration and the remaining stream requirements above are still open.
 
+### Current unfinished source handoffs
+
+These private branches preserve ongoing work. Their component results do not
+establish full parity or an integrated release result.
+
+| Work | Private source | Remaining gate |
+| --- | --- | --- |
+| Contexts/closures | [Runtime](https://github.com/wasmerio/wasmer-next/tree/wasixv2/native-contexts-recovery), [WLK](https://github.com/wasmerio/wlk/tree/parity/contexts-core) | Native consumers and physical cleanup tests pass; canonical generation, complete JS companions and startup/cancellation integration remain. |
+| Shared resolved installer | [Runtime `2d6f404f2c4`](https://github.com/wasmerio/wasmer-next/tree/wasixv2/parity-cli-resolved-install) | Reviewed common constructor and error-custody fixture correction; rerun combined validation. |
+| Download progress | [Runtime `00a4094fa19`](https://github.com/wasmerio/wasmer-next/tree/wasixv2/parity-cli-package-progress) | Reviewed streaming observer interface; validate and connect SDK subscribers. |
+| Browser isolation | [SDK `a5be3a955f9`](https://github.com/wasmerio/wasmer-next/tree/parity/sdk-isolation-20261105) | Real Chromium/Firefox busy-module, sibling, live-directory and empty-worker-inventory checks pass on WLK `8bce49d4`; coherent current public API assembly and Node remain. |
+| Original-source coredumps | [Runtime `18df6357995`](https://github.com/wasmerio/wasmer-next/tree/wasixv2/parity-coredump-next), [CLI `6e082fdaf85`](https://github.com/wasmerio/wasmer-next/tree/wasixv2/parity-cli-coredump-wiring) | Type-level tests pass; compiler/artifact, original guest, observer/cache and CLI integration validation remain. |
+| Cross-sandbox network endpoints | [WLK `4dc0bab536c`](https://github.com/wasmerio/wlk/tree/parity/endpoint-selection-20261105) | Reviewed optional API only; routing and SDK provider integration remain. |
+
+Proposed macOS pathname-observation and configured-CPU contracts are documented in
+[WLK's reviewed design](https://github.com/wasmerio/wlk/blob/main/docs/plans/2026-11-05-v1-parity-contracts/design.md).
+They require architectural agreement before implementation. Native NAPI/V8 stack
+integration and its supported macOS profile remain mandatory work.
+
 ## Scope and snapshot
 
 The delivery goal is everything that worked in supported v1 profiles working well
