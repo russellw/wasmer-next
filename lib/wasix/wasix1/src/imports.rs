@@ -6,7 +6,7 @@
 
 use wasixv2_exec::ExecEnv;
 use wasixv2_syscalls::{Control, Syscalls};
-use wasmer::{Function, FunctionEnv, FunctionType, Imports, RuntimeError, Store, Type, Value};
+use wasmer::{Function, FunctionEnv, FunctionType, Imports, RuntimeError, StoreMut, Type, Value};
 
 use crate::{abi::Errno, calls};
 
@@ -314,7 +314,7 @@ pub fn validate(wasm: &wasmer::Module) -> Result<(), String> {
 /// those: every instance (each thread, each image) defines its own. An import the table does
 /// not have stays undefined, and the module fails to link.
 pub(crate) fn imports<S>(
-    store: &mut Store,
+    store: &mut StoreMut<'_>,
     env: &FunctionEnv<ExecEnv<S>>,
     wasm: &wasmer::Module,
 ) -> Imports
@@ -341,7 +341,7 @@ where
 
 /// The shim serving `name` in `module`, if there is one.
 pub(crate) fn shim<S>(
-    store: &mut Store,
+    store: &mut StoreMut<'_>,
     env: &FunctionEnv<ExecEnv<S>>,
     module: Module,
     name: &str,
@@ -511,7 +511,7 @@ where
 }
 
 /// A function that serves `entry` with its stub behaviour.
-fn stub_function(store: &mut Store, entry: &'static Entry, stub: Stub) -> Function {
+fn stub_function(store: &mut StoreMut<'_>, entry: &'static Entry, stub: Stub) -> Function {
     let ty = FunctionType::new(entry.params, entry.results);
     let name = entry.name;
     let errno = match stub {
@@ -535,6 +535,7 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
+    use wasmer::Store;
 
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
     #[cfg_attr(not(target_arch = "wasm32"), test)]

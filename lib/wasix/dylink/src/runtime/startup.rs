@@ -106,7 +106,7 @@ impl<S: Syscalls + Control + Send + Sync + 'static> PreparedImage<S> for Prepare
     fn bind(
         mut self: Box<Self>,
         instance: &Instance,
-        store: &mut Store,
+        store: &mut StoreMut<'_>,
         task: TaskId,
         role: Role,
     ) -> std::result::Result<Arc<dyn AbiInstance<S>>, ExecError> {

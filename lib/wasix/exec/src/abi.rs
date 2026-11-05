@@ -11,7 +11,7 @@ use wasixv2_syscalls::{
 };
 use wasmer::{
     AsyncFunctionEnvMut, Function, FunctionEnv, Imports, Instance, Module, RuntimeError, Store,
-    StoreAsync, Value,
+    StoreAsync, StoreMut, Value,
 };
 
 use crate::{ExecEnv, ExecError, LoadError, Loader, Preparation, asyncify};
@@ -58,8 +58,12 @@ where
 
     /// Every function import the ABI provides for an instance of `module`. The execution layer
     /// adds the memory import.
-    fn imports(&self, store: &mut Store, env: &FunctionEnv<ExecEnv<S>>, module: &Module)
-    -> Imports;
+    fn imports(
+        &self,
+        store: &mut StoreMut<'_>,
+        env: &FunctionEnv<ExecEnv<S>>,
+        module: &Module,
+    ) -> Imports;
 
     /// Optionally supplies store-local imports/state before instantiating the main module.
     /// Default/custom ABIs retain the ordinary imports and bind path. No guest code may
@@ -79,7 +83,7 @@ where
     fn bind(
         &self,
         instance: &Instance,
-        store: &mut Store,
+        store: &mut StoreMut<'_>,
         task: TaskId,
         role: Role,
     ) -> Result<Arc<dyn AbiInstance<S>>, ExecError>;
@@ -88,17 +92,17 @@ where
         &self,
         instance: &Instance,
         memory: &wasmer::Memory,
-        store: &mut Store,
+        store: &mut StoreMut<'_>,
         unwind: bool,
     ) -> Option<wasixv2_syscalls::MemoryLayout> {
         self.low_guard()
             .then(|| crate::memory::image_layout(instance, memory, store, unwind))
             .flatten()
     }
-    fn main_stack(&self, instance: &Instance, store: &mut Store) -> std::ops::Range<u32> {
+    fn main_stack(&self, instance: &Instance, store: &mut StoreMut<'_>) -> std::ops::Range<u32> {
         crate::memory::main_stack(instance, store)
     }
-    fn guardable(&self, instance: &Instance, store: &mut Store) -> bool {
+    fn guardable(&self, instance: &Instance, store: &mut StoreMut<'_>) -> bool {
         self.low_guard() && crate::memory::guardable(instance, store)
     }
 
@@ -121,7 +125,7 @@ pub trait PreparedImage<S: 'static>: 'static {
     fn bind(
         self: Box<Self>,
         instance: &Instance,
-        store: &mut Store,
+        store: &mut StoreMut<'_>,
         task: TaskId,
         role: Role,
     ) -> Result<Arc<dyn AbiInstance<S>>, ExecError>;
@@ -528,7 +532,7 @@ where
         self.owning_thread
     }
 
-    pub(crate) fn install_hooks(&self, store: &mut Store, env: &FunctionEnv<ExecEnv<S>>) {
+    pub(crate) fn install_hooks(&self, store: &mut StoreMut<'_>, env: &FunctionEnv<ExecEnv<S>>) {
         if !self.hooks.is_empty() {
             env.as_mut(store).hooks =
                 Some(crate::InstanceHooks::new(self.hooks.clone(), env.clone()));
@@ -649,7 +653,7 @@ mod tests {
         }
         fn imports(
             &self,
-            _: &mut Store,
+            _: &mut StoreMut<'_>,
             _: &FunctionEnv<ExecEnv<Recorder>>,
             _: &Module,
         ) -> Imports {
@@ -658,7 +662,7 @@ mod tests {
         fn bind(
             &self,
             _: &Instance,
-            _: &mut Store,
+            _: &mut StoreMut<'_>,
             _: TaskId,
             _: Role,
         ) -> Result<Arc<dyn AbiInstance<Recorder>>, ExecError> {
@@ -678,7 +682,7 @@ mod tests {
         }
         fn imports(
             &self,
-            _: &mut Store,
+            _: &mut StoreMut<'_>,
             _: &FunctionEnv<ExecEnv<Recorder>>,
             _: &Module,
         ) -> Imports {
@@ -687,7 +691,7 @@ mod tests {
         fn bind(
             &self,
             _: &Instance,
-            _: &mut Store,
+            _: &mut StoreMut<'_>,
             _: TaskId,
             _: Role,
         ) -> Result<Arc<dyn AbiInstance<Recorder>>, ExecError> {

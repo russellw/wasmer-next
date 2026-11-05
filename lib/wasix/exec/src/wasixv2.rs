@@ -6,7 +6,7 @@ use std::{any::Any, sync::Arc};
 use wasixv2_syscalls::{Control, LocalFuture, SignalFrame, Syscalls, TaskId};
 use wasmer::{
     AsyncFunctionEnvMut, Function, FunctionEnv, Global, Imports, Instance, Module, RuntimeError,
-    Store, Value,
+    StoreMut, Value,
 };
 
 use crate::{
@@ -60,7 +60,7 @@ where
 
     fn imports(
         &self,
-        store: &mut Store,
+        store: &mut StoreMut<'_>,
         env: &FunctionEnv<ExecEnv<S>>,
         module: &Module,
     ) -> Imports {
@@ -74,7 +74,7 @@ where
     fn bind(
         &self,
         instance: &Instance,
-        _store: &mut Store,
+        _store: &mut StoreMut<'_>,
         _task: TaskId,
         role: Role,
     ) -> Result<Arc<dyn AbiInstance<S>>, ExecError> {

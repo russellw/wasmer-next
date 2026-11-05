@@ -67,8 +67,8 @@ use wasixv2_syscalls::{
 };
 pub use wasixv2_syscalls::{Image, ImageId};
 use wasmer::{
-    AsyncFunctionEnvMut, CompileError, Engine, Function, FunctionEnv, Global, Imports, Instance,
-    Memory, MemoryError, Module, Pages, RuntimeError, Store, Value,
+    AsStoreMut, AsyncFunctionEnvMut, CompileError, Engine, Function, FunctionEnv, Global, Imports,
+    Instance, Memory, MemoryError, Module, Pages, RuntimeError, Store, StoreMut, Value,
 };
 use wasmer_types::TrapCode;
 
@@ -937,10 +937,10 @@ where
         ExecEnv::new(syscalls.clone(), task, proc, host.clone()),
     );
     env.as_mut(&mut store).cleanup = Some(cleanup.shared().clone());
-    abis.install_hooks(&mut store, &env);
-    let mut imports = imports(&*abi, &mut store, &env, module);
+    abis.install_hooks(&mut store.as_store_mut(), &env);
+    let mut imports = imports(&*abi, &mut store.as_store_mut(), &env, module);
     let size = fork.map(|image| image.memory.size());
-    let imported = import_memory(&mut store, module, &mut imports, size)?;
+    let imported = import_memory(&mut store.as_store_mut(), module, &mut imports, size)?;
     // Fork copies retain their existing rewind/bind contract. Native startup is
     // EH/PIC-only; this opt-in phase does not add multi-module asyncify/fork support.
     let (mut store, prepared, bootstrap, invocations) = if fork.is_none() {
@@ -987,10 +987,15 @@ where
             None => instance.exports.get_memory("memory")?.clone(),
         };
         // Decided from the module's own globals, before a fork child's copy replaces them.
-        let guarded = abi.guardable(&instance, &mut store);
-        let main_stack = abi.main_stack(&instance, &mut store);
+        let guarded = abi.guardable(&instance, &mut store.as_store_mut());
+        let main_stack = abi.main_stack(&instance, &mut store.as_store_mut());
         let mut asyncify = asyncify::Asyncify::new(&instance, &mut store)?;
-        let layout = abi.image_layout(&instance, &memory, &mut store, asyncify.is_some());
+        let layout = abi.image_layout(
+            &instance,
+            &memory,
+            &mut store.as_store_mut(),
+            asyncify.is_some(),
+        );
         if let Some(bootstrap) = &bootstrap
             && (layout.as_ref() != bootstrap.layout.as_ref()
                 || main_stack != bootstrap.stack
@@ -1031,8 +1036,10 @@ where
             return Err(ExecError::Load(LoadError::Format(Errno::EINVAL)));
         }
         let bound = match prepared {
-            Some(prepared) => prepared.bind(&instance, &mut store, task, Role::Process)?,
-            None => abi.bind(&instance, &mut store, task, Role::Process)?,
+            Some(prepared) => {
+                prepared.bind(&instance, &mut store.as_store_mut(), task, Role::Process)?
+            }
+            None => abi.bind(&instance, &mut store.as_store_mut(), task, Role::Process)?,
         };
         let shared = memory.as_shared(&store);
         if let Some(shared) = &shared {
@@ -1360,7 +1367,7 @@ impl<S: Syscalls + Control + Send + Sync + 'static> Ready<S> {
 /// the imports its atomic waits and notifies became.
 fn imports<S>(
     abi: &dyn Abi<S>,
-    store: &mut Store,
+    store: &mut StoreMut<'_>,
     env: &FunctionEnv<ExecEnv<S>>,
     module: &Module,
 ) -> Imports
@@ -1405,7 +1412,7 @@ fn jspi_import(future: wasmer::js::JspiFuture) -> js_sys::Promise {
 /// and at least `size` bytes. libc-built guests import a shared memory so threads can share it;
 /// others export `memory`.
 fn import_memory(
-    store: &mut Store,
+    store: &mut StoreMut<'_>,
     module: &Module,
     imports: &mut Imports,
     size: Option<u64>,

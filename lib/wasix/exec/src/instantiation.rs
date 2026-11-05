@@ -1910,7 +1910,7 @@ mod tests {
         }
         fn imports(
             &self,
-            store: &mut Store,
+            store: &mut StoreMut<'_>,
             env: &FunctionEnv<ExecEnv<Recorder>>,
             module: &Module,
         ) -> Imports {
@@ -1919,7 +1919,7 @@ mod tests {
         fn bind(
             &self,
             instance: &Instance,
-            store: &mut Store,
+            store: &mut StoreMut<'_>,
             task: TaskId,
             role: crate::Role,
         ) -> Result<Arc<dyn crate::AbiInstance<Recorder>>, ExecError> {

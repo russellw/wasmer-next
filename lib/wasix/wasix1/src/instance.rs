@@ -81,7 +81,7 @@ impl Wasix1Instance {
         http: Option<Arc<dyn crate::http::HttpProvider>>,
         limits: crate::Limits,
         instance: &Instance,
-        store: &mut wasmer::Store,
+        store: &mut wasmer::StoreMut<'_>,
         task: TaskId,
         role: Role,
     ) -> Result<Self, wasmer::ExportError> {

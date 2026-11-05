@@ -16,7 +16,7 @@ pub struct TableMetadata {
 }
 
 impl TableMetadata {
-    pub fn bind(instance: &wasmer::Instance, store: &mut wasmer::Store) -> Self {
+    pub fn bind(instance: &wasmer::Instance, store: &mut wasmer::StoreMut<'_>) -> Self {
         let table = instance
             .exports
             .get_table("__wasix_exec_table")

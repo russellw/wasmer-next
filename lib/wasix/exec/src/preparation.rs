@@ -341,7 +341,7 @@ pub(crate) mod tests {
         task::{Context, Waker},
     };
     use wasixv2_syscalls::{LocalFuture, SignalFrame, TaskId};
-    use wasmer::{AsyncFunctionEnvMut, Function, Imports, Instance, RuntimeError};
+    use wasmer::{AsyncFunctionEnvMut, Function, Imports, Instance, RuntimeError, StoreMut};
 
     #[derive(Clone, Copy, PartialEq, Eq)]
     pub(crate) enum Mode {
@@ -430,7 +430,7 @@ pub(crate) mod tests {
         }
         fn imports(
             &self,
-            store: &mut Store,
+            store: &mut StoreMut<'_>,
             env: &FunctionEnv<ExecEnv<Recorder>>,
             module: &Module,
         ) -> Imports {
@@ -534,7 +534,7 @@ pub(crate) mod tests {
         fn bind(
             &self,
             instance: &Instance,
-            store: &mut Store,
+            store: &mut StoreMut<'_>,
             task: TaskId,
             role: Role,
         ) -> Result<Arc<dyn AbiInstance<Recorder>>, ExecError> {
@@ -552,7 +552,7 @@ pub(crate) mod tests {
             &self,
             _: &Instance,
             _: &Memory,
-            _: &mut Store,
+            _: &mut StoreMut<'_>,
             _: bool,
         ) -> Option<MemoryLayout> {
             let mut layout = layout();
@@ -561,7 +561,7 @@ pub(crate) mod tests {
             }
             Some(layout)
         }
-        fn main_stack(&self, _: &Instance, _: &mut Store) -> Range<u32> {
+        fn main_stack(&self, _: &Instance, _: &mut StoreMut<'_>) -> Range<u32> {
             0..131072
         }
     }
@@ -585,7 +585,7 @@ pub(crate) mod tests {
         }
         fn imports(
             &self,
-            store: &mut Store,
+            store: &mut StoreMut<'_>,
             env: &FunctionEnv<ExecEnv<Recorder>>,
             module: &Module,
         ) -> Imports {
@@ -594,7 +594,7 @@ pub(crate) mod tests {
         fn bind(
             &self,
             instance: &Instance,
-            store: &mut Store,
+            store: &mut StoreMut<'_>,
             task: TaskId,
             role: Role,
         ) -> Result<Arc<dyn AbiInstance<Recorder>>, ExecError> {
@@ -649,7 +649,7 @@ pub(crate) mod tests {
         fn bind(
             mut self: Box<Self>,
             instance: &Instance,
-            store: &mut Store,
+            store: &mut StoreMut<'_>,
             task: TaskId,
             role: Role,
         ) -> Result<Arc<dyn AbiInstance<Recorder>>, ExecError> {
