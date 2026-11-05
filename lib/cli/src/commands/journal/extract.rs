@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use clap::Parser;
-use wasmer_wasix::journal::{LogFileJournal, copy_journal};
+use wasmer_journal::{LogFileJournal, copy_journal};
 
 use crate::commands::CliCommand;
 
@@ -37,8 +37,7 @@ impl CliCommand for CmdJournalExtract {
 
         match self.what {
             CmdExtractWhat::Memory(cmd) => {
-                let memory_file =
-                    wasmer_wasix::journal::MemFileJournal::new(&cmd.memory_file_path)?;
+                let memory_file = wasmer_journal::MemFileJournal::new(&cmd.memory_file_path)?;
                 copy_journal(&journal, &memory_file)?;
             }
         }

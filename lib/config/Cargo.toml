@@ -28,6 +28,11 @@ url = { workspace = true, features = ["serde"] }
 hex.workspace = true
 ciborium.workspace = true
 saffron = { workspace = true, features = ["std"] }
+ipnet = { workspace = true, optional = true }
+iprange = { workspace = true, optional = true }
+
+[features]
+network-rules = ["dep:ipnet", "dep:iprange"]
 
 [dev-dependencies]
 pretty_assertions.workspace = true

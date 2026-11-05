@@ -14,8 +14,7 @@ base64.workspace = true
 hyper = { workspace = true, optional = true }
 rkyv = { workspace = true, optional = true }
 
-ipnet.workspace = true
-iprange.workspace = true
+wasmer-config = { workspace = true, features = ["network-rules"] }
 thiserror.workspace = true
 bytes.workspace = true
 async-trait.workspace = true

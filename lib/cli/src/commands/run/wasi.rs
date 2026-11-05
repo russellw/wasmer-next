@@ -7,7 +7,7 @@ use itertools::Itertools;
 use url::Url;
 use wasmer::Engine;
 #[cfg(feature = "journal")]
-use wasmer_wasix::journal::SnapshotTrigger;
+use wasmer_journal::SnapshotTrigger;
 use wasmer_wasix::{
     PluggableRuntime, Runtime,
     http::HttpClient,

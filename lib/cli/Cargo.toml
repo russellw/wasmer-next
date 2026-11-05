@@ -46,7 +46,7 @@ default = [
 # 	"mac_address",
 # 	"dep:interfaces",
 # ]
-journal = ["wasmer-wasix/journal"]
+journal = ["dep:wasmer-journal", "wasmer-journal/log-file"]
 backend = []
 coredump = ["wasm-coredump-builder"]
 sys = ["compiler", "dep:wasmer-vm", "wasixv2/sys"]
@@ -140,6 +140,7 @@ wasmer-wasix = { path = "../wasix-legacy", version = "=0.705.0", features = [
   "ctrlc",
   "sys",
 ], default-features = false }
+wasmer-journal = { path = "../journal", version = "0.705.0", default-features = false, optional = true }
 wasmer-wast = { version = "=7.5.0", path = "../../tests/lib/wast", optional = true }
 wasmer-types = { version = "=7.5.0", path = "../types", features = [
   "enable-serde",
@@ -163,7 +164,7 @@ virtual-mio = { version = "0.705.0", path = "../virtual-io" }
 webc.workspace = true
 wasmer-backend-api = { version = "=0.705.0", path = "../backend-api" }
 wasmer-package-sdk = { version = "=7.5.0", path = "../package-sdk" }
-wasmer-config = { version = "0.705.0", path = "../config" }
+wasmer-config = { version = "0.705.0", path = "../config", features = ["network-rules"] }
 
 shared-buffer = { workspace = true, optional = true }
 rkyv = { workspace = true, optional = true }

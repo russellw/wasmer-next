@@ -42,13 +42,13 @@ use crate::utils::PublishedProtocol;
 
 /// The CLI's historical rules, independent of the kernel's socket implementation.
 #[derive(Debug)]
-struct NetworkRules(virtual_net::ruleset::Ruleset);
+struct NetworkRules(wasmer_config::network_rules::Ruleset);
 
 impl wasixv2::NetworkPolicy for NetworkRules {
     fn allows_socket(&self, addr: SocketAddr, direction: wasixv2::PolicyDirection) -> bool {
         let direction = match direction {
-            wasixv2::PolicyDirection::Inbound => virtual_net::ruleset::Direction::Inbound,
-            wasixv2::PolicyDirection::Outbound => virtual_net::ruleset::Direction::Outbound,
+            wasixv2::PolicyDirection::Inbound => wasmer_config::network_rules::Direction::Inbound,
+            wasixv2::PolicyDirection::Outbound => wasmer_config::network_rules::Direction::Outbound,
         };
         self.0.allows_socket(addr, direction)
     }
@@ -1481,8 +1481,8 @@ impl Reader {
 #[cfg(test)]
 mod tests {
     use super::NetworkRules;
-    use virtual_net::ruleset::{Direction, Ruleset};
     use wasixv2::{NetworkPolicy, PolicyDirection};
+    use wasmer_config::network_rules::{Direction, Ruleset};
 
     #[test]
     fn machine_network_rules_keep_v1_address_direction_and_deny_precedence() {
