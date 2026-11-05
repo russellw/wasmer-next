@@ -6,7 +6,9 @@
 //! [`WebHost`] for `wasm32-unknown-unknown` in a browser or node (feature `web`).
 
 mod loader_cleanup;
-pub use loader_cleanup::{LoaderCleanup, LoaderCleanupJob};
+pub use loader_cleanup::{
+    LoaderCleanup, LoaderCleanupJob, LocalCleanupRunner, LocalCleanupSink, LocalLoaderCleanupJob,
+};
 
 #[cfg(all(feature = "terminal", unix))]
 pub mod terminal;

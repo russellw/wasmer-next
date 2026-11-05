@@ -3,23 +3,119 @@
 use crate::{Host, LocalFuture};
 use std::{
     collections::VecDeque,
-    future::{Future, poll_fn},
+    future::Future,
     pin::Pin,
+    rc::Rc,
     sync::{Arc, Mutex, MutexGuard, Weak},
     task::{Context, Poll, Waker},
 };
 
-/// A factory crosses threads; the local future is created only on the owning runner.
 pub type LoaderCleanupJob = Box<dyn FnOnce() -> LocalFuture<'static, ()> + Send>;
+/// The factory crosses threads; its runner capability is supplied on materialization.
+pub type LocalLoaderCleanupJob =
+    Box<dyn FnOnce(Option<LocalCleanupRunner>) -> LocalFuture<'static, ()> + Send>;
 
-/// Custody of loader release work for one guest runner. Ordinary Executor tasks stay detached.
+/// Owner-local retirement custody. Implementations must commit custody before
+/// invoking callbacks and retain a continuation if notification unwinds.
+pub trait LocalCleanupSink {
+    fn retain(&self, future: LocalFuture<'static, ()>);
+    fn notify(&self);
+}
+
+/// Local capability for the single runner of a shared cleanup scope. Keep this
+/// capability across image replacements; shared image declarations retain only
+/// the Send + Sync LoaderCleanup and receive this capability in their factories.
+#[derive(Clone)]
+pub struct LocalCleanupRunner {
+    scope: Arc<LoaderCleanup>,
+    sink: Rc<dyn LocalCleanupSink>,
+}
+impl LocalCleanupRunner {
+    pub fn new(scope: Arc<LoaderCleanup>, sink: Rc<dyn LocalCleanupSink>) -> Self {
+        Self { scope, sink }
+    }
+    pub fn shared(&self) -> &Arc<LoaderCleanup> {
+        &self.scope
+    }
+    pub fn spawn(&self, future: LocalFuture<'static, ()>) {
+        self.scope.spawn_inner(future, Some(self), false);
+    }
+    /// Only native owner drains use fallback; ordinary jobs retain their existing
+    /// cancellation behavior and notify this local runner when their lease ends.
+    pub fn spawn_with_fallback(&self, future: LocalFuture<'static, ()>) {
+        self.scope.spawn_inner(future, Some(self), true);
+    }
+    /// Admit a new native cleanup obligation. Closed runners return exact custody;
+    /// transferring a previously admitted ScopedJob never calls this method.
+    pub fn retain(&self, future: LocalFuture<'static, ()>) -> Result<(), LocalFuture<'static, ()>> {
+        {
+            let mut state = self.scope.state();
+            if state.closed {
+                return Err(future);
+            }
+            state.pending += 1;
+        }
+        self.sink.retain(Box::pin(ScopedJob {
+            future: Some(future),
+            completion: Some(Completion {
+                scope: self.scope.clone(),
+                local: Some(self.clone()),
+            }),
+            fallback: None,
+            panicked: false,
+        }));
+        Ok(())
+    }
+    pub fn submit(&self, job: LocalLoaderCleanupJob) -> Result<(), LocalLoaderCleanupJob> {
+        self.scope.submit_local(job)
+    }
+    pub fn on_retire(
+        &self,
+        owner: &Arc<()>,
+        job: LocalLoaderCleanupJob,
+    ) -> Result<(), LocalLoaderCleanupJob> {
+        self.scope.on_retire_local(owner, job)
+    }
+    pub fn run<'a, R: 'a, G: Future<Output = R> + 'a>(
+        &self,
+        guest: G,
+    ) -> impl Future<Output = R> + 'a + use<'a, R, G> {
+        Runner::new(self.scope.clone(), Some(self.clone()), guest, None)
+    }
+    pub fn run_with_keepalive<'a, R: 'a, G: Future<Output = R> + 'a, K: std::any::Any>(
+        &self,
+        guest: G,
+        keepalive: K,
+    ) -> impl Future<Output = R> + 'a + use<'a, R, G, K> {
+        Runner::new(
+            self.scope.clone(),
+            Some(self.clone()),
+            guest,
+            Some(Box::new(keepalive)),
+        )
+    }
+}
+
+enum Job {
+    Shared(LoaderCleanupJob),
+    Local(LocalLoaderCleanupJob),
+}
+impl Job {
+    fn materialize(self, local: Option<&LocalCleanupRunner>) -> LocalFuture<'static, ()> {
+        match self {
+            Self::Shared(job) => job(),
+            Self::Local(job) => job(local.cloned()),
+        }
+    }
+}
+
 pub struct LoaderCleanup {
     host: Arc<dyn Host>,
     state: Mutex<State>,
 }
 #[derive(Default)]
 struct State {
-    jobs: VecDeque<LoaderCleanupJob>,
+    jobs: VecDeque<Job>,
     retire: Vec<Retirement>,
     pending: usize,
     closed: bool,
@@ -27,7 +123,7 @@ struct State {
 }
 struct Retirement {
     owner: Weak<()>,
-    job: LoaderCleanupJob,
+    job: Job,
 }
 impl LoaderCleanup {
     pub fn new(host: Arc<dyn Host>) -> Arc<Self> {
@@ -44,9 +140,22 @@ impl LoaderCleanup {
     pub fn is_open(&self) -> bool {
         !self.state().closed
     }
-    /// Enqueue a last-owner release on this runner, atomically with its final drain.
-    /// A closed runner returns custody to the caller for another live attachment.
     pub fn submit(self: &Arc<Self>, job: LoaderCleanupJob) -> Result<(), LoaderCleanupJob> {
+        self.enqueue(Job::Shared(job)).map_err(|job| match job {
+            Job::Shared(job) => job,
+            _ => unreachable!(),
+        })
+    }
+    pub fn submit_local(
+        self: &Arc<Self>,
+        job: LocalLoaderCleanupJob,
+    ) -> Result<(), LocalLoaderCleanupJob> {
+        self.enqueue(Job::Local(job)).map_err(|job| match job {
+            Job::Local(job) => job,
+            _ => unreachable!(),
+        })
+    }
+    fn enqueue(&self, job: Job) -> Result<(), Job> {
         let mut state = self.state();
         if state.closed {
             return Err(job);
@@ -60,19 +169,33 @@ impl LoaderCleanup {
         }
         Ok(())
     }
-    /// A weak loader attachment is checked after the guest/task teardown and all
-    /// prior releases. The callback must not retain the image or store strongly.
     pub fn on_retire(
         &self,
         owner: &Arc<()>,
         job: LoaderCleanupJob,
     ) -> Result<(), LoaderCleanupJob> {
+        self.retirement(owner, Job::Shared(job))
+            .map_err(|job| match job {
+                Job::Shared(job) => job,
+                _ => unreachable!(),
+            })
+    }
+    pub fn on_retire_local(
+        &self,
+        owner: &Arc<()>,
+        job: LocalLoaderCleanupJob,
+    ) -> Result<(), LocalLoaderCleanupJob> {
+        self.retirement(owner, Job::Local(job))
+            .map_err(|job| match job {
+                Job::Local(job) => job,
+                _ => unreachable!(),
+            })
+    }
+    fn retirement(&self, owner: &Arc<()>, job: Job) -> Result<(), Job> {
         let mut state = self.state();
         if state.closed {
             return Err(job);
         }
-        // A runner spans exec replacements. Dead image callbacks must not grow
-        // indefinitely while the next image keeps that runner alive.
         state
             .retire
             .retain(|retirement| retirement.owner.strong_count() != 0);
@@ -82,141 +205,307 @@ impl LoaderCleanup {
         });
         Ok(())
     }
-    /// Transfer an already suspended local cleanup operation. Call only from this
-    /// runner's executor while its guest or another scoped job still owns custody.
+    /// Transfer on this runner's executor while its guest or another job owns custody.
     pub fn spawn(self: &Arc<Self>, future: LocalFuture<'static, ()>) {
+        self.spawn_inner(future, None, false);
+    }
+    fn spawn_inner(
+        self: &Arc<Self>,
+        future: LocalFuture<'static, ()>,
+        local: Option<&LocalCleanupRunner>,
+        fallback: bool,
+    ) {
         let mut state = self.state();
         if state.closed {
             drop(state);
-            // Preserve the existing executor-context requirement for a trusted host
-            // retaining ABI objects beyond their runner. Managed retirement never
-            // takes this path; it cannot gain custody from an already ended runner.
             self.host.executor().spawn_local(future);
             return;
         }
         state.pending += 1;
         drop(state);
-        self.start(future);
+        self.start(future, local, fallback);
     }
-    fn start(self: &Arc<Self>, future: LocalFuture<'static, ()>) {
-        let completion = Completion(self.clone());
-        self.host.executor().spawn_local(Box::pin(async move {
-            future.await;
-            drop(completion);
+    fn start(
+        self: &Arc<Self>,
+        future: LocalFuture<'static, ()>,
+        local: Option<&LocalCleanupRunner>,
+        fallback: bool,
+    ) {
+        self.host.executor().spawn_local(Box::pin(ScopedJob {
+            future: Some(future),
+            completion: Some(Completion {
+                scope: self.clone(),
+                local: local.cloned(),
+            }),
+            fallback: fallback
+                .then(|| local.expect("fallback requires local custody").sink.clone()),
+            panicked: false,
         }));
     }
-    fn flush(self: &Arc<Self>, cx: &mut Context<'_>) {
-        let next_waker = cx.waker().clone();
-        let old_waker = self.state().waker.replace(next_waker);
-        drop(old_waker);
-        // A Waker destructor can panic or submit more work. Leave factories in
-        // scope custody until that callback has finished.
-        let jobs = std::mem::take(&mut self.state().jobs);
-        for job in jobs {
-            self.start(job());
+    fn flush(self: &Arc<Self>, cx: &mut Context<'_>, local: Option<&LocalCleanupRunner>) {
+        let next = cx.waker().clone();
+        let old = self.state().waker.replace(next);
+        drop(old);
+        loop {
+            // Keep unmaterialized factories in shared custody if a factory or its
+            // destructor unwinds. The popped admission has its lease first.
+            let Some(job) = self.state().jobs.pop_front() else {
+                break;
+            };
+            let completion = Completion {
+                scope: self.clone(),
+                local: local.cloned(),
+            };
+            let future = job.materialize(local);
+            self.host.executor().spawn_local(Box::pin(ScopedJob {
+                future: Some(future),
+                completion: Some(completion),
+                fallback: None,
+                panicked: false,
+            }));
         }
     }
-    async fn drain(self: Arc<Self>) {
-        poll_fn(|cx| {
-            self.flush(cx);
-            let (retire, closed_waker) = {
+    fn poll_drain(
+        self: &Arc<Self>,
+        cx: &mut Context<'_>,
+        local: Option<&LocalCleanupRunner>,
+    ) -> Poll<()> {
+        loop {
+            self.flush(cx, local);
+            let closed_waker = {
                 let mut state = self.state();
                 if state.pending != 0 {
                     return Poll::Pending;
                 }
-                let retire: Vec<_> = std::mem::take(&mut state.retire)
-                    .into_iter()
-                    .filter(|retirement| retirement.owner.strong_count() != 0)
-                    .map(|retirement| retirement.job)
-                    .collect();
-                if retire.is_empty() {
-                    state.closed = true;
-                    (retire, state.waker.take())
-                } else {
-                    state.pending = retire.len();
-                    (retire, None)
+                let retire = std::mem::take(&mut state.retire);
+                for retirement in retire {
+                    if retirement.owner.strong_count() != 0 {
+                        state.pending += 1;
+                        state.jobs.push_back(retirement.job);
+                    }
                 }
+                if state.pending != 0 {
+                    continue;
+                }
+                state.closed = true;
+                state.waker.take()
             };
             drop(closed_waker);
-            if retire.is_empty() {
-                return Poll::Ready(());
-            }
-            for job in retire {
-                self.start(job());
-            }
-            Poll::Pending
-        })
-        .await
+            return Poll::Ready(());
+        }
     }
-    /// Drive the guest and queued factories on this executor, then await only its
-    /// loader jobs. kernel/exit.c:do_exit completes memory retirement before exit_notify.
     pub fn run<'a, R: 'a>(
         self: &Arc<Self>,
         guest: impl Future<Output = R> + 'a,
     ) -> impl Future<Output = R> + 'a {
-        Runner {
-            scope: self.clone(),
-            guest: Some(Box::pin(guest)),
-            output: None,
-            drain: None,
-            keepalive: None,
-            done: false,
-        }
+        Runner::new(self.clone(), None, guest, None)
     }
-
-    /// Retain an owner-local lease until guest teardown and the complete loader
-    /// drain finish, including when cancellation transfers that drain. The lease
-    /// must own no Store, provider, or resource needed by the drain's own jobs.
     pub fn run_with_keepalive<'a, R: 'a>(
         self: &Arc<Self>,
         guest: impl Future<Output = R> + 'a,
         keepalive: impl std::any::Any,
     ) -> impl Future<Output = R> + 'a {
-        Runner {
-            scope: self.clone(),
-            guest: Some(Box::pin(guest)),
-            output: None,
-            drain: None,
-            keepalive: Some(Box::new(keepalive)),
-            done: false,
+        Runner::new(self.clone(), None, guest, Some(Box::new(keepalive)))
+    }
+}
+
+fn callbacks(wake: impl FnOnce(), notify: impl FnOnce()) {
+    let unwinding = std::thread::panicking();
+    let first = std::panic::catch_unwind(std::panic::AssertUnwindSafe(wake));
+    let second = std::panic::catch_unwind(std::panic::AssertUnwindSafe(notify));
+    let mut failures = [first, second].into_iter().filter_map(Result::err);
+    let first = failures.next();
+    for failure in failures {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(failure)));
+    }
+    if let Some(first) = first {
+        if unwinding {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(first)));
+        } else {
+            std::panic::resume_unwind(first);
         }
     }
 }
-struct Completion(Arc<LoaderCleanup>);
+struct Completion {
+    scope: Arc<LoaderCleanup>,
+    local: Option<LocalCleanupRunner>,
+}
 impl Drop for Completion {
     fn drop(&mut self) {
-        let mut state = self.0.state();
-        state.pending -= 1;
-        let waker = state.waker.take();
-        drop(state);
-        if let Some(waker) = waker {
-            waker.wake();
+        let waker = {
+            let mut state = self.scope.state();
+            state.pending -= 1;
+            state.waker.take()
+        };
+        callbacks(
+            || {
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
+            },
+            || {
+                if let Some(local) = &self.local {
+                    local.sink.notify();
+                }
+            },
+        );
+    }
+}
+
+/// This wrapper transfers the same future and completion lease before either
+/// can drop. The sink-owned copy has no recursive executor fallback.
+struct ScopedJob {
+    future: Option<LocalFuture<'static, ()>>,
+    completion: Option<Completion>,
+    fallback: Option<Rc<dyn LocalCleanupSink>>,
+    panicked: bool,
+}
+impl Unpin for ScopedJob {}
+impl Future for ScopedJob {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = self.get_mut();
+        let polled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            this.future
+                .as_mut()
+                .expect("live cleanup")
+                .as_mut()
+                .poll(cx)
+        }));
+        match polled {
+            Ok(Poll::Pending) => return Poll::Pending,
+            Ok(Poll::Ready(())) => (),
+            Err(panic) => {
+                this.panicked = true;
+                std::panic::resume_unwind(panic);
+            }
+        }
+        drop(this.future.take());
+        drop(this.completion.take());
+        this.fallback = None;
+        Poll::Ready(())
+    }
+}
+impl Drop for ScopedJob {
+    fn drop(&mut self) {
+        if !self.panicked
+            && let Some(sink) = self.fallback.take()
+            && self.future.is_some()
+        {
+            let future = Box::pin(Self {
+                future: self.future.take(),
+                completion: self.completion.take(),
+                fallback: None,
+                panicked: false,
+            });
+            callbacks(|| {}, || sink.retain(future));
+            return;
+        }
+        // A panicked async orchestration is never polled again. Embedded native
+        // guards commit replacement state while the original lease is still held.
+        let future = self.future.take();
+        let completion = self.completion.take();
+        callbacks(|| drop(future), || drop(completion));
+    }
+}
+
+struct Drain {
+    scope: Arc<LoaderCleanup>,
+    local: Option<LocalCleanupRunner>,
+}
+impl Future for Drain {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        self.scope.poll_drain(cx, self.local.as_ref())
+    }
+}
+struct FinalDrain {
+    drain: Option<LocalFuture<'static, ()>>,
+    keepalive: Option<Box<dyn std::any::Any>>,
+    local: Option<LocalCleanupRunner>,
+    completed: bool,
+}
+impl Future for FinalDrain {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = self.get_mut();
+        if this
+            .drain
+            .as_mut()
+            .expect("live final drain")
+            .as_mut()
+            .poll(cx)
+            .is_pending()
+        {
+            return Poll::Pending;
+        }
+        this.completed = true;
+        drop(this.drain.take());
+        drop(this.keepalive.take());
+        Poll::Ready(())
+    }
+}
+impl Drop for FinalDrain {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        if let Some(local) = self.local.take() {
+            let future = Box::pin(Self {
+                drain: self.drain.take(),
+                keepalive: self.keepalive.take(),
+                local: Some(local.clone()),
+                completed: false,
+            });
+            // This same obligation is uncounted: it observes the counted jobs.
+            // A failed poll transfers its actual drain/lease without the executor.
+            callbacks(|| {}, || local.sink.retain(future));
         }
     }
 }
 struct Runner<'a, R> {
     scope: Arc<LoaderCleanup>,
+    local: Option<LocalCleanupRunner>,
     guest: Option<LocalFuture<'a, R>>,
     output: Option<R>,
     drain: Option<LocalFuture<'static, ()>>,
     keepalive: Option<Box<dyn std::any::Any>>,
     done: bool,
 }
-// Only the boxed futures are pinned; output is never projected as pinned.
+impl<'a, R: 'a> Runner<'a, R> {
+    fn new(
+        scope: Arc<LoaderCleanup>,
+        local: Option<LocalCleanupRunner>,
+        guest: impl Future<Output = R> + 'a,
+        keepalive: Option<Box<dyn std::any::Any>>,
+    ) -> Self {
+        Self {
+            scope,
+            local,
+            guest: Some(Box::pin(guest)),
+            output: None,
+            drain: None,
+            keepalive,
+            done: false,
+        }
+    }
+}
 impl<R> Unpin for Runner<'_, R> {}
 impl<R> Future for Runner<'_, R> {
     type Output = R;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<R> {
         let this = self.get_mut();
-        this.scope.flush(cx);
+        this.scope.flush(cx, this.local.as_ref());
         if let Some(guest) = &mut this.guest {
             match guest.as_mut().poll(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(output) => this.output = Some(output),
             }
-            // Drop all frame/image attachments before starting the final drain.
             drop(this.guest.take());
-            this.drain = Some(Box::pin(this.scope.clone().drain()));
+            this.drain = Some(Box::pin(Drain {
+                scope: this.scope.clone(),
+                local: this.local.clone(),
+            }));
         }
         if this.drain.as_mut().unwrap().as_mut().poll(cx).is_pending() {
             return Poll::Pending;
@@ -233,29 +522,41 @@ impl<R> Drop for Runner<'_, R> {
         if self.done {
             return;
         }
-        // Establish custody before either user destructor can enqueue work or
-        // unwind. Its Drop transfers the exact continuation and lease together.
         let custody = DrainCustody {
             scope: self.scope.clone(),
+            local: self.local.clone(),
             drain: self.drain.take(),
             keepalive: self.keepalive.take(),
         };
         let output = self.output.take();
         let guest = self.guest.take();
-        drop(guest);
-        drop(output);
-        drop(custody);
+        callbacks(
+            || callbacks(|| drop(guest), || drop(output)),
+            || drop(custody),
+        );
     }
 }
-
 struct DrainCustody {
     scope: Arc<LoaderCleanup>,
+    local: Option<LocalCleanupRunner>,
     drain: Option<LocalFuture<'static, ()>>,
     keepalive: Option<Box<dyn std::any::Any>>,
 }
-
 impl Drop for DrainCustody {
     fn drop(&mut self) {
+        // Establish the exact final-drain and lease guard before a Waker or
+        // executor callback can unwind through any of the old owner's fields.
+        let mut future = FinalDrain {
+            drain: Some(self.drain.take().unwrap_or_else(|| {
+                Box::pin(Drain {
+                    scope: self.scope.clone(),
+                    local: self.local.clone(),
+                })
+            })),
+            keepalive: self.keepalive.take(),
+            local: self.local.clone(),
+            completed: false,
+        };
         let (closed, waker) = {
             let mut state = self.scope.state();
             if state.pending == 0 && state.retire.is_empty() {
@@ -265,25 +566,28 @@ impl Drop for DrainCustody {
                 (false, None)
             }
         };
-        drop(waker);
-        if closed {
-            drop(self.drain.take());
-            drop(self.keepalive.take());
-            return;
-        }
-        let drain = self
-            .drain
-            .take()
-            .unwrap_or_else(|| Box::pin(self.scope.clone().drain()));
-        if let Some(keepalive) = self.keepalive.take() {
-            self.scope.host.executor().spawn_local(Box::pin(async move {
-                drain.await;
-                drop(keepalive);
-            }));
-        } else {
-            // Ordinary runners keep their existing allocation/custody path.
-            self.scope.host.executor().spawn_local(drain);
-        }
+        callbacks(
+            || drop(waker),
+            || {
+                if closed {
+                    future.completed = true;
+                    callbacks(
+                        || drop(future.drain.take()),
+                        || drop(future.keepalive.take()),
+                    );
+                } else if let Some(local) = &self.local {
+                    // The final drain is not counted among the jobs it observes.
+                    self.scope.host.executor().spawn_local(Box::pin(ScopedJob {
+                        future: Some(Box::pin(future)),
+                        completion: None,
+                        fallback: Some(local.sink.clone()),
+                        panicked: false,
+                    }));
+                } else {
+                    self.scope.host.executor().spawn_local(Box::pin(future));
+                }
+            },
+        );
     }
 }
 
@@ -518,7 +822,7 @@ mod tests {
                 );
                 scope.state().waker = Some(Waker::from(Arc::new(DropPanic)));
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    scope.flush(&mut Context::from_waker(Waker::noop()));
+                    scope.flush(&mut Context::from_waker(Waker::noop()), None);
                 }));
                 assert!(result.is_err());
                 {
@@ -614,5 +918,586 @@ mod tests {
             .await;
         local.await;
         assert!(weak.upgrade().is_none());
+    }
+}
+
+#[cfg(test)]
+mod local_custody_tests {
+    use super::*;
+    use crate::Executor;
+    use std::{
+        cell::{Cell, RefCell},
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+        time::Duration,
+    };
+
+    thread_local! {
+        static JOBS: RefCell<Vec<LocalFuture<'static, ()>>> = const { RefCell::new(Vec::new()) };
+    }
+    struct QueueHost(AtomicBool);
+    impl Host for QueueHost {
+        fn realtime(&self) -> Duration {
+            Duration::ZERO
+        }
+        fn monotonic(&self) -> Duration {
+            Duration::ZERO
+        }
+        fn sleep(&self, _: Duration) -> LocalFuture<'_, ()> {
+            Box::pin(async {})
+        }
+        fn random(&self, _: &mut [u8]) {}
+        fn executor(&self) -> &dyn Executor {
+            self
+        }
+        fn report(&self, _: &str) {}
+    }
+    impl Executor for QueueHost {
+        fn spawn_local(&self, future: LocalFuture<'static, ()>) {
+            if self.0.load(Ordering::SeqCst) {
+                drop(future);
+            } else {
+                JOBS.with(|jobs| jobs.borrow_mut().push(future));
+            }
+        }
+        fn spawn_blocking(&self, work: Box<dyn FnOnce() + Send>) -> LocalFuture<'static, ()> {
+            Box::pin(async move { work() })
+        }
+    }
+    #[derive(Default)]
+    struct Sink {
+        futures: RefCell<Vec<LocalFuture<'static, ()>>>,
+        running: Cell<bool>,
+        ready: Cell<bool>,
+        notifications: Cell<usize>,
+    }
+    impl LocalCleanupSink for Sink {
+        fn retain(&self, future: LocalFuture<'static, ()>) {
+            self.futures.borrow_mut().push(future);
+            self.notify();
+        }
+        fn notify(&self) {
+            self.notifications.set(self.notifications.get() + 1);
+            self.ready.set(true);
+            if self.running.replace(true) {
+                return;
+            }
+            while self.ready.replace(false) {
+                let futures = std::mem::take(&mut *self.futures.borrow_mut());
+                for mut future in futures {
+                    if future
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_pending()
+                    {
+                        self.futures.borrow_mut().push(future);
+                    }
+                }
+            }
+            self.running.set(false);
+        }
+    }
+    struct Probe {
+        ready: Arc<AtomicBool>,
+        dropped: Arc<AtomicUsize>,
+        address: Arc<AtomicUsize>,
+    }
+    impl Future for Probe {
+        type Output = ();
+        fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+            let address = (&*self as *const Self) as usize;
+            let previous = self.address.swap(address, Ordering::SeqCst);
+            assert!(
+                previous == 0 || previous == address,
+                "the exact pinned future moved"
+            );
+            if self.ready.load(Ordering::SeqCst) {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            self.dropped.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    fn probe() -> (Probe, Arc<AtomicBool>, Arc<AtomicUsize>) {
+        let ready = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        (
+            Probe {
+                ready: ready.clone(),
+                dropped: dropped.clone(),
+                address: Arc::new(AtomicUsize::new(0)),
+            },
+            ready,
+            dropped,
+        )
+    }
+    #[test]
+    fn queued_native_discard_transfers_exact_future_and_completion_lease_once() {
+        fn send_sync<T: Send + Sync>() {}
+        send_sync::<LoaderCleanup>();
+        assert!(JOBS.with(|jobs| jobs.borrow().is_empty()));
+        let host = Arc::new(QueueHost(AtomicBool::new(false)));
+        let scope = LoaderCleanup::new(host);
+        let sink = Rc::new(Sink::default());
+        let local = LocalCleanupRunner::new(scope.clone(), sink.clone());
+        let (future, ready, dropped) = probe();
+        local.spawn_with_fallback(Box::pin(future));
+        let mut queued = JOBS.with(|jobs| jobs.borrow_mut().pop().unwrap());
+        assert!(
+            queued
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        drop(queued);
+        assert_eq!(
+            scope.state().pending,
+            1,
+            "discard is a transfer, not completion"
+        );
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        assert!(
+            JOBS.with(|jobs| jobs.borrow().is_empty()),
+            "no recursive executor submission"
+        );
+        ready.store(true, Ordering::SeqCst);
+        sink.notify();
+        assert_eq!(scope.state().pending, 0);
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        assert!(sink.futures.borrow().is_empty());
+    }
+    #[test]
+    fn final_drain_waits_for_generic_completion_after_the_last_native_event() {
+        assert!(JOBS.with(|jobs| jobs.borrow().is_empty()));
+        let host = Arc::new(QueueHost(AtomicBool::new(false)));
+        let scope = LoaderCleanup::new(host.clone());
+        let sink = Rc::new(Sink::default());
+        let local = LocalCleanupRunner::new(scope.clone(), sink.clone());
+        let (future, ready, dropped) = probe();
+        local.spawn(Box::pin(future));
+        struct Lease(Rc<Cell<bool>>);
+        impl Drop for Lease {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+        let released = Rc::new(Cell::new(false));
+        let mut runner = Box::pin(local.run_with_keepalive(async {}, Lease(released.clone())));
+        assert!(
+            runner
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        host.0.store(true, Ordering::SeqCst);
+        drop(runner); // Final drain is synchronously discarded into local custody.
+        assert!(!released.get());
+        assert_eq!(
+            scope.state().pending,
+            1,
+            "the final drain does not count itself"
+        );
+        ready.store(true, Ordering::SeqCst);
+        let mut job = JOBS.with(|jobs| jobs.borrow_mut().pop().unwrap());
+        assert!(
+            job.as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_ready()
+        );
+        drop(job); // This ordinary Completion is the only remaining progress event.
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        assert!(released.get());
+        assert!(!scope.is_open());
+        assert!(sink.futures.borrow().is_empty());
+    }
+    #[test]
+    fn generic_completion_notifies_owner_after_a_panicking_user_waker() {
+        struct PanicWake;
+        impl std::task::Wake for PanicWake {
+            fn wake(self: Arc<Self>) {
+                panic!("cleanup wake proof");
+            }
+        }
+        assert!(JOBS.with(|jobs| jobs.borrow().is_empty()));
+        let scope = LoaderCleanup::new(Arc::new(QueueHost(AtomicBool::new(false))));
+        let sink = Rc::new(Sink::default());
+        let local = LocalCleanupRunner::new(scope.clone(), sink.clone());
+        local.spawn(Box::pin(async {}));
+        scope.state().waker = Some(Waker::from(Arc::new(PanicWake)));
+        let job = JOBS.with(|jobs| jobs.borrow_mut().pop().unwrap());
+        let panic =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(job))).unwrap_err();
+        assert_eq!(panic.downcast_ref::<&str>(), Some(&"cleanup wake proof"));
+        assert_eq!(scope.state().pending, 0);
+        assert_eq!(sink.notifications.get(), 1);
+    }
+
+    #[test]
+    fn final_drain_poll_panic_transfers_the_exact_drain_and_keepalive() {
+        struct PanicOnceThenPending {
+            polls: Rc<Cell<usize>>,
+            address: Rc<Cell<usize>>,
+            ready: Rc<Cell<bool>>,
+            drops: Rc<Cell<usize>>,
+        }
+        impl Future for PanicOnceThenPending {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+                let this = self.get_mut();
+                let address = this as *mut Self as usize;
+                let previous = this.address.replace(address);
+                assert!(previous == 0 || previous == address, "exact drain moved");
+                let polls = this.polls.get() + 1;
+                this.polls.set(polls);
+                if polls == 1 {
+                    panic!("final drain poll proof");
+                }
+                if this.ready.get() {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+        impl Drop for PanicOnceThenPending {
+            fn drop(&mut self) {
+                self.drops.set(self.drops.get() + 1);
+            }
+        }
+        struct Lease(Rc<Cell<usize>>);
+        impl Drop for Lease {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+
+        let sink = Rc::new(Sink::default());
+        let scope = LoaderCleanup::new(Arc::new(QueueHost(AtomicBool::new(false))));
+        let local = LocalCleanupRunner::new(scope, sink.clone());
+        let polls = Rc::new(Cell::new(0));
+        let address = Rc::new(Cell::new(0));
+        let ready = Rc::new(Cell::new(false));
+        let drops = Rc::new(Cell::new(0));
+        let lease_drops = Rc::new(Cell::new(0));
+        let drain: LocalFuture<'static, ()> = Box::pin(PanicOnceThenPending {
+            polls: polls.clone(),
+            address: address.clone(),
+            ready: ready.clone(),
+            drops: drops.clone(),
+        });
+        let mut final_drain = Box::pin(FinalDrain {
+            drain: Some(drain),
+            keepalive: Some(Box::new(Lease(lease_drops.clone()))),
+            local: Some(local),
+            completed: false,
+        });
+        let first_poll = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            final_drain
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+        }))
+        .unwrap_err();
+        assert_eq!(
+            first_poll.downcast_ref::<&str>(),
+            Some(&"final drain poll proof")
+        );
+
+        // FinalDrain's own Drop must transfer both exact objects before the
+        // owner-local poll can run or any panic can escape.
+        drop(final_drain);
+        assert_eq!(polls.get(), 2);
+        assert_eq!(drops.get(), 0);
+        assert_eq!(lease_drops.get(), 0);
+        assert_eq!(sink.futures.borrow().len(), 1);
+        ready.set(true);
+        sink.notify();
+        assert_eq!(polls.get(), 3);
+        assert_eq!(drops.get(), 1);
+        assert_eq!(lease_drops.get(), 1);
+        assert!(sink.futures.borrow().is_empty());
+    }
+
+    #[test]
+    fn drain_custody_finishes_after_a_panicking_raw_waker_destructor() {
+        struct Lease(Rc<Cell<usize>>);
+        impl Drop for Lease {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+        struct DropPanicWake;
+        impl std::task::Wake for DropPanicWake {
+            fn wake(self: Arc<Self>) {}
+        }
+        impl Drop for DropPanicWake {
+            fn drop(&mut self) {
+                panic!("drain custody waker destructor proof");
+            }
+        }
+
+        let host = Arc::new(QueueHost(AtomicBool::new(false)));
+        let scope = LoaderCleanup::new(host);
+        let sink = Rc::new(Sink::default());
+        let local = LocalCleanupRunner::new(scope.clone(), sink);
+        local.spawn(Box::pin(async {}));
+        let lease_drops = Rc::new(Cell::new(0));
+        let mut runner = Box::pin(local.run_with_keepalive(async {}, Lease(lease_drops.clone())));
+        assert!(
+            runner
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        let mut job = JOBS.with(|jobs| jobs.borrow_mut().pop().unwrap());
+        assert!(
+            job.as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_ready()
+        );
+        drop(job);
+        assert_eq!(scope.state().pending, 0);
+        // Reinstall a destructor that panics after the runner's ordinary
+        // completion callback has already returned.
+        scope.state().waker = Some(Waker::from(Arc::new(DropPanicWake)));
+
+        let panic =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runner))).unwrap_err();
+        assert_eq!(
+            panic.downcast_ref::<&str>(),
+            Some(&"drain custody waker destructor proof")
+        );
+        assert!(!scope.is_open());
+        assert_eq!(lease_drops.get(), 1);
+    }
+
+    #[test]
+    fn factory_panic_keeps_admitted_sibling_until_final_drain() {
+        let host = Arc::new(QueueHost(AtomicBool::new(false)));
+        let scope = LoaderCleanup::new(host);
+        let sink = Rc::new(Sink::default());
+        let local = LocalCleanupRunner::new(scope.clone(), sink);
+        let first: LocalLoaderCleanupJob =
+            Box::new(|_| -> LocalFuture<'static, ()> { panic!("factory panic proof") });
+        let materialized = Arc::new(AtomicUsize::new(0));
+        let ran = Arc::new(AtomicUsize::new(0));
+        let made = materialized.clone();
+        let ran_by_future = ran.clone();
+        let sibling: LocalLoaderCleanupJob = Box::new(move |_| -> LocalFuture<'static, ()> {
+            made.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                ran_by_future.fetch_add(1, Ordering::SeqCst);
+            })
+        });
+        assert!(local.submit(first).is_ok());
+        assert!(local.submit(sibling).is_ok());
+        let lease_drops = Rc::new(Cell::new(0));
+        let mut runner = Box::pin(local.run_with_keepalive(async {}, {
+            struct Lease(Rc<Cell<usize>>);
+            impl Drop for Lease {
+                fn drop(&mut self) {
+                    self.0.set(self.0.get() + 1);
+                }
+            }
+            Lease(lease_drops.clone())
+        }));
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runner
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+        }))
+        .unwrap_err();
+        assert_eq!(panic.downcast_ref::<&str>(), Some(&"factory panic proof"));
+        assert_eq!(scope.state().pending, 1);
+        assert_eq!(scope.state().jobs.len(), 1, "sibling admission was lost");
+        drop(runner);
+        assert_eq!(lease_drops.get(), 0);
+
+        let mut final_drain = JOBS.with(|jobs| jobs.borrow_mut().pop().unwrap());
+        assert!(
+            final_drain
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        assert_eq!(materialized.load(Ordering::SeqCst), 1);
+        assert_eq!(ran.load(Ordering::SeqCst), 0);
+        let mut sibling = JOBS.with(|jobs| jobs.borrow_mut().pop().unwrap());
+        assert!(
+            sibling
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_ready()
+        );
+        drop(sibling);
+        assert_eq!(scope.state().pending, 0);
+        assert!(
+            final_drain
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_ready()
+        );
+        drop(final_drain);
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
+        assert_eq!(lease_drops.get(), 1);
+        assert!(!scope.is_open());
+    }
+
+    #[test]
+    fn runner_drop_during_unwind_preserves_primary_panic_and_cleanup_custody() {
+        const CHILD: &str = "WASIXV2_CLEANUP_UNWIND_DROP_CHILD";
+        const TEST: &str = "loader_cleanup::local_custody_tests::runner_drop_during_unwind_preserves_primary_panic_and_cleanup_custody";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg(TEST)
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated unwind proof failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        struct Lease(Rc<Cell<usize>>);
+        impl Drop for Lease {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+        struct DropOnUnwind<R>(Option<LocalFuture<'static, R>>);
+        impl<R> Drop for DropOnUnwind<R> {
+            fn drop(&mut self) {
+                drop(self.0.take());
+            }
+        }
+        struct PanickingGuest;
+        impl Future for PanickingGuest {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+                Poll::Pending
+            }
+        }
+        impl Drop for PanickingGuest {
+            fn drop(&mut self) {
+                panic!("guest destructor proof");
+            }
+        }
+        struct PanickingOutput;
+        impl Drop for PanickingOutput {
+            fn drop(&mut self) {
+                panic!("output destructor proof");
+            }
+        }
+        struct DropPanicWake;
+        impl std::task::Wake for DropPanicWake {
+            fn wake(self: Arc<Self>) {}
+        }
+        impl Drop for DropPanicWake {
+            fn drop(&mut self) {
+                panic!("unwind waker destructor proof");
+            }
+        }
+        fn drop_runner_during_primary_unwind<R: 'static>(runner: LocalFuture<'static, R>) {
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _runner = DropOnUnwind(Some(runner));
+                panic!("primary unwind proof");
+            }))
+            .unwrap_err();
+            assert_eq!(panic.downcast_ref::<&str>(), Some(&"primary unwind proof"));
+        }
+
+        fn fixture() -> (
+            Arc<LoaderCleanup>,
+            Rc<Sink>,
+            LocalCleanupRunner,
+            Arc<AtomicBool>,
+        ) {
+            let host = Arc::new(QueueHost(AtomicBool::new(true)));
+            let scope = LoaderCleanup::new(host);
+            let sink = Rc::new(Sink::default());
+            let local = LocalCleanupRunner::new(scope.clone(), sink.clone());
+            let (future, ready, _) = probe();
+            assert!(local.retain(Box::pin(future)).is_ok());
+            (scope, sink, local, ready)
+        }
+        fn settle(
+            scope: &Arc<LoaderCleanup>,
+            sink: &Sink,
+            ready: &AtomicBool,
+            lease_drops: &Cell<usize>,
+        ) {
+            assert_eq!(lease_drops.get(), 0, "pending work lost keepalive");
+            assert_eq!(scope.state().pending, 1);
+            ready.store(true, Ordering::SeqCst);
+            sink.notify();
+            assert_eq!(scope.state().pending, 0);
+            assert_eq!(lease_drops.get(), 1);
+            assert!(!scope.is_open());
+        }
+
+        // A guest future's destructor can panic while the caller is already
+        // unwinding; its admitted sibling and the exact lease still settle.
+        {
+            let (scope, sink, local, ready) = fixture();
+            let lease_drops = Rc::new(Cell::new(0));
+            let mut runner: LocalFuture<'static, ()> =
+                Box::pin(local.run_with_keepalive(PanickingGuest, Lease(lease_drops.clone())));
+            assert!(
+                runner
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            drop_runner_during_primary_unwind(runner);
+            settle(&scope, &sink, &ready, &lease_drops);
+        }
+
+        // The output destructor is a distinct Runner::drop phase after guest
+        // completion; it must not bypass transfer of the final drain.
+        {
+            let (scope, sink, local, ready) = fixture();
+            let lease_drops = Rc::new(Cell::new(0));
+            let mut runner: LocalFuture<'static, PanickingOutput> = Box::pin(
+                local.run_with_keepalive(async { PanickingOutput }, Lease(lease_drops.clone())),
+            );
+            assert!(
+                runner
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            drop_runner_during_primary_unwind(runner);
+            settle(&scope, &sink, &ready, &lease_drops);
+        }
+
+        // A user RawWaker destructor can also panic after the last counted job
+        // finishes, exactly while the runner unwinds.
+        {
+            let (scope, sink, local, ready) = fixture();
+            let lease_drops = Rc::new(Cell::new(0));
+            let mut runner: LocalFuture<'static, ()> =
+                Box::pin(local.run_with_keepalive(async {}, Lease(lease_drops.clone())));
+            assert!(
+                runner
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            ready.store(true, Ordering::SeqCst);
+            sink.notify();
+            assert_eq!(scope.state().pending, 0);
+            scope.state().waker = Some(Waker::from(Arc::new(DropPanicWake)));
+            drop_runner_during_primary_unwind(runner);
+            assert_eq!(lease_drops.get(), 1);
+            assert!(!scope.is_open());
+            assert!(sink.futures.borrow().is_empty());
+        }
     }
 }
