@@ -23,6 +23,11 @@ use crate::{
     addr::{canonical, canonical_ip, present, sockaddr_bytes, unbound},
     bpf::{Arrival, PACKET_HOST, PACKET_LOOPBACK, PACKET_MULTICAST, SockFilter},
     cmsg::{self, SendCtl},
+    endpoint::{
+        AttemptGate, DatagramDelivery, EndpointChoice, EndpointDatagramTx, EndpointKind,
+        EndpointQuery, EndpointSource, EndpointSourceId, EndpointTarget, UdpTxConfig,
+        runtime::{Namespace, SocketEndpoint},
+    },
     icmp::{Back, IPPROTO_UDP, IPV4_HDR, IPV6_HDR, Quoted, UDP_HDR, udp_datagram},
     mcast::McRoute,
     net::{Net, Path, UdpRoute, serves},
@@ -64,6 +69,26 @@ struct Pending {
     now: std::time::Duration,
 }
 
+#[derive(Clone)]
+enum EndpointConnection {
+    Local,
+    Host,
+    Peer(EndpointTarget),
+}
+#[derive(Clone)]
+enum WriteSlot {
+    Host(Arc<dyn BackendDatagram>),
+    // Retain the selected peer identity while its unaccepted send is the poll witness.
+    Peer { _target: EndpointTarget },
+}
+#[derive(Clone)]
+struct WriteFocus {
+    source: EndpointSourceId,
+    revision: u64,
+    slot: WriteSlot,
+    _destination: SocketAddr,
+}
+
 struct Inner {
     opts: SockOpts,
     cork: bool,
@@ -90,6 +115,12 @@ struct Inner {
     /// The publication the socket serves (its id and endpoint), whose endpoint is `backend`
     /// unless the socket is connected inside the namespace.
     published: Option<(u64, Arc<dyn BackendDatagram>)>,
+    endpoint_tx: Option<Arc<dyn EndpointDatagramTx>>,
+    endpoint_opening: bool,
+    endpoint_revision: u64,
+    endpoint_connection: Option<EndpointConnection>,
+    endpoint_blocked: Option<WriteFocus>,
+    endpoint_write_revision: u64,
 }
 
 fn policy_destination(g: &Inner, msg: &SendMsg<'_>) -> Option<SocketAddr> {
@@ -104,6 +135,7 @@ fn policy_destination(g: &Inner, msg: &SendMsg<'_>) -> Option<SocketAddr> {
 pub struct UdpSocket {
     net: Arc<Net>,
     id: SockId,
+    endpoint: SocketEndpoint,
     domain: AtomicU8,
     /// `sk_uid`, for `SO_REUSEPORT`.
     uid: u32,
@@ -122,6 +154,7 @@ impl UdpSocket {
         Arc::new_cyclic(|me| Self {
             net,
             id,
+            endpoint: SocketEndpoint::new(id),
             domain: AtomicU8::new(domain as u8),
             uid,
             ino: AtomicU64::new(0),
@@ -145,6 +178,12 @@ impl UdpSocket {
                 wr_shut: false,
                 backend: None,
                 published: None,
+                endpoint_tx: None,
+                endpoint_opening: false,
+                endpoint_revision: 1,
+                endpoint_connection: None,
+                endpoint_blocked: None,
+                endpoint_write_revision: 0,
             }),
             auto_publication: Mutex::new(None),
         })
@@ -174,6 +213,7 @@ impl UdpSocket {
 
     fn autobind(&self, g: &mut Inner) -> NetResult<SocketAddr> {
         if let Some(local) = g.local {
+            self.endpoint_join(g, local);
             return Ok(local);
         }
         let ip = g.saddr.unwrap_or(self.any());
@@ -182,7 +222,186 @@ impl UdpSocket {
             .udp_bind(self.id, self.spec(&g.opts, ip), 0, self.me.clone())?;
         let local = SocketAddr::new(ip, port);
         g.local = Some(local);
+        self.endpoint_join(g, local);
         Ok(local)
+    }
+
+    fn endpoint_join(&self, g: &Inner, local: SocketAddr) {
+        if let Some(ns) = self.net.endpoints() {
+            ns.join_udp(
+                &self.endpoint,
+                self.me.clone(),
+                local,
+                self.domain(),
+                g.opts.v6only,
+            );
+        }
+    }
+    fn endpoint_config(&self, g: &Inner) -> UdpTxConfig {
+        UdpTxConfig {
+            source_id: self.endpoint.source(),
+            revision: g.endpoint_revision,
+            peer: g.peer,
+            recv_v4_errors: g.opts.flag(RECVERR[0].0, RECVERR[0].1),
+            recv_v6_errors: g.opts.flag(RECVERR[1].0, RECVERR[1].1),
+        }
+    }
+    fn endpoint_reset(&self, g: &mut Inner, ns: &Namespace) {
+        self.endpoint.renew(ns);
+        g.endpoint_tx = None;
+        g.endpoint_opening = false;
+        g.endpoint_revision = 1;
+        g.endpoint_connection = None;
+        g.endpoint_blocked = None;
+        g.endpoint_write_revision = 0;
+    }
+    /// Explicit unlocked factory/configuration path; no accepted payload is retried here.
+    fn endpoint_prepare_tx(
+        &self,
+        ns: &Arc<Namespace>,
+        source: EndpointSourceId,
+    ) -> NetResult<Arc<dyn EndpointDatagramTx>> {
+        loop {
+            let mut g = self.lock();
+            if self.endpoint.source() != source {
+                return Err(Errno::ECANCELED);
+            }
+            let initial = self.endpoint_config(&g);
+            let tx = if let Some(tx) = g.endpoint_tx.clone() {
+                drop(g);
+                tx
+            } else {
+                if g.endpoint_opening {
+                    return Err(Errno::EAGAIN);
+                }
+                let local = g.local.ok_or(Errno::EINVAL)?;
+                let group_id = self.endpoint.group_id().ok_or(Errno::EINVAL)?;
+                g.endpoint_opening = true;
+                drop(g);
+                let result = ns.provider.datagram(
+                    EndpointSource {
+                        id: source,
+                        group_id,
+                        bound: local,
+                        domain: self.domain(),
+                    },
+                    initial,
+                    self.wq.clone(),
+                );
+                let mut g = self.lock();
+                if self.endpoint.source() != source {
+                    drop(g);
+                    drop(result);
+                    return Err(Errno::ECANCELED);
+                }
+                g.endpoint_opening = false;
+                let tx = match result {
+                    Ok(tx) => tx,
+                    Err(error) => {
+                        drop(g);
+                        self.wq.wake(PollMask::empty());
+                        return Err(error);
+                    }
+                };
+                g.endpoint_tx = Some(tx.clone());
+                drop(g);
+                self.wq.wake(PollMask::empty());
+                tx
+            };
+            let config = {
+                let g = self.lock();
+                if self.endpoint.source() != source {
+                    return Err(Errno::ECANCELED);
+                }
+                self.endpoint_config(&g)
+            };
+            tx.configure(config);
+            let g = self.lock();
+            if self.endpoint.source() != source {
+                return Err(Errno::ECANCELED);
+            }
+            if g.endpoint_revision == config.revision {
+                return Ok(tx);
+            }
+        }
+    }
+    fn endpoint_outcome(
+        &self,
+        source: EndpointSourceId,
+        revision: u64,
+        dispatch: u64,
+        slot: WriteSlot,
+        destination: SocketAddr,
+        result: &NetResult<usize>,
+    ) {
+        let mut g = self.lock();
+        if self.endpoint.source() == source
+            && g.endpoint_revision == revision
+            && g.endpoint_write_revision == dispatch
+        {
+            g.endpoint_blocked = if *result == Err(Errno::EAGAIN) {
+                Some(WriteFocus {
+                    source,
+                    revision,
+                    slot,
+                    _destination: destination,
+                })
+            } else {
+                None
+            };
+        }
+    }
+
+    pub(crate) fn deliver_endpoint(
+        &self,
+        source: EndpointSourceId,
+        gate: &AttemptGate,
+        data: &[u8],
+        from: SocketAddr,
+        destination: SocketAddr,
+    ) -> DatagramDelivery {
+        let at = Arrival {
+            src: from.ip(),
+            dst: destination.ip(),
+            ttl: 64,
+            traffic_class: 0,
+            iif: crate::iface::LOOPBACK_INDEX,
+            pkttype: PACKET_HOST,
+        };
+        let (filter, port) = {
+            let g = self.lock();
+            (g.opts.filter.clone(), g.local.map_or(0, |a| a.port()))
+        };
+        let Some(data) = self.filtered(&filter, data, from, port, &at) else {
+            return DatagramDelivery::Dropped;
+        };
+        let mut g = self.lock();
+        if self.endpoint.source() != source {
+            return DatagramDelivery::Retired;
+        }
+        if g.peer.is_some_and(|peer| peer != from) || g.queued > g.opts.rcvbuf {
+            return DatagramDelivery::Dropped;
+        }
+        let result = self
+            .endpoint
+            .commit(source, || {
+                gate.commit(|| {
+                    g.queued += data.len() + DGRAM_OVERHEAD;
+                    g.queue.push_back(Datagram {
+                        data: data.to_vec(),
+                        from,
+                        at,
+                    });
+                })
+            })
+            .flatten();
+        drop(g);
+        if result.is_some() {
+            self.wq.wake(PollMask::IN | PollMask::RDNORM);
+            DatagramDelivery::Queued
+        } else {
+            DatagramDelivery::Retired
+        }
     }
 
     pub(crate) fn port_entry(&self) -> Option<PortEntry> {
@@ -532,13 +751,16 @@ impl UdpSocket {
             }
             None => {
                 let backend = g.backend.clone();
+                let peer = g.endpoint_tx.clone();
                 drop(g);
-                let mut e = backend
-                    .and_then(|b| b.take_queued_error())
-                    .ok_or(Errno::EAGAIN)?;
-                e.dst = e.dst.map(|a| self.net.guest_view(a));
-                e.offender = e.offender.map(|a| self.net.guest_view(a));
-                e
+                if let Some(mut e) = backend.and_then(|b| b.take_queued_error()) {
+                    e.dst = e.dst.map(|a| self.net.guest_view(a));
+                    e.offender = e.offender.map(|a| self.net.guest_view(a));
+                    e
+                } else {
+                    peer.and_then(|tx| tx.take_queued_error())
+                        .ok_or(Errno::EAGAIN)?
+                }
             }
         };
         Ok(error_result(self.domain(), &e, buf))
@@ -549,6 +771,7 @@ impl UdpSocket {
         g.err
             .take()
             .or_else(|| g.backend.as_ref().and_then(|b| b.take_error()))
+            .or_else(|| g.endpoint_tx.as_ref().and_then(|tx| tx.take_error()))
     }
 }
 
@@ -784,6 +1007,118 @@ impl UdpSocket {
             });
             return Ok(msg.data.len());
         }
+        if let Some(ns) = self.net.endpoints() {
+            let source = self.endpoint.source();
+            let revision = g.endpoint_revision;
+            let config = self.endpoint_config(&g);
+            let local_binding = g.local;
+            let connected = g.endpoint_connection.clone();
+            let eligible = matches!(&route,UdpRoute::Local {at,..} if Arc::ptr_eq(at,&self.net));
+            let effective = match &route {
+                UdpRoute::Local { from, .. } => *from,
+                _ => local,
+            };
+            let group = self.endpoint.group();
+            let query = EndpointQuery {
+                kind: EndpointKind::Datagram,
+                source_id: source,
+                bound: local_binding,
+                effective_source: Some(effective),
+                destination: dst,
+                local_binding: ns.hint(EndpointKind::Datagram, dst, effective),
+            };
+            drop(g);
+            if let Some(group) = group {
+                ns.refresh(&group);
+            }
+            let choice = if eligible {
+                match connected {
+                    Some(EndpointConnection::Peer(target)) if config.peer == Some(dst) => {
+                        EndpointChoice::Provider(target)
+                    }
+                    Some(EndpointConnection::Local | EndpointConnection::Host)
+                        if config.peer == Some(dst) =>
+                    {
+                        EndpointChoice::Namespace
+                    }
+                    _ => ns.provider.select(&query)?,
+                }
+            } else {
+                EndpointChoice::Namespace
+            };
+            g = self.lock();
+            if source != self.endpoint.source() || g.local != local_binding {
+                return Err(Errno::ECANCELED);
+            }
+            if let EndpointChoice::Provider(target) = choice {
+                g.endpoint_blocked = None;
+                g.endpoint_write_revision = g.endpoint_write_revision.saturating_add(1);
+                let dispatch = g.endpoint_write_revision;
+                drop(g);
+                let tx = match self.endpoint_prepare_tx(&ns, source) {
+                    Ok(tx) => tx,
+                    Err(error) => {
+                        let result = Err(error);
+                        self.endpoint_outcome(
+                            source,
+                            revision,
+                            dispatch,
+                            WriteSlot::Peer { _target: target },
+                            dst,
+                            &result,
+                        );
+                        return result;
+                    }
+                };
+                let current = {
+                    let mut g = self.lock();
+                    if source != self.endpoint.source() {
+                        return Err(Errno::ECANCELED);
+                    }
+                    if g.wr_shut {
+                        return Err(Errno::EPIPE);
+                    }
+                    if let Some(error) = Self::take_err(&mut g) {
+                        return Err(error);
+                    }
+                    g.endpoint_revision
+                };
+                let segment = ctl.gso_size.unwrap_or(usize::MAX).max(1);
+                let send = |bytes: &[u8]| {
+                    let n = tx.send_to(current, &target, effective, dst, bytes)?;
+                    if n == bytes.len() {
+                        Ok(n)
+                    } else {
+                        Err(Errno::EPROTO)
+                    }
+                };
+                let result = if msg.data.len() <= segment {
+                    send(msg.data)
+                } else {
+                    let mut result = Ok(msg.data.len());
+                    for (i, chunk) in msg.data.chunks(segment).enumerate() {
+                        if let Err(error) = send(chunk) {
+                            if i == 0 {
+                                result = Err(error);
+                            }
+                            break;
+                        }
+                    }
+                    result
+                };
+                self.endpoint_outcome(
+                    source,
+                    current,
+                    dispatch,
+                    WriteSlot::Peer { _target: target },
+                    dst,
+                    &result,
+                );
+                return result;
+            }
+            g.endpoint_blocked = None;
+            g.endpoint_write_revision = g.endpoint_write_revision.saturating_add(1);
+        }
         // `UDP_SEGMENT`: the payload leaves as datagrams of the segment size.
         let segment = ctl.gso_size.unwrap_or(usize::MAX).max(1);
         let ttl = ctl.ttl.unwrap_or_else(|| g.opts.unicast_ttl(self.domain()));
@@ -848,20 +1183,49 @@ impl UdpSocket {
             }
             UdpRoute::Backend { host_dst } => {
                 let b = self.backend_endpoint(&mut g)?;
+                let source = self.endpoint.source();
+                let revision = g.endpoint_revision;
+                let dispatch = g.endpoint_write_revision;
                 drop(g);
                 if msg.data.len() <= segment {
-                    return b.send_to(msg.data, host_dst);
+                    let result = b.send_to(msg.data, host_dst);
+                    if self.net.endpoints().is_some() {
+                        self.endpoint_outcome(
+                            source,
+                            revision,
+                            dispatch,
+                            WriteSlot::Host(b),
+                            dst,
+                            &result,
+                        );
+                    }
+                    return result;
                 }
                 // One GSO send is one skb on Linux: it fails whole or goes out whole.
+                let mut result = Ok(msg.data.len());
                 for (i, chunk) in msg.data.chunks(segment).enumerate() {
                     match b.send_to(chunk, host_dst) {
                         Ok(_) => {}
-                        Err(e) if i == 0 => return Err(e),
-                        // The rest is lost on the way, as segments may be.
-                        Err(_) => break,
+                        Err(e) => {
+                            if i == 0 {
+                                result = Err(e);
+                            }
+                            // Already accepted segments are never replayed.
+                            break;
+                        }
                     }
                 }
-                Ok(msg.data.len())
+                if self.net.endpoints().is_some() {
+                    self.endpoint_outcome(
+                        source,
+                        revision,
+                        dispatch,
+                        WriteSlot::Host(b),
+                        dst,
+                        &result,
+                    );
+                }
+                result
             }
         }
     }
@@ -1057,6 +1421,9 @@ fn scope_of(addr: SocketAddr) -> u32 {
 
 impl Drop for UdpSocket {
     fn drop(&mut self) {
+        if let Some(ns) = self.net.endpoints() {
+            self.endpoint.renew(&ns);
+        }
         let g = self.inner.get_mut().unwrap();
         g.opts.mc.drop_all(&self.net);
         let local = g.local.take();
@@ -1077,34 +1444,73 @@ impl Pollable for UdpSocket {
     /// `udp_poll` / `datagram_poll`.
     fn poll(&self, mut table: Option<&mut PollTable<'_>>) -> PollMask {
         poll_wait(&mut table, &self.wq);
-        let g = self.lock();
-        let mut m = PollMask::empty();
-        if g.err.is_some() || !g.errqueue.is_empty() {
-            m |= PollMask::ERR;
+        loop {
+            let g = self.lock();
+            let mut m = PollMask::empty();
+            if g.err.is_some() || !g.errqueue.is_empty() {
+                m |= PollMask::ERR;
+            }
+            if g.rd_shut {
+                m |= PollMask::RDHUP | PollMask::IN | PollMask::RDNORM;
+            }
+            if g.rd_shut && g.wr_shut {
+                m |= PollMask::HUP;
+            }
+            if !g.queue.is_empty() {
+                m |= PollMask::IN | PollMask::RDNORM;
+            }
+            let backend = g.backend.clone();
+            let peer = g.endpoint_tx.clone();
+            let opening = g.endpoint_opening;
+            let source = self.endpoint.source();
+            let revision = g.endpoint_revision;
+            let dispatch = g.endpoint_write_revision;
+            let blocked = g
+                .endpoint_blocked
+                .as_ref()
+                .filter(|f| f.source == source && f.revision == revision)
+                .cloned();
+            let connection = g.endpoint_connection.clone();
+            let opted = self.net.endpoints().is_some();
+            drop(g);
+            let host_mask = backend.as_ref().map_or(PollMask::OUT, |b| b.poll(None));
+            let peer_mask = peer.as_ref().map_or(
+                if opening {
+                    PollMask::empty()
+                } else {
+                    PollMask::OUT
+                },
+                |tx| tx.poll_tx(revision),
+            );
+            m |= host_mask & (PollMask::IN | PollMask::RDNORM | PollMask::ERR);
+            m |= peer_mask & PollMask::ERR;
+            let writable = if !opted {
+                host_mask.contains(PollMask::OUT)
+            } else {
+                match blocked.map(|focus| focus.slot) {
+                    Some(WriteSlot::Host(slot)) => slot.poll(None).contains(PollMask::OUT),
+                    Some(WriteSlot::Peer { .. }) => peer_mask.contains(PollMask::OUT),
+                    None => match connection {
+                        Some(EndpointConnection::Host) => host_mask.contains(PollMask::OUT),
+                        Some(EndpointConnection::Peer(_)) => peer_mask.contains(PollMask::OUT),
+                        _ => true,
+                    },
+                }
+            };
+            let g = self.lock();
+            if opted
+                && (self.endpoint.source() != source
+                    || g.endpoint_revision != revision
+                    || g.endpoint_write_revision != dispatch)
+            {
+                drop(g);
+                continue;
+            }
+            if writable {
+                m |= PollMask::OUT | PollMask::WRNORM | PollMask::WRBAND;
+            }
+            return m;
         }
-        if g.rd_shut {
-            m |= PollMask::RDHUP | PollMask::IN | PollMask::RDNORM;
-        }
-        if g.rd_shut && g.wr_shut {
-            m |= PollMask::HUP;
-        }
-        if !g.queue.is_empty() {
-            m |= PollMask::IN | PollMask::RDNORM;
-        }
-        let backend = g.backend.clone();
-        drop(g);
-        // `sock_writeable`: datagrams inside the namespace never wait; the backend's endpoint
-        // is writable while the host would take a datagram.
-        let mut writable = true;
-        if let Some(b) = backend {
-            let bm = b.poll(None);
-            m |= bm & (PollMask::IN | PollMask::RDNORM | PollMask::ERR);
-            writable = bm.contains(PollMask::OUT);
-        }
-        if writable {
-            m |= PollMask::OUT | PollMask::WRNORM | PollMask::WRBAND;
-        }
-        m
     }
 }
 
@@ -1156,7 +1562,13 @@ impl Socket for UdpSocket {
         g.addr_locked |= !addr.ip().is_unspecified();
         g.port_locked = addr.port() != 0;
         self.claim_publication(&mut g, None);
+        self.endpoint_join(&g, local);
+        let group = self.endpoint.group();
+        let ns = self.net.endpoints();
         drop(g);
+        if let (Some(ns), Some(group)) = (ns, group) {
+            ns.refresh(&group);
+        }
         self.auto_publish(local);
         Ok(())
     }
@@ -1189,6 +1601,41 @@ impl Socket for UdpSocket {
         if admission == crate::net::Admission::DnsOnly && !matches!(path, Path::Dns { .. }) {
             return Err(Errno::EPERM);
         }
+        let mut selected = None;
+        let namespace = self.net.endpoints();
+        let mut next_source = None;
+        if let Some(ns) = &namespace {
+            let candidate = EndpointSourceId(self.net.next_id());
+            next_source = Some(candidate);
+            if matches!(path, Path::Local { net: None, .. }) {
+                let previous = self.endpoint.source();
+                let bound = g.local;
+                let saddr = g.saddr;
+                let effective = SocketAddr::new(path.src(), bound.map_or(0, |a| a.port()));
+                let query = EndpointQuery {
+                    kind: EndpointKind::Datagram,
+                    source_id: candidate,
+                    bound,
+                    effective_source: Some(effective),
+                    destination: dst,
+                    local_binding: ns.hint(EndpointKind::Datagram, dst, effective),
+                };
+                drop(g);
+                let choice = ns.provider.select(&query)?;
+                g = self.lock();
+                if previous != self.endpoint.source() || bound != g.local || saddr != g.saddr {
+                    return Err(Errno::ECANCELED);
+                }
+                let current = self.net.path(dst, g.local.map(|l| l.ip()).or(g.saddr))?;
+                if current.src() != path.src() || !matches!(current, Path::Local { net: None, .. })
+                {
+                    return Err(Errno::EAGAIN);
+                }
+                if let EndpointChoice::Provider(target) = choice {
+                    selected = Some(target);
+                }
+            }
+        }
         let src = path.src();
         let local = self.autobind(&mut g)?;
         if local.ip().is_unspecified() {
@@ -1199,6 +1646,19 @@ impl Socket for UdpSocket {
             .state()
             .udp
             .set_remote(self.id, local.port(), Some(dst));
+        if let (Some(ns), Some(source)) = (&namespace, next_source) {
+            self.endpoint_reset(&mut g, ns);
+            self.endpoint.replace_source(ns, source);
+            let bound = g.local.unwrap();
+            self.endpoint_join(&g, bound);
+        }
+        let endpoint_connection = if let Some(target) = selected {
+            EndpointConnection::Peer(target)
+        } else if matches!(path, Path::Backend { .. }) {
+            EndpointConnection::Host
+        } else {
+            EndpointConnection::Local
+        };
         match path {
             // The host endpoint filters by the peer and reports its ICMP errors.
             Path::Backend { host_dst, .. } => {
@@ -1216,6 +1676,14 @@ impl Socket for UdpSocket {
         }
         g.peer = Some(dst);
         g.policy_peer = Some(addr);
+        if namespace.is_some() {
+            g.endpoint_connection = Some(endpoint_connection);
+        }
+        let group = self.endpoint.group();
+        drop(g);
+        if let (Some(ns), Some(group)) = (namespace, group) {
+            ns.refresh(&group);
+        }
         Ok(())
     }
 
@@ -1249,7 +1717,18 @@ impl Socket for UdpSocket {
         if g.published.is_some() && g.backend.is_none() {
             self.activate_publication(&mut g);
         }
+        let namespace = self.net.endpoints();
+        if let Some(ns) = &namespace {
+            self.endpoint_reset(&mut g, ns);
+            if let Some(local) = g.local {
+                self.endpoint_join(&g, local);
+            }
+        }
+        let group = self.endpoint.group();
         drop(g);
+        if let (Some(ns), Some(group)) = (namespace, group) {
+            ns.refresh(&group);
+        }
         if let Some(id) = released {
             self.net.offer_udp_publication(id);
         }
@@ -1402,6 +1881,20 @@ impl Socket for UdpSocket {
                     .set_family(self.id, local.port(), Domain::Inet);
             }
             self.domain.store(Domain::Inet as u8, Ordering::Release);
+            let ns = self.net.endpoints();
+            if let Some(ns) = &ns {
+                let connection = g.endpoint_connection.clone();
+                self.endpoint_reset(&mut g, ns);
+                g.endpoint_connection = connection;
+                if let Some(local) = g.local {
+                    self.endpoint_join(&g, local);
+                }
+            }
+            let group = self.endpoint.group();
+            drop(g);
+            if let (Some(ns), Some(group)) = (ns, group) {
+                ns.refresh(&group);
+            }
             return Ok(());
         }
         if crate::mcast::handles(level, name) {
@@ -1410,6 +1903,7 @@ impl Socket for UdpSocket {
         let bound = g.local.is_some();
         let changed = g.opts.set(level, name, value, bound)?;
         if RECVERR.contains(&(level, name)) {
+            g.endpoint_revision = g.endpoint_revision.saturating_add(1);
             // Turning either off purges the whole queue (`skb_errqueue_purge`), leaving the
             // pending error as it is.
             if !g.opts.flag(level, name) {
@@ -1434,6 +1928,17 @@ impl Socket for UdpSocket {
                 g.opts.reuseaddr,
                 g.opts.reuseport,
             );
+        }
+        let configuration = if RECVERR.contains(&(level, name)) {
+            g.endpoint_tx
+                .clone()
+                .map(|tx| (tx, self.endpoint_config(&g)))
+        } else {
+            None
+        };
+        drop(g);
+        if let Some((tx, config)) = configuration {
+            tx.configure(config);
         }
         Ok(())
     }

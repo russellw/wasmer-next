@@ -333,6 +333,7 @@ pub struct Net {
     state: Mutex<NetState>,
     pub(crate) backend: Option<Arc<dyn Backend>>,
     endpoint_namespace: Option<Arc<dyn crate::endpoint::EndpointProvider>>,
+    endpoint_runtime: Option<Arc<crate::endpoint::runtime::Namespace>>,
     pub(crate) config: NetConfig,
     next_id: AtomicU64,
     me: Weak<Net>,
@@ -388,6 +389,9 @@ impl Net {
                 sctp: SctpPorts::default(),
             }),
             backend,
+            endpoint_runtime: endpoint_namespace.as_ref().map(|provider| {
+                crate::endpoint::runtime::Namespace::new(me.clone(), provider.clone())
+            }),
             endpoint_namespace,
             config,
             next_id: AtomicU64::new(1),
@@ -399,6 +403,25 @@ impl Net {
     /// or retrieving it alone does not select routes, publish sockets or establish peering.
     pub fn endpoint_namespace(&self) -> Option<Arc<dyn crate::endpoint::EndpointProvider>> {
         self.endpoint_namespace.clone()
+    }
+
+    pub(crate) fn endpoints(&self) -> Option<Arc<crate::endpoint::runtime::Namespace>> {
+        self.endpoint_runtime.clone()
+    }
+
+    /// Snapshot registration status without changing local bind/listen success.
+    pub fn endpoint_publications(&self) -> Vec<crate::endpoint::EndpointPublicationStatus> {
+        self.endpoint_runtime
+            .as_ref()
+            .map_or_else(Vec::new, |ns| ns.statuses())
+    }
+
+    /// Explicit unlocked control entry. Retry failed registrations and refresh dirty hints;
+    /// accepted connect/send work is never replayed. Do not call with WLK locks held.
+    pub fn retry_endpoint_publications(&self) {
+        if let Some(namespace) = &self.endpoint_runtime {
+            namespace.retry_all();
+        }
     }
 
     /// Publishes one complete provider readback atomically, before its waiter is woken.

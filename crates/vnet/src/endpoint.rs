@@ -356,3 +356,211 @@ pub trait EndpointProvider: Send + Sync {
         Err(Errno::EOPNOTSUPP)
     }
 }
+
+/// Local attempt state. The socket layer validates group/member identity before taking this
+/// gate last at enqueue commit; gate code never enters a Net, socket or provider.
+pub(crate) struct AttemptGate {
+    state: std::sync::Mutex<AttemptState>,
+    wait: WaitQueue,
+}
+
+#[derive(Default)]
+struct AttemptState {
+    accepted: bool,
+    ready: bool,
+    retired: bool,
+    error: Option<Errno>,
+}
+
+impl AttemptGate {
+    pub(crate) fn new() -> (Arc<Self>, PublicationReporter) {
+        let gate = Arc::new(Self {
+            state: std::sync::Mutex::new(AttemptState::default()),
+            wait: WaitQueue::new(),
+        });
+        (gate.clone(), PublicationReporter(gate))
+    }
+
+    /// A successful factory result is committed to this still-current attempt. A provider
+    /// Ready report before this point does not admit ingress.
+    pub(crate) fn accept(&self) -> bool {
+        let accepted = {
+            let mut state = self.state.lock().unwrap();
+            if state.retired {
+                false
+            } else {
+                state.accepted = true;
+                true
+            }
+        };
+        self.wait.wake(PollMask::empty());
+        accepted
+    }
+
+    /// Invalidation precedes removal of an old lease and creation of a replacement attempt.
+    pub(crate) fn retire(&self) {
+        {
+            let mut state = self.state.lock().unwrap();
+            state.retired = true;
+            state.error.get_or_insert(Errno::ECANCELED);
+        }
+        self.wait.wake(PollMask::empty());
+    }
+
+    /// Register before inspecting state so a provisional publisher cannot miss commit or
+    /// retirement. None means the caller may proceed to its group-filtered room lookup.
+    pub(crate) fn room(&self, mut table: Option<&mut PollTable<'_>>) -> Option<Room> {
+        wasixv2_wait::poll_wait(&mut table, &self.wait);
+        let state = self.state.lock().unwrap();
+        if state.retired {
+            Some(Room::Gone)
+        } else if state.accepted && state.ready {
+            None
+        } else {
+            Some(Room::Full)
+        }
+    }
+
+    /// Take this guard only after the member/listener queue lock, never while it could enter
+    /// namespace/provider code. Retirement and enqueue thereby have one ordering point.
+    pub(crate) fn commit<T>(&self, enqueue: impl FnOnce() -> T) -> Option<T> {
+        let state = self.state.lock().unwrap();
+        if state.retired || !state.accepted || !state.ready {
+            drop(state);
+            return None;
+        }
+        Some(enqueue())
+    }
+}
+
+impl PublicationReport for AttemptGate {
+    fn state(&self) -> PublicationState {
+        let state = self.state.lock().unwrap();
+        if let Some(error) = state.error {
+            PublicationState::Failed(error)
+        } else if state.accepted && state.ready {
+            PublicationState::Ready
+        } else {
+            PublicationState::Pending
+        }
+    }
+
+    fn ready(&self) {
+        let changed = {
+            let mut state = self.state.lock().unwrap();
+            if state.retired || state.ready {
+                false
+            } else {
+                state.ready = true;
+                true
+            }
+        };
+        if changed {
+            self.wait.wake(PollMask::empty());
+        }
+    }
+
+    fn failed(&self, error: Errno) {
+        let changed = {
+            let mut state = self.state.lock().unwrap();
+            if state.retired {
+                false
+            } else {
+                state.retired = true;
+                state.error = Some(error);
+                true
+            }
+        };
+        if changed {
+            self.wait.wake(PollMask::empty());
+        }
+    }
+}
+
+impl Pollable for AttemptGate {
+    fn poll(&self, mut table: Option<&mut PollTable<'_>>) -> PollMask {
+        wasixv2_wait::poll_wait(&mut table, &self.wait);
+        match PublicationReport::state(self) {
+            PublicationState::Pending => PollMask::empty(),
+            PublicationState::Ready => PollMask::OUT | PollMask::WRNORM,
+            PublicationState::Failed(_) => PollMask::ERR,
+        }
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use wasixv2_wait::{WaitEntry, WaitRegistration};
+
+    struct WakeCount(AtomicUsize);
+    impl WaitEntry for WakeCount {
+        fn wake(&self, _: PollMask) -> bool {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            true
+        }
+    }
+
+    #[test]
+    fn provisional_waiter_wakes_on_commit_without_backlog_change() {
+        let (gate, reporter) = AttemptGate::new();
+        let count = Arc::new(WakeCount(AtomicUsize::new(0)));
+        let mut registrations: Vec<WaitRegistration> = Vec::new();
+        let mut register = |queue: &WaitQueue, _| {
+            registrations.push(queue.add(count.clone()));
+        };
+        let mut table = PollTable::new(PollMask::OUT, &mut register);
+        assert_eq!(gate.room(Some(&mut table)), Some(Room::Full));
+        reporter.ready();
+        assert_eq!(reporter.state(), PublicationState::Pending);
+        assert_eq!(gate.room(None), Some(Room::Full));
+        let before = count.0.load(Ordering::SeqCst);
+        assert!(gate.accept());
+        assert!(count.0.load(Ordering::SeqCst) > before);
+        assert_eq!(gate.room(None), None);
+        assert_eq!(gate.commit(|| 37), Some(37));
+    }
+
+    #[test]
+    fn failed_attempt_cannot_commit_into_retried_live_group() {
+        let (old, reporter) = AttemptGate::new();
+        assert!(old.accept());
+        reporter.ready();
+        reporter.failed(Errno::EIO);
+        let (replacement, next_reporter) = AttemptGate::new();
+        next_reporter.ready();
+        assert!(replacement.accept());
+        assert_eq!(
+            old.commit(|| panic!("retired callback enqueued")),
+            None::<()>
+        );
+        reporter.ready();
+        assert_eq!(reporter.state(), PublicationState::Failed(Errno::EIO));
+        assert_eq!(replacement.commit(|| 42), Some(42));
+    }
+
+    #[test]
+    fn canceled_provisional_attempt_has_no_ingress_custody() {
+        let (gate, reporter) = AttemptGate::new();
+        gate.retire();
+        reporter.ready();
+        assert!(!gate.accept());
+        assert_eq!(gate.room(None), Some(Room::Gone));
+        assert_eq!(gate.commit(|| DatagramDelivery::Queued), None);
+    }
+}
+
+/// Observable status of one live group's current registration attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EndpointPublicationStatus {
+    pub group: EndpointGroupSpec,
+    pub state: PublicationState,
+}
+
+pub(crate) mod runtime;
+
+pub(crate) mod pending;
+
+#[cfg(test)]
+mod tests;

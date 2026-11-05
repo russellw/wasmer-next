@@ -17,6 +17,10 @@ use crate::{
     Accepted, BackendStream, Domain, NetResult, PortEntry, Publication, RecvMsg, Room, SendMsg,
     Shutdown, Socket, SocketKind, StreamState,
     addr::{canonical, connect_target, present, unbound},
+    endpoint::{
+        AttemptGate, EndpointChoice, EndpointKind, EndpointQuery, EndpointSourceId,
+        pending::PendingStream, runtime::SocketEndpoint,
+    },
     net::{Net, Path},
     opts::{self, Changed, SockOpts},
     ports::{BindSpec, SockId},
@@ -221,6 +225,7 @@ struct Inner {
 pub struct TcpSocket {
     net: Arc<Net>,
     id: SockId,
+    endpoint: SocketEndpoint,
     domain: AtomicU8,
     /// `sk_uid`, for `SO_REUSEPORT`.
     uid: u32,
@@ -305,6 +310,7 @@ impl TcpSocket {
         Arc::new_cyclic(|me| Self {
             net,
             id,
+            endpoint: SocketEndpoint::new(id),
             domain: AtomicU8::new(domain as u8),
             uid,
             ino: AtomicU64::new(0),
@@ -444,6 +450,9 @@ impl TcpSocket {
         if !matches!(g.state, State::Listening(_)) {
             return;
         }
+        if let Some(namespace) = self.net.endpoints() {
+            self.endpoint.renew(&namespace);
+        }
         let State::Listening(l) = std::mem::replace(&mut g.state, State::Closed) else {
             unreachable!("checked above");
         };
@@ -501,6 +510,9 @@ impl TcpSocket {
     fn release_inner(&self, abort: bool) {
         let mut g = self.inner.lock().unwrap();
         self.stop_listening(&mut g);
+        if let Some(namespace) = self.net.endpoints() {
+            self.endpoint.renew(&namespace);
+        }
         let abort = abort || g.opts.linger == Some(0);
         let old = std::mem::replace(&mut g.state, State::Closed);
         if let Some(local) = g.local.take() {
@@ -572,6 +584,31 @@ impl TcpSocket {
 
     /// A connection accepted by the backend for a published port; `wq` is the queue the stream
     /// wakes.
+    pub(crate) fn endpoint_room(
+        &self,
+        source: EndpointSourceId,
+        _peer: SocketAddr,
+        _destination: SocketAddr,
+        table: Option<&mut PollTable<'_>>,
+    ) -> Room {
+        if self.endpoint.source() != source {
+            return Room::Gone;
+        }
+        self.poll_room(table)
+    }
+
+    pub(crate) fn incoming_endpoint(
+        &self,
+        source: EndpointSourceId,
+        gate: &AttemptGate,
+        stream: Arc<dyn BackendStream>,
+        wq: WaitQueue,
+        local: SocketAddr,
+        peer: SocketAddr,
+    ) -> Offer {
+        self.incoming_scoped(Some((source, gate)), stream, wq, local, peer)
+    }
+
     pub(crate) fn incoming_remote(
         &self,
         stream: Arc<dyn BackendStream>,
@@ -579,6 +616,20 @@ impl TcpSocket {
         local: SocketAddr,
         peer: SocketAddr,
     ) -> Offer {
+        self.incoming_scoped(None, stream, wq, local, peer)
+    }
+
+    fn incoming_scoped(
+        &self,
+        scope: Option<(EndpointSourceId, &AttemptGate)>,
+        stream: Arc<dyn BackendStream>,
+        wq: WaitQueue,
+        local: SocketAddr,
+        peer: SocketAddr,
+    ) -> Offer {
+        if scope.is_some_and(|(source, _)| self.endpoint.source() != source) {
+            return Offer::Declined(stream);
+        }
         let Some(l) = self.listener.lock().unwrap().clone() else {
             return Offer::Declined(stream);
         };
@@ -588,21 +639,37 @@ impl TcpSocket {
                 return Offer::Declined(stream);
             }
         }
-        // `inet_csk_clone_lock` copies the listener's options into the new sock.
         let child = self.new_child(local, peer, wq, |_, opts| {
             replay_options(&*stream, opts);
             Transport::Remote(stream)
         });
         let mut li = l.inner.lock().unwrap();
-        if li.closed || li.full() {
+        if li.closed
+            || li.full()
+            || scope.is_some_and(|(source, _)| self.endpoint.source() != source)
+        {
             drop(li);
             child.release_inner(true);
             return Offer::Dropped;
         }
-        li.ready.push_back((child, peer));
+        let queued = match scope {
+            Some((source, gate)) => self
+                .endpoint
+                .commit(source, || gate.commit(|| li.ready.push_back((child, peer))))
+                .flatten()
+                .is_some(),
+            None => {
+                li.ready.push_back((child, peer));
+                true
+            }
+        };
         drop(li);
-        l.wq.wake(PollMask::IN | PollMask::RDNORM);
-        Offer::Queued
+        if queued {
+            l.wq.wake(PollMask::IN | PollMask::RDNORM);
+            Offer::Queued
+        } else {
+            Offer::Dropped
+        }
     }
 
     /// Connects to a listener of `target`, this namespace or the one across a veth.
@@ -805,6 +872,21 @@ impl Socket for TcpSocket {
                 }
                 // A larger queue may have room for connections held back.
                 l.room.wake(PollMask::empty());
+                let group = self.net.endpoints().map(|ns| {
+                    let group = ns.join_tcp(
+                        &self.endpoint,
+                        self.me.clone(),
+                        g.local.unwrap(),
+                        self.domain(),
+                        g.opts.v6only,
+                        backlog,
+                    );
+                    (ns, group)
+                });
+                drop(g);
+                if let Some((ns, group)) = group {
+                    ns.refresh(&group);
+                }
                 return Ok(());
             }
             State::Connecting(..) | State::Connected(..) => return Err(Errno::EINVAL),
@@ -828,7 +910,21 @@ impl Socket for TcpSocket {
         g.state = State::Listening(l.clone());
         g.rd_shut = false;
         g.wr_shut = false;
+        let group = self.net.endpoints().map(|ns| {
+            let group = ns.join_tcp(
+                &self.endpoint,
+                self.me.clone(),
+                local,
+                self.domain(),
+                g.opts.v6only,
+                backlog,
+            );
+            (ns, group)
+        });
         drop(g);
+        if let Some((ns, group)) = group {
+            ns.refresh(&group);
+        }
         self.auto_publish(&l, local, backlog);
         Ok(())
     }
@@ -869,7 +965,55 @@ impl Socket for TcpSocket {
         if mapped && g.opts.v6only {
             return Err(Errno::ENETUNREACH);
         }
-        let path = self.net.path(dst, g.local.map(|l| l.ip()).or(g.saddr))?;
+        let mut path = self.net.path(dst, g.local.map(|l| l.ip()).or(g.saddr))?;
+        if admission == crate::net::Admission::DnsOnly && !matches!(path, Path::Dns { .. }) {
+            return Err(Errno::EPERM);
+        }
+        let mut endpoint_target = None;
+        if let Some(namespace) = self.net.endpoints() {
+            // Every new association attempt has an identity even after an immediate refusal.
+            self.endpoint.renew(&namespace);
+            while matches!(path, Path::Local { net: None, .. }) {
+                let source = self.endpoint.source();
+                let bound = g.local;
+                let saddr = g.saddr;
+                let v6only = g.opts.v6only;
+                let effective = Some(SocketAddr::new(path.src(), bound.map_or(0, |a| a.port())));
+                let query = EndpointQuery {
+                    kind: EndpointKind::Stream,
+                    source_id: source,
+                    bound,
+                    effective_source: effective,
+                    destination: dst,
+                    local_binding: namespace.hint(EndpointKind::Stream, dst, effective.unwrap()),
+                };
+                drop(g);
+                let choice = namespace.provider.select(&query)?;
+                g = self.lock();
+                if !matches!(g.state, State::Closed) {
+                    return Err(if matches!(g.state, State::Connecting(..)) {
+                        Errno::EALREADY
+                    } else {
+                        Errno::EISCONN
+                    });
+                }
+                let next = self.net.path(dst, g.local.map(|l| l.ip()).or(g.saddr))?;
+                if source != self.endpoint.source()
+                    || bound != g.local
+                    || saddr != g.saddr
+                    || v6only != g.opts.v6only
+                    || next.src() != path.src()
+                    || !matches!(next, Path::Local { net: None, .. })
+                {
+                    path = next;
+                    continue;
+                }
+                if let EndpointChoice::Provider(target) = choice {
+                    endpoint_target = Some(target);
+                }
+                break;
+            }
+        }
         if admission == crate::net::Admission::DnsOnly && !matches!(path, Path::Dns { .. }) {
             return Err(Errno::EPERM);
         }
@@ -897,6 +1041,47 @@ impl Socket for TcpSocket {
         g.rd_shut = false;
         g.wr_shut = false;
         g.err = None;
+        if let Some(target) = endpoint_target {
+            let namespace = self.net.endpoints().unwrap();
+            let source = self.endpoint.source();
+            let local = g.local.unwrap();
+            let pending = PendingStream::new(dst, self.wq.clone());
+            let reserved: Arc<dyn BackendStream> = pending.clone();
+            g.state = State::Connecting(Transport::Remote(reserved.clone()), dst);
+            drop(g);
+            let result = namespace
+                .provider
+                .connect(target, source, local, dst, self.wq.clone());
+            let failure = result.as_ref().err().copied();
+            let mut g = self.lock();
+            let current = self.endpoint.source() == source
+                && matches!(&g.state,State::Connecting(Transport::Remote(stream),_) if Arc::ptr_eq(stream,&reserved));
+            if current {
+                match result {
+                    Ok(stream) => {
+                        if canonical(stream.peer_addr()) != dst {
+                            pending.complete(Err(Errno::EPROTO));
+                        } else {
+                            replay_options(&*stream, &g.opts);
+                            pending.complete(Ok(stream));
+                        }
+                    }
+                    Err(e) => pending.complete(Err(e)),
+                }
+                self.refresh(&mut g);
+                if let Some(error) = failure {
+                    g.failed = false;
+                    g.err = None;
+                    return Err(error);
+                }
+            } else {
+                drop(g);
+                drop(result);
+                pending.complete(Err(Errno::ECANCELED));
+                return Err(Errno::ECANCELED);
+            }
+            return Err(Errno::EINPROGRESS);
+        }
         match path {
             Path::Local { net, .. } => {
                 let target = net.unwrap_or_else(|| self.net.clone());
@@ -930,6 +1115,9 @@ impl Socket for TcpSocket {
         // an autobound port (`tcp_set_state` calls `inet_put_port`) and the source address.
         let mut g = self.lock();
         self.stop_listening(&mut g);
+        if let Some(namespace) = self.net.endpoints() {
+            self.endpoint.renew(&namespace);
+        }
         self.abort_connection(&mut g);
         g.rd_shut = false;
         g.wr_shut = false;
@@ -952,6 +1140,9 @@ impl Socket for TcpSocket {
             }
             // `inet_shutdown` in `SYN_SENT` disconnects (`tcp_disconnect`).
             State::Connecting(..) => {
+                if let Some(namespace) = self.net.endpoints() {
+                    self.endpoint.renew(&namespace);
+                }
                 self.abort_connection(&mut g);
                 self.reset_saddr(&mut g);
                 self.put_port(&mut g);
