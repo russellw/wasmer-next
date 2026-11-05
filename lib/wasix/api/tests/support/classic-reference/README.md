@@ -13,8 +13,9 @@ Both retain the original MIT license and copyright notice in `LICENSE`.
 ruleset, tcp_pair and their unit-test module). The retained `host.rs` selects the
 original `LocalNetworking::new()` profile: it removes the unused `with_ruleset`
 constructor, optional ruleset storage and its conditional policy branches, which
-are unreachable in that profile. All socket/TCP/UDP/DNS/selector behavior is
-retained. No wire tag, serialization layout, server dispatch, asynchronous task,
+are unreachable in that profile. The host module declaration alone skips rustfmt recursion to preserve that retained
+profile's exact bytes; its expected digest remains checked. All socket/TCP/UDP/DNS/
+selector behavior is retained. No wire tag, serialization layout, server dispatch, asynchronous task,
 ACK, socket readiness, queue or EOF behavior has been replaced with a mock.
 
 The test-only manifests keep only dependencies and features needed for that

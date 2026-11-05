@@ -1,5 +1,7 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![allow(clippy::multiple_bound_locations)]
+// Preserve the retained original host profile byte-for-byte; see SOURCES.json.
+#[rustfmt::skip]
 #[cfg(feature = "host-net")]
 pub mod host;
 pub mod meta;
