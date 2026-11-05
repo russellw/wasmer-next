@@ -21,6 +21,11 @@ on the v2 kernel. Original fixtures and behavior evidence remain removal gates.
 | Browser SDK | Current/classic public APIs, packages, streams/mounts/transports, termination and resource retirement. |
 | Providers and coredumps | Optional configured-provider controls and compositional original-source trap coordinates. |
 
+Journaling, journal commands and compatibility with old journal formats are
+explicitly excluded by the user. Do not port their formats or retain them as a
+parity gate. Remove their CLI hooks and retire old journal dependencies with the
+remaining legacy consumers.
+
 Managers use native Sol 6.1 high implementors/reviewers and Luna max validators.
 Large designs require independent review. Validation runs serially against the
 integrated source tuple; a compile or placeholder is not a completed parity item.
@@ -239,6 +244,8 @@ Additional reference-lifetime test draft:
 ## Intentional deferrals / later design work
 
 - Snapshot/restore: intentionally excluded; unused legacy feature to be redesigned.
+- Journaling and old journal-format compatibility: explicitly excluded. No new
+  format crate or compatibility implementation is required.
 - Windows and nominal WASIX64: deferred by the user; not current parity blockers.
 - SDK `parallelism` configuration: deferred by the user. Guest-advertised parallelism
   currently follows the kernel default rather than the requested SDK value. Do not
