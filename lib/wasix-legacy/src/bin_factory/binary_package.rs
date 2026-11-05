@@ -237,7 +237,7 @@ impl BinaryPackage {
     pub fn hash(&self) -> ModuleHash {
         *self.hash.get_or_init(|| {
             if let Some(cmd) = self.get_entrypoint_command() {
-                cmd.hash
+                *cmd.hash()
             } else {
                 ModuleHash::new(self.id.to_string())
             }
