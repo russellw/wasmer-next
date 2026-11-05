@@ -296,10 +296,29 @@ impl RawMode {
     fn acquire(key: TerminalKey, fd: OwnedFd) -> io::Result<Self> {
         let generation = loop {
             let mut state = REGISTRY.lock();
+            let cooked = state.suspended;
             match state.entries.get_mut(&key) {
                 Some(Entry::Active(active)) => {
                     active.leases += 1;
                     let generation = active.generation;
+                    if active.cooked != Some(cooked) {
+                        let Entry::Active(active) = state
+                            .entries
+                            .insert(key, Entry::Transition(generation))
+                            .unwrap()
+                        else {
+                            unreachable!()
+                        };
+                        drop(state);
+                        let mut lease = Self(Some((key, generation)));
+                        if let Err(err) = REGISTRY.publish(key, active, false) {
+                            // Roll back only this reservation, retaining the original capture
+                            // and every sibling's generation, even when the mode is unknown.
+                            let _ = lease.restore();
+                            return Err(err);
+                        }
+                        return Ok(lease);
+                    }
                     drop(state);
                     return Ok(Self(Some((key, generation))));
                 }
@@ -638,6 +657,88 @@ mod tests {
         );
         drop(raw);
         assert!(same(&get(pty.slave).unwrap(), &cooked));
+    }
+
+    #[test]
+    fn acquiring_a_shared_lease_retries_a_failed_resume_without_recapturing_settings() {
+        if !isolated(
+            "acquiring_a_shared_lease_retries_a_failed_resume_without_recapturing_settings",
+        ) {
+            return;
+        }
+        let pty = Pty::open();
+        let cooked = get(pty.slave).unwrap();
+        let first = RawMode::enter(pty.slave).unwrap();
+        suspend();
+        // Another host may change settings while stopped. They must not replace the first
+        // lease's original capture when a failed resume is retried by a joining run.
+        let mut changed = cooked;
+        changed.c_lflag ^= libc::ECHO;
+        set(pty.slave, &changed, libc::TCSANOW).unwrap();
+        *SET_HOOK.lock().unwrap() = Some(Box::new(|| {
+            assert!(REGISTRY.state.try_lock().is_ok());
+            Err(io::Error::from_raw_os_error(libc::EIO))
+        }));
+        resume();
+        assert!(same(&get(pty.slave).unwrap(), &changed));
+        let joining = RawMode::enter(pty.slave).unwrap();
+        assert!(
+            is_raw(&get(pty.slave).unwrap()),
+            "joining run retried raw mode"
+        );
+        drop(first);
+        assert!(
+            is_raw(&get(pty.slave).unwrap()),
+            "joining run retains its lease"
+        );
+        drop(joining);
+        assert!(
+            same(&get(pty.slave).unwrap(), &cooked),
+            "first capture restored"
+        );
+    }
+
+    #[test]
+    fn a_failed_shared_acquisition_rolls_back_only_its_new_lease() {
+        if !isolated("a_failed_shared_acquisition_rolls_back_only_its_new_lease") {
+            return;
+        }
+        let pty = Pty::open();
+        let cooked = get(pty.slave).unwrap();
+        let first = RawMode::enter(pty.slave).unwrap();
+        let sibling = RawMode::enter(pty.slave).unwrap();
+        suspend();
+        let fail_next_set = || {
+            *SET_HOOK.lock().unwrap() = Some(Box::new(|| {
+                assert!(REGISTRY.state.try_lock().is_ok());
+                Err(io::Error::from_raw_os_error(libc::EIO))
+            }));
+        };
+        fail_next_set();
+        resume();
+        assert!(same(&get(pty.slave).unwrap(), &cooked));
+        fail_next_set();
+        let error = match RawMode::enter(pty.slave) {
+            Ok(_) => panic!("joining a terminal with a failed mode retry must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+        // Make last-owner restoration observable even though the failed calls left the
+        // terminal cooked. A leaked reservation or retired old entry leaves this raw.
+        let mut raw = cooked;
+        // SAFETY: cfmakeraw changes only the initialized termios flags.
+        unsafe { libc::cfmakeraw(&mut raw) };
+        set(pty.slave, &raw, libc::TCSANOW).unwrap();
+        drop(first);
+        assert!(
+            is_raw(&get(pty.slave).unwrap()),
+            "original sibling still owns the terminal"
+        );
+        drop(sibling);
+        assert!(
+            same(&get(pty.slave).unwrap(), &cooked),
+            "no leaked joining lease or lost original capture"
+        );
     }
 
     #[test]
