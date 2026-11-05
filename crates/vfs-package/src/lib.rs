@@ -1,7 +1,7 @@
-//! Read-only filesystem driver over a webc v3 package volume, after Linux's squashfs and erofs,
+//! Read-only filesystem driver over a webc package volume, after Linux's squashfs and erofs,
 //! or over files given as byte buffers, such as a package's commands.
 //!
-//! Only the v3 reader is used. A directory's entries are parsed the first time it is looked up
+//! With the optimized v3 reader, a directory's entries are parsed the first time it is looked up
 //! or read, into a table shared by every node for it; lookups then binary-search the table, which
 //! is in name order because v3 writes it from a `BTreeMap`. File data is a slice of the
 //! container's buffer (an mmap or `Bytes`), so nothing is copied until a read fills the caller's
@@ -22,6 +22,8 @@
 //!
 //! [`PackageFs::from_files`] builds the same kind of tree from paths and buffers, with the
 //! directories their paths imply; it is how a package tree's commands appear in `/bin`.
+//! [`PackageFs::from_volume`] collects the entries exposed by a version-independent volume,
+//! preserving empty directories and symlinks and sharing its file buffers.
 
 use std::{
     any::Any,
@@ -80,7 +82,7 @@ pub enum PackageFsError {
     PathTooLong(usize),
 }
 
-/// One volume of a webc v3 package, mounted read-only.
+/// One volume of a webc package, mounted read-only.
 pub struct PackageFs {
     root: Arc<DirData>,
     vol: Arc<Volume>,
@@ -157,8 +159,96 @@ impl PackageFs {
         let mut size = 0;
         for (path, data) in files {
             size += data.len() as u64;
-            tree.insert(&path, data)?;
+            tree.insert(&path, TreeEntry::File(data))?;
         }
+        Self::from_tree(tree, size, uid, gid)
+    }
+
+    /// Mounts the entries exposed by any WebC volume, including in-memory and v2 volumes.
+    /// Shares file buffers and preserves empty directories and symlinks without following
+    /// them. Rejects unreadable entries, inconsistent lengths, invalid or duplicate names,
+    /// and paths exceeding the same bounds as [`PackageFs::from_files`]. Provider panics
+    /// are treated as malformed metadata where panics unwind. Errors a provider suppresses
+    /// internally cannot be detected through this interface.
+    pub fn from_volume(volume: &webc::Volume, uid: u32, gid: u32) -> Result<Self, PackageFsError> {
+        std::panic::catch_unwind(AssertUnwindSafe(|| {
+            if !matches!(
+                volume.metadata(webc::PathSegments::ROOT),
+                Some(webc::Metadata::Dir { .. })
+            ) {
+                return Err(PackageFsError::Malformed("the root is not a directory"));
+            }
+            let mut tree = Tree::default();
+            let mut size = 0u64;
+            let mut pending = vec![(String::new(), webc::PathSegments::ROOT)];
+            while let Some((parent, path)) = pending.pop() {
+                let entries = volume
+                    .read_dir(&path)
+                    .ok_or(PackageFsError::Malformed("a directory cannot be read"))?;
+                if entries.len() as u64 > MAX_DIR_COOKIE {
+                    return Err(PackageFsError::TooManyEntries);
+                }
+                for (name, _, metadata) in entries {
+                    if !valid_name(name.as_str()) {
+                        return Err(PackageFsError::Malformed(
+                            "an entry's name is not a file name",
+                        ));
+                    }
+                    let relative = if parent.is_empty() {
+                        name.to_string()
+                    } else {
+                        format!("{parent}/{name}")
+                    };
+                    // Bounds traversal depth even when a provider repeats a directory forever.
+                    if relative.len() >= PATH_MAX {
+                        return Err(PackageFsError::PathTooLong(relative.len()));
+                    }
+                    let path = path.join(name);
+                    if volume.metadata(&path) != Some(metadata) {
+                        return Err(PackageFsError::Malformed(
+                            "an entry's metadata is inconsistent",
+                        ));
+                    }
+                    let entry = match metadata {
+                        webc::Metadata::Dir { .. } => TreeEntry::Dir(Tree::default()),
+                        webc::Metadata::File { length, .. } => {
+                            let (data, _) = volume
+                                .read_file(&path)
+                                .ok_or(PackageFsError::Malformed("a file cannot be read"))?;
+                            if data.len() != length {
+                                return Err(PackageFsError::Malformed(
+                                    "a file's length is inconsistent",
+                                ));
+                            }
+                            size = size
+                                .checked_add(data.len() as u64)
+                                .ok_or(PackageFsError::Malformed("the volume's size overflows"))?;
+                            TreeEntry::File(data)
+                        }
+                        webc::Metadata::Symlink { target_length, .. } => {
+                            let (target, _) = volume
+                                .read_link(&path)
+                                .ok_or(PackageFsError::Malformed("a symlink cannot be read"))?;
+                            if target.len() != target_length {
+                                return Err(PackageFsError::Malformed(
+                                    "a symlink's length is inconsistent",
+                                ));
+                            }
+                            TreeEntry::Symlink(target)
+                        }
+                    };
+                    tree.insert(&relative, entry)?;
+                    if metadata.is_dir() {
+                        pending.push((relative, path));
+                    }
+                }
+            }
+            Self::from_tree(tree, size, uid, gid)
+        }))
+        .map_err(|_| PackageFsError::Malformed("a volume operation panicked"))?
+    }
+
+    fn from_tree(tree: Tree, size: u64, uid: u32, gid: u32) -> Result<Self, PackageFsError> {
         let vol = Arc::new(Volume {
             _section: None,
             size,
@@ -170,17 +260,18 @@ impl PackageFs {
     }
 }
 
-/// The directories of [`PackageFs::from_files`] while they are collected.
+/// A tree's entries while they are collected.
 #[derive(Default)]
 struct Tree(BTreeMap<String, TreeEntry>);
 
 enum TreeEntry {
     Dir(Tree),
     File(OwnedBuffer),
+    Symlink(String),
 }
 
 impl Tree {
-    fn insert(&mut self, path: &str, data: OwnedBuffer) -> Result<(), PackageFsError> {
+    fn insert(&mut self, path: &str, item: TreeEntry) -> Result<(), PackageFsError> {
         // The bound on the length bounds the depth, which building and dropping the tree
         // recurse through.
         if path.len() >= PATH_MAX {
@@ -201,12 +292,12 @@ impl Tree {
                 .or_insert_with(|| TreeEntry::Dir(Tree::default()));
             dir = match entry {
                 TreeEntry::Dir(tree) => tree,
-                TreeEntry::File(_) => return Err(conflict()),
+                TreeEntry::File(_) | TreeEntry::Symlink(_) => return Err(conflict()),
             };
         }
         match dir.0.entry(file.to_string()) {
             btree_map::Entry::Vacant(entry) => {
-                entry.insert(TreeEntry::File(data));
+                entry.insert(item);
                 Ok(())
             }
             btree_map::Entry::Occupied(_) => Err(conflict()),
@@ -220,6 +311,7 @@ impl Tree {
     fn build(self, vol: &Arc<Volume>) -> Result<Arc<DirData>, PackageFsError> {
         enum Slot {
             File(OwnedBuffer),
+            Symlink(String),
             /// The index of the subdirectory's table in `tables`.
             Dir(usize),
         }
@@ -242,6 +334,7 @@ impl Tree {
             for (i, (ino, (name, entry))) in (first..).zip(tree.0).enumerate() {
                 match entry {
                     TreeEntry::File(data) => entries.push((name, ino, Slot::File(data))),
+                    TreeEntry::Symlink(target) => entries.push((name, ino, Slot::Symlink(target))),
                     TreeEntry::Dir(sub) => {
                         entries.push((name, ino, Slot::Dir(usize::MAX)));
                         subdirs.push((sub, Some((table, i))));
@@ -262,6 +355,7 @@ impl Tree {
                 .map(|(name, ino, slot)| {
                     let kind = match slot {
                         Slot::File(data) => Kind::File(data),
+                        Slot::Symlink(target) => Kind::Symlink(Cow::Owned(target)),
                         Slot::Dir(table) => {
                             subdirs += 1;
                             Kind::Dir(built[table].take().expect("built before its parent"))
@@ -351,7 +445,7 @@ struct Child {
 enum Kind {
     Dir(Arc<DirData>),
     File(OwnedBuffer),
-    Symlink(&'static str),
+    Symlink(Cow<'static, str>),
 }
 
 impl Kind {
@@ -399,7 +493,7 @@ impl DirData {
                     Kind::Dir(Arc::new(DirData::new(dir, self.vol.clone())))
                 }
                 WebcEntry::File(file) => Kind::File(file.bytes().clone()),
-                WebcEntry::Symlink(link) => Kind::Symlink(link.target()),
+                WebcEntry::Symlink(link) => Kind::Symlink(Cow::Borrowed(link.target())),
             };
             entries.push(Child {
                 name: Cow::Borrowed(name),

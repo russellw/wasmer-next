@@ -378,3 +378,265 @@ fn from_files_bounds_the_depth() {
         Err(PackageFsError::PathTooLong(len)) if len == hostile.len()
     ));
 }
+
+#[test]
+fn from_volume_preserves_v3_directories_symlinks_and_buffers_after_source_drop() {
+    let container = webc::Container::from(reader());
+    let volume = container.get_volume("atom").unwrap();
+    let (bytes, _) = volume.read_file("/bin/tool").unwrap();
+    let fs = PackageFs::from_volume(&volume, 41, 42).unwrap();
+    drop(volume);
+    drop(container);
+
+    for path in ["empty", "z"] {
+        let node = lookup(&fs, path);
+        assert_eq!(node.file_type(), FileType::Directory);
+        assert!(read_dir(&*node, 0, usize::MAX).is_empty());
+    }
+    let link = lookup(&fs, "bin/sh");
+    assert_eq!(link.file_type(), FileType::Symlink);
+    assert_eq!(block_on(link.readlink()), Ok(b"tool".to_vec()));
+    assert_eq!(
+        block_on(link.open(OpenOptions::default())).err(),
+        Some(Errno::ELOOP)
+    );
+    for path in ["", "bin", "bin/tool", "bin/sh", "empty"] {
+        let attr = block_on(lookup(&fs, path).getattr()).unwrap();
+        assert_eq!((attr.uid, attr.gid), (41, 42));
+    }
+    let handle = block_on(lookup(&fs, "bin/tool").open(OpenOptions::default())).unwrap();
+    let shared = block_on(handle.shared_contents()).unwrap();
+    assert_eq!(shared.as_ref().as_ref().as_ptr(), bytes.as_slice().as_ptr());
+    drop(bytes);
+    drop(fs);
+    let mut buf = [0; 4];
+    assert_eq!(block_on(handle.read_at(&mut buf, 0)), Ok(4));
+    assert_eq!(&buf, b"\0asm");
+    assert_eq!(shared.as_ref().as_ref(), b"\0asm");
+}
+
+#[test]
+fn from_volume_preserves_v2_nested_and_empty_directories() {
+    use webc::v2::{
+        ChecksumAlgorithm, SignatureAlgorithm,
+        write::{DirEntry, Directory, FileEntry, Writer},
+    };
+    let directory = |entries: Vec<(&str, DirEntry<'static>)>| Directory {
+        children: entries
+            .into_iter()
+            .map(|(n, e)| (n.parse().unwrap(), e))
+            .collect(),
+    };
+    let nested = directory(vec![
+        ("data", DirEntry::File(FileEntry::Borrowed(b"v2"))),
+        ("empty", DirEntry::Dir(directory(vec![]))),
+    ]);
+    let root = directory(vec![("nested", DirEntry::Dir(nested))]);
+    let mut writer = Writer::new(ChecksumAlgorithm::Sha256)
+        .write_manifest(&Default::default())
+        .unwrap()
+        .write_atoms(BTreeMap::new())
+        .unwrap();
+    writer.write_volume("atom", root).unwrap();
+    let bytes = writer.finish(SignatureAlgorithm::None).unwrap();
+    let container = webc::Container::from(webc::v2::read::OwnedReader::parse(bytes).unwrap());
+    let volume = container.get_volume("atom").unwrap();
+    let fs = PackageFs::from_volume(&volume, 1, 2).unwrap();
+    drop(volume);
+    drop(container);
+    let nested = lookup(&fs, "nested");
+    let entries = read_dir(&*nested, 0, usize::MAX);
+    assert_eq!(
+        entries.iter().map(|e| e.0.as_slice()).collect::<Vec<_>>(),
+        [b"data".as_slice(), b"empty"]
+    );
+    assert_eq!(read_dir(&*nested, entries[0].3, usize::MAX), entries[1..]);
+    assert!(read_dir(&*lookup(&fs, "nested/empty"), 0, usize::MAX).is_empty());
+    let handle = block_on(lookup(&fs, "nested/data").open(OpenOptions::default())).unwrap();
+    let mut buf = [0; 2];
+    assert_eq!(block_on(handle.read_at(&mut buf, 0)), Ok(2));
+    assert_eq!(&buf, b"v2");
+}
+
+#[test]
+fn from_volume_keeps_directory_and_cyclic_symlinks_as_links() {
+    let bytes = webc_bytes(vec![
+        ("directory", WEntry::Dir(dir(vec![]))),
+        (
+            "nested",
+            WEntry::Dir(dir(vec![("empty", WEntry::Dir(dir(vec![])))])),
+        ),
+        (
+            "directory-link",
+            WEntry::Symlink(SymlinkEntry::borrowed("directory", Timestamps::default())),
+        ),
+        (
+            "nested-link",
+            WEntry::Symlink(SymlinkEntry::borrowed(
+                "nested/empty",
+                Timestamps::default(),
+            )),
+        ),
+        (
+            "cycle",
+            WEntry::Symlink(SymlinkEntry::borrowed("cycle", Timestamps::default())),
+        ),
+    ]);
+    let container = webc::Container::from(OwnedReader::parse(bytes).unwrap());
+    let fs = PackageFs::from_volume(&container.get_volume("atom").unwrap(), 0, 0).unwrap();
+    for (name, target) in [
+        ("directory-link", "directory"),
+        ("nested-link", "nested/empty"),
+        ("cycle", "cycle"),
+    ] {
+        let link = lookup(&fs, name);
+        assert_eq!(link.file_type(), FileType::Symlink);
+        assert_eq!(block_on(link.readlink()), Ok(target.as_bytes().to_vec()));
+    }
+    assert!(read_dir(&*lookup(&fs, "nested/empty"), 0, usize::MAX).is_empty());
+}
+
+#[derive(Debug)]
+enum BadVolume {
+    MissingRoot,
+    RootFile,
+    MissingRootDir,
+    MissingDir,
+    MissingFile,
+    MissingLink,
+    MissingMetadata,
+    FileLength,
+    LinkLength,
+    InvalidName(String),
+    Duplicate,
+    RepeatedDir,
+    Panic,
+}
+
+impl BadVolume {
+    fn entry(&self) -> webc::Metadata {
+        use webc::Metadata;
+        match self {
+            Self::MissingDir | Self::RepeatedDir => Metadata::Dir { timestamps: None },
+            Self::MissingLink | Self::LinkLength => Metadata::Symlink {
+                target_length: usize::MAX,
+                timestamps: None,
+            },
+            Self::Duplicate => Metadata::File {
+                length: 4,
+                timestamps: None,
+            },
+            _ => Metadata::File {
+                length: usize::MAX,
+                timestamps: None,
+            },
+        }
+    }
+
+    fn volume(self) -> webc::Volume {
+        let provider: Arc<dyn webc::AbstractVolume + Send + Sync> = Arc::new(self);
+        provider.into()
+    }
+}
+
+impl webc::AbstractVolume for BadVolume {
+    fn metadata(&self, path: &webc::PathSegments) -> Option<webc::Metadata> {
+        if *path == webc::PathSegments::ROOT {
+            match self {
+                Self::MissingRoot => None,
+                Self::RootFile => Some(self.entry()),
+                _ => Some(webc::Metadata::Dir { timestamps: None }),
+            }
+        } else if matches!(self, Self::MissingMetadata) {
+            None
+        } else {
+            Some(self.entry())
+        }
+    }
+
+    fn read_dir(
+        &self,
+        path: &webc::PathSegments,
+    ) -> Option<Vec<(webc::PathSegment, Option<[u8; 32]>, webc::Metadata)>> {
+        assert!(!matches!(self, Self::Panic), "broken volume provider");
+        if matches!(self, Self::MissingRootDir) {
+            return None;
+        }
+        if matches!(self, Self::MissingDir) && *path != webc::PathSegments::ROOT {
+            return None;
+        }
+        let name = match self {
+            Self::InvalidName(name) => name.as_str(),
+            _ => "entry",
+        };
+        let entry = (name.parse().unwrap(), None, self.entry());
+        Some(if matches!(self, Self::Duplicate) {
+            vec![entry.clone(), entry]
+        } else {
+            vec![entry]
+        })
+    }
+
+    fn read_file(&self, _path: &webc::PathSegments) -> Option<(OwnedBuffer, Option<[u8; 32]>)> {
+        if matches!(self, Self::MissingFile) {
+            None
+        } else {
+            Some((OwnedBuffer::from_static(b"data"), None))
+        }
+    }
+
+    fn read_link(&self, _path: &webc::PathSegments) -> Option<(String, Option<[u8; 32]>)> {
+        if matches!(self, Self::MissingLink) {
+            None
+        } else {
+            Some(("target".to_string(), None))
+        }
+    }
+}
+
+#[test]
+fn from_volume_fails_closed_on_unreadable_or_inconsistent_entries() {
+    for provider in [
+        BadVolume::MissingRoot,
+        BadVolume::RootFile,
+        BadVolume::MissingRootDir,
+        BadVolume::MissingDir,
+        BadVolume::MissingFile,
+        BadVolume::MissingLink,
+        BadVolume::MissingMetadata,
+        BadVolume::FileLength,
+        BadVolume::LinkLength,
+        BadVolume::Panic,
+    ] {
+        assert!(matches!(
+            PackageFs::from_volume(&provider.volume(), 0, 0),
+            Err(PackageFsError::Malformed(_))
+        ));
+    }
+}
+
+#[test]
+fn from_volume_rejects_invalid_and_duplicate_names() {
+    for name in [
+        "a/b".to_string(),
+        "a\0b".to_string(),
+        "n".repeat(NAME_MAX + 1),
+    ] {
+        assert!(matches!(
+            PackageFs::from_volume(&BadVolume::InvalidName(name).volume(), 0, 0),
+            Err(PackageFsError::Malformed(_))
+        ));
+    }
+    assert!(matches!(
+        PackageFs::from_volume(&BadVolume::Duplicate.volume(), 0, 0),
+        Err(PackageFsError::Conflict(_))
+    ));
+}
+
+#[test]
+fn from_volume_bounds_repeated_directory_traversal() {
+    assert!(matches!(
+        PackageFs::from_volume(&BadVolume::RepeatedDir.volume(), 0, 0),
+        Err(PackageFsError::PathTooLong(_))
+    ));
+}
