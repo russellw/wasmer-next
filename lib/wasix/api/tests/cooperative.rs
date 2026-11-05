@@ -28,7 +28,8 @@ use wasixv2_syscalls::{
 };
 use wasixv2_vfs_mem::MemFs;
 use wasmer::{
-    AsyncFunctionEnvMut, FunctionEnv, Global, Imports, Instance, Module, RuntimeError, Store, Value,
+    AsyncFunctionEnvMut, FunctionEnv, Global, Imports, Instance, Module, RuntimeError, Store,
+    StoreMut, Value,
 };
 
 struct CountCalls(Arc<AtomicUsize>);
@@ -100,7 +101,7 @@ impl Abi<Stack> for TestAbi {
     }
     fn imports(
         &self,
-        store: &mut Store,
+        store: &mut StoreMut<'_>,
         env: &FunctionEnv<ExecEnv<Stack>>,
         module: &Module,
     ) -> Imports {
@@ -109,7 +110,7 @@ impl Abi<Stack> for TestAbi {
     fn bind(
         &self,
         instance: &Instance,
-        store: &mut Store,
+        store: &mut StoreMut<'_>,
         task: TaskId,
         role: Role,
     ) -> Result<Arc<dyn AbiInstance<Stack>>, ExecError> {

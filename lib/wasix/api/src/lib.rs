@@ -2144,7 +2144,7 @@ mod tests {
             }
             fn imports(
                 &self,
-                store: &mut Store,
+                store: &mut StoreMut<'_>,
                 env: &FunctionEnv<ExecEnv<MachineSyscalls>>,
                 module: &Module,
             ) -> Imports {
@@ -2207,7 +2207,7 @@ mod tests {
             fn bind(
                 &self,
                 instance: &Instance,
-                store: &mut Store,
+                store: &mut StoreMut<'_>,
                 task: TaskId,
                 role: Role,
             ) -> Result<Arc<dyn AbiInstance<MachineSyscalls>>, ExecError> {
@@ -2235,7 +2235,7 @@ mod tests {
             fn bind(
                 self: Box<Self>,
                 instance: &Instance,
-                store: &mut Store,
+                store: &mut StoreMut<'_>,
                 task: TaskId,
                 role: Role,
             ) -> Result<Arc<dyn AbiInstance<MachineSyscalls>>, ExecError> {

@@ -19,7 +19,9 @@ use std::{
 use wasixv2_abi::Signal;
 use wasixv2_host::Host;
 use wasixv2_syscalls::{Control, Syscalls, TaskId};
-use wasmer::{AsyncFunctionEnvMut, Engine, FunctionEnv, Instance, Module, SharedMemory, Store};
+use wasmer::{
+    AsStoreMut, AsyncFunctionEnvMut, Engine, FunctionEnv, Instance, Module, SharedMemory, Store,
+};
 
 use crate::{
     Ended, ExecEnv, ExecError,
@@ -465,8 +467,8 @@ where
             ),
         );
         env.as_mut(&mut store).cleanup = Some(cleanup.shared().clone());
-        self.abis.install_hooks(&mut store, &env);
-        let mut imports = crate::imports(&*self.abi, &mut store, &env, &self.module);
+        self.abis.install_hooks(&mut store.as_store_mut(), &env);
+        let mut imports = crate::imports(&*self.abi, &mut store.as_store_mut(), &env, &self.module);
         let memory = self.memory.clone().try_attach(&mut store)?;
         if let Some(import) = self.module.imports().memories().next() {
             imports.define(import.module(), import.name(), memory.clone());
@@ -529,8 +531,13 @@ where
                     .map_err(ExecError::CustomBinding)?;
                 let instance = Instance::new(&mut store, &self.module, &imports)?;
                 let abi = match prepared {
-                    Some(prepared) => prepared.bind(&instance, &mut store, task, Role::Thread)?,
-                    None => self.abi.bind(&instance, &mut store, task, Role::Thread)?,
+                    Some(prepared) => {
+                        prepared.bind(&instance, &mut store.as_store_mut(), task, Role::Thread)?
+                    }
+                    None => {
+                        self.abi
+                            .bind(&instance, &mut store.as_store_mut(), task, Role::Thread)?
+                    }
                 };
                 let asyncify = crate::asyncify::Asyncify::new(&instance, &mut store)?;
                 let data = env.as_mut(&mut store);

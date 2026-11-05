@@ -30,11 +30,13 @@ use wasixv2_syscalls::{
     LoaderTransaction, LoaderWait, LocalFuture, SignalFrame, SysResult, Syscalls, TaskId,
     UserSliceMut, read_cstr, write_value,
 };
+#[cfg(test)]
+use wasmer::Store;
 use wasmer::{
     AsEngineRef, AsStoreAsync, AsStoreMut, AsyncFunctionEnvMut, Extern, FunctionEnv, Global,
-    Imports, Instance, Memory, Module, Mutability, RuntimeError, Store, StoreMut, Table, Type,
-    Value,
+    Imports, Instance, Memory, Module, Mutability, RuntimeError, StoreMut, Table, Type, Value,
 };
+
 type Result<T> = std::result::Result<T, RuntimeError>;
 fn failure(error: impl std::fmt::Debug) -> RuntimeError {
     RuntimeError::new(format!("{error:?}"))
@@ -111,13 +113,13 @@ impl<S: Syscalls + Control + Send + Sync + 'static> Abi<S> for Native {
         compose(module, Arc::new(Wasixv2), Arc::new(policy::NativePolicy))
     }
 
-    fn imports(&self, _: &mut Store, _: &FunctionEnv<ExecEnv<S>>, _: &Module) -> Imports {
+    fn imports(&self, _: &mut StoreMut<'_>, _: &FunctionEnv<ExecEnv<S>>, _: &Module) -> Imports {
         Imports::new()
     }
     fn bind(
         &self,
         _: &Instance,
-        _: &mut Store,
+        _: &mut StoreMut<'_>,
         _: TaskId,
         _: Role,
     ) -> std::result::Result<Arc<dyn AbiInstance<S>>, ExecError> {
@@ -506,7 +508,7 @@ impl<S: Syscalls + Control + Send + Sync + 'static> Abi<S> for Image<S> {
     }
     fn imports(
         &self,
-        store: &mut Store,
+        store: &mut StoreMut<'_>,
         env: &FunctionEnv<ExecEnv<S>>,
         module: &Module,
     ) -> Imports {
@@ -669,7 +671,7 @@ impl<S: Syscalls + Control + Send + Sync + 'static> Abi<S> for Image<S> {
     fn bind(
         &self,
         instance: &Instance,
-        store: &mut Store,
+        store: &mut StoreMut<'_>,
         task: TaskId,
         role: Role,
     ) -> std::result::Result<Arc<dyn AbiInstance<S>>, ExecError> {
@@ -680,7 +682,7 @@ impl<S: Syscalls + Control + Send + Sync + 'static> Abi<S> for Image<S> {
         &self,
         _: &Instance,
         memory: &Memory,
-        store: &mut Store,
+        store: &mut StoreMut<'_>,
         _: bool,
     ) -> Option<wasixv2_syscalls::MemoryLayout> {
         if !self.root.policy.mapped_memory() {
@@ -700,10 +702,10 @@ impl<S: Syscalls + Control + Send + Sync + 'static> Abi<S> for Image<S> {
             reserved: Vec::new(),
         })
     }
-    fn main_stack(&self, _: &Instance, _: &mut Store) -> Range<u32> {
+    fn main_stack(&self, _: &Instance, _: &mut StoreMut<'_>) -> Range<u32> {
         0..self.root.stack
     }
-    fn guardable(&self, _: &Instance, _: &mut Store) -> bool {
+    fn guardable(&self, _: &Instance, _: &mut StoreMut<'_>) -> bool {
         // Match exec::memory::protect_low: JS and hosts without page protection
         // cannot claim a guard during pre-instantiation bootstrap.
         cfg!(all(unix, feature = "sys"))
@@ -716,7 +718,7 @@ impl<S: Syscalls + Control + Send + Sync + 'static> Image<S> {
     fn bind_store(
         &self,
         instance: &Instance,
-        store: &mut Store,
+        store: &mut StoreMut<'_>,
         task: TaskId,
         role: Role,
         prepared: Option<Box<dyn PreparedImage<S>>>,

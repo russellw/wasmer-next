@@ -46,7 +46,7 @@ pub use instance::{SIGNAL_CALLBACK, THREAD_ENTRY};
 pub use process::{CommandDefaults, Commands, FileId};
 use wasixv2_exec::{Abi, AbiInstance, ExecEnv, ExecError, Role};
 use wasixv2_syscalls::{Control, Syscalls, TaskId};
-use wasmer::{FunctionEnv, Imports, Instance, Module, Store};
+use wasmer::{FunctionEnv, Imports, Instance, Module, StoreMut};
 
 use crate::{imports::Module as V1Module, instance::Wasix1Instance, process::Procs};
 
@@ -142,7 +142,7 @@ where
 
     fn imports(
         &self,
-        store: &mut Store,
+        store: &mut StoreMut<'_>,
         env: &FunctionEnv<ExecEnv<S>>,
         module: &Module,
     ) -> Imports {
@@ -152,7 +152,7 @@ where
     fn bind(
         &self,
         instance: &Instance,
-        _store: &mut Store,
+        _store: &mut StoreMut<'_>,
         task: TaskId,
         role: Role,
     ) -> Result<Arc<dyn AbiInstance<S>>, ExecError> {

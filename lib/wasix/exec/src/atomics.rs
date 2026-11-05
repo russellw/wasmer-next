@@ -14,14 +14,17 @@
 use std::time::Duration;
 
 use wasixv2_syscalls::{AtomicWord, Caller, Control, Errno, Syscalls, UserMemory};
-use wasmer::{AsyncFunctionEnvMut, Function, FunctionEnv, Imports, RuntimeError, Store};
+use wasmer::{AsyncFunctionEnvMut, Function, FunctionEnv, Imports, RuntimeError, StoreMut};
 use wasmer_types::TrapCode;
 
 use crate::{ExecEnv, GuestMemory, caller_parts, preempt, return_to_guest};
 
 /// Defines the imports that replace the instructions.
-pub(crate) fn define<S>(imports: &mut Imports, store: &mut Store, env: &FunctionEnv<ExecEnv<S>>)
-where
+pub(crate) fn define<S>(
+    imports: &mut Imports,
+    store: &mut StoreMut<'_>,
+    env: &FunctionEnv<ExecEnv<S>>,
+) where
     S: Syscalls + Control + 'static,
 {
     let module = preempt::HOOK_MODULE;
