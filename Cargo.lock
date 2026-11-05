@@ -8242,13 +8242,17 @@ dependencies = [
 name = "wasmer-swift"
 version = "0.705.0"
 dependencies = [
+ "anyhow",
+ "futures-util",
+ "serde_json",
  "thiserror 2.0.21",
  "tokio",
  "uniffi",
- "virtual-fs",
+ "wasixv2",
  "wasmer",
+ "wasmer-config",
  "wasmer-package",
- "wasmer-wasix",
+ "wat",
  "webc",
 ]
 
