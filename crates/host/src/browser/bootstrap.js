@@ -8,12 +8,9 @@ export async function startCoordinator(options, onMessage = () => {}) {
         !(options.memory.buffer instanceof SharedArrayBuffer)) {
         throw new Error("expected a compiled runtime module and its shared runtime memory");
     }
-    // Cancellation belongs to the caller realm and must never be cloned into workers.
-    const { signal, ...workerOptions } = options;
-    signal?.throwIfAborted();
     const config = {
         taskLimit: 64, serviceLimit: 4, prewarm: 2, servicePrewarm: 2,
-        stackSize: 1024 * 1024, admissionTimeout: 10000, ...workerOptions,
+        stackSize: 1024 * 1024, admissionTimeout: 10000, ...options,
     };
     for (const role of ["task", "service"]) {
         const limit = config[role + "Limit"];
@@ -46,8 +43,6 @@ export async function startCoordinator(options, onMessage = () => {}) {
     }
     coordinators.set(config.memory, coordinator);
     let timer;
-    let abort;
-    let abortRequested = false;
     let disposed = false;
     function dispose() {
         if (disposed) return;
@@ -56,7 +51,6 @@ export async function startCoordinator(options, onMessage = () => {}) {
         // without retaining the coordinator or allowing a poisoned heap to reboot.
         coordinators.set(config.memory, null);
         clearTimeout(timer);
-        if (abort) signal?.removeEventListener("abort", abort);
         coordinator.onmessage = coordinator.onerror = coordinator.onmessageerror = null;
         coordinator.terminate();
     }
@@ -70,10 +64,10 @@ export async function startCoordinator(options, onMessage = () => {}) {
                 onMessage({ type: "fatal", error: event.message });
             };
             coordinator.onmessage = ({ data }) => {
-                if (disposed || (abortRequested && data.type === "ready")) return;
+                if (disposed) return;
                 if (data.type === "fatal" || data.type === "stopped") dispose();
                 if (data.type === "ready") { clearTimeout(timer); resolve(); }
-                if (data.type === "fatal") { clearTimeout(timer); reject(abortRequested ? signal.reason : new Error(data.error)); }
+                if (data.type === "fatal") { clearTimeout(timer); reject(new Error(data.error)); }
                 if (data.type === "stopped") reject(new Error("coordinator stopped during bootstrap"));
                 onMessage(data);
             };
@@ -83,22 +77,7 @@ export async function startCoordinator(options, onMessage = () => {}) {
                 reject(new Error("coordinator message could not be decoded"));
                 onMessage({ type: "fatal", error: "coordinator message could not be decoded" });
             };
-            abort = () => {
-                if (disposed || abortRequested) return;
-                abortRequested = true;
-                try {
-                    // Wait for the existing whole-heap discard notification rather
-                    // than terminating only the coordinator and losing child custody.
-                    coordinator.postMessage({ type: "abort", error: "runtime aborted by its owner" });
-                } catch (error) {
-                    dispose();
-                    reject(error);
-                    onMessage({ type: "fatal", error: String(error) });
-                }
-            };
-            signal?.addEventListener("abort", abort, { once: true });
-            if (signal?.aborted) abort();
-            else coordinator.postMessage({ ...config, type: "init" });
+            coordinator.postMessage({ ...config, type: "init" });
         });
         return coordinator;
     } catch (error) {
