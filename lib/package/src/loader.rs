@@ -1608,6 +1608,7 @@ mod tests {
             fail: bool,
             returned: AtomicBool,
             dropped: Arc<AtomicBool>,
+            http_started: Mutex<Option<futures::channel::oneshot::Sender<()>>>,
         }
 
         impl BodyClient {
@@ -1621,6 +1622,7 @@ mod tests {
                     fail: false,
                     returned: AtomicBool::new(false),
                     dropped: Arc::default(),
+                    http_started: Mutex::new(None),
                 })
             }
             fn response(&self) -> HttpResponse {
@@ -1655,6 +1657,9 @@ mod tests {
                         }
                     }
                     let _guard = Dropped(self.dropped.clone());
+                    if let Some(started) = self.http_started.lock().unwrap().take() {
+                        let _ = started.send(());
+                    }
                     progress(HttpBodyEvent::Head {
                         status: self.status,
                         headers: &self.headers,
@@ -2006,13 +2011,25 @@ mod tests {
         async fn dropping_an_http_load_stops_before_cache_and_ready() {
             let body = webc();
             let mut client = BodyClient::new(body.clone(), HeaderMap::new());
-            Arc::get_mut(&mut client).unwrap().stall = true;
+            let (started, in_http) = futures::channel::oneshot::channel();
+            let configuration = Arc::get_mut(&mut client).unwrap();
+            configuration.stall = true;
+            *configuration.http_started.get_mut().unwrap() = Some(started);
             let (events, observer) = observe(&client);
             let cache = TempDir::new().unwrap();
             let downloader = PackageDownloader::new(client.clone()).with_cache_dir(cache.path());
             let summary = summary(&body);
             let mut load = Box::pin(downloader.load_with_progress(&summary, Some(observer)));
-            assert!(futures::poll!(load.as_mut()).is_pending());
+            // Disk-cache lookup may be the first Pending. Drive it until the
+            // actual HTTP future has been polled and owns its live drop guard.
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::select! {
+                    result = &mut load => panic!("load completed before HTTP cancellation: {result:?}"),
+                    started = in_http => started.expect("HTTP future started"),
+                }
+            })
+            .await
+            .expect("HTTP future must start within the test deadline");
             assert!(!client.dropped.load(Ordering::SeqCst));
             drop(load);
             assert!(
