@@ -6867,8 +6867,6 @@ dependencies = [
  "hyper",
  "hyper-tungstenite",
  "hyper-util",
- "ipnet",
- "iprange",
  "libc",
  "mio",
  "pin-project-lite",
@@ -6885,6 +6883,7 @@ dependencies = [
  "tracing",
  "tracing-test",
  "virtual-mio",
+ "wasmer-config",
 ]
 
 [[package]]
@@ -7864,6 +7863,7 @@ dependencies = [
  "wasmer-compiler-llvm",
  "wasmer-compiler-singlepass",
  "wasmer-config",
+ "wasmer-journal",
  "wasmer-package",
  "wasmer-package-sdk",
  "wasmer-types",
@@ -8000,6 +8000,8 @@ dependencies = [
  "derive_builder",
  "hex",
  "indexmap",
+ "ipnet",
+ "iprange",
  "pretty_assertions",
  "saffron",
  "schemars",
