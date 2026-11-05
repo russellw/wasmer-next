@@ -2178,7 +2178,7 @@ fn provider_ioctl_denies_before_lookup_and_retains_socket_namespace() {
     let fd = block_on(kernel.socket(&caller, AddressFamily::AF_NETLINK, DGRAM, 0)).unwrap();
     // An old descriptor stays bound to its original provider after unshare.
     assert_eq!(
-        block_on(kernel.unshare(&caller, CloneFlags::CLONE_NEWNET.0)),
+        block_on(kernel.unshare(&caller, CloneFlags::CLONE_NEWNET.0 as u32)),
         Ok(0)
     );
     assert_eq!(
