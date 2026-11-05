@@ -198,7 +198,14 @@ mod tests {
         manifest
     }
 
-    fn archive(manifest: Value, module: Option<&[u8]>, files: bool) -> Vec<u8> {
+    fn archive(mut manifest: Value, module: Option<&[u8]>, files: bool) -> Vec<u8> {
+        if let Some(module) = module {
+            let hash = WebcHash::sha256(module).as_bytes();
+            manifest["atoms"]["main"] = json!({
+                "kind": "https://webc.org/kind/wasm",
+                "signature": webc::metadata::AtomSignature::Sha256(hash).to_string(),
+            });
+        }
         let manifest = serde_json::from_value(manifest).unwrap();
         let atoms = module
             .into_iter()
