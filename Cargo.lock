@@ -8481,6 +8481,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ureq 3.4.2",
+ "wasixv2",
  "wasmer",
  "wasmer-cache",
  "wasmer-compiler",
