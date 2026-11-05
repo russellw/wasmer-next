@@ -23,7 +23,7 @@ const LOCAL_ITEMS: &[&str] = &[
     "Imports",
     "Module",
     "RuntimeError",
-    "Store",
+    "StoreMut",
     "Syscalls",
     "TaskId",
     "UserSlice",
@@ -76,7 +76,7 @@ impl Gen<'_> {
         );
         let _ = writeln!(self.out, "use wasixv2_syscalls::{{{}}};", items.join(", "));
         self.line(
-            "use wasmer::{AsyncFunctionEnvMut, Function, FunctionEnv, Imports, Module, RuntimeError, Store};",
+            "use wasmer::{AsyncFunctionEnvMut, Function, FunctionEnv, Imports, Module, RuntimeError, StoreMut};",
         );
         self.line("");
         self.line("use crate::{ExecEnv, caller_parts, memory::GuestMemory, return_to_guest};");
@@ -96,7 +96,7 @@ impl Gen<'_> {
         );
         self.line("/// no syscall answers to stays undefined, and the module fails to link.");
         self.line(
-            "pub(crate) fn imports<S>(store: &mut Store, env: &FunctionEnv<ExecEnv<S>>, module: &Module) -> Imports",
+            "pub(crate) fn imports<S>(store: &mut StoreMut<'_>, env: &FunctionEnv<ExecEnv<S>>, module: &Module) -> Imports",
         );
         self.line("where S: Syscalls + Control + Send + Sync + 'static,");
         self.line("{");
@@ -276,7 +276,7 @@ mod tests {
         .unwrap();
         for want in [
             "pub const IMPORT_MODULE: &str = \"m\";",
-            "pub(crate) fn imports<S>(store: &mut Store, env: &FunctionEnv<ExecEnv<S>>, module: &Module) -> Imports",
+            "pub(crate) fn imports<S>(store: &mut StoreMut<'_>, env: &FunctionEnv<ExecEnv<S>>, module: &Module) -> Imports",
             "if import.module() != IMPORT_MODULE { continue; }",
             "\"exit_group\" => Function::new_typed_with_env_async(store, env, exit_group::<S>),",
             "_ => continue,",
@@ -293,7 +293,7 @@ mod tests {
             "use wasixv2_abi::{Cstr, Fd};",
             "use wasixv2_syscalls::{Caller, Control, Syscalls, UserSliceMut};",
             "use crate::{ExecEnv, caller_parts, memory::GuestMemory, return_to_guest};",
-            "use wasmer::{AsyncFunctionEnvMut, Function, FunctionEnv, Imports, Module, RuntimeError, Store};",
+            "use wasmer::{AsyncFunctionEnvMut, Function, FunctionEnv, Imports, Module, RuntimeError, StoreMut};",
         ] {
             assert!(out.contains(want), "missing `{want}` in:\n{out}");
         }
