@@ -16,6 +16,7 @@ use virtual_net::{
     host::LocalNetworking,
     meta::{MessageRequest, MessageResponse},
 };
+use wasix1_net_reference as virtual_net;
 use wasixv2_abi::Errno;
 use wasixv2_vnet::{Answer, Backend, Domain, Lookup, Shutdown, StreamState};
 use wasixv2_vnet_web::{
@@ -315,6 +316,9 @@ struct ConfiguredReference {
     state: Mutex<ConfiguredState>,
     fail_readback: std::sync::atomic::AtomicBool,
     changing: std::sync::atomic::AtomicBool,
+    stall_dhcp: std::sync::atomic::AtomicBool,
+    dhcp_entered: std::sync::atomic::AtomicBool,
+    release_dhcp: tokio::sync::Notify,
 }
 #[derive(Debug, Default)]
 struct ConfiguredState {
@@ -336,6 +340,9 @@ impl ConfiguredReference {
             }),
             fail_readback: std::sync::atomic::AtomicBool::new(false),
             changing: std::sync::atomic::AtomicBool::new(false),
+            stall_dhcp: std::sync::atomic::AtomicBool::new(false),
+            dhcp_entered: std::sync::atomic::AtomicBool::new(false),
+            release_dhcp: tokio::sync::Notify::new(),
         })
     }
 }
@@ -375,6 +382,11 @@ impl virtual_net::VirtualNetworking for ConfiguredReference {
         Ok(())
     }
     async fn dhcp_acquire(&self) -> virtual_net::Result<Vec<IpAddr>> {
+        if self.stall_dhcp.load(std::sync::atomic::Ordering::SeqCst) {
+            self.dhcp_entered
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.release_dhcp.notified().await;
+        }
         let mut state = self.state.lock().unwrap();
         state.calls.push("dhcp");
         state.addresses = vec![virtual_net::IpCidr {
@@ -594,4 +606,44 @@ fn configured_classic_provider_controls_deadlines_reconciliation_and_same_transp
         drive_until("unbridge affects actual socket provider",&mut driver,&mut relay,|| stream.state()!=StreamState::Connecting).await;
         assert_eq!(stream.state(),StreamState::Closed);assert_eq!(stream.take_error(),Some(Errno::ENOTCONN));
     });
+}
+
+/// A genuinely blocked v1 import must take SIGKILL without waiting for its provider.
+/// The retained transaction subsequently publishes into the same namespace after task exit.
+#[tokio::test]
+async fn configured_classic_blocked_v1_guest_is_killable_without_replaying_dhcp() {
+    use std::sync::atomic::Ordering;
+    use wasixv2_vnet::{Network, provider::Readback};
+    tokio::task::LocalSet::new().run_until(async {
+        let reference=ConfiguredReference::new();
+        reference.stall_dhcp.store(true,Ordering::SeqCst);
+        let mut capabilities=Capabilities::classic(true);
+        capabilities.provider=Some(Readback {addresses:true,mac:false,routes:false});
+        let (backend,driver)=WebBackend::new(Config::default(),capabilities).unwrap();
+        let net=wasixv2_vnet::Net::new(wasixv2_vnet::NetConfig::host_default(),Some(backend));
+        let relay=Classic::new(ReferenceRelay::with_provider(reference.clone()),capabilities);
+        let io=tokio::task::spawn_local(driver.run(relay));
+        let machine=std::rc::Rc::new(wasixv2::Machine::builder().user(wasixv2::Credentials::new(0,0)).network(net.clone()).build());
+        let wasm=wat::parse_str(r#"(module
+          (import "wasix_32v1" "port_dhcp_acquire" (func $dhcp (result i32)))
+          (import "wasi_snapshot_preview1" "proc_exit" (func $exit (param i32)))
+          (memory (export "memory") 1)
+          (func (export "_start") (call $exit (call $dhcp))))"#).unwrap();
+        let run=tokio::task::spawn_local({let machine=machine.clone();async move {machine.run(&wasm,wasixv2::Stdio::from_fns(|_|{},|_|{})).await}});
+        tokio::time::timeout(Duration::from_secs(10),async {
+            while !reference.dhcp_entered.load(Ordering::SeqCst) {tokio::task::yield_now().await;}
+        }).await.expect("guest reached actual blocked provider");
+        tokio::time::timeout(Duration::from_secs(10),machine.shutdown()).await.expect("SIGKILL ends blocked provider import");
+        assert_eq!(tokio::time::timeout(Duration::from_secs(10),run).await.expect("guest task completes after SIGKILL").unwrap().unwrap(),128+9);
+        assert_eq!(reference.state.lock().unwrap().calls.iter().filter(|c| **c=="dhcp").count(),0);
+        reference.release_dhcp.notify_one();
+        tokio::time::timeout(Duration::from_secs(10),async {
+            while !net.interfaces().iter().flat_map(|i| &i.addresses).any(|a| a.addr=="192.0.2.9".parse::<IpAddr>().unwrap()) {tokio::task::yield_now().await;}
+        }).await.expect("accepted completion publishes after killed guest");
+        assert_eq!(reference.state.lock().unwrap().calls.iter().filter(|c| **c=="dhcp").count(),1,"accepted mutation was never replayed");
+        let wasm=wat::parse_str(r#"(module (import "wasi_snapshot_preview1" "proc_exit" (func $exit (param i32))) (memory (export "memory") 1) (func (export "_start") (call $exit (i32.const 0))))"#).unwrap();
+        assert_eq!(machine.run(&wasm,wasixv2::Stdio::from_fns(|_|{},|_|{})).await.unwrap(),0);
+        io.abort();
+        assert!(io.await.unwrap_err().is_cancelled());
+    }).await;
 }

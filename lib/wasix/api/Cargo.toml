@@ -53,7 +53,7 @@ wat.workspace = true
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 futures-util.workspace = true
 bincode = { workspace = true, features = ["serde"] }
-virtual-net = { path = "../../virtual-net" }
+wasix1-net-reference = { path = "tests/support/classic-reference" }
 wasixv2-vnet-web = { workspace = true }
 wasixv2-wait = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }

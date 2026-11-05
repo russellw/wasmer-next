@@ -8,6 +8,7 @@ use virtual_net::{
         ResponseType as Reply, SocketId,
     },
 };
+use wasix1_net_reference as virtual_net;
 use wasixv2_abi::Errno;
 use wasixv2_vnet::{Answer, Lookup, Shutdown};
 use wasixv2_vnet_web::{Command, Event, codec};

@@ -1,0 +1,37 @@
+[package]
+name = "wasix1-net-reference"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+[workspace]
+
+[features]
+default = ["host-net", "remote", "tokio", "libc"]
+host-net = ["virtual-mio/sys"]
+remote = []
+tokio = []
+libc = []
+
+[dependencies]
+virtual-mio = { package = "wasix1-io-reference", path = "../classic-io-reference" }
+async-trait = "0.1.68"
+anyhow = "1.0"
+bincode = { version = "=2.0.1", features = ["serde"] }
+bytes = "1.11.1"
+derive_more = { version = "2.0.1", features = ["debug"] }
+futures-util = { version = "0.3.31", features = ["sink"] }
+libc = "0.2.178"
+mio = { version = "1", features = ["net", "os-poll", "os-ext"] }
+pin-project-lite = "0.2.10"
+serde = { version = "1", features = ["derive"] }
+socket2 = { version = "0.6.1", features = ["all"] }
+thiserror = "2.0.17"
+tokio = { version = "1.39.0", features = ["io-util", "rt", "sync", "net"] }
+tokio-serde = { version = "0.9", features = ["bincode"] }
+tokio-util = { version = "0.7.8", features = ["codec"] }
+tracing = "0.1"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(docsrs)', 'cfg(feature, values("rkyv", "hyper", "tokio-tungstenite", "json", "messagepack", "cbor"))'] }
