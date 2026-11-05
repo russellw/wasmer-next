@@ -198,7 +198,7 @@ fn filesystem_mapping_from_manifest(
             Ok(mappings)
         }
         None => {
-            if webc_version == webc::Version::V2 {
+            if matches!(webc_version, webc::Version::V1 | webc::Version::V2) {
                 tracing::debug!(target: "wasmer_wasix::runtime::resolver::inputs",
                     "No \"fs\" package annotations found. Mounting the \"atom\" volume to \"/\" for compatibility."
                 );

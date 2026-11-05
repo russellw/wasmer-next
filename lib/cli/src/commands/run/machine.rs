@@ -684,6 +684,10 @@ impl Run {
         let readers: RefCell<HashMap<PackageId, Reader>> = RefCell::new(HashMap::new());
         let provider =
             |request: ResolvedVolumeRequest<'_>| -> io::Result<Option<ResolvedReaderVolume>> {
+                // V1 has an original opaque volume adapter, not a V3 reader migration.
+                if request.container.version() == webc::Version::V1 {
+                    return Ok(None);
+                }
                 let mut readers = readers.borrow_mut();
                 let reader = match readers.entry(request.package.clone()) {
                     std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
