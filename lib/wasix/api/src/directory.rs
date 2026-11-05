@@ -145,6 +145,55 @@ pub async fn populate_directory(
     Ok(())
 }
 
+impl crate::Machine {
+    /// Check that `path` can be read as a directory, creating that directory if
+    /// absent. Parents must exist. This trusted setup operation uses the machine
+    /// owner's filesystem ids; it does not change any process's working directory.
+    pub async fn ensure_directory(&self, path: &str) -> std::io::Result<()> {
+        struct Entries;
+        impl wasixv2_vfs::DirSink for Entries {
+            fn push(&mut self, _: wasixv2_vfs::DirEntry<'_>) -> bool {
+                true
+            }
+        }
+        let vfs = self.vfs();
+        let root = vfs.root();
+        let cred = Cred {
+            fsuid: self.owner.0,
+            fsgid: self.owner.1,
+            ..Cred::root()
+        };
+        let cx = Ctx {
+            cred: &cred,
+            root: &root,
+            umask: 0,
+            task: 0,
+            leases: None,
+        };
+        let read = async {
+            let file = vfs
+                .open(
+                    &cx,
+                    &root,
+                    path.as_bytes(),
+                    &OpenHow {
+                        flags: OpenFlags::O_RDONLY | OpenFlags::O_DIRECTORY,
+                        mode: 0,
+                        lookup: LookupFlags::follow(),
+                    },
+                )
+                .await?;
+            file.readdir(0, &mut Entries).await.map(|_| ())
+        }
+        .await;
+        match read {
+            Err(Errno::ENOENT) => vfs.mkdir(&cx, &root, path.as_bytes(), 0o777).await,
+            result => result,
+        }
+        .map_err(crate::errno_to_io)
+    }
+}
+
 #[cfg(all(test, feature = "tokio", not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
@@ -157,6 +206,56 @@ mod tests {
             42,
             43,
         ))
+    }
+    #[tokio::test]
+    async fn machine_directory_setup_creates_one_owned_directory_without_parents() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let machine = crate::Machine::builder()
+                    .user(crate::Credentials::new(42, 43))
+                    .build();
+                machine.ensure_directory("/tmp/child").await.unwrap();
+                machine.ensure_directory("/tmp/child").await.unwrap();
+                let vfs = machine.vfs();
+                let root = vfs.root();
+                let cred = Cred::root();
+                let cx = Ctx {
+                    cred: &cred,
+                    root: &root,
+                    umask: 0,
+                    task: 0,
+                    leases: None,
+                };
+                let directory = vfs
+                    .lookup(&cx, &root, b"/tmp/child", LookupFlags::follow())
+                    .await
+                    .unwrap();
+                let attr = directory.dentry.node().getattr().await.unwrap();
+                assert_eq!((attr.uid, attr.gid, attr.mode & 0o777), (42, 43, 0o777));
+                assert_eq!(
+                    machine
+                        .ensure_directory("/missing/child")
+                        .await
+                        .unwrap_err()
+                        .raw_os_error(),
+                    Some(2)
+                );
+                assert!(
+                    vfs.lookup(&cx, &root, b"/missing", LookupFlags::follow())
+                        .await
+                        .is_err()
+                );
+                assert_eq!(
+                    machine
+                        .ensure_directory("/etc/passwd")
+                        .await
+                        .unwrap_err()
+                        .raw_os_error(),
+                    Some(20)
+                );
+                machine.shutdown().await;
+            })
+            .await;
     }
     #[tokio::test]
     async fn readonly_directories_bytes_and_symlinks_keep_their_identity() {
