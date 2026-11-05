@@ -211,6 +211,8 @@ Additional reference-lifetime test draft:
 
 - Snapshot/restore: intentionally excluded; unused legacy feature to be redesigned.
 - Windows and nominal WASIX64: deferred by the user; not current parity blockers.
+- macOS support targets 13 and newer, explicitly approved by the user. The
+  descriptor-safe host-filesystem port and its validation remain required.
 - RTLD_NEXT: deferred. Full Linux compatibility is not the completion criterion.
 - Full-image dynamic copying fork / multi-module asyncify, TLS-dependent initializer
   snapshots and unsupported dynamic relocation forms require their own consumer-backed
