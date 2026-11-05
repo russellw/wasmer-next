@@ -72,7 +72,12 @@ members = [
   "tests/lib/wast",
   "tests/wasmer-argus",
 ]
-exclude = ["./lib/cli/tests/packages/axum", "lib/wild"]
+exclude = [
+  "./lib/cli/tests/packages/axum",
+  "lib/wild",
+  "lib/wasix/api/tests/support/classic-reference",
+  "lib/wasix/api/tests/support/classic-io-reference",
+]
 resolver = "2"
 
 [workspace.package]
