@@ -704,15 +704,23 @@ mod tests {
         )
         .await
         .expect_err("malformed selected v3 reader must not fall back to valid opaque contents");
-        let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);
-        let mut original = false;
-        while let Some(error) = source {
-            if let Some(error) = error.downcast_ref::<wasixv2_vfs_package::PackageFsError>() {
-                original = matches!(error, wasixv2_vfs_package::PackageFsError::Malformed(_));
-            }
-            source = error.source();
-        }
-        assert!(original, "original malformed-volume error is preserved");
+        // io::Error::source delegates to the payload's source, skipping the
+        // payload itself. Inspect both owned payloads to check typed custody.
+        let context = error
+            .get_ref()
+            .and_then(|error| error.downcast_ref::<VolumeError>())
+            .expect("selected reader failure retains its volume context");
+        assert_eq!(context.name, "atom");
+        assert_eq!(context.path, "/data");
+        let original = context
+            .source
+            .get_ref()
+            .and_then(|error| error.downcast_ref::<wasixv2_vfs_package::PackageFsError>())
+            .expect("volume context retains the original typed package error");
+        assert!(
+            matches!(original, wasixv2_vfs_package::PackageFsError::Malformed(_)),
+            "original malformed-volume error is preserved"
+        );
     }
 
     #[tokio::test]
