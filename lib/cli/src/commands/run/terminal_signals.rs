@@ -370,7 +370,7 @@ mod tests {
                 )
             };
             if found != 0 {
-                assert_eq!(found, child.id() as _);
+                assert_eq!(found, child.id() as libc::pid_t);
                 assert!(
                     libc::WIFSTOPPED(status),
                     "child stopped rather than exiting"
