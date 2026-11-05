@@ -32,7 +32,6 @@ default = [
   "sys",
   "wat",
   "wast",
-  "journal",
   "wasmer-artifact-create",
   "static-artifact-create",
 ]
@@ -46,7 +45,6 @@ default = [
 # 	"mac_address",
 # 	"dep:interfaces",
 # ]
-journal = ["dep:wasmer-journal", "wasmer-journal/log-file"]
 backend = []
 coredump = ["wasm-coredump-builder"]
 sys = ["compiler", "dep:wasmer-vm", "wasixv2/sys", "wasmer-cache/module-cache-sys"]
@@ -135,7 +133,6 @@ wasmer-compiler-llvm = { version = "=7.5.0", path = "../compiler-llvm", optional
 wasmer-package = { workspace = true, features = ["authoring", "acquisition-thread", "http-client"] }
 wasmer-vm = { version = "=7.5.0", path = "../vm", optional = true }
 wasmer-cache = { path = "../cache", version = "=7.5.0", default-features = false, features = ["module-cache", "module-cache-filesystem"] }
-wasmer-journal = { path = "../journal", version = "0.705.0", default-features = false, optional = true }
 wasmer-wast = { version = "=7.5.0", path = "../../tests/lib/wast", optional = true }
 wasmer-types = { version = "=7.5.0", path = "../types", features = [
   "enable-serde",

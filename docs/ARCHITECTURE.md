@@ -14,7 +14,7 @@ will touch most:
 | `lib/vm`                                              | Low-level VM runtime.                                                |
 | `lib/wasix/*`                                         | Wasmer-specific WASIX facade, execution, loader and v1 bindings.      |
 | `lib/wasix-legacy`                                    | Legacy `wasmer-wasix` embedding and package APIs; retained until consumer parity. |
-| `lib/journal`                                         | Snapshot and restore support. See [journal.md](./journal.md).        |
+| `lib/journal`                                         | Temporary legacy compile dependency; journaling is intentionally unsupported. See [journal.md](./journal.md). |
 | `lib/virtual-fs`, `lib/virtual-net`, `lib/virtual-io` | Host abstraction layers.                                             |
 | `lib/c-api`                                           | C API (`cdylib` named `wasmer`).                                     |
 | `lib/backend-api`                                     | GraphQL client for the Wasmer registry.                              |

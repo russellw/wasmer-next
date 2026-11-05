@@ -7907,7 +7907,6 @@ dependencies = [
  "wasmer-compiler-llvm",
  "wasmer-compiler-singlepass",
  "wasmer-config",
- "wasmer-journal",
  "wasmer-package",
  "wasmer-package-sdk",
  "wasmer-types",

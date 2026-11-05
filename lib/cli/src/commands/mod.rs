@@ -16,8 +16,6 @@ mod gen_completions;
 mod gen_manpage;
 mod init;
 mod inspect;
-#[cfg(feature = "journal")]
-mod journal;
 pub(crate) mod namespace;
 mod package;
 mod run;
@@ -38,8 +36,6 @@ pub use compile::*;
 #[cfg(feature = "wast")]
 pub use wast::*;
 
-#[cfg(feature = "journal")]
-pub use self::journal::*;
 pub use self::{
     add::*, auth::*, cache::*, config::*, container::*, init::*, inspect::*, package::*,
     publish::*, run::Run, self_update::*, validate::*,
@@ -201,8 +197,6 @@ impl WasmerCmd {
             Some(Cmd::Deploy(c)) => c.run(),
             Some(Cmd::App(apps)) => apps.run(),
             Some(Cmd::Cron(cron)) => cron.run(),
-            #[cfg(feature = "journal")]
-            Some(Cmd::Journal(journal)) => journal.run(),
             Some(Cmd::Ssh(ssh)) => ssh.run(),
             Some(Cmd::Namespace(namespace)) => namespace.run(),
             Some(Cmd::Domain(namespace)) => namespace.run(),
@@ -376,11 +370,6 @@ enum Cmd {
     /// Run a WebAssembly file or Wasmer container
     #[clap(alias = "run-unstable")]
     Run(Run),
-
-    /// Manage journals (compacting, inspecting, filtering, ...)
-    #[cfg(feature = "journal")]
-    #[clap(subcommand)]
-    Journal(CmdJournal),
 
     #[clap(subcommand)]
     Package(crate::commands::Package),

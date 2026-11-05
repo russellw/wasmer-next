@@ -1006,8 +1006,7 @@ impl Run {
 
     fn reject_options_unsupported_by_the_machine(&self, is_package: bool) -> Result<(), Error> {
         let wasi = &self.wasi;
-        #[allow(unused_mut)]
-        let mut given = vec![
+        let given = [
             (
                 "--enable-async-threads",
                 wasi.enable_async_threads.is_some(),
@@ -1024,14 +1023,6 @@ impl Run {
             // A trap kills the process with its signal; the kernel writes no core.
             ("--coredump-on-trap", self.coredump_on_trap.is_some()),
         ];
-        #[cfg(feature = "journal")]
-        given.extend([
-            ("--journal", !wasi.read_only_journals.is_empty()),
-            ("--journal-writable", !wasi.writable_journals.is_empty()),
-            ("--snapshot-on", !wasi.snapshot_on.is_empty()),
-            ("--snapshot-period", wasi.snapshot_interval.is_some()),
-            ("--stop-after-snapshot", wasi.stop_after_snapshot),
-        ]);
 
         let unsupported: Vec<_> = given
             .into_iter()

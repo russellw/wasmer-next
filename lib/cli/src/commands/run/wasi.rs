@@ -9,8 +9,6 @@ use url::Url;
 use wasmer::Engine;
 use wasmer_cache::module_cache::{FileSystemCache, ModuleCache, SharedCache};
 use wasmer_config::filesystem::{MAPPED_CURRENT_DIR_DEFAULT_PATH, MappedDirectory};
-#[cfg(feature = "journal")]
-use wasmer_journal::SnapshotTrigger;
 use wasmer_package::{
     http::{HttpClient, reqwest::ReqwestHttpClient},
     loader::PackageDownloader,
@@ -187,80 +185,6 @@ pub struct Wasi {
     /// (default = off)
     #[clap(long = "enable-cpu-backoff")]
     pub enable_cpu_backoff: Option<u64>,
-
-    /// Specifies one or more journal files that Wasmer will use to restore
-    /// the state of the WASM process as it executes.
-    ///
-    /// The state of the WASM process and its sandbox will be reapplied using
-    /// the journals in the order that you specify here.
-    #[cfg(feature = "journal")]
-    #[clap(long = "journal")]
-    pub read_only_journals: Vec<PathBuf>,
-
-    /// Specifies one or more journal files that Wasmer will use to restore
-    /// and save the state of the WASM process as it executes.
-    ///
-    /// The state of the WASM process and its sandbox will be reapplied using
-    /// the journals in the order that you specify here.
-    ///
-    /// The last journal file specified will be created if it does not exist
-    /// and opened for read and write. New journal events will be written to this
-    /// file
-    #[cfg(feature = "journal")]
-    #[clap(long = "journal-writable")]
-    pub writable_journals: Vec<PathBuf>,
-
-    /// Flag that indicates if the journal will be automatically compacted
-    /// as it fills up and when the process exits
-    #[cfg(feature = "journal")]
-    #[clap(long = "enable-compaction")]
-    pub enable_compaction: bool,
-
-    /// Tells the compactor not to compact when the journal log file is closed
-    #[cfg(feature = "journal")]
-    #[clap(long = "without-compact-on-drop")]
-    pub without_compact_on_drop: bool,
-
-    /// Tells the compactor to compact when it grows by a certain factor of
-    /// its original size. (i.e. '0.2' would be it compacts after the journal
-    /// has grown by 20 percent)
-    ///
-    /// Default is to compact on growth that exceeds 15%
-    #[cfg(feature = "journal")]
-    #[clap(long = "with-compact-on-growth", default_value = "0.15")]
-    pub with_compact_on_growth: f32,
-
-    /// Indicates what events will cause a snapshot to be taken
-    /// and written to the journal file.
-    ///
-    /// If not specified, the default is to snapshot when the process idles, when
-    /// the process exits or periodically if an interval argument is also supplied,
-    /// as well as when the process requests a snapshot explicitly.
-    ///
-    /// Additionally if the snapshot-on is not specified it will also take a snapshot
-    /// on the first stdin, environ or socket listen - this can be used to accelerate
-    /// the boot up time of WASM processes.
-    #[cfg(feature = "journal")]
-    #[clap(long = "snapshot-on")]
-    pub snapshot_on: Vec<SnapshotTrigger>,
-
-    /// Adds a periodic interval (measured in milli-seconds) that the runtime will automatically
-    /// take snapshots of the running process and write them to the journal. When specifying
-    /// this parameter it implies that `--snapshot-on interval` has also been specified.
-    #[cfg(feature = "journal")]
-    #[clap(long = "snapshot-period")]
-    pub snapshot_interval: Option<u64>,
-
-    /// If specified, the runtime will stop executing the WASM module after the first snapshot
-    /// is taken.
-    #[cfg(feature = "journal")]
-    #[clap(long = "stop-after-snapshot")]
-    pub stop_after_snapshot: bool,
-
-    /// Skip writes to stdout and stderr when replying journal events to bootstrap a module.
-    #[cfg(feature = "journal")]
-    #[clap(long = "skip-journal-stdio")]
-    pub skip_stdio_during_bootstrap: bool,
 
     /// Allow instances to send http requests.
     ///
