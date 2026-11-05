@@ -1522,7 +1522,8 @@ fn tty_on_the_console() {
     assert_eq!(status, 0);
 }
 
-/// v1 guest resizing and host resizing share one terminal and its SIGWINCH semantics.
+/// Guest and host sizing share terminal state; v1 leaves SIGWINCH default-ignored.
+/// Kernel TTY tests cover actual notification and same-size signal suppression.
 #[test]
 fn tty_resize_and_host_resize_share_the_console_state() {
     let wat = r#"
@@ -1549,13 +1550,13 @@ fn tty_resize_and_host_resize_share_the_console_state() {
         (call $check (i32.eqz (i32.load (i32.const 104))) (i32.const 3))
         (call $check (i32.eqz (i32.load (i32.const 108))) (i32.const 4))
         (call $check (i32.eqz (i32.load (i32.const 112))) (i32.const 5))
-        ;; Guest tty_set updates the actual console, and delivers exactly one SIGWINCH.
+        ;; Guest tty_set updates the console; v1 keeps SIGWINCH default-ignored.
         (i32.store (i32.const 100) (i32.const 120))
         (i32.store (i32.const 104) (i32.const 40))
         (i32.store (i32.const 108) (i32.const 960))
         (i32.store (i32.const 112) (i32.const 640))
         (call $check (i32.eqz (call $set (i32.const 100))) (i32.const 6))
-        (call $check (i32.eq (global.get $resizes) (i32.const 1)) (i32.const 7))
+        (call $check (i32.eq (global.get $resizes) (i32.const 0)) (i32.const 7))
         (call $check (i32.eqz (call $get (i32.const 100))) (i32.const 8))
         (call $check (i32.eq (i32.load (i32.const 100)) (i32.const 120)) (i32.const 9))
         (call $check (i32.eq (i32.load (i32.const 104)) (i32.const 40)) (i32.const 10))
@@ -1565,16 +1566,16 @@ fn tty_resize_and_host_resize_share_the_console_state() {
         (i32.store (i32.const 200) (i32.const 64))
         (i32.store (i32.const 204) (i32.const 1))
         (call $check (i32.eqz (call $write (i32.const 1) (i32.const 200) (i32.const 1) (i32.const 208))) (i32.const 13))
-        (call $check (i32.eq (global.get $resizes) (i32.const 2)) (i32.const 14))
+        (call $check (i32.eq (global.get $resizes) (i32.const 0)) (i32.const 14))
         (call $check (i32.eqz (call $get (i32.const 100))) (i32.const 15))
         (call $check (i32.eq (i32.load (i32.const 100)) (i32.const 90)) (i32.const 16))
         (call $check (i32.eq (i32.load (i32.const 104)) (i32.const 30)) (i32.const 17))
         (call $check (i32.eq (i32.load (i32.const 108)) (i32.const 720)) (i32.const 18))
         (call $check (i32.eq (i32.load (i32.const 112)) (i32.const 480)) (i32.const 19))
-        ;; Neither host nor guest setting the same dimensions emits another SIGWINCH.
+        ;; Same-size host and guest updates also leave v1's callback quiet.
         (call $check (i32.eqz (call $write (i32.const 1) (i32.const 200) (i32.const 1) (i32.const 208))) (i32.const 20))
         (call $check (i32.eqz (call $set (i32.const 100))) (i32.const 21))
-        (call $check (i32.eq (global.get $resizes) (i32.const 2)) (i32.const 22))
+        (call $check (i32.eq (global.get $resizes) (i32.const 0)) (i32.const 22))
         (call $exit (i32.const 0))))
     "#;
     struct ResizeOnWrite(Mutex<std::sync::Weak<wasixv2::Signaller>>);
