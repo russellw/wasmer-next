@@ -200,9 +200,9 @@ table! {
     "proc_signals_get" WASIX (I32) -> (I32) Shim;
     "proc_signals_sizes_get" WASIX (I32) -> (I32) Shim;
     "proc_snapshot" WASIX () -> (I32) Unsupported;
-    "port_bridge" WASIX (I32 I32 I32 I32 I32) -> (I32) Unsupported;
-    "port_unbridge" WASIX () -> (I32) Unsupported;
-    "port_dhcp_acquire" WASIX () -> (I32) Unsupported;
+    "port_bridge" WASIX (I32 I32 I32 I32 I32) -> (I32) Shim;
+    "port_unbridge" WASIX () -> (I32) Shim;
+    "port_dhcp_acquire" WASIX () -> (I32) Shim;
     "port_addr_add" WASIX (I32) -> (I32) Shim;
     "port_addr_remove" WASIX (I32) -> (I32) Shim;
     "port_addr_clear" WASIX () -> (I32) Shim;
@@ -458,6 +458,9 @@ where
         "sock_join_multicast_v6" => f!(sockopt::sock_join_multicast_v6::<S>),
         "sock_leave_multicast_v6" => f!(sockopt::sock_leave_multicast_v6::<S>),
         "resolve" => f!(resolve::resolve::<S>),
+        "port_bridge" => f!(port::port_bridge::<S>),
+        "port_unbridge" => f!(port::port_unbridge::<S>),
+        "port_dhcp_acquire" => f!(port::port_dhcp_acquire::<S>),
         "port_addr_add" => f!(port::port_addr_add::<S>),
         "port_addr_remove" => f!(port::port_addr_remove::<S>),
         "port_addr_clear" => f!(port::port_addr_clear::<S>),

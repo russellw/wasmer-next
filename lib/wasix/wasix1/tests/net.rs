@@ -68,6 +68,9 @@ const PRELUDE: &str = r#"
   (import "wasix_32v1" "port_addr_add" (func $port_addr_add (param i32) (result i32)))
   (import "wasix_32v1" "port_addr_remove" (func $port_addr_remove (param i32) (result i32)))
   (import "wasix_32v1" "port_addr_clear" (func $port_addr_clear (result i32)))
+  (import "wasix_32v1" "port_bridge" (func $port_bridge (param i32 i32 i32 i32 i32) (result i32)))
+  (import "wasix_32v1" "port_unbridge" (func $port_unbridge (result i32)))
+  (import "wasix_32v1" "port_dhcp_acquire" (func $port_dhcp_acquire (result i32)))
   (import "wasix_32v1" "port_route_add" (func $port_route_add (param i32 i32 i32 i32) (result i32)))
   (import "wasix_32v1" "port_route_remove" (func $port_route_remove (param i32) (result i32)))
   (import "wasix_32v1" "port_route_clear" (func $port_route_clear (result i32)))
@@ -872,4 +875,16 @@ async fn receive_limit_uses_the_checked_iovecs_after_guest_mutation() {
             .unwrap(),
         0
     );
+}
+
+#[test]
+fn port_provider_absence_preserves_validation_and_authorization_order() {
+    let data = r#"(data (i32.const 400) "tenantcredential")"#;
+    let body = r#"
+      (call $assert (i32.eq (call $port_bridge (i32.const 400) (i32.const 6) (i32.const 406) (i32.const 10) (i32.const 99)) (i32.const 28)) (i32.const 1))
+      (call $assert (i32.eq (call $port_bridge (i32.const 400) (i32.const 6) (i32.const 406) (i32.const 10) (i32.const 3)) (i32.const 58)) (i32.const 2))
+      (call $assert (i32.eq (call $port_unbridge) (i32.const 58)) (i32.const 3))
+      (call $assert (i32.eq (call $port_dhcp_acquire) (i32.const 58)) (i32.const 4))
+    "#;
+    assert_eq!(run_port(data, body), 0);
 }

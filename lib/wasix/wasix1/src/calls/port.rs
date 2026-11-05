@@ -1,10 +1,14 @@
 //! WASIX v1 network queries and configuration through `NETLINK_ROUTE`.
-//! Bridge/DHCP require provider controls that this transport does not expose.
+//! Optional configured-provider controls are pinned by the same namespace socket.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use wasixv2_abi::{AddressFamily, GuestPtr, GuestPtrMut, MsgFlags, SocketFlags, SocketType};
-use wasixv2_syscalls::{Control, Syscalls, UserSliceMut};
+use wasixv2_syscalls::{Control, Syscalls, UserMemory, UserSliceMut};
+use wasixv2_vnet::provider::{
+    self, Cidr as ProviderCidr, Reply as ProviderReply, Request as ProviderRequest,
+    Route as ProviderRoute,
+};
 use wasmer::RuntimeError;
 
 use crate::{
@@ -16,6 +20,136 @@ use crate::{
     errno::V1Result,
     shim::{self, Env, Frame},
 };
+
+/// Only capability absence permits the ordinary netlink fallback. Operation refusals,
+/// including EOPNOTSUPP, must remain the configured provider's answer.
+async fn provider<S: Syscalls + Control + 'static>(
+    frame: &Frame<'_, S>,
+    operation: ProviderRequest,
+) -> V1Result<Option<ProviderReply>> {
+    let caller = frame.caller();
+    let ty = SocketType::SOCK_DGRAM.0 | SocketFlags::SOCK_CLOEXEC.0 as i32;
+    let fd = frame
+        .syscalls
+        .socket(&caller, AddressFamily::AF_NETLINK, ty, NETLINK_ROUTE)
+        .await?;
+    let result = async {
+        let present = frame
+            .syscalls
+            .ioctl(
+                &caller,
+                fd,
+                wasixv2_abi::IoctlRequest(provider::PROBE),
+                u32::from(operation.mutates()),
+            )
+            .await?;
+        if present == 0 {
+            return Ok(None);
+        }
+        let input = frame.mem.alloc_bytes(&provider::encode(&operation)?)?;
+        let output = frame.mem.alloc_zeroed(provider::MAX_MESSAGE as u32)?;
+        let mut header = Vec::new();
+        for value in [input.addr, input.len, output.addr, output.len] {
+            header.extend_from_slice(&value.to_le_bytes());
+        }
+        let header = frame.mem.alloc_bytes(&header)?;
+        let n = frame
+            .syscalls
+            .ioctl(
+                &caller,
+                fd,
+                wasixv2_abi::IoctlRequest(provider::CALL),
+                header.addr,
+            )
+            .await?;
+        if n < 0 || n as u32 > output.len {
+            return Err(wasixv2_abi::Errno::EPROTO.into());
+        }
+        Ok(Some(provider::decode(
+            &frame.mem.take_bytes(output, n as usize),
+        )?))
+    }
+    .await;
+    let _ = frame.syscalls.close(&caller, fd).await;
+    result
+}
+fn provider_none(reply: ProviderReply) -> V1Result<()> {
+    if reply == ProviderReply::None {
+        Ok(())
+    } else {
+        Err(wasixv2_abi::Errno::EPROTO.into())
+    }
+}
+async fn bridge_string<S: Syscalls + Control + 'static>(
+    frame: &Frame<'_, S>,
+    ptr: i32,
+    len: i32,
+) -> V1Result<String> {
+    if len as u32 as usize > provider::MAX_MESSAGE {
+        return shim::fail(Errno::INVAL);
+    }
+    let mut bytes = vec![0; len as u32 as usize];
+    frame.mem.guest().read(ptr as u32, &mut bytes).await?;
+    String::from_utf8(bytes).map_err(|_| Errno::INVAL.into())
+}
+pub(crate) async fn port_bridge<S: Syscalls + Control + 'static>(
+    env: Env<S>,
+    network: i32,
+    network_len: i32,
+    token: i32,
+    token_len: i32,
+    security: i32,
+) -> Result<i32, RuntimeError> {
+    shim::errno(&env, async |frame| {
+        let network = bridge_string(frame, network, network_len).await?;
+        let token = bridge_string(frame, token, token_len).await?;
+        let security = match security {
+            0 => provider::Security::Unencrypted,
+            1 => provider::Security::AnyEncryption,
+            2 => provider::Security::ClassicEncryption,
+            3 => provider::Security::DoubleEncryption,
+            _ => return shim::fail(Errno::INVAL),
+        };
+        let reply = provider(
+            frame,
+            ProviderRequest::Bridge {
+                network,
+                token,
+                security,
+            },
+        )
+        .await?
+        .ok_or(Errno::NOTSUP)?;
+        provider_none(reply)
+    })
+    .await
+}
+pub(crate) async fn port_unbridge<S: Syscalls + Control + 'static>(
+    env: Env<S>,
+) -> Result<i32, RuntimeError> {
+    shim::errno(&env, async |frame| {
+        provider_none(
+            provider(frame, ProviderRequest::Unbridge)
+                .await?
+                .ok_or(Errno::NOTSUP)?,
+        )
+    })
+    .await
+}
+pub(crate) async fn port_dhcp_acquire<S: Syscalls + Control + 'static>(
+    env: Env<S>,
+) -> Result<i32, RuntimeError> {
+    shim::errno(&env, async |frame| {
+        match provider(frame, ProviderRequest::Dhcp)
+            .await?
+            .ok_or(Errno::NOTSUP)?
+        {
+            ProviderReply::Acquired(_) => Ok(()),
+            _ => Err(wasixv2_abi::Errno::EPROTO.into()),
+        }
+    })
+    .await
+}
 
 const NETLINK_ROUTE: i32 = 0;
 const NLMSG_HDR: usize = 16;
@@ -312,7 +446,14 @@ pub(crate) async fn port_addr_list<S: Syscalls + Control + 'static>(
 ) -> Result<i32, RuntimeError> {
     shim::errno(&env, async |frame| {
         let room: u32 = frame.read(naddrs as u32).await?;
-        let list = addresses(&dump(frame, RTM_GETADDR, IFADDRMSG).await?);
+        let list = match provider(frame, ProviderRequest::Addresses).await? {
+            None => addresses(&dump(frame, RTM_GETADDR, IFADDRMSG).await?),
+            Some(ProviderReply::Addresses(list)) => list
+                .into_iter()
+                .map(|a| AddrCidr::new(a.ip, a.prefix))
+                .collect(),
+            _ => return Err(wasixv2_abi::Errno::EPROTO.into()),
+        };
         frame.write(naddrs as u32, &(list.len() as u32)).await?;
         if list.len() > room as usize {
             return shim::fail(Errno::OVERFLOW);
@@ -331,7 +472,12 @@ pub(crate) async fn port_mac<S: Syscalls + Control + 'static>(
     ro_mac: i32,
 ) -> Result<i32, RuntimeError> {
     shim::errno(&env, async |frame| {
-        let Some(octets) = mac(&dump(frame, RTM_GETLINK, IFINFOMSG).await?) else {
+        let octets = match provider(frame, ProviderRequest::Mac).await? {
+            None => mac(&dump(frame, RTM_GETLINK, IFINFOMSG).await?),
+            Some(ProviderReply::Mac(mac)) => Some(mac),
+            _ => return Err(wasixv2_abi::Errno::EPROTO.into()),
+        };
+        let Some(octets) = octets else {
             return shim::fail(Errno::NODEV);
         };
         frame
@@ -339,6 +485,29 @@ pub(crate) async fn port_mac<S: Syscalls + Control + 'static>(
             .await
     })
     .await
+}
+
+fn provider_route(route: ProviderRoute) -> Route {
+    let mut via = Addr::ZERO;
+    via.tag = if route.via_router.is_ipv4() {
+        Addressfamily::INET4
+    } else {
+        Addressfamily::INET6
+    };
+    let bytes = octets(route.via_router);
+    via.payload[..bytes.len()].copy_from_slice(&bytes);
+    let timestamp = |value: Option<u64>| {
+        value.map_or(OptionTimestamp::ZERO, |timestamp| OptionTimestamp {
+            tag: OptionTag::SOME,
+            timestamp,
+        })
+    };
+    Route {
+        cidr: AddrCidr::new(route.cidr.ip, route.cidr.prefix),
+        via_router: via,
+        preferred_until: timestamp(route.preferred_until),
+        expires_at: timestamp(route.expires_at),
+    }
 }
 
 fn routes(msgs: &[(u16, Vec<u8>)]) -> Vec<Route> {
@@ -381,6 +550,14 @@ pub(crate) async fn port_addr_add<S: Syscalls + Control + 'static>(
 ) -> Result<i32, RuntimeError> {
     shim::errno(&env, async |frame| {
         let (ip, prefix) = cidr(&frame.read(addr as u32).await?)?;
+        if let Some(reply) = provider(
+            frame,
+            ProviderRequest::AddAddress(ProviderCidr { ip, prefix }),
+        )
+        .await?
+        {
+            return provider_none(reply);
+        }
         let Some(index) = link(&dump(frame, RTM_GETLINK, IFINFOMSG).await?) else {
             return shim::fail(Errno::NODEV);
         };
@@ -421,7 +598,11 @@ pub(crate) async fn port_addr_remove<S: Syscalls + Control + 'static>(
 ) -> Result<i32, RuntimeError> {
     shim::errno(&env, async |frame| {
         let addr: Addr = frame.read(addr as u32).await?;
-        remove_addresses(frame, Some(v1_ip(addr.tag, &addr.payload)?)).await
+        let ip = v1_ip(addr.tag, &addr.payload)?;
+        if let Some(reply) = provider(frame, ProviderRequest::RemoveAddress(ip)).await? {
+            return provider_none(reply);
+        }
+        remove_addresses(frame, Some(ip)).await
     })
     .await
 }
@@ -429,7 +610,13 @@ pub(crate) async fn port_addr_remove<S: Syscalls + Control + 'static>(
 pub(crate) async fn port_addr_clear<S: Syscalls + Control + 'static>(
     env: Env<S>,
 ) -> Result<i32, RuntimeError> {
-    shim::errno(&env, async |frame| remove_addresses(frame, None).await).await
+    shim::errno(&env, async |frame| {
+        if let Some(reply) = provider(frame, ProviderRequest::ClearAddresses).await? {
+            return provider_none(reply);
+        }
+        remove_addresses(frame, None).await
+    })
+    .await
 }
 
 fn route_payload(dst: IpAddr, prefix: u8, gateway: IpAddr) -> V1Result<Vec<u8>> {
@@ -463,11 +650,10 @@ async fn add_route<S: Syscalls + Control + 'static>(
     change(frame, RTM_NEWROUTE, NLM_F_CREATE | NLM_F_REPLACE, &payload).await
 }
 
-fn lifetime(value: OptionTimestamp) -> V1Result<()> {
+fn lifetime(value: OptionTimestamp) -> V1Result<Option<u64>> {
     match value.tag {
-        OptionTag::NONE => Ok(()),
-        // Kernel routes have no expiry storage. Never acknowledge a discarded deadline.
-        OptionTag::SOME => shim::fail(Errno::NOTSUP),
+        OptionTag::NONE => Ok(None),
+        OptionTag::SOME => Ok(Some(value.timestamp)),
         _ => shim::fail(Errno::INVAL),
     }
 }
@@ -483,8 +669,24 @@ pub(crate) async fn port_route_add<S: Syscalls + Control + 'static>(
         let (dst, prefix) = cidr(&frame.read(addr as u32).await?)?;
         let via: Addr = frame.read(via as u32).await?;
         let gateway = v1_ip(via.tag, &via.payload)?;
-        lifetime(frame.read(preferred as u32).await?)?;
-        lifetime(frame.read(expires as u32).await?)?;
+        let preferred_until = lifetime(frame.read(preferred as u32).await?)?;
+        let expires_at = lifetime(frame.read(expires as u32).await?)?;
+        if let Some(reply) = provider(
+            frame,
+            ProviderRequest::AddRoute(ProviderRoute {
+                cidr: ProviderCidr { ip: dst, prefix },
+                via_router: gateway,
+                preferred_until,
+                expires_at,
+            }),
+        )
+        .await?
+        {
+            return provider_none(reply);
+        }
+        if preferred_until.is_some() || expires_at.is_some() {
+            return shim::fail(Errno::NOTSUP);
+        }
         add_route(frame, dst, prefix, gateway).await
     })
     .await
@@ -497,6 +699,9 @@ pub(crate) async fn port_gateway_set<S: Syscalls + Control + 'static>(
     shim::errno(&env, async |frame| {
         let addr: Addr = frame.read(addr as u32).await?;
         let gateway = v1_ip(addr.tag, &addr.payload)?;
+        if let Some(reply) = provider(frame, ProviderRequest::Gateway(gateway)).await? {
+            return provider_none(reply);
+        }
         let dst = ip(family(gateway), &[0; 16]).unwrap();
         add_route(frame, dst, 0, gateway).await
     })
@@ -528,7 +733,11 @@ pub(crate) async fn port_route_remove<S: Syscalls + Control + 'static>(
 ) -> Result<i32, RuntimeError> {
     shim::errno(&env, async |frame| {
         let addr: Addr = frame.read(addr as u32).await?;
-        remove_routes(frame, Some(v1_ip(addr.tag, &addr.payload)?)).await
+        let ip = v1_ip(addr.tag, &addr.payload)?;
+        if let Some(reply) = provider(frame, ProviderRequest::RemoveRoute(ip)).await? {
+            return provider_none(reply);
+        }
+        remove_routes(frame, Some(ip)).await
     })
     .await
 }
@@ -536,7 +745,13 @@ pub(crate) async fn port_route_remove<S: Syscalls + Control + 'static>(
 pub(crate) async fn port_route_clear<S: Syscalls + Control + 'static>(
     env: Env<S>,
 ) -> Result<i32, RuntimeError> {
-    shim::errno(&env, async |frame| remove_routes(frame, None).await).await
+    shim::errno(&env, async |frame| {
+        if let Some(reply) = provider(frame, ProviderRequest::ClearRoutes).await? {
+            return provider_none(reply);
+        }
+        remove_routes(frame, None).await
+    })
+    .await
 }
 
 pub(crate) async fn port_route_list<S: Syscalls + Control + 'static>(
@@ -546,7 +761,11 @@ pub(crate) async fn port_route_list<S: Syscalls + Control + 'static>(
 ) -> Result<i32, RuntimeError> {
     shim::errno(&env, async |frame| {
         let room: u32 = frame.read(count as u32).await?;
-        let list = routes(&dump(frame, RTM_GETROUTE, RTMSG).await?);
+        let list = match provider(frame, ProviderRequest::Routes).await? {
+            None => routes(&dump(frame, RTM_GETROUTE, RTMSG).await?),
+            Some(ProviderReply::Routes(routes)) => routes.into_iter().map(provider_route).collect(),
+            _ => return Err(wasixv2_abi::Errno::EPROTO.into()),
+        };
         frame.write(count as u32, &(list.len() as u32)).await?;
         if list.len() > room as usize {
             return shim::fail(Errno::OVERFLOW);

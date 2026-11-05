@@ -403,3 +403,94 @@ fn port_unreachable_record_preserves_destination_offender_and_quote() {
     trailing.push(0);
     assert!(codec::decode(&trailing).is_err());
 }
+
+#[test]
+fn provider_controls_match_original_classic_records_and_exact_deadlines() {
+    use wasixv2_vnet::provider::{
+        Cidr, Reply as ControlReply, Request as Control, Route, Security,
+    };
+    let ip = "2001:db8::4".parse().unwrap();
+    let via = "2001:db8::1".parse().unwrap();
+    let cidr = Cidr { ip, prefix: 64 };
+    let old_cidr = virtual_net::IpCidr { ip, prefix: 64 };
+    let route = Route {
+        cidr: cidr.clone(),
+        via_router: via,
+        preferred_until: Some(0),
+        expires_at: Some(u64::MAX),
+    };
+    let cases = vec![
+        (
+            Control::Bridge {
+                network: "tenant/example".into(),
+                token: "opaque token".into(),
+                security: Security::DoubleEncryption,
+            },
+            Op::Bridge {
+                network: "tenant/example".into(),
+                access_token: "opaque token".into(),
+                security: virtual_net::StreamSecurity::DoubleEncryption,
+            },
+        ),
+        (Control::Unbridge, Op::Unbridge),
+        (Control::Dhcp, Op::DhcpAcquire),
+        (Control::AddAddress(cidr), Op::IpAdd { ip, prefix: 64 }),
+        (Control::RemoveAddress(ip), Op::IpRemove(ip)),
+        (Control::ClearAddresses, Op::IpClear),
+        (Control::Addresses, Op::GetIpList),
+        (Control::Mac, Op::GetMac),
+        (Control::Gateway(via), Op::GatewaySet(via)),
+        (
+            Control::AddRoute(route.clone()),
+            Op::RouteAdd {
+                cidr: old_cidr,
+                via_router: via,
+                preferred_until: Some(Duration::ZERO),
+                expires_at: Some(Duration::from_nanos(u64::MAX)),
+            },
+        ),
+        (Control::RemoveRoute(ip), Op::RouteRemove(ip)),
+        (Control::ClearRoutes, Op::RouteClear),
+        (Control::Routes, Op::GetRouteList),
+    ];
+    for (operation, req) in cases {
+        assert_eq!(
+            codec::encode(&Command::Provider {
+                request: 37,
+                operation
+            })
+            .unwrap(),
+            packed(Request::Interface {
+                req,
+                req_id: Some(37)
+            })
+        );
+    }
+    for (res, expected) in [
+        (
+            Reply::Mac([2, 3, 4, 5, 6, 7]),
+            ControlReply::Mac([2, 3, 4, 5, 6, 7]),
+        ),
+        (
+            Reply::CidrList(vec![old_cidr]),
+            ControlReply::Addresses(vec![Cidr { ip, prefix: 64 }]),
+        ),
+        (
+            Reply::RouteList(vec![virtual_net::IpRoute {
+                cidr: old_cidr,
+                via_router: via,
+                preferred_until: Some(Duration::ZERO),
+                expires_at: Some(Duration::from_nanos(u64::MAX)),
+            }]),
+            ControlReply::Routes(vec![route]),
+        ),
+    ] {
+        match codec::decode(&packed(Response::ResponseToRequest { req_id: 37, res })).unwrap() {
+            Event::Provider { request, reply } => {
+                assert_eq!(request, 37);
+                assert_eq!(reply, expected);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+}
