@@ -25,6 +25,14 @@ Managers use native Sol 6.1 high implementors/reviewers and Luna max validators.
 Large designs require independent review. Validation runs serially against the
 integrated source tuple; a compile or placeholder is not a completed parity item.
 
+Delivered checkpoints: shared resolver/HTTP/downloader and resolved-command/package
+metadata are integrated; package tests pass (66). Configured-provider controls are
+integrated at runtime `6a216cca2d6` with WLK `2a99684cd671`: 228 component behavior
+tests and strict lint passed, followed by the integrated CLI journal check,
+22 compatibility net tests and 13 original-reference codec/relay tests. Generic
+package-volume mounting also passed 20 component tests. Full CLI/SDK consumer
+migration and the remaining stream requirements above are still open.
+
 ## Scope and snapshot
 
 The delivery goal is everything that worked in supported v1 profiles working well
@@ -161,9 +169,10 @@ They are not part of the checked raw SDK foundation or integration snapshot.
 
 ## Other required behavior and integration
 
-- [ ] Configured-provider bridge/unbridge/DHCP acquisition and route lifetimes.
-  Network access-policy rules are delivered; those do not provide these controls.
-  Use proper optional provider contracts and preserve authorization/error ordering.
+- [x] Configured-provider bridge/unbridge/DHCP acquisition and forwarding of the
+  existing provider route deadlines. Optional provider contracts preserve
+  authorization/error ordering and cancellation custody; unavailable providers
+  remain explicit. This does not claim additional Linux route-expiration semantics.
 - [ ] Correct coredump original-source function indices and instruction offsets
   through dynamic preparation and preemption before delivering trap dumps. Current
   observer/flag tests pass, but frames currently describe transformed code while
