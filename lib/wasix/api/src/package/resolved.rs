@@ -9,6 +9,7 @@ use std::{
 use crate::{Layer, Machine, OwnedBuffer};
 use wasmer_config::package::PackageId;
 use wasmer_package::{
+    commands::BinaryPackageCommand,
     loader::LoadedPackage,
     resolver::{ResolvedFileSystemMapping, ResolvedPackage},
 };
@@ -82,11 +83,30 @@ impl ResolvedLayout {
         root_is_local_dir: bool,
         provider: Option<&ResolvedReaderProvider<'_>>,
     ) -> io::Result<Self> {
+        Self::from_parts(
+            &package.resolution.package,
+            &package.containers,
+            &package.commands,
+            root_is_local_dir,
+            provider,
+        )
+    }
+
+    /// Prepare already-resolved container and command data without requiring the
+    /// dependency graph used during acquisition. Uses the same installation policy
+    /// as [`Self::new`].
+    pub fn from_parts(
+        package: &ResolvedPackage,
+        containers: &HashMap<PackageId, Container>,
+        commands: &[BinaryPackageCommand],
+        root_is_local_dir: bool,
+        provider: Option<&ResolvedReaderProvider<'_>>,
+    ) -> io::Result<Self> {
         let mut layout = Self::default();
         let mut identities: HashMap<&PackageId, Arc<()>> = HashMap::new();
         let mut volumes: HashMap<&PackageId, BTreeMap<String, Volume>> = HashMap::new();
-        for mapping in package.resolution.package.filesystem.iter().rev() {
-            if root_is_local_dir && mapping.package == package.resolution.package.root_package {
+        for mapping in package.filesystem.iter().rev() {
+            if root_is_local_dir && mapping.package == package.root_package {
                 continue;
             }
             let mount_path = mapping.mount_path.to_str().ok_or_else(|| {
@@ -101,7 +121,7 @@ impl ResolvedLayout {
                     mapping.package
                 )));
             }
-            let container = package.containers.get(&mapping.package).ok_or_else(|| {
+            let container = containers.get(&mapping.package).ok_or_else(|| {
                 super::invalid(&format!(
                     "the package \"{}\" is not in the dependency tree",
                     mapping.package
@@ -176,7 +196,7 @@ impl ResolvedLayout {
         layout
             .volumes
             .sort_by_key(|volume| Path::new(&volume.mount_path).components().count());
-        for command in &package.commands {
+        for command in commands {
             layout
                 .commands
                 .push((command.name().to_owned(), command.atom()));
