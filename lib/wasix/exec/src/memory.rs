@@ -39,10 +39,62 @@ use wasixv2_pages::SharedPages;
 #[cfg(all(unix, feature = "sys"))]
 use wasixv2_syscalls::Errno;
 use wasixv2_syscalls::{Fault, LocalFuture, PageAccess, UserMemory, copied};
+#[cfg(not(all(feature = "sys", not(target_arch = "wasm32"))))]
+use wasmer::SharedMemory;
 use wasmer::{
     AsStoreMut, AsStoreRef, AsyncFunctionEnvHandle, AsyncFunctionEnvMut, Instance, Memory,
-    SharedMemory,
 };
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+pub(crate) enum ForeignBacking {
+    Access(wasmer::sys::HostMemoryAccess),
+    // Preserve existing foreign copies for real shared memories whose custom
+    // wrapper or backing does not provide the stricter native access contract.
+    Shared(wasmer::SharedMemory),
+}
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+impl From<wasmer::sys::HostMemoryAccess> for ForeignBacking {
+    fn from(access: wasmer::sys::HostMemoryAccess) -> Self {
+        Self::Access(access)
+    }
+}
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+impl From<wasmer::SharedMemory> for ForeignBacking {
+    fn from(memory: wasmer::SharedMemory) -> Self {
+        Self::Shared(memory)
+    }
+}
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+impl ForeignBacking {
+    fn host_data(&self) -> Option<(*mut u8, u64)> {
+        match self {
+            Self::Access(memory) => memory.host_data(),
+            Self::Shared(memory) => memory.host_data(),
+        }
+    }
+    #[cfg(unix)]
+    fn begin_host_mapping_change(
+        &self,
+        range: Range<u64>,
+    ) -> Result<wasmer::sys::HostMemoryMappingChange, wasmer::MemoryError> {
+        match self {
+            Self::Access(memory) => memory.begin_host_mapping_change(range),
+            Self::Shared(memory) => memory.begin_host_mapping_change(range),
+        }
+    }
+    #[cfg(unix)]
+    unsafe fn commit_private_host_pin(
+        &self,
+        mapping: wasmer::sys::HostMemoryMappingChange,
+    ) -> Result<wasmer::sys::HostMemoryPin, wasmer::MemoryError> {
+        match self {
+            // SAFETY: the caller proves successful private replacement and metadata.
+            Self::Access(memory) => unsafe { memory.commit_private_host_pin(mapping) },
+            Self::Shared(memory) => unsafe { memory.commit_private_host_pin(mapping) },
+        }
+    }
+}
+#[cfg(not(all(feature = "sys", not(target_arch = "wasm32"))))]
+type ForeignBacking = SharedMemory;
 
 use crate::{
     ExecEnv,
@@ -608,6 +660,92 @@ impl<S> ExecEnv<S> {
     }
 }
 
+/// Attempts one host reservation using the exact borrowed Store. No borrowed
+/// future or memory capability escapes this call, including on Pending.
+/// This is the NoYield allocator path; ordinary managed reservations use
+/// GuestMemory and the existing native host-future transport instead.
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+pub fn poll_native_host_reservation<S: wasixv2_syscalls::LoaderControl + Send + Sync + 'static>(
+    env: &wasmer::FunctionEnv<ExecEnv<S>>,
+    store: &mut wasmer::StoreMut<'_>,
+    bytes: u32,
+) -> std::task::Poll<wasixv2_syscalls::SysResult<Box<dyn wasixv2_syscalls::HostMemoryLease>>> {
+    use std::cell::RefCell;
+    let (memory, layout, syscalls, task) = {
+        let data = env.as_ref(&*store);
+        let Some(memory) = data.memory.clone() else {
+            return std::task::Poll::Ready(Err(wasixv2_syscalls::Errno::ENOSYS.into()));
+        };
+        (
+            memory,
+            data.layout.clone(),
+            data.syscalls.clone(),
+            data.task,
+        )
+    };
+    let memory = ReservationMemory {
+        memory,
+        layout,
+        store: RefCell::new(store.as_store_mut()),
+    };
+    poll_borrowed_reservation(&*syscalls, task, &memory, bytes)
+}
+
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+fn poll_borrowed_reservation(
+    control: &impl wasixv2_syscalls::LoaderControl,
+    task: wasixv2_syscalls::TaskId,
+    memory: &dyn UserMemory,
+    bytes: u32,
+) -> std::task::Poll<wasixv2_syscalls::SysResult<Box<dyn wasixv2_syscalls::HostMemoryLease>>> {
+    use std::task::{Context, Waker};
+    let caller = wasixv2_syscalls::Caller::new(task, memory);
+    let mut future = control.loader_reserve_host(&caller, bytes, 65536);
+    let mut context = Context::from_waker(Waker::noop());
+    let result = future.as_mut().poll(&mut context);
+    // All cancellation/rollback finishes while the original Store borrow is
+    // still held. Pending is not retained, retried or migrated to another mode.
+    drop(future);
+    result
+}
+
+/// Only the operations used by allocate_host_range: layout, size and growth.
+/// It cannot be registered or returned. Payload copies fail closed; pinning is
+/// performed by loader_reserve_host on its existing protected ForeignMemory.
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+struct ReservationMemory<'a> {
+    memory: Memory,
+    layout: Option<wasixv2_syscalls::MemoryLayout>,
+    store: std::cell::RefCell<wasmer::StoreMut<'a>>,
+}
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+impl UserMemory for ReservationMemory<'_> {
+    fn layout(&self) -> LocalFuture<'_, Option<wasixv2_syscalls::MemoryLayout>> {
+        let layout = self.layout.clone();
+        Box::pin(async move { layout })
+    }
+    fn size(&self) -> LocalFuture<'_, u64> {
+        let size = self.memory.view(&*self.store.borrow()).data_size();
+        Box::pin(async move { size })
+    }
+    fn grow(&self, pages: u32) -> LocalFuture<'_, Option<u64>> {
+        // Same Memory::grow path as GuestMemory/OutsideMemory: same budget,
+        // stable mapping, callback guards and backend validation.
+        Box::pin(async move {
+            self.memory
+                .grow(&mut *self.store.borrow_mut(), pages)
+                .ok()
+                .map(|previous| previous.bytes().0 as u64)
+        })
+    }
+    fn read<'a>(&'a self, _: u32, _: &'a mut [u8]) -> LocalFuture<'a, Result<(), Fault>> {
+        Box::pin(async { Err(Fault) })
+    }
+    fn write<'a>(&'a self, _: u32, _: &'a [u8]) -> LocalFuture<'a, Result<(), Fault>> {
+        Box::pin(async { Err(Fault) })
+    }
+}
+
 /// The calling instance's linear memory, reached through its async function environment.
 pub struct GuestMemory<'a, S: 'static> {
     pub(crate) env: &'a AsyncFunctionEnvMut<ExecEnv<S>>,
@@ -925,29 +1063,15 @@ impl<S: Send + Sync + 'static> UserMemory for OutsideMemory<'_, '_, S> {
     }
 }
 
-/// A process's linear memory as other tasks reach it, from any host thread: the kernel's hold on
-/// an address space for `access_process_vm` (ptrace's `PEEKDATA`, `process_vm_readv`,
-/// `/proc/<pid>/mem`). Only a shared memory has one: it is not bound to the store of the
-/// thread that runs the guest, and copies through it run on the caller's host thread while the
-/// guest runs on its own.
-///
-/// In the browser, copies use a locally registered JS Memory or synchronously wait
-/// for the pure-JS memory-copy worker (C1); its timeout poisons the runtime. These
-/// calls never run on the page main thread. On native hosts copies use the memory
-/// host address directly, which is sound because:
-/// - the memory is one host mapping reserved to its maximum that never moves (a shared
-///   memory's static reservation), whose base and current size [`SharedMemory::host_data`]
-///   reads anew for every copy;
-/// - a shared memory never shrinks, so a range inside the size read before a copy stays inside
-///   the memory during it, and every copy is checked against that size first;
-/// - this handle holds the [`SharedMemory`], so the mapping outlives every copy through it;
-/// - writes stay out of the low guard and the read-only views, which the host may not write,
-///   holding the views' lock across the copy as [`write`] does.
-///
-/// The guest's threads may access the bytes at the same time, as they do each other's; Linux's
-/// `access_process_vm` gives no atomicity either.
+/// A process's linear memory as other tasks reach it, without borrowing its Store.
+/// Checked native backing retains static allocation access and current bounds;
+/// real shared memories also keep their existing foreign-access fallback. Private
+/// memory cannot attach to another Store or gain guest thread rights.
+/// Browser backing uses the existing shared-memory registration and copy worker.
+/// Copies preserve low-guard, read-only, page-access and frozen-image protections.
+/// Raw copies have the same guest synchronization requirements as MemoryView.
 pub(crate) struct ForeignMemory {
-    memory: SharedMemory,
+    memory: ForeignBacking,
     #[cfg(all(feature = "js", target_arch = "wasm32"))]
     browser: browser::Registration,
     /// The frozen image must remain a private view of its file when pages are cleared.
@@ -961,11 +1085,12 @@ pub(crate) struct ForeignMemory {
 
 impl ForeignMemory {
     pub(crate) fn new(
-        memory: SharedMemory,
+        memory: impl Into<ForeignBacking>,
         low_guard: u32,
         read_only: Arc<ReadOnly>,
         page_access: Option<Arc<PageAccess>>,
     ) -> Self {
+        let memory = memory.into();
         Self {
             #[cfg(all(feature = "js", target_arch = "wasm32"))]
             browser: browser::Registration::new(&memory),
@@ -1251,6 +1376,48 @@ fn copied_value<T: 'static>(result: T) -> LocalFuture<'static, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+    #[test]
+    fn borrowed_reservation_pending_drops_before_store_is_reused() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wasixv2_syscalls::{Caller, HostMemoryLease, LoaderControl, SysResult, TaskId};
+        struct Pending(Arc<AtomicUsize>);
+        impl LoaderControl for Pending {
+            fn loader_reserve_host<'a>(
+                &'a self,
+                _: &'a Caller<'_>,
+                _: u32,
+                _: u32,
+            ) -> LocalFuture<'a, SysResult<Box<dyn HostMemoryLease>>> {
+                struct DropCount(Arc<AtomicUsize>);
+                impl Drop for DropCount {
+                    fn drop(&mut self) {
+                        self.0.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+                let guard = DropCount(self.0.clone());
+                Box::pin(async move {
+                    let _guard = guard;
+                    std::future::pending().await
+                })
+            }
+        }
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut store = wasmer::Store::default();
+        let memory = Memory::new(&mut store, wasmer::MemoryType::new(1, Some(4), true)).unwrap();
+        let borrowed = ReservationMemory {
+            memory: memory.clone(),
+            layout: None,
+            store: std::cell::RefCell::new(store.as_store_mut()),
+        };
+        let result =
+            poll_borrowed_reservation(&Pending(drops.clone()), TaskId(1), &borrowed, 65536);
+        assert!(result.is_pending());
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        drop(borrowed);
+        assert_eq!(memory.grow(&mut store, 1).unwrap().0, 1);
+    }
 
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
     #[cfg_attr(not(target_arch = "wasm32"), test)]
@@ -1624,7 +1791,12 @@ mod tests {
         // assume this range stayed private, even though its allocation is alive.
         drop(shared.begin_host_mapping_change(PAGE..2 * PAGE).unwrap());
         assert!(shared.pin_host_range(PAGE..2 * PAGE).is_err());
-        let remote = ForeignMemory::new(shared.clone(), 0, Arc::new(ReadOnly::default()), None);
+        let remote = ForeignMemory::new(
+            shared.host_memory_access().unwrap(),
+            0,
+            Arc::new(ReadOnly::default()),
+            None,
+        );
         // SAFETY: this test exclusively owns a whole private logical page, with
         // no mapping/object or retained host consumer; only its provenance is unknown.
         let pin = unsafe { remote.pin_private_host_range(PAGE as u32, PAGE) }.unwrap();
@@ -1679,7 +1851,12 @@ mod tests {
             zero_pages(&sibling, (0, &read_only, None), &store, PAGE as u32, PAGE),
             Err(Fault)
         );
-        let remote = ForeignMemory::new(shared.clone(), 0, Arc::new(ReadOnly::default()), None);
+        let remote = ForeignMemory::new(
+            shared.host_memory_access().unwrap(),
+            0,
+            Arc::new(ReadOnly::default()),
+            None,
+        );
         assert_eq!(remote.discard_pages(PAGE as u32, PAGE), Err(Fault));
         assert_eq!(memory.view(&store).read_u8(PAGE).unwrap(), 42);
         assert!(sibling.reset(&mut store).is_err());
@@ -1846,7 +2023,7 @@ mod tests {
         memory.grow(&mut store, 1).unwrap();
         let read_only = Arc::<ReadOnly>::default();
         let foreign = ForeignMemory::new(
-            memory.as_shared(&store).unwrap(),
+            memory.host_memory_access(&store).unwrap(),
             PAGE,
             read_only.clone(),
             None,
@@ -1930,55 +2107,61 @@ mod tests {
         use futures::executor::block_on;
         use wasmer::{MemoryType, Store};
 
-        const PAGE: u32 = 65536;
-        let mut store = Store::default();
-        let memory = Memory::new(&mut store, MemoryType::new(2, Some(4), true)).unwrap();
-        let shared = memory.as_shared(&store).unwrap();
-        let read_only = Arc::<ReadOnly>::default();
-        read_only
-            .ranges_mut()
-            .push(u64::from(PAGE + 0x100)..u64::from(PAGE + 0x200));
-        let access = Arc::new(PageAccess::default());
-        let foreign = Arc::new(ForeignMemory::new(shared, 0x1000, read_only, Some(access)));
-        memory.view(&store).write(0x2000, b"guest").unwrap();
+        for (shared, checked) in [(false, true), (true, true), (true, false)] {
+            const PAGE: u32 = 65536;
+            let mut store = Store::default();
+            let memory = Memory::new(&mut store, MemoryType::new(2, Some(4), shared)).unwrap();
+            let backing = if checked {
+                ForeignBacking::Access(memory.host_memory_access(&store).unwrap())
+            } else {
+                ForeignBacking::Shared(memory.as_shared(&store).unwrap())
+            };
+            let read_only = Arc::<ReadOnly>::default();
+            read_only
+                .ranges_mut()
+                .push(u64::from(PAGE + 0x100)..u64::from(PAGE + 0x200));
+            let access = Arc::new(PageAccess::default());
+            let foreign = Arc::new(ForeignMemory::new(backing, 0x1000, read_only, Some(access)));
+            memory.view(&store).write(0x2000, b"guest").unwrap();
 
-        let remote = foreign.clone();
-        let read = std::thread::spawn(move || {
-            let mut buf = [0; 5];
-            block_on(remote.read(0x2000, &mut buf)).map(|()| buf)
-        });
-        assert_eq!(read.join().unwrap(), Ok(*b"guest"));
+            let remote = foreign.clone();
+            let read = std::thread::spawn(move || {
+                let mut buf = [0; 5];
+                block_on(remote.read(0x2000, &mut buf)).map(|()| buf)
+            });
+            assert_eq!(read.join().unwrap(), Ok(*b"guest"));
 
-        assert_eq!(block_on(foreign.write(0x3000, b"poke")), Ok(()));
-        let mut back = [0; 4];
-        memory.view(&store).read(0x3000, &mut back).unwrap();
-        assert_eq!(&back, b"poke");
+            assert_eq!(block_on(foreign.write(0x3000, b"poke")), Ok(()));
+            let mut back = [0; 4];
+            memory.view(&store).read(0x3000, &mut back).unwrap();
+            assert_eq!(&back, b"poke");
 
-        let mut buf = [0; 8];
-        let end = 2 * PAGE - 4;
-        assert_eq!(
-            block_on(foreign.read(end, &mut buf)),
-            Err(Fault),
-            "past the end"
-        );
-        assert_eq!(block_on(foreign.size()), u64::from(2 * PAGE));
-        assert_eq!(block_on(foreign.write(0x10, b"x")), Err(Fault), "the guard");
-        assert_eq!(
-            block_on(foreign.force_write(PAGE + 0x180, b"x")),
-            Err(Fault),
-            "read-only view"
-        );
-        assert_eq!(
-            block_on(foreign.read(0x10, &mut buf)),
-            Err(Fault),
-            "ordinary user copies cannot read the low guard"
-        );
-        assert_eq!(block_on(foreign.force_read(0x10, &mut buf)), Ok(()));
-        assert_eq!(block_on(foreign.read(0x10, &mut [])), Ok(()));
-        assert_eq!(block_on(foreign.grow(1)), None);
+            let mut buf = [0; 8];
+            let end = 2 * PAGE - 4;
+            assert_eq!(
+                block_on(foreign.read(end, &mut buf)),
+                Err(Fault),
+                "past the end"
+            );
+            assert_eq!(block_on(foreign.size()), u64::from(2 * PAGE));
+            assert_eq!(block_on(foreign.write(0x10, b"x")), Err(Fault), "the guard");
+            assert_eq!(
+                block_on(foreign.force_write(PAGE + 0x180, b"x")),
+                Err(Fault),
+                "read-only view"
+            );
+            assert_eq!(
+                block_on(foreign.read(0x10, &mut buf)),
+                Err(Fault),
+                "ordinary user copies cannot read the low guard"
+            );
+            assert_eq!(block_on(foreign.force_read(0x10, &mut buf)), Ok(()));
+            assert_eq!(block_on(foreign.read(0x10, &mut [])), Ok(()));
+            assert_eq!(block_on(foreign.grow(1)), None);
 
-        // Growing shows the new pages to the handle.
-        memory.grow(&mut store, 1).unwrap();
-        assert_eq!(block_on(foreign.read(end, &mut buf)), Ok(()));
+            // Growing shows the new pages to the handle.
+            memory.grow(&mut store, 1).unwrap();
+            assert_eq!(block_on(foreign.read(end, &mut buf)), Ok(()));
+        }
     }
 }

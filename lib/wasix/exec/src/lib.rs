@@ -48,6 +48,8 @@ pub use instantiation::{
 };
 pub use loader::{Compile, LoadError, Loader};
 pub use memory::GuestMemory;
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+pub use memory::poll_native_host_reservation;
 pub use preempt::InstrumentError;
 pub use preparation::Preparation;
 pub use process::VFORK_RETURN;
@@ -1057,11 +1059,19 @@ where
             None => abi.bind(&instance, &mut store, task, Role::Process)?,
         };
         let shared = memory.as_shared(&store);
-        if let Some(shared) = &shared {
+        #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+        let foreign = memory
+            .host_memory_access(&store)
+            .ok()
+            .map(memory::ForeignBacking::Access)
+            .or_else(|| shared.clone().map(memory::ForeignBacking::Shared));
+        #[cfg(not(all(feature = "sys", not(target_arch = "wasm32"))))]
+        let foreign = shared.clone();
+        if let Some(foreign) = foreign {
             // Browser C1 posts registration here before attachment; foreign requests
             // may complete through the independent JS copy worker without a readiness ack.
             let foreign = memory::ForeignMemory::new(
-                shared.clone(),
+                foreign,
                 low_guard,
                 read_only.clone(),
                 syscalls.page_access(task),
