@@ -5,6 +5,9 @@
 #[cfg(feature = "host-net")]
 pub mod host;
 pub mod meta;
+// Keep original shared client/optional transport helpers without changing their source bytes.
+// This server-only reference profile deliberately leaves those helpers unused.
+#[allow(dead_code, unused_imports)]
 #[cfg(feature = "remote")]
 pub mod rx_tx;
 #[cfg(feature = "remote")]

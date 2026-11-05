@@ -19,7 +19,10 @@ selector behavior is retained. No wire tag, serialization layout, server dispatc
 ACK, socket readiness, queue or EOF behavior has been replaced with a mock.
 
 The test-only manifests keep only dependencies and features needed for that
-profile. Original disabled optional transport/archive cfgs remain in the source
+profile. The `rx_tx` module declaration permits only `dead_code` and
+`unused_imports`: the original shared client/optional transport helpers remain
+intentionally unused in this server-only profile. Its source bytes and digest are
+unchanged; runtime and adapter crates retain their ordinary strict lint gates. Original disabled optional transport/archive cfgs remain in the source
 and are declared as expected cfg names without offering those fixture features.
 This fixture deliberately preserves original protocol defects so the existing
 reference tests continue to expose them. It permits retiring the old production

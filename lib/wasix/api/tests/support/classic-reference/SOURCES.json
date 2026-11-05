@@ -6,7 +6,7 @@
       "original": "lib/virtual-net/src/lib.rs",
       "fixture": "classic-reference/src/lib.rs",
       "sha256_original": "0837ee5b2940a8b564095e026ce84d16ee657b262f5ba48b16d2e06487a9ec01",
-      "sha256_fixture": "595e3daa17e4c843d07564d619193dfd41643f8a4596e4e3fe5643a3da35c958"
+      "sha256_fixture": "f520d1308a4cef862c72e830e98b6681218bc4b8695156bdc9e66ad6907c27bf"
     },
     {
       "original": "lib/virtual-net/src/meta.rs",
