@@ -3,7 +3,7 @@ use std::{
     collections::{HashMap, HashSet},
     io::{ErrorKind, Read, Write as _},
     path::PathBuf,
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
 };
 
 use crate::{
@@ -21,11 +21,184 @@ use webc::DetectError;
 use webc::{Container, ContainerError};
 
 use crate::{
-    http::{HttpClient, HttpRequest, USER_AGENT},
+    http::{HttpBodyEvent, HttpClient, HttpRequest, USER_AGENT},
     resolver::{
         DependencyGraph, DistributionInfo, PackageSummary, Resolution, ResolvedPackage, WebcHash,
     },
 };
+
+/// Acquisition phases. `Ready` is emitted only after a container loads successfully.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PackageDownloadPhase {
+    Downloading,
+    Loading,
+    Ready,
+}
+
+/// A snapshot of decoded package-body bytes, not encoded HTTP transfer bytes.
+/// Cache hits and local files contribute zero. An opaque/archive body whose decoded
+/// size is unavailable retains `0`/`None`, including after a successful load.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PackageDownloadProgress {
+    pub phase: PackageDownloadPhase,
+    pub downloaded_bytes: u64,
+    pub total_bytes: Option<u64>,
+    pub cached: bool,
+}
+
+pub type PackageDownloadObserver = Arc<dyn Fn(PackageDownloadProgress) + Send + Sync>;
+
+struct BodyProgress {
+    snapshot: PackageDownloadProgress,
+    identity: bool,
+    total: Option<u64>,
+    received: u64,
+    prefix: [u8; 8],
+    prefix_len: usize,
+    raw_webc: bool,
+}
+
+struct DownloadProgress {
+    observer: PackageDownloadObserver,
+    state: Mutex<BodyProgress>,
+}
+
+fn raw_webc(prefix: &[u8]) -> bool {
+    matches!(
+        webc::detect(prefix),
+        Ok(webc::Version::V1 | webc::Version::V2 | webc::Version::V3)
+    )
+}
+
+impl DownloadProgress {
+    fn new(observer: PackageDownloadObserver) -> Self {
+        Self {
+            observer,
+            state: Mutex::new(BodyProgress {
+                snapshot: PackageDownloadProgress {
+                    phase: PackageDownloadPhase::Downloading,
+                    downloaded_bytes: 0,
+                    total_bytes: None,
+                    cached: false,
+                },
+                identity: false,
+                total: None,
+                received: 0,
+                prefix: [0; 8],
+                prefix_len: 0,
+                raw_webc: false,
+            }),
+        }
+    }
+
+    fn update(&self, update: impl FnOnce(&mut BodyProgress) -> bool) {
+        let snapshot = {
+            let mut state = self.state.lock().unwrap();
+            update(&mut state).then(|| state.snapshot.clone())
+        };
+        // Embedders may reenter acquisition/cache APIs from the callback.
+        if let Some(snapshot) = snapshot {
+            (self.observer)(snapshot);
+        }
+    }
+
+    fn body(&self, event: HttpBodyEvent<'_>) {
+        self.update(|state| match event {
+            HttpBodyEvent::Head {
+                status,
+                headers,
+                cached,
+            } => {
+                state.identity = !status.is_client_error()
+                    && !status.is_server_error()
+                    && headers
+                        .get(http::header::CONTENT_ENCODING)
+                        .is_none_or(|encoding| {
+                            encoding.to_str().ok().is_some_and(|encoding| {
+                                encoding.split(',').all(|part| {
+                                    matches!(
+                                        part.trim().to_ascii_lowercase().as_str(),
+                                        "" | "identity"
+                                    )
+                                })
+                            })
+                        });
+                state.total = crate::http::content_length(headers);
+                state.received = 0;
+                state.prefix_len = 0;
+                state.raw_webc = false;
+                state.snapshot.cached = cached;
+                state.snapshot.downloaded_bytes = 0;
+                state.snapshot.total_bytes = if cached { Some(0) } else { None };
+                true
+            }
+            HttpBodyEvent::Chunk(chunk) => {
+                if !state.identity || state.snapshot.cached {
+                    return false;
+                }
+                state.received = state.received.saturating_add(chunk.len() as u64);
+                let take = (state.prefix.len() - state.prefix_len).min(chunk.len());
+                state.prefix[state.prefix_len..state.prefix_len + take]
+                    .copy_from_slice(&chunk[..take]);
+                state.prefix_len += take;
+                if state.prefix_len == state.prefix.len() {
+                    state.raw_webc = raw_webc(&state.prefix);
+                }
+                if !state.raw_webc {
+                    return false;
+                }
+                state.snapshot.downloaded_bytes = state.received;
+                state.snapshot.total_bytes = state.total.filter(|total| *total >= state.received);
+                true
+            }
+        });
+    }
+
+    fn decoded(&self, body: &[u8]) {
+        self.update(|state| {
+            if state.snapshot.cached {
+                state.snapshot.downloaded_bytes = 0;
+                state.snapshot.total_bytes = Some(0);
+            } else if raw_webc(body) {
+                state.snapshot.downloaded_bytes = body.len() as u64;
+                state.snapshot.total_bytes = Some(body.len() as u64);
+            } else {
+                // Container-wrapper decoding belongs to from_bytes; it exposes no
+                // decoded length. Never report the encoded wrapper length as progress.
+                state.snapshot.downloaded_bytes = 0;
+                state.snapshot.total_bytes = None;
+            }
+            true
+        });
+    }
+
+    fn local(&self) {
+        self.update(|state| {
+            state.snapshot.downloaded_bytes = 0;
+            state.snapshot.total_bytes = Some(0);
+            true
+        });
+    }
+
+    fn phase(&self, phase: PackageDownloadPhase) {
+        self.update(|state| {
+            state.snapshot.phase = phase;
+            true
+        });
+    }
+
+    fn cached(&self) {
+        self.update(|state| {
+            state.snapshot = PackageDownloadProgress {
+                phase: PackageDownloadPhase::Ready,
+                downloaded_bytes: 0,
+                total_bytes: Some(0),
+                cached: true,
+            };
+            true
+        });
+    }
+}
 
 /// Downloads package containers through an embedder's HTTP client and caches.
 /// Dependency resolution and guest execution are separate concerns.
@@ -270,7 +443,11 @@ impl PackageDownloader {
     }
 
     #[tracing::instrument(target = "wasmer_wasix::runtime::package_loader::builtin_loader", level = "debug", skip_all, fields(%dist.webc, %dist.webc_sha256))]
-    async fn download(&self, dist: &DistributionInfo) -> Result<Bytes, Error> {
+    async fn download(
+        &self,
+        dist: &DistributionInfo,
+        progress: Option<&Arc<DownloadProgress>>,
+    ) -> Result<Bytes, Error> {
         if dist.webc.scheme() == "file" {
             match crate::resolver::utils::file_path_from_url(&dist.webc) {
                 Ok(path) => {
@@ -284,6 +461,9 @@ impl PackageDownloader {
                     let bytes = bytes::Bytes::from(bytes);
 
                     Self::validate_hash(&bytes, self.hash_validation, dist).await?;
+                    if let Some(progress) = progress {
+                        progress.local();
+                    }
 
                     return Ok(bytes);
                 }
@@ -308,7 +488,15 @@ impl PackageDownloader {
         tracing::event!(target: "wasmer_wasix::runtime::package_loader::builtin_loader", tracing::Level::DEBUG, %request.url, %request.method, "webc_package_download_start");
         tracing::event!(target: "wasmer_wasix::runtime::package_loader::builtin_loader", tracing::Level::TRACE, ?request.headers);
 
-        let response = self.client.request(request).await?;
+        let response = if let Some(progress) = progress {
+            progress.phase(PackageDownloadPhase::Downloading);
+            let progress = progress.clone();
+            self.client
+                .request_with_body_progress(request, Arc::new(move |event| progress.body(event)))
+                .await?
+        } else {
+            self.client.request(request).await?
+        };
 
         tracing::event!(target: "wasmer_wasix::runtime::package_loader::builtin_loader", tracing::Level::TRACE,
             %response.status,
@@ -334,6 +522,9 @@ impl PackageDownloader {
         tracing::event!(target: "wasmer_wasix::runtime::package_loader::builtin_loader", tracing::Level::DEBUG, %url, "package_download_succeeded");
 
         let body = bytes::Bytes::from(body);
+        if let Some(progress) = progress {
+            progress.decoded(&body);
+        }
 
         Self::validate_hash(&body, self.hash_validation, dist).await?;
 
@@ -440,16 +631,36 @@ impl PackageDownloader {
         ),
     )]
     pub async fn load(&self, summary: &PackageSummary) -> Result<Container, Error> {
+        self.load_with_progress(summary, None).await
+    }
+
+    /// Observe acquisition without changing cache, validation, or parsing policy.
+    /// Dropping the future during HTTP stops this load from advancing to Loading/Ready.
+    /// Already-started blocking cache work and custom cache/provider effects retain their
+    /// existing lifetime; this API does not promise cancellation of their publication.
+    pub async fn load_with_progress(
+        &self,
+        summary: &PackageSummary,
+        progress: Option<PackageDownloadObserver>,
+    ) -> Result<Container, Error> {
+        let progress = progress.map(|observer| Arc::new(DownloadProgress::new(observer)));
         if let Some(container) = self.get_cached(&summary.dist.webc_sha256).await? {
             tracing::event!(target: "wasmer_wasix::runtime::package_loader::builtin_loader", tracing::Level::DEBUG, "Cache hit!");
+            if let Some(progress) = &progress {
+                progress.cached();
+            }
             return Ok(container);
         }
 
         // looks like we had a cache miss and need to download it manually
         let bytes = self
-            .download(&summary.dist)
+            .download(&summary.dist, progress.as_ref())
             .await
             .with_context(|| format!("Unable to download \"{}\"", summary.dist.webc))?;
+
+        if let Some(progress) = &progress {
+            progress.phase(PackageDownloadPhase::Loading);
+        }
 
         // We want to cache the container we downloaded, but we want to do it
         // in a smart way to keep memory usage down.
@@ -463,6 +674,9 @@ impl PackageDownloader {
                     }
                     // The happy path - we've saved to both caches and loaded the
                     // container from disk (hopefully using mmap) so we're done.
+                    if let Some(progress) = &progress {
+                        progress.phase(PackageDownloadPhase::Ready);
+                    }
                     return Ok(container);
                 }
                 Err(e) => {
@@ -483,6 +697,9 @@ impl PackageDownloader {
         if let Some(in_memory) = &self.in_memory {
             // We still want to cache it in memory, of course
             in_memory.save(&container, summary.dist.webc_sha256);
+        }
+        if let Some(progress) = &progress {
+            progress.phase(PackageDownloadPhase::Ready);
         }
         Ok(container)
     }
@@ -1372,6 +1589,483 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(state, 1);
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    mod progress {
+        use super::*;
+        use crate::http::{HttpBodyObserver, HttpResponse};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        #[derive(Debug)]
+        struct BodyClient {
+            body: Vec<u8>,
+            headers: HeaderMap,
+            status: StatusCode,
+            cached: bool,
+            stall: bool,
+            fail: bool,
+            returned: AtomicBool,
+            dropped: Arc<AtomicBool>,
+        }
+
+        impl BodyClient {
+            fn new(body: Vec<u8>, headers: HeaderMap) -> Arc<Self> {
+                Arc::new(Self {
+                    body,
+                    headers,
+                    status: StatusCode::OK,
+                    cached: false,
+                    stall: false,
+                    fail: false,
+                    returned: AtomicBool::new(false),
+                    dropped: Arc::default(),
+                })
+            }
+            fn response(&self) -> HttpResponse {
+                HttpResponse {
+                    body: Some(self.body.clone()),
+                    headers: self.headers.clone(),
+                    status: self.status,
+                    redirected: false,
+                }
+            }
+        }
+
+        impl HttpClient for BodyClient {
+            fn request(&self, _: HttpRequest) -> BoxFuture<'_, Result<HttpResponse, Error>> {
+                Box::pin(async move {
+                    if self.fail {
+                        bail!("body stream failed");
+                    }
+                    Ok(self.response())
+                })
+            }
+            fn request_with_body_progress(
+                &self,
+                _: HttpRequest,
+                progress: HttpBodyObserver,
+            ) -> BoxFuture<'_, Result<HttpResponse, Error>> {
+                Box::pin(async move {
+                    struct Dropped(Arc<AtomicBool>);
+                    impl Drop for Dropped {
+                        fn drop(&mut self) {
+                            self.0.store(true, Ordering::SeqCst);
+                        }
+                    }
+                    let _guard = Dropped(self.dropped.clone());
+                    progress(HttpBodyEvent::Head {
+                        status: self.status,
+                        headers: &self.headers,
+                        cached: self.cached,
+                    });
+                    // Split the WEBC format prefix across chunks, not just the payload.
+                    for chunk in self.body.chunks(5) {
+                        progress(HttpBodyEvent::Chunk(chunk));
+                    }
+                    if self.stall {
+                        futures::future::pending::<()>().await;
+                    }
+                    if self.fail {
+                        bail!("body stream failed");
+                    }
+                    self.returned.store(true, Ordering::SeqCst);
+                    Ok(self.response())
+                })
+            }
+        }
+
+        fn webc() -> Vec<u8> {
+            use webc::v3::{ChecksumAlgorithm, SignatureAlgorithm, write::Writer};
+            Writer::new(ChecksumAlgorithm::Sha256)
+                .write_manifest(&webc::metadata::Manifest::default())
+                .unwrap()
+                .write_atoms(Default::default())
+                .unwrap()
+                .finish(SignatureAlgorithm::None)
+                .unwrap()
+                .to_vec()
+        }
+
+        fn summary(body: &[u8]) -> PackageSummary {
+            PackageSummary {
+                pkg: PackageInfo {
+                    id: PackageId::new_named("test/progress", "1.0.0".parse().unwrap()),
+                    dependencies: Vec::new(),
+                    commands: Vec::new(),
+                    entrypoint: None,
+                    filesystem: Vec::new(),
+                },
+                dist: DistributionInfo {
+                    webc: "https://example.test/package.webc".parse().unwrap(),
+                    webc_sha256: WebcHash::sha256(body),
+                },
+            }
+        }
+
+        type Events = Arc<Mutex<Vec<(bool, PackageDownloadProgress)>>>;
+        fn observe(client: &Arc<BodyClient>) -> (Events, PackageDownloadObserver) {
+            let events: Events = Arc::default();
+            let captured = events.clone();
+            let client = client.clone();
+            let observer = Arc::new(move |event| {
+                captured
+                    .lock()
+                    .unwrap()
+                    .push((client.returned.load(Ordering::SeqCst), event));
+            });
+            (events, observer)
+        }
+
+        fn gzip(body: &[u8]) -> Vec<u8> {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(body).unwrap();
+            encoder.finish().unwrap()
+        }
+
+        #[tokio::test]
+        async fn raw_webc_progress_uses_actual_chunks_and_known_or_unknown_totals() {
+            let body = webc();
+            for known in [false, true] {
+                let mut headers = HeaderMap::new();
+                if known {
+                    headers.insert(http::header::CONTENT_LENGTH, body.len().into());
+                }
+                let client = BodyClient::new(body.clone(), headers);
+                let (events, observer) = observe(&client);
+                PackageDownloader::new(client)
+                    .load_with_progress(&summary(&body), Some(observer))
+                    .await
+                    .unwrap();
+                let events = events.lock().unwrap();
+                let during: Vec<_> = events
+                    .iter()
+                    .filter(|(returned, p)| !returned && p.downloaded_bytes > 0)
+                    .map(|(_, p)| p)
+                    .collect();
+                assert!(during.len() > 1);
+                assert_eq!(
+                    during[0].downloaded_bytes, 10,
+                    "first five bytes cannot identify a raw WEBC"
+                );
+                for progress in &during {
+                    assert_eq!(progress.phase, PackageDownloadPhase::Downloading);
+                    assert_eq!(progress.total_bytes, known.then_some(body.len() as u64));
+                }
+                assert_eq!(during.last().unwrap().downloaded_bytes, body.len() as u64);
+                assert_eq!(
+                    events.last().unwrap().1,
+                    PackageDownloadProgress {
+                        phase: PackageDownloadPhase::Ready,
+                        downloaded_bytes: body.len() as u64,
+                        total_bytes: Some(body.len() as u64),
+                        cached: false,
+                    }
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn declared_compression_counts_only_the_existing_decoders_output() {
+            let body = webc();
+            for (encoding, encoded) in [
+                ("gzip", gzip(&body)),
+                (
+                    "zstd",
+                    zstd::stream::encode_all(body.as_slice(), 0).unwrap(),
+                ),
+                (
+                    "gzip, zstd",
+                    zstd::stream::encode_all(gzip(&body).as_slice(), 0).unwrap(),
+                ),
+            ] {
+                let mut headers = headers_with_encoding(Some(encoding));
+                headers.insert(http::header::CONTENT_LENGTH, encoded.len().into());
+                let client = BodyClient::new(encoded.clone(), headers);
+                let (events, observer) = observe(&client);
+                PackageDownloader::new(client)
+                    .load_with_progress(&summary(&body), Some(observer))
+                    .await
+                    .unwrap();
+                let events = events.lock().unwrap();
+                assert!(
+                    events
+                        .iter()
+                        .filter(|(returned, _)| !returned)
+                        .all(|(_, p)| p.downloaded_bytes == 0 && p.total_bytes.is_none())
+                );
+                let ready = &events.last().unwrap().1;
+                assert_eq!(ready.phase, PackageDownloadPhase::Ready);
+                assert_eq!(ready.downloaded_bytes, body.len() as u64);
+                assert_eq!(ready.total_bytes, Some(body.len() as u64));
+            }
+        }
+
+        #[tokio::test]
+        async fn unknown_wrappers_bad_headers_and_failures_never_invent_decoded_bytes_or_ready() {
+            let raw = webc();
+            let mut bad_status = BodyClient::new(raw.clone(), headers_with_encoding(Some("gzip")));
+            Arc::get_mut(&mut bad_status).unwrap().status = StatusCode::BAD_GATEWAY;
+            let mut stream_failure = BodyClient::new(raw.clone(), HeaderMap::new());
+            Arc::get_mut(&mut stream_failure).unwrap().fail = true;
+            let clients = [
+                BodyClient::new(gzip(&raw), HeaderMap::new()),
+                BodyClient::new(
+                    zstd::stream::encode_all(raw.as_slice(), 0).unwrap(),
+                    HeaderMap::new(),
+                ),
+                BodyClient::new(gzip(&gzip(&raw)), headers_with_encoding(Some("gzip"))),
+                BodyClient::new(raw.clone(), headers_with_encoding(Some("unknown"))),
+                BodyClient::new(raw.clone(), headers_with_raw_encoding(&[0xff])),
+                BodyClient::new(b"opaque unknown container".to_vec(), HeaderMap::new()),
+                bad_status,
+            ];
+            for client in clients {
+                let (events, observer) = observe(&client);
+                let downloader = PackageDownloader::new(client);
+                let summary = summary(&raw);
+                let observed = downloader
+                    .load_with_progress(&summary, Some(observer))
+                    .await
+                    .unwrap_err();
+                let unobserved = downloader.load(&summary).await.unwrap_err();
+                assert_eq!(format!("{observed:#}"), format!("{unobserved:#}"));
+                assert!(
+                    events
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .all(|(_, p)| p.downloaded_bytes == 0
+                            && p.total_bytes.is_none()
+                            && p.phase != PackageDownloadPhase::Ready)
+                );
+            }
+            // Failures after a recognizable raw prefix can report genuine bytes,
+            // but only a successfully parsed container may become Ready.
+            for (client, hash_failure) in [
+                (stream_failure, false),
+                (
+                    BodyClient::new(b"\0webc003bad container".to_vec(), HeaderMap::new()),
+                    false,
+                ),
+                (BodyClient::new(raw.clone(), HeaderMap::new()), true),
+            ] {
+                let (events, observer) = observe(&client);
+                let mut summary = summary(&client.body);
+                let downloader = PackageDownloader::new(client)
+                    .with_hash_validation_mode(HashIntegrityValidationMode::FailOnHashMismatch);
+                if hash_failure {
+                    summary.dist.webc_sha256 = [0xaa; 32].into();
+                }
+                assert!(
+                    downloader
+                        .load_with_progress(&summary, Some(observer))
+                        .await
+                        .is_err()
+                );
+                assert!(
+                    events
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .all(|(_, p)| p.phase != PackageDownloadPhase::Ready)
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn local_and_memory_or_persistent_cache_hits_contribute_zero_download_bytes() {
+            let body = webc();
+            let summary = summary(&body);
+            let cache = TempDir::new().unwrap();
+            let client = BodyClient::new(body.clone(), HeaderMap::new());
+            let downloader =
+                Arc::new(PackageDownloader::new(client.clone()).with_cache_dir(cache.path()));
+            downloader.load(&summary).await.unwrap();
+            for loader in [
+                downloader.clone(),
+                Arc::new(PackageDownloader::new(client.clone()).with_cache_dir(cache.path())),
+            ] {
+                let events: Arc<Mutex<Vec<_>>> = Arc::default();
+                let captured = events.clone();
+                let reentrant = loader.clone();
+                let summary = summary.clone();
+                let hash = summary.dist.webc_sha256;
+                loader
+                    .load_with_progress(
+                        &summary,
+                        Some(Arc::new(move |progress| {
+                            // This takes the cache write lock: observer calls are outside it.
+                            reentrant.evict_cached(&hash);
+                            captured.lock().unwrap().push(progress);
+                        })),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    *events.lock().unwrap(),
+                    [PackageDownloadProgress {
+                        phase: PackageDownloadPhase::Ready,
+                        downloaded_bytes: 0,
+                        total_bytes: Some(0),
+                        cached: true,
+                    }]
+                );
+            }
+            let file = cache.path().join("local.webc");
+            std::fs::write(&file, &body).unwrap();
+            let mut local = summary.clone();
+            local.dist.webc = Url::from_file_path(&file).unwrap();
+            let (events, observer) = observe(&client);
+            PackageDownloader::new(client)
+                .load_with_progress(&local, Some(observer))
+                .await
+                .unwrap();
+            assert!(
+                events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|(_, p)| p.downloaded_bytes == 0 && p.total_bytes == Some(0))
+            );
+        }
+
+        #[tokio::test]
+        async fn provider_cache_hits_preserve_cached_identity_without_transfer_bytes() {
+            let body = webc();
+            let mut client = BodyClient::new(body.clone(), HeaderMap::new());
+            Arc::get_mut(&mut client).unwrap().cached = true;
+            let (events, observer) = observe(&client);
+            PackageDownloader::new(client)
+                .load_with_progress(&summary(&body), Some(observer))
+                .await
+                .unwrap();
+            let events = events.lock().unwrap();
+            assert!(
+                events
+                    .iter()
+                    .skip(1)
+                    .all(|(_, p)| p.cached && p.downloaded_bytes == 0 && p.total_bytes == Some(0))
+            );
+            assert_eq!(events.last().unwrap().1.phase, PackageDownloadPhase::Ready);
+        }
+
+        #[tokio::test]
+        async fn tuple_only_provider_cache_hits_do_not_count_buffered_package_bytes() {
+            #[derive(Debug)]
+            struct TupleCacheClient(Arc<BodyClient>);
+            impl HttpClient for TupleCacheClient {
+                fn request(
+                    &self,
+                    request: HttpRequest,
+                ) -> BoxFuture<'_, Result<HttpResponse, Error>> {
+                    self.0.request(request)
+                }
+                fn request_with_progress(
+                    &self,
+                    request: HttpRequest,
+                    progress: crate::http::HttpDownloadObserver,
+                ) -> BoxFuture<'_, Result<HttpResponse, Error>> {
+                    let response = self.request(request);
+                    Box::pin(async move {
+                        progress(1000, None, false);
+                        progress(1, None, true);
+                        response.await
+                    })
+                }
+            }
+            let body = webc();
+            let events: Arc<Mutex<Vec<PackageDownloadProgress>>> = Arc::default();
+            let captured = events.clone();
+            let client = Arc::new(TupleCacheClient(BodyClient::new(
+                body.clone(),
+                HeaderMap::new(),
+            )));
+            PackageDownloader::new(client)
+                .load_with_progress(
+                    &summary(&body),
+                    Some(Arc::new(move |progress| {
+                        captured.lock().unwrap().push(progress)
+                    })),
+                )
+                .await
+                .unwrap();
+            let events = events.lock().unwrap();
+            assert!(
+                events
+                    .iter()
+                    .skip(1)
+                    .all(|p| p.cached && p.downloaded_bytes == 0 && p.total_bytes == Some(0))
+            );
+            assert_eq!(events.last().unwrap().phase, PackageDownloadPhase::Ready);
+        }
+
+        #[tokio::test]
+        async fn dropping_an_http_load_stops_before_cache_and_ready() {
+            let body = webc();
+            let mut client = BodyClient::new(body.clone(), HeaderMap::new());
+            Arc::get_mut(&mut client).unwrap().stall = true;
+            let (events, observer) = observe(&client);
+            let cache = TempDir::new().unwrap();
+            let downloader = PackageDownloader::new(client.clone()).with_cache_dir(cache.path());
+            let summary = summary(&body);
+            let mut load = Box::pin(downloader.load_with_progress(&summary, Some(observer)));
+            assert!(futures::poll!(load.as_mut()).is_pending());
+            assert!(!client.dropped.load(Ordering::SeqCst));
+            drop(load);
+            assert!(
+                client.dropped.load(Ordering::SeqCst),
+                "the actual HTTP future was dropped"
+            );
+            assert!(
+                downloader
+                    .in_memory
+                    .as_ref()
+                    .unwrap()
+                    .0
+                    .read()
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(std::fs::read_dir(cache.path()).unwrap().next().is_none());
+            assert!(
+                events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|(_, p)| p.phase == PackageDownloadPhase::Downloading)
+            );
+        }
+
+        #[cfg(feature = "authoring")]
+        #[tokio::test]
+        async fn an_opaque_archive_can_be_ready_with_unknown_decoded_size() {
+            let manifest =
+                b"[package]\nname = 'test'\nversion = '0.0.0'\ndescription = 'opaque archive'\n";
+            let mut archive = tar::Builder::new(Vec::new());
+            let mut header = tar::Header::new_gnu();
+            header.set_size(manifest.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, "wasmer.toml", manifest.as_slice())
+                .unwrap();
+            let body = gzip(&archive.into_inner().unwrap());
+            let client = BodyClient::new(body.clone(), HeaderMap::new());
+            let (events, observer) = observe(&client);
+            PackageDownloader::new(client)
+                .load_with_progress(&summary(&body), Some(observer))
+                .await
+                .unwrap();
+            let events = events.lock().unwrap();
+            assert!(
+                events
+                    .iter()
+                    .all(|(_, p)| p.downloaded_bytes == 0 && p.total_bytes.is_none())
+            );
+            assert_eq!(events.last().unwrap().1.phase, PackageDownloadPhase::Ready);
         }
     }
 }
