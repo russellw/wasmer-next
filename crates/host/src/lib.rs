@@ -8,6 +8,9 @@
 mod loader_cleanup;
 pub use loader_cleanup::{LoaderCleanup, LoaderCleanupJob};
 
+#[cfg(all(feature = "terminal", unix))]
+pub mod terminal;
+
 #[cfg(feature = "browser")]
 pub mod browser;
 #[cfg(feature = "tokio")]

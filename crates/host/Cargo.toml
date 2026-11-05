@@ -38,6 +38,8 @@ wasixv2-abi = { path = "../abi" }
 [features]
 default = []
 tokio = ["dep:tokio", "dep:getrandom", "dep:libc"]
+# Native inherited-terminal handles and shared raw-mode leases; no engine or executor.
+terminal = ["dep:libc"]
 # A host on the JavaScript event loop, for wasm32-unknown-unknown in browsers and node.
 web = ["dep:js-sys", "dep:wasm-bindgen", "dep:wasm-bindgen-futures"]
 # Dedicated blocking workers sharing a threaded Rust runtime heap.

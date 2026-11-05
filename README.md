@@ -32,6 +32,21 @@ The workspace contains 21 crates under `crates/`:
 
 The kernel uses engine-free capability traits. Host implementations provide clocks, timers, randomness, standard I/O, task execution, and platform-specific drivers. Engine-specific imports, Store and Instance ownership, guest memory access, and runtime control stay in Wasmer.
 
+The host crate's optional `terminal` feature provides owned native-terminal handles and
+shared raw-mode leases without an engine or async runtime. The Wasmer facade owns the
+process-stdio and Console routing policy. Native terminal support targets Linux and
+macOS 13 or later. The inherited-terminal profile uses Linux `TIOCGDEV` to unify direct
+and `/dev/tty` descriptors; independently mounted devpts instances that reuse device
+numbers are outside its process-wide identity domain. macOS `/dev/tty` handles are
+reopened as verified canonical endpoints, with the original access mode, because XNU
+resolves that alias against the calling process on each operation. See the source
+contracts in [Linux tty_io.c](https://github.com/torvalds/linux/blob/master/drivers/tty/tty_io.c),
+[XNU tty_tty.c](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/tty_tty.c),
+and [XNU proc_info.c](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/proc_info.c).
+CI runs the terminal regressions and strict Clippy with default features disabled on
+Linux and macOS, using a macOS deployment target of 13.0. A newer macOS CI runner
+does not by itself establish execution coverage on macOS 13.
+
 See [PROVENANCE.md](PROVENANCE.md) for the source revision and extraction boundary.
 
 ## Build

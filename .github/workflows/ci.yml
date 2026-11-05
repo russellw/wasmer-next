@@ -39,6 +39,25 @@ jobs:
       - name: Rust tests
         run: cargo nextest run --workspace --locked
 
+  terminal:
+    name: Native terminal leases (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96 --profile minimal --component clippy
+      - name: Terminal lease regressions
+        run: cargo test --locked -p wasixv2-host --no-default-features --features terminal --lib terminal::tests
+      - name: Terminal profile Clippy
+        run: cargo clippy --locked -p wasixv2-host --no-default-features --features terminal --all-targets -- -D clippy::all
+
   wasm:
     name: wasm32 feature profiles
     runs-on: ubuntu-24.04
