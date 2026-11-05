@@ -32,7 +32,7 @@ use wasixv2_abi::{
     XattrArgsPtr, XattrFlags,
 };
 use wasixv2_syscalls::{Caller, Control, Syscalls, UserSlice, UserSliceMut};
-use wasmer::{AsyncFunctionEnvMut, Function, FunctionEnv, Imports, Module, RuntimeError, Store};
+use wasmer::{AsyncFunctionEnvMut, Function, FunctionEnv, Imports, Module, RuntimeError, StoreMut};
 
 use crate::{ExecEnv, caller_parts, memory::GuestMemory, return_to_guest};
 
@@ -43,7 +43,7 @@ pub const IMPORT_MODULE: &str = "wasixv2";
 /// is `env`. Only those: every instance (each thread, each image) defines its own. An import
 /// no syscall answers to stays undefined, and the module fails to link.
 pub(crate) fn imports<S>(
-    store: &mut Store,
+    store: &mut StoreMut<'_>,
     env: &FunctionEnv<ExecEnv<S>>,
     module: &Module,
 ) -> Imports
