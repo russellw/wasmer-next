@@ -21,7 +21,9 @@ on the v2 kernel. Original fixtures and behavior evidence remain removal gates.
 | Browser SDK | Current/classic public APIs, packages, streams/mounts/transports, termination and resource retirement. |
 | Providers and coredumps | Optional configured-provider controls and compositional original-source trap coordinates. |
 
-WebC v1 container compatibility is excluded; do not add a legacy container port.
+Only WebC v3 containers are required. WebC v1 and v2 container compatibility
+are excluded; remove their compatibility paths and retain clear unsupported-format
+errors. This does not remove WASIX v1 guest compatibility through the v2 runtime.
 
 Journaling, journal commands and compatibility with old journal formats are
 explicitly excluded by the user. Do not port their formats or retain them as a
