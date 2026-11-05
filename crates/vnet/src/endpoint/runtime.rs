@@ -1,7 +1,7 @@
 //! Namespace-local groups and publication custody. Only explicit socket operations and
 //! driver ingress call refresh; cascading destruction never invokes provider control code.
 use super::*;
-use crate::{Net, Socket, addr::canonical, net::serves, tcp::TcpSocket, udp::UdpSocket};
+use crate::{Net, addr::canonical, net::serves, tcp::TcpSocket, udp::UdpSocket};
 use std::{
     collections::HashMap,
     sync::{

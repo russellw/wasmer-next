@@ -891,9 +891,9 @@ impl UdpSocket {
     /// `inet_sendmsg` and `udp_sendmsg`/`udpv6_sendmsg`, failing in their order: autobind,
     /// the size and flags, the destination, the control messages, the route, the payload
     /// limit, then (`sock_alloc_send_pskb`) a pending error and a shut down sender.
-    fn send_locked(
-        &self,
-        mut g: MutexGuard<'_, Inner>,
+    fn send_locked<'a>(
+        &'a self,
+        mut g: MutexGuard<'a, Inner>,
         msg: SendMsg<'_>,
         policy_dst: Option<SocketAddr>,
         admission: crate::net::Admission,
