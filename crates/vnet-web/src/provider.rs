@@ -18,6 +18,11 @@ pub(crate) struct Transaction {
     pub done: Done,
 }
 impl Transaction {
+    pub(crate) fn activity_ambiguous(&self) -> bool {
+        self.reply.is_none()
+            && self.sent
+            && matches!(self.operation, Request::Bridge { .. } | Request::Unbridge)
+    }
     pub(crate) fn needs_reconciliation(&self) -> bool {
         self.reply.is_some() || self.operation.mutates() && self.sent
     }
@@ -106,13 +111,14 @@ impl Driver {
             return Ok(false);
         }
         let mut control = inner.controls.pop_front().unwrap();
-        let result = result.and_then(|reply| {
-            if expected(&control.command, &reply) {
-                Ok(reply)
-            } else {
-                Err(Errno::EPROTO)
-            }
-        });
+        let malformed = result
+            .as_ref()
+            .is_ok_and(|reply| !expected(&control.command, reply));
+        let result = if malformed {
+            Err(Errno::EPROTO)
+        } else {
+            result
+        };
         let mut reconciliation = None;
         match result {
             Ok(reply) => {
@@ -132,9 +138,11 @@ impl Driver {
                 }
             }
             Err(error) => {
-                // Preserve an operation error; only failed promised readback is partial commit.
-                if control.reply.is_some() {
+                // Keep definite refusals exact. A malformed sent mutation is ambiguous;
+                // a failed promised readback follows a known remote completion.
+                if control.reply.is_some() || malformed && control.needs_reconciliation() {
                     reconciliation = Some(error);
+                    control.snapshot.active_unknown = malformed && control.activity_ambiguous();
                 }
                 let completion = Completion {
                     result: Err(error),

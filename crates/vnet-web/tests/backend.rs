@@ -1837,3 +1837,128 @@ fn provider_disconnect_after_commit_preserves_reconciliation_custody() {
             .all(|i| i.flags & 1 == 0)
     );
 }
+
+fn bridge_request() -> wasixv2_vnet::provider::Request {
+    use wasixv2_vnet::provider::{Request, Security};
+    Request::Bridge {
+        network: "tenant".into(),
+        token: "credential".into(),
+        security: Security::DoubleEncryption,
+    }
+}
+fn uplink_up(net: &wasixv2_vnet::Net) -> bool {
+    use wasixv2_vnet::Network;
+    net.interfaces()
+        .iter()
+        .any(|i| i.name == "eth0" && i.flags & 1 != 0)
+}
+#[test]
+fn provider_malformed_mutation_reply_disables_until_explicit_activity_ack() {
+    use wasixv2_vnet::{
+        Network,
+        provider::{Readback, Reply, Request},
+    };
+    for operation in [bridge_request(), Request::Unbridge] {
+        let (mut h, net) = provider_harness(Readback::default());
+        let result = Arc::new(Mutex::new(None));
+        let output = result.clone();
+        net.provider().unwrap().start(
+            operation,
+            Box::new(move |done| {
+                *output.lock().unwrap() = Some((done.result, done.reconciliation))
+            }),
+        );
+        assert!(h.pump().is_pending());
+        let (id, _) = provider_command(&h);
+        // The remote side may already have changed activity; an address list is no ACK.
+        h.event(Event::Provider {
+            request: id,
+            reply: Reply::Addresses(vec![]),
+        });
+        assert_eq!(
+            *result.lock().unwrap(),
+            Some((Err(Errno::EPROTO), Some(Errno::EPROTO)))
+        );
+        assert!(!uplink_up(&net));
+        net.provider().unwrap().start(
+            Request::Addresses,
+            Box::new(|done| assert!(done.result.is_ok())),
+        );
+        assert!(h.pump().is_pending());
+        let (id, _) = provider_command(&h);
+        h.event(Event::Provider {
+            request: id,
+            reply: Reply::Addresses(vec![]),
+        });
+        assert!(!uplink_up(&net), "getters cannot prove bridge activity");
+        net.provider().unwrap().start(
+            bridge_request(),
+            Box::new(|done| assert!(done.result.is_ok())),
+        );
+        assert!(h.pump().is_pending());
+        let (id, _) = provider_command(&h);
+        h.event(Event::Complete {
+            request: id,
+            result: Ok(()),
+        });
+        assert!(uplink_up(&net));
+    }
+}
+#[test]
+fn provider_ambiguous_bridge_and_unbridge_cannot_recover_from_getters_after_reconnect() {
+    use wasixv2_vnet::{
+        Network,
+        provider::{Readback, Reply, Request},
+    };
+    for operation in [bridge_request(), Request::Unbridge] {
+        let (mut h, net) = provider_harness(Readback::default());
+        net.provider().unwrap().start(
+            operation,
+            Box::new(|done| {
+                assert_eq!(done.result, Err(Errno::ECONNABORTED));
+                assert_eq!(done.reconciliation, Some(Errno::ECONNABORTED));
+            }),
+        );
+        assert!(h.pump().is_pending());
+        h.transport.error = Some(Errno::ECONNABORTED);
+        assert!(h.pump().is_ready());
+        assert!(!uplink_up(&net));
+        h.driver = h.backend.reconnect(h.transport.capabilities).unwrap();
+        net.provider().unwrap().start(
+            Request::Routes,
+            Box::new(|done| assert!(done.result.is_ok())),
+        );
+        assert!(h.pump().is_pending());
+        let (id, _) = provider_command(&h);
+        h.event(Event::Provider {
+            request: id,
+            reply: Reply::Routes(vec![]),
+        });
+        assert!(
+            !uplink_up(&net),
+            "readback after reconnect cannot invent activity"
+        );
+        net.provider().unwrap().start(
+            Request::Unbridge,
+            Box::new(|done| assert!(done.result.is_ok())),
+        );
+        assert!(h.pump().is_pending());
+        let (id, _) = provider_command(&h);
+        h.event(Event::Complete {
+            request: id,
+            result: Ok(()),
+        });
+        assert!(!uplink_up(&net));
+        net.provider().unwrap().start(
+            bridge_request(),
+            Box::new(|done| assert!(done.result.is_ok())),
+        );
+        assert!(h.pump().is_pending());
+        let (id, _) = provider_command(&h);
+        h.event(Event::Complete {
+            request: id,
+            result: Ok(()),
+        });
+        assert!(uplink_up(&net));
+    }
+}

@@ -982,7 +982,8 @@ impl Driver {
         for wq in queues {
             wq.wake(PollMask::ERR | PollMask::HUP | PollMask::READABLE | PollMask::WRITABLE);
         }
-        for control in controls {
+        for mut control in controls {
+            control.snapshot.active_unknown = control.activity_ambiguous();
             let reconciliation = control
                 .needs_reconciliation()
                 .then_some(Errno::ECONNABORTED);

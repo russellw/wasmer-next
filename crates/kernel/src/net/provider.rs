@@ -1,14 +1,12 @@
 //! Namespace-pinned optional provider controls for the v1 adapter. This private ioctl
 //! envelope does not extend Linux rtnetlink or expose a process-global provider pointer.
 use crate::{Kernel, netlink::NetlinkSocket};
-use std::{
-    sync::{Arc, Mutex},
-    task::{Poll, Waker},
-};
+use std::sync::{Arc, Mutex};
 use wasixv2_abi::IoctlRequest;
 use wasixv2_syscalls::{Caller, Errno, SysResult};
 use wasixv2_vfs::Cap;
 use wasixv2_vnet::provider::{self, Reply, Request};
+use wasixv2_wait::{PollMask, WaitQueue, wait_event};
 
 impl Kernel {
     pub(crate) async fn provider_ioctl(
@@ -75,37 +73,31 @@ impl Kernel {
         // No kernel/namespace lock spans the asynchronous provider operation. The socket
         // pins its original namespace through setns/unshare and through waiter cancellation.
         struct Wait {
-            result: Option<Result<Reply, Errno>>,
-            waker: Option<Waker>,
+            result: Mutex<Option<Result<Reply, Errno>>>,
+            queue: WaitQueue,
         }
-        let wait = Arc::new(Mutex::new(Wait {
-            result: None,
-            waker: None,
-        }));
+        let wait = Arc::new(Wait {
+            result: Mutex::new(None),
+            queue: WaitQueue::new(),
+        });
         let completed = wait.clone();
         provider.start(
             operation,
             Box::new(move |completion| {
-                let wake = {
-                    let mut wait = completed.lock().unwrap();
-                    wait.result = Some(completion.result);
-                    wait.waker.take()
-                };
-                if let Some(wake) = wake {
-                    wake.wake();
-                }
+                *completed.result.lock().unwrap() = Some(completion.result);
+                completed.queue.wake(PollMask::IN);
             }),
         );
-        let reply = std::future::poll_fn(|cx| {
-            let mut wait = wait.lock().unwrap();
-            if let Some(result) = wait.result.take() {
-                Poll::Ready(result)
-            } else {
-                wait.waker = Some(cx.waker().clone());
-                Poll::Pending
-            }
-        })
-        .await?;
+        // The accepted transaction continues after interruption, while dropping this wait
+        // unregisters the guest's waker. Never return Restart: that could replay a mutation.
+        let interrupt = self.interrupt(caller);
+        let reply = wait_event(
+            &wait.queue,
+            || wait.result.lock().unwrap().take(),
+            &*interrupt,
+        )
+        .await
+        .map_err(|_| Errno::EINTR)??;
         let bytes = provider::encode(&reply)?;
         if bytes.len() > capacity as usize {
             return Err(Errno::EOVERFLOW.into());

@@ -97,6 +97,8 @@ pub struct Readback {
 #[derive(Clone, Debug, Default)]
 pub struct Snapshot {
     pub active: Option<bool>,
+    /// A sent bridge/unbridge had no trustworthy acknowledgement. Getters cannot resolve it.
+    pub active_unknown: bool,
     pub addresses: Option<Vec<Cidr>>,
     pub mac: Option<[u8; 6]>,
     pub routes: Option<Vec<Route>>,

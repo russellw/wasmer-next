@@ -136,6 +136,19 @@ restores availability (unless the provider was explicitly unbridged). Unpromised
 fields are unchanged; embedders must advertise the readbacks needed to reflect
 that provider's configuration in the local namespace.
 
+A malformed reply to a sent mutation is also a reconciliation failure. A sent
+bridge/unbridge without a trustworthy ACK additionally makes bridge activity
+unknown, including after transport reconnect. Successful address/MAC/route getters
+can refresh configuration but cannot prove that activity. The uplink remains down
+until a later explicit bridge/unbridge receives its proper ACK; an unbridge ACK
+keeps it down. Known-ACK mutations with a subsequent failed getter remain eligible
+for ordinary full-readback recovery.
+
+Provider ioctl waits use the kernel's interruptible wait queue. A signal returns
+`EINTR`, allowing fatal signals and shutdown to end an actually blocked guest.
+The accepted operation is never automatically restarted, and removing the waiter
+unregisters its guest waker while its provider-owned completion still publishes.
+
 Route deadlines remain exact optional `u64` nanosecond values on the v1 surface
 and original `Duration` records on the wire. Their interpretation and expiration
 belong to the configured provider. WLK does not invent a clock or expire projected

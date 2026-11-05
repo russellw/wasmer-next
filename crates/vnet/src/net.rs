@@ -213,6 +213,7 @@ pub(crate) struct NetState {
     pub udp_pubs: Vec<UdpPublication>,
     pub ifaces: Interfaces,
     pub provider_active: bool,
+    pub provider_activity_known: bool,
     pub provider_reconciliation: Option<Errno>,
     pub rng: PortRng,
     /// The ids this namespace knows other namespaces by (`netns_ids`).
@@ -375,6 +376,7 @@ impl Net {
                 udp_pubs: Vec::new(),
                 ifaces,
                 provider_active: true,
+                provider_activity_known: true,
                 provider_reconciliation: None,
                 rng: PortRng::new(seed),
                 nsids: Vec::new(),
@@ -398,11 +400,15 @@ impl Net {
         let mut st = self.configure(&lock);
         if let Some(active) = snapshot.active {
             st.provider_active = active;
+            st.provider_activity_known = true;
         }
-        match st
-            .ifaces
-            .provider_snapshot(snapshot, error.is_some() || !st.provider_active)
-        {
+        if snapshot.active_unknown {
+            st.provider_activity_known = false;
+        }
+        match st.ifaces.provider_snapshot(
+            snapshot,
+            error.is_some() || !st.provider_active || !st.provider_activity_known,
+        ) {
             Ok(next) => {
                 st.ifaces = next;
                 st.provider_reconciliation = error;
@@ -457,7 +463,10 @@ impl Net {
 
     pub(crate) fn state(&self) -> MutexGuard<'_, NetState> {
         let mut state = self.state.lock_or_recover();
-        if state.provider_reconciliation.is_some() || !state.provider_active {
+        if state.provider_reconciliation.is_some()
+            || !state.provider_active
+            || !state.provider_activity_known
+        {
             state.ifaces.provider_unavailable();
         }
         state
