@@ -6,6 +6,9 @@
 #[cfg(all(feature = "browser", target_arch = "wasm32"))]
 pub mod browser;
 
+#[cfg(all(feature = "terminal", unix))]
+pub mod terminal;
+
 mod package;
 pub use package::{
     Package, PackageInstallSource, PreparedPackageSources, command_config, install_package_sources,

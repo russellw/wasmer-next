@@ -52,6 +52,9 @@ serde_json.workspace = true
 [dev-dependencies]
 wat.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+tokio = { workspace = true, optional = true, features = ["fs", "io-util", "sync"] }
+
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 futures-util.workspace = true
 bincode = { workspace = true, features = ["serde"] }
@@ -88,6 +91,8 @@ js = [
 wasix1 = ["dep:wasixv2-wasix1"]
 # `Machine::new` and `Stdio::inherit` on a tokio runtime.
 tokio = ["wasixv2-host/tokio"]
+# Inherited native terminal policy and shared raw-mode leases, independent of the engine.
+terminal = ["wasixv2-host/terminal", "dep:tokio"]
 # Guest traffic leaving the machine goes through host sockets (Unix only). Without it the
 # network is loopback-only.
 host-network = ["dep:wasixv2-vnet-host"]
