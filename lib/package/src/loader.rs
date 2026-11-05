@@ -1,6 +1,6 @@
 //! Package-container acquisition and persistent checkout caches.
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::{ErrorKind, Read, Write as _},
     path::PathBuf,
     sync::{Arc, RwLock},
@@ -12,15 +12,19 @@ use crate::{
 };
 use anyhow::{Context, Error, bail};
 use bytes::Bytes;
+use futures::{StreamExt, TryStreamExt};
 use http::{HeaderMap, Method};
 use tempfile::NamedTempFile;
 use url::Url;
+use wasmer_config::package::PackageId;
 use webc::DetectError;
 use webc::{Container, ContainerError};
 
 use crate::{
     http::{HttpClient, HttpRequest, USER_AGENT},
-    resolver::{DistributionInfo, PackageSummary, WebcHash},
+    resolver::{
+        DependencyGraph, DistributionInfo, PackageSummary, Resolution, ResolvedPackage, WebcHash,
+    },
 };
 
 /// Downloads package containers through an embedder's HTTP client and caches.
@@ -814,6 +818,129 @@ impl InMemoryCache {
     fn remove(&self, hash: &WebcHash) -> Option<Container> {
         self.0.write().unwrap().remove(hash)
     }
+}
+
+/// Resolved containers and command bytes, independent of filesystem or guest execution.
+#[derive(Debug, Clone)]
+pub struct LoadedPackage {
+    pub resolution: Resolution,
+    pub containers: HashMap<PackageId, Container>,
+    pub commands: Vec<crate::commands::BinaryPackageCommand>,
+    pub webc_version: webc::Version,
+}
+
+impl LoadedPackage {
+    /// Select commands from supplied containers after the embedder's filesystem preflight.
+    pub fn from_containers(
+        resolution: Resolution,
+        containers: HashMap<PackageId, Container>,
+    ) -> Result<Self, Error> {
+        let webc_version = containers
+            .get(&resolution.package.root_package)
+            .with_context(|| {
+                format!(
+                    "Unable to find the \"{}\" root package",
+                    resolution.package.root_package
+                )
+            })?
+            .version();
+        let commands = crate::commands::load_commands(&containers, &resolution)?;
+        Ok(Self {
+            resolution,
+            containers,
+            commands,
+            webc_version,
+        })
+    }
+
+    pub fn get_command(&self, name: &str) -> Option<&crate::commands::BinaryPackageCommand> {
+        self.commands.iter().find(|cmd| cmd.name() == name)
+    }
+
+    pub fn infer_entrypoint(&self) -> Result<&str, Error> {
+        infer_entrypoint(
+            self.resolution.package.entrypoint.as_deref(),
+            &self.commands,
+        )
+    }
+}
+
+/// Apply the package entrypoint and the historical single-command inference.
+pub fn infer_entrypoint<'a>(
+    entrypoint: Option<&'a str>,
+    commands: &'a [crate::commands::BinaryPackageCommand],
+) -> Result<&'a str, Error> {
+    if let Some(entrypoint) = entrypoint {
+        return Ok(entrypoint);
+    }
+    match commands {
+        [] => anyhow::bail!("The package doesn't contain any executable commands"),
+        [one] => Ok(one.name()),
+        [..] => {
+            let mut commands: Vec<_> = commands.iter().map(|cmd| cmd.name()).collect();
+            commands.sort();
+            anyhow::bail!(
+                "Unable to determine the package's entrypoint. Please choose one of {commands:?}"
+            );
+        }
+    }
+}
+
+const MAX_PARALLEL_DOWNLOADS: usize = 32;
+
+/// Fetch the command/filesystem dependency closure using the embedder's loader future.
+/// Callbacks retain control of scheduling; their futures need not be Send.
+pub async fn fetch_dependencies<F, Fut>(
+    pkg: &ResolvedPackage,
+    graph: &DependencyGraph,
+    load: F,
+) -> Result<HashMap<PackageId, Container>, Error>
+where
+    F: Fn(PackageSummary) -> Fut,
+    Fut: std::future::Future<Output = Result<Container, Error>>,
+{
+    let packages = packages_needed_for_load(pkg);
+
+    let packages = packages.into_iter().filter_map(|id| {
+        let crate::resolver::Node { pkg, dist, .. } = &graph[&id];
+        let summary = PackageSummary {
+            pkg: pkg.clone(),
+            dist: dist.clone()?,
+        };
+        Some((id, summary))
+    });
+    let packages: HashMap<PackageId, Container> = futures::stream::iter(packages)
+        .map(|(id, s)| {
+            let load = &load;
+            async move {
+                match load(s).await {
+                    Ok(webc) => Ok((id, webc)),
+                    Err(e) => Err(e),
+                }
+            }
+        })
+        .buffer_unordered(MAX_PARALLEL_DOWNLOADS)
+        .try_collect()
+        .await?;
+
+    Ok(packages)
+}
+
+fn packages_needed_for_load(pkg: &ResolvedPackage) -> HashSet<PackageId> {
+    let mut packages = HashSet::new();
+
+    for loc in pkg.commands.values() {
+        packages.insert(loc.package.clone());
+    }
+
+    for mapping in &pkg.filesystem {
+        packages.insert(mapping.package.clone());
+    }
+
+    // We don't need to download the root package
+    packages.remove(&pkg.root_package);
+
+    packages
 }
 
 #[cfg(test)]
