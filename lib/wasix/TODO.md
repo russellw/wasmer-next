@@ -205,6 +205,12 @@ They are not part of the checked raw SDK foundation or integration snapshot.
   do not subtract a fixed import count or disable preemption.
 - [ ] Recheck function/reflection table-mutation/cacheability, original-error,
   signature and custom-layer behavior with completed closures and contexts.
+  Conservative `cacheable=false` on mutable imported tables is an accepted
+  nonblocking result difference: the contract permits refusing caching, while
+  `true` promises future signature stability. Keep the two original reflection
+  fixtures and their failing `true` assertions unchanged and report this gap;
+  do not claim all reflection fixtures pass. Do not add permanent table-write
+  enforcement or restrict accepted modules merely to enable this optimization.
 - [ ] Finish Chromium retirement diagnosis: debugger-free controls established
   sleeping worker OS threads persisting at 5 seconds; Firefox passed. Heap/context
   retention versus caching is unproved. Do not waive it as a known leak or claim
