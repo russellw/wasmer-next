@@ -763,6 +763,15 @@ pub trait Backend: Send + Sync {
         done(Err(LookupError::Failed));
     }
 
+    /// Optional endpoint control/factory for one newly constructed namespace. Called once
+    /// per Net, without Net/socket locks; default None preserves ordinary Linux routing.
+    /// A shared backend must return separately scoped handles rather than assume shared Net
+    /// state. Returned transports queue peer delivery/cleanup and never synchronously enter
+    /// ANY WLK Net, socket or endpoint ingress from data-plane methods or Drop.
+    fn endpoint_namespace(&self) -> Option<Arc<dyn crate::endpoint::EndpointProvider>> {
+        None
+    }
+
     /// Optional controls for this same transport, never a different network session.
     fn provider(&self) -> Option<Arc<dyn crate::provider::Provider>> {
         None

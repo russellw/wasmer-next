@@ -9,6 +9,7 @@ mod api;
 pub mod bpf;
 mod cmsg;
 mod dns;
+pub mod endpoint;
 mod errors;
 mod icmp;
 pub mod iface;

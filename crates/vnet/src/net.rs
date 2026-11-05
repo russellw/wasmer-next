@@ -332,6 +332,7 @@ impl IpPath {
 pub struct Net {
     state: Mutex<NetState>,
     pub(crate) backend: Option<Arc<dyn Backend>>,
+    endpoint_namespace: Option<Arc<dyn crate::endpoint::EndpointProvider>>,
     pub(crate) config: NetConfig,
     next_id: AtomicU64,
     me: Weak<Net>,
@@ -369,6 +370,7 @@ impl Net {
                 }
             }
         }
+        let endpoint_namespace = backend.as_ref().and_then(|b| b.endpoint_namespace());
         let seed = config.seed;
         Arc::new_cyclic(|me| Self {
             state: Mutex::new(NetState {
@@ -386,10 +388,17 @@ impl Net {
                 sctp: SctpPorts::default(),
             }),
             backend,
+            endpoint_namespace,
             config,
             next_id: AtomicU64::new(1),
             me: me.clone(),
         })
+    }
+
+    /// The optional namespace-scoped endpoint capability captured at construction. Capturing
+    /// or retrieving it alone does not select routes, publish sockets or establish peering.
+    pub fn endpoint_namespace(&self) -> Option<Arc<dyn crate::endpoint::EndpointProvider>> {
+        self.endpoint_namespace.clone()
     }
 
     /// Publishes one complete provider readback atomically, before its waiter is woken.
