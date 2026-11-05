@@ -781,3 +781,35 @@ test("fatal initialization cannot restore root or driver references after cleanu
         assert(instances.every(({ terminated }) => terminated));
     }
 });
+
+test("owner abort discards busy workers and ignores late initialization", async () => {
+    const h = await busyTask();
+    h.task.send({ type: "watch-word", ticket: 1, address: 0, observed: 0 });
+    await h.context.onmessage({ data: { type: "abort", error: "process killed" } });
+    assert(h.instances.every(worker => worker.terminated));
+    assert.equal(h.output.at(-1).type, "fatal");
+    assert.equal(h.output.at(-1).error, "process killed");
+    assert.equal(vm.runInContext("workers.size + admissions.size + wordWaiters.size", h.context), 0);
+    assert.equal(vm.runInContext("options", h.context), null);
+    assert(h.control.closed);
+    const count = h.instances.length;
+    await h.context.onmessage({ data: { type: "init", workerUrl: "stale.js" } });
+    await h.context.onmessage({ data: { type: "abort" } });
+    h.task.send({ type: "idle", id: 1 });
+    assert.equal(h.instances.length, count);
+    assert.equal(h.output.filter(data => data.type === "fatal").length, 1);
+});
+
+test("owner abort cancels unaccepted admission and terminates copy worker", async () => {
+    const h = await setup({ memoryCopyUrl: "copy-worker.js" });
+    h.control.hold = true;
+    const reply = new Int32Array(new SharedArrayBuffer(4));
+    h.instances[1].send({ type: "prepare", id: 1, reply });
+    await flush();
+    assert.equal(Atomics.load(reply, 0), 0);
+    await h.context.onmessage({ data: { type: "abort" } });
+    assert.equal(Atomics.load(reply, 0), 2);
+    assert(h.instances.every(worker => worker.terminated));
+    assert.equal(vm.runInContext("memoryCopies", h.context), null);
+    assert.equal(h.output.at(-1).error, "runtime aborted by its owner");
+});

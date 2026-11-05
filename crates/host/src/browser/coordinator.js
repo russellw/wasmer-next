@@ -363,6 +363,7 @@ function receive(state, data) {
 }
 
 globalThis.onmessage = async ({ data }) => {
+    if (poisoned) return;
     try {
         switch (data.type) {
             case "wake-word":
@@ -400,6 +401,11 @@ globalThis.onmessage = async ({ data }) => {
                 break;
             case "stats":
                 postMessage({ type: "stats", workers: [...workers.values()].map(({ id, role, status, waitAsync, workerCreationForbidden }) => ({ id, role, status, waitAsync, workerCreationForbidden })), admissions: admissions.size, copyRotations, taskRotations });
+                break;
+            case "abort":
+                // Explicit heap discard uses accepted-worker failure custody. This
+                // notification confirms termination requests, not a native join.
+                fail(data.error ?? "runtime aborted by its owner");
                 break;
             case "shutdown":
                 if (admissions.size || [...workers.values()].some((state) => state.status !== "idle")) {
