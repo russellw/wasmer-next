@@ -1,6 +1,6 @@
 //! Package acquisition and module compilation used by `wasmer run`.
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -25,7 +25,7 @@ use wasmer_package::{
         Source,
     },
 };
-use webc::{Container, Volume};
+use webc::Container;
 
 /// The compilation service used for the machine's prepared module bytes.
 pub(super) trait ModuleCompiler: Send + Sync {
@@ -185,7 +185,7 @@ impl RunContext {
         )
         .await?;
         containers.insert(resolution.package.root_package.clone(), root);
-        preflight_filesystem(&containers, &resolution.package, local)?;
+        wasixv2::preflight_resolved_filesystem(&containers, &resolution.package, local)?;
         let package = LoadedPackage::from_containers(resolution, containers)?;
         let files = self.files.lock().unwrap();
         let tree = PackageTree {
@@ -307,75 +307,6 @@ impl Source for MonitoringSource {
         self.progress.set_message(format!("Looking up {package}"));
         self.inner.query(package).await
     }
-}
-
-/// Preserve acquisition validation before command selection; machine mounts remain separate.
-fn preflight_filesystem(
-    packages: &HashMap<PackageId, Container>,
-    pkg: &resolver::ResolvedPackage,
-    local: bool,
-) -> Result<(), Error> {
-    if pkg.filesystem.is_empty() {
-        return Ok(());
-    }
-    let mut found_v2 = None;
-    let mut found_v3 = None;
-    for ResolvedFileSystemMapping { package, .. } in &pkg.filesystem {
-        let container = packages.get(package).with_context(|| {
-            format!(
-                "\"{}\" wants to use the \"{}\" package, but it isn't in the dependency tree",
-                pkg.root_package, package
-            )
-        })?;
-        match container.version() {
-            webc::Version::V2 => {
-                if found_v2.is_none() {
-                    found_v2 = Some(package.clone());
-                }
-            }
-            webc::Version::V3 => {
-                if found_v3.is_none() {
-                    found_v3 = Some(package.clone());
-                }
-            }
-            other => anyhow::bail!("the package '{package}' has an unknown webc version: {other}"),
-        }
-    }
-    match (found_v2, found_v3) {
-        (Some(v2), Some(v3)) => anyhow::bail!(
-            "Mix of webc v2 and v3 in the same dependency tree is not supported; v2: {v2}, v3: {v3}"
-        ),
-        (None, None) => anyhow::bail!("Internal error: no packages found in tree"),
-        _ => {}
-    }
-    let mut volumes: HashMap<&PackageId, BTreeMap<String, Volume>> = HashMap::new();
-    for ResolvedFileSystemMapping {
-        mount_path,
-        volume_name,
-        package,
-        ..
-    } in &pkg.filesystem
-    {
-        if *package == pkg.root_package && local {
-            continue;
-        }
-        if mount_path.as_path() == Path::new("/") {
-            tracing::event!(target: "wasmer_wasix::runtime::package_loader::load_package_tree", tracing::Level::WARN, "The \"{package}\" package wants to mount a volume at \"/\", which breaks WASIX modules' filesystems");
-        }
-        let container = packages.get(package).with_context(|| {
-            format!(
-                "\"{}\" wants to use the \"{}\" package, but it isn't in the dependency tree",
-                pkg.root_package, package
-            )
-        })?;
-        let container_volumes = volumes
-            .entry(package)
-            .or_insert_with(|| container.volumes());
-        container_volumes.get(volume_name).with_context(|| {
-            format!("The \"{package}\" package doesn't have a \"{volume_name}\" volume")
-        })?;
-    }
-    Ok(())
 }
 
 #[cfg(all(test, feature = "sys"))]

@@ -41,6 +41,8 @@ thiserror.workspace = true
 tracing.workspace = true
 wasmparser.workspace = true
 webc.workspace = true
+wasmer-package = { workspace = true, features = ["acquisition"], optional = true }
+wasmer-config = { workspace = true, optional = true }
 futures-util = { workspace = true, optional = true }
 async-trait.workspace = true
 wasm-bindgen = { workspace = true, optional = true }
@@ -67,6 +69,7 @@ wasm-bindgen-futures.workspace = true
 js-sys.workspace = true
 
 [features]
+resolved-packages = ["dep:wasmer-package", "dep:wasmer-config"]
 default = ["sys", "tokio", "host-network", "wasix1"]
 sys = [
   "wasmer/sys",

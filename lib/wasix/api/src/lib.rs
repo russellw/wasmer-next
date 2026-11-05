@@ -7,7 +7,15 @@
 pub mod browser;
 
 mod package;
-pub use package::{Package, install_packages};
+pub use package::{
+    Package, PackageInstallSource, PreparedPackageSources, command_config, install_package_sources,
+    install_package_sources_with_root_overlays, install_packages, prepare_package_sources,
+};
+#[cfg(feature = "resolved-packages")]
+pub use package::{
+    ResolvedCommand, ResolvedLayout, ResolvedReaderProvider, ResolvedReaderVolume,
+    ResolvedVolumeRequest, preflight_resolved_filesystem,
+};
 
 mod directory;
 pub use directory::{DirectoryEntry, populate_directory};

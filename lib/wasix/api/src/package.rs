@@ -1,12 +1,65 @@
 //! Byte-backed package assembly. Acquisition, credentials and persistent caches belong
 //! to the embedder; execution remains ordinary VFS exec (`fs/exec.c:kernel_execve`).
-use crate::{Layer, Machine, OwnedBuffer};
+use crate::{Filesystem, Layer, Machine, OwnedBuffer};
+#[cfg(feature = "resolved-packages")]
+mod resolved;
+#[cfg(feature = "resolved-packages")]
+pub use resolved::{
+    ResolvedCommand, ResolvedLayout, ResolvedReaderProvider, ResolvedReaderVolume,
+    ResolvedVolumeRequest, preflight_resolved_filesystem,
+};
 use std::{
     collections::{BTreeMap, HashSet},
     io,
     sync::Arc,
 };
 use webc::{Version, metadata::annotations::Wasi, v3::read::OwnedReader};
+
+/// Apply command annotations to initial launch arguments and environment.
+/// Explicit caller environment values retain precedence and position. Returns
+/// the annotation cwd for the consumer to apply with its own cwd policy.
+pub fn command_config(
+    name: &str,
+    annotation: Option<&Wasi>,
+    config: &mut crate::ProcessConfig,
+) -> io::Result<Option<String>> {
+    let mut args = vec![
+        annotation
+            .and_then(|annotation| annotation.exec_name.clone())
+            .unwrap_or_else(|| name.to_owned()),
+    ];
+    let mut environment: Vec<(String, String)> = Vec::new();
+    if let Some(annotation) = annotation {
+        args.extend(annotation.main_args.clone().unwrap_or_default());
+        for entry in annotation.env.as_deref().unwrap_or_default() {
+            let (key, value) = entry.split_once('=').unwrap_or((entry, ""));
+            match environment.iter_mut().find(|(existing, _)| existing == key) {
+                Some((_, old)) => *old = value.to_owned(),
+                None => environment.push((key.to_owned(), value.to_owned())),
+            }
+        }
+    }
+    for (key, value) in environment {
+        if !config
+            .env
+            .iter()
+            .any(|entry| entry.split_once('=').map_or(entry.as_str(), |(key, _)| key) == key)
+        {
+            config.env.push(format!("{key}={value}"));
+        }
+    }
+    let cwd = annotation
+        .and_then(|annotation| annotation.cwd.as_ref())
+        .map(|cwd| {
+            cwd.to_str()
+                .map(str::to_owned)
+                .ok_or_else(|| invalid("package cwd is not UTF-8"))
+        })
+        .transpose()?;
+    args.append(&mut config.args);
+    config.args = args;
+    Ok(cwd)
+}
 
 /// A WEBC with dependencies supplied as bytes rather than fetched by the runtime.
 /// Dependency aliases are those in the WEBC manifest's `use` map.
@@ -91,33 +144,12 @@ impl Package {
             .ok_or_else(|| invalid("package has no entrypoint"))?;
         self.binary(name)?;
         let annotation = self.annotation(name)?;
-        let mut args = vec![
-            annotation
-                .as_ref()
-                .and_then(|a| a.exec_name.clone())
-                .unwrap_or_else(|| name.to_owned()),
-        ];
-        if let Some(annotation) = annotation {
-            args.extend(annotation.main_args.unwrap_or_default());
-            for entry in annotation.env.unwrap_or_default() {
-                let key = entry.split_once('=').map_or(entry.as_str(), |(key, _)| key);
-                if !config.env.iter().any(|value| {
-                    value.split_once('=').map_or(value.as_str(), |(key, _)| key) == key
-                }) {
-                    config.env.push(entry);
-                }
-            }
-            if machine.working_dir.is_none()
-                && let Some(cwd) = annotation.cwd
-            {
-                machine.set_working_dir(
-                    cwd.to_str()
-                        .ok_or_else(|| invalid("package cwd is not UTF-8"))?,
-                );
-            }
+        let cwd = command_config(name, annotation.as_ref(), config)?;
+        if machine.working_dir.is_none()
+            && let Some(cwd) = cwd
+        {
+            machine.set_working_dir(cwd);
         }
-        args.append(&mut config.args);
-        config.args = args;
         Ok(format!("/bin/{name}"))
     }
 
@@ -144,24 +176,231 @@ impl Package {
 /// Install a root package followed by additional injected packages. The first
 /// command of a name wins; all file access remains under the Machine's VFS root.
 pub async fn install_packages(machine: &mut Machine, packages: &[&Package]) -> io::Result<()> {
+    let sources = packages
+        .iter()
+        .map(|package| PackageInstallSource::Webc(*package))
+        .collect::<Vec<_>>();
+    install_package_sources(machine, &sources).await
+}
+
+/// Sources in package precedence order. In-memory content has no WEBC archive;
+/// its existing filesystem remains shared as a lower layer, with private writes
+/// in each Machine's upper layer. The embedder owns package identity/validation.
+#[derive(Clone)]
+pub enum PackageInstallSource<'a> {
+    Webc(&'a Package),
+    #[cfg(feature = "resolved-packages")]
+    Resolved(&'a ResolvedLayout),
+    Memory {
+        commands: &'a [(String, OwnedBuffer)],
+        root: Option<Arc<dyn Filesystem>>,
+    },
+}
+
+/// The same installer as [`install_packages`], with ordered in-memory command
+/// and file contents. Every root/command layer is prepared before any nonroot
+/// mount. As with `install_packages`, a failure can leave partial installation.
+pub async fn install_package_sources(
+    machine: &mut Machine,
+    sources: &[PackageInstallSource<'_>],
+) -> io::Result<()> {
+    install_package_sources_with_root_overlays(machine, sources, &[]).await
+}
+
+/// Install sources with caller-selected root layers above the command layer.
+pub async fn install_package_sources_with_root_overlays(
+    machine: &mut Machine,
+    sources: &[PackageInstallSource<'_>],
+    root_overlays: &[Layer],
+) -> io::Result<()> {
+    let mut prepared = prepare_package_sources(machine, sources).await?;
+    prepared.mount_roots(machine, root_overlays).await?;
+    prepared.mount_volumes(machine).await
+}
+
+#[derive(Clone)]
+enum PreparedVolume {
+    Layer(Layer),
+    #[cfg(feature = "resolved-packages")]
+    Resolved(resolved::ResolvedVolume),
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("cannot install the package's commands in /bin and /usr/bin")]
+struct CommandLayerError(#[source] io::Error);
+
+#[derive(Debug, thiserror::Error)]
+#[error("cannot stack the root filesystem's layers")]
+struct RootLayersError(#[source] io::Error);
+
+#[cfg(feature = "wasix1")]
+#[derive(Debug, thiserror::Error)]
+#[error("cannot configure the package's commands")]
+struct CommandDefaultsError(#[source] io::Error);
+
+/// Sources prepared for a Machine, with separate root and nonroot mount phases.
+/// This lets a consumer apply its cwd policy between those existing phases.
+pub struct PreparedPackageSources {
+    root_layers: Vec<PreparedVolume>,
+    prepared_roots: Option<Vec<Layer>>,
+    resolved: bool,
+    commands: Vec<(String, OwnedBuffer)>,
+    #[cfg(feature = "wasix1")]
+    defaults: Vec<(String, crate::CommandDefaults)>,
+    mounts: Vec<(String, PreparedVolume, usize)>,
+    #[cfg(feature = "resolved-packages")]
+    volume_layers: resolved::VolumeLayers,
+}
+
+impl PreparedPackageSources {
+    pub fn mount_paths(&self) -> impl Iterator<Item = &str> {
+        self.mounts.iter().map(|(path, _, _)| path.as_str())
+    }
+
+    async fn layer(&mut self, machine: &Machine, backing: &PreparedVolume) -> io::Result<Layer> {
+        match backing {
+            PreparedVolume::Layer(layer) => Ok(layer.clone()),
+            #[cfg(feature = "resolved-packages")]
+            PreparedVolume::Resolved(volume) => self.volume_layers.get(machine, volume).await,
+        }
+    }
+
+    pub async fn prepare_roots(&mut self, machine: &Machine) -> io::Result<()> {
+        if self.prepared_roots.is_some() {
+            return Ok(());
+        }
+        let mut roots = Vec::new();
+        for backing in self.root_layers.clone() {
+            roots.push(self.layer(machine, &backing).await?);
+        }
+        let commands = machine
+            .commands_layer(self.commands.clone())
+            .map_err(|source| {
+                if self.resolved {
+                    io::Error::new(source.kind(), CommandLayerError(source))
+                } else {
+                    source
+                }
+            })?;
+        roots.extend(commands);
+        self.prepared_roots = Some(roots);
+        Ok(())
+    }
+
+    pub async fn mount_roots(
+        &mut self,
+        machine: &mut Machine,
+        root_overlays: &[Layer],
+    ) -> io::Result<()> {
+        self.prepare_roots(machine).await?;
+        let mut roots = self.prepared_roots.as_ref().unwrap().clone();
+        roots.extend(root_overlays.iter().cloned());
+        machine.mount_root_layers(roots).await.map_err(|source| {
+            if self.resolved {
+                io::Error::new(source.kind(), RootLayersError(source))
+            } else {
+                source
+            }
+        })?;
+        #[cfg(feature = "wasix1")]
+        machine
+            .set_wasix1_command_defaults(self.defaults.clone())
+            .map_err(|source| {
+                if self.resolved {
+                    io::Error::new(source.kind(), CommandDefaultsError(source))
+                } else {
+                    source
+                }
+            })?;
+        Ok(())
+    }
+
+    pub async fn mount_volumes(&mut self, machine: &Machine) -> io::Result<()> {
+        for (path, backing, _) in self.mounts.clone() {
+            let layer = self.layer(machine, &backing).await?;
+            machine
+                .mount_layer(&path, &layer, true)
+                .await
+                .map_err(|error| match &backing {
+                    #[cfg(feature = "resolved-packages")]
+                    PreparedVolume::Resolved(volume) => volume.context(error),
+                    PreparedVolume::Layer(_) => error,
+                })?;
+        }
+        Ok(())
+    }
+}
+
+/// Prepare sources in their existing precedence order, without mounting roots.
+pub async fn prepare_package_sources(
+    machine: &Machine,
+    sources: &[PackageInstallSource<'_>],
+) -> io::Result<PreparedPackageSources> {
     let mut ordered = Vec::new();
     let mut seen = HashSet::new();
-    let mut pending = packages.iter().rev().copied().collect::<Vec<_>>();
-    while let Some(package) = pending.pop() {
-        if !seen.insert(package as *const Package) {
-            continue;
+    let mut pending = sources.iter().rev().cloned().collect::<Vec<_>>();
+    while let Some(source) = pending.pop() {
+        if let PackageInstallSource::Webc(package) = &source {
+            let package = *package;
+            if !seen.insert(package as *const Package) {
+                continue;
+            }
+            for (alias, _) in &package.reader.manifest().use_map {
+                package.dependency(Some(alias))?;
+            }
+            pending.extend(
+                package
+                    .dependencies
+                    .values()
+                    .rev()
+                    .map(|package| PackageInstallSource::Webc(package.as_ref())),
+            );
+        } else if let PackageInstallSource::Memory {
+            root: Some(root), ..
+        } = &source
+            && root.root().file_type() != wasixv2_vfs::FileType::Directory
+        {
+            return Err(invalid("in-memory package root is not a directory"));
         }
-        ordered.push(package);
-        for (alias, _) in &package.reader.manifest().use_map {
-            package.dependency(Some(alias))?;
-        }
-        pending.extend(package.dependencies.values().rev().map(Arc::as_ref));
+        ordered.push(source);
     }
     let mut commands = Vec::new();
     #[cfg(feature = "wasix1")]
     let mut defaults = Vec::new();
     let mut names = HashSet::new();
-    for package in &ordered {
+    for source in &ordered {
+        #[cfg(feature = "resolved-packages")]
+        if let PackageInstallSource::Resolved(layout) = source {
+            let mut selected = HashSet::new();
+            for (name, bytes) in &layout.commands {
+                if names.insert(name.clone()) {
+                    selected.insert(name.clone());
+                    commands.push((name.clone(), bytes.clone()));
+                }
+            }
+            #[cfg(feature = "wasix1")]
+            defaults.extend(
+                layout
+                    .defaults
+                    .iter()
+                    .filter(|(name, _)| selected.contains(name))
+                    .cloned(),
+            );
+            continue;
+        }
+        let PackageInstallSource::Webc(package) = source else {
+            if let PackageInstallSource::Memory {
+                commands: memory, ..
+            } = source
+            {
+                for (name, bytes) in *memory {
+                    if names.insert(name.clone()) {
+                        commands.push((name.clone(), bytes.clone()));
+                    }
+                }
+            }
+            continue;
+        };
         for name in package.commands() {
             if names.insert(name.to_owned()) {
                 commands.push((name.to_owned(), package.binary(name)?));
@@ -179,9 +418,34 @@ pub async fn install_packages(machine: &mut Machine, packages: &[&Package]) -> i
             }
         }
     }
-    let mut root_layers: Vec<Layer> = Vec::new();
+    let mut root_layers: Vec<PreparedVolume> = Vec::new();
     let mut mounts = Vec::new();
-    for package in ordered.iter().rev() {
+    for source in ordered.iter().rev() {
+        #[cfg(feature = "resolved-packages")]
+        if let PackageInstallSource::Resolved(layout) = source {
+            for volume in &layout.volumes {
+                let backing = PreparedVolume::Resolved(volume.clone());
+                if std::path::Path::new(&volume.mount_path) == std::path::Path::new("/") {
+                    root_layers.push(backing);
+                } else {
+                    let depth = std::path::Path::new(&volume.mount_path)
+                        .components()
+                        .count()
+                        .saturating_sub(1);
+                    mounts.push((volume.mount_path.clone(), backing, depth));
+                }
+            }
+            continue;
+        }
+        let PackageInstallSource::Webc(package) = source else {
+            if let PackageInstallSource::Memory {
+                root: Some(root), ..
+            } = source
+            {
+                root_layers.push(PreparedVolume::Layer(Layer(root.clone())));
+            }
+            continue;
+        };
         if let Some(mappings) = package
             .reader
             .manifest()
@@ -199,52 +463,80 @@ pub async fn install_packages(machine: &mut Machine, packages: &[&Package]) -> i
                     .as_deref()
                     .filter(|p| !matches!(*p, "" | "/"))
                 {
-                    let vfs = wasixv2_vfs::Vfs::new(layer.0.clone());
-                    let root = vfs.root();
-                    let cred = wasixv2_vfs::Cred::root();
-                    let cx = wasixv2_vfs::Ctx {
-                        cred: &cred,
-                        root: &root,
-                        umask: 0,
-                        task: 0,
-                        leases: None,
-                    };
-                    let node = vfs
-                        .lookup(
-                            &cx,
-                            &root,
-                            path.as_bytes(),
-                            wasixv2_vfs::LookupFlags {
-                                in_root: true,
-                                directory: true,
-                                ..wasixv2_vfs::LookupFlags::follow()
-                            },
-                        )
-                        .await
-                        .map_err(crate::errno_to_io)?;
-                    layer = Layer(Arc::new(VolumeView {
-                        fs: layer.0,
-                        root: node.dentry.node().clone(),
-                    }));
+                    layer = volume_subtree(layer, Some(path)).await?;
                 }
                 if mapping.mount_path == "/" {
-                    root_layers.push(layer);
+                    root_layers.push(PreparedVolume::Layer(layer));
                 } else {
-                    mounts.push((mapping.mount_path, layer));
+                    let depth = mapping
+                        .mount_path
+                        .split('/')
+                        .filter(|part| !part.is_empty())
+                        .count();
+                    mounts.push((mapping.mount_path, PreparedVolume::Layer(layer), depth));
                 }
             }
         }
     }
-    root_layers.extend(machine.commands_layer(commands)?);
-    machine.mount_root_layers(root_layers).await?;
-    #[cfg(feature = "wasix1")]
-    machine.set_wasix1_command_defaults(defaults)?;
-    // Parents before children; equal-depth entries preserve package precedence.
-    mounts.sort_by_key(|(path, _)| path.split('/').filter(|c| !c.is_empty()).count());
-    for (path, layer) in mounts {
-        machine.mount_layer(&path, &layer, true).await?;
+
+    mounts.sort_by_key(|(_, _, depth)| *depth);
+    let resolved = {
+        #[cfg(feature = "resolved-packages")]
+        {
+            ordered
+                .iter()
+                .any(|source| matches!(source, PackageInstallSource::Resolved(_)))
+        }
+        #[cfg(not(feature = "resolved-packages"))]
+        {
+            false
+        }
+    };
+    Ok(PreparedPackageSources {
+        root_layers,
+        resolved,
+        prepared_roots: None,
+        commands,
+        #[cfg(feature = "wasix1")]
+        defaults,
+        mounts,
+        #[cfg(feature = "resolved-packages")]
+        volume_layers: resolved::VolumeLayers::default(),
+    })
+}
+
+async fn volume_subtree(layer: Layer, path: Option<&str>) -> io::Result<Layer> {
+    if let Some(path) = path.filter(|path| !matches!(*path, "" | "/")) {
+        let vfs = wasixv2_vfs::Vfs::new(layer.0.clone());
+        let root = vfs.root();
+        let cred = wasixv2_vfs::Cred::root();
+        let cx = wasixv2_vfs::Ctx {
+            cred: &cred,
+            root: &root,
+            umask: 0,
+            task: 0,
+            leases: None,
+        };
+        let node = vfs
+            .lookup(
+                &cx,
+                &root,
+                path.as_bytes(),
+                wasixv2_vfs::LookupFlags {
+                    in_root: true,
+                    directory: true,
+                    ..wasixv2_vfs::LookupFlags::follow()
+                },
+            )
+            .await
+            .map_err(crate::errno_to_io)?;
+        let layer = Layer(Arc::new(VolumeView {
+            fs: layer.0,
+            root: node.dentry.node().clone(),
+        }));
+        return Ok(layer);
     }
-    Ok(())
+    Ok(layer)
 }
 
 fn invalid(message: &str) -> io::Error {
@@ -258,6 +550,34 @@ mod tests {
         ChecksumAlgorithm, SignatureAlgorithm, Timestamps,
         write::{FileEntry, Writer},
     };
+    #[test]
+    fn annotation_environment_keeps_first_position_with_last_value_and_caller_precedence() {
+        let mut annotation = Wasi::new("main");
+        annotation.exec_name = Some("program".to_owned());
+        annotation.main_args = Some(vec!["default".to_owned()]);
+        annotation.env = Some(vec![
+            "A=old".to_owned(),
+            "B=second".to_owned(),
+            "A=new".to_owned(),
+            "BARE".to_owned(),
+            "CALLER=ignored".to_owned(),
+        ]);
+        let mut config = crate::ProcessConfig {
+            args: vec!["argument".to_owned()],
+            env: vec!["CALLER=explicit".to_owned()],
+            stdio: crate::Stdio::from_fns(|_| {}, |_| {}),
+        };
+        assert_eq!(
+            command_config("main", Some(&annotation), &mut config).unwrap(),
+            None
+        );
+        assert_eq!(config.args, ["program", "default", "argument"]);
+        assert_eq!(
+            config.env,
+            ["CALLER=explicit", "A=new", "B=second", "BARE="]
+        );
+    }
+
     fn bytes(code: i32) -> OwnedBuffer {
         let module = wat::parse_str(format!(r#"(module (import "wasixv2" "exit_group" (func $exit (param i32))) (memory (export "memory") 1) (func (export "_start") (call $exit (i32.const {code})) unreachable))"#)).unwrap();
         let manifest = serde_json::from_value(serde_json::json!({"entrypoint":"hello","commands":{"hello":{"runner":"https://webc.org/runner/wasi","annotations":{"atom":{"name":"main"}}}}})).unwrap();
@@ -299,6 +619,139 @@ mod tests {
             })
             .await;
     }
+    #[tokio::test]
+    async fn mixed_sources_keep_first_command_and_live_memory_root() {
+        use wasixv2_vfs::{Cred, Ctx, LookupFlags, OpenHow, Vfs};
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let archive = Package::from_bytes(bytes(23)).unwrap();
+                let memory_binary = Package::from_bytes(bytes(99))
+                    .unwrap()
+                    .binary("hello")
+                    .unwrap();
+                let commands = vec![
+                    ("hello".to_owned(), memory_binary.clone()),
+                    ("memory-only".to_owned(), memory_binary),
+                ];
+                let fs: Arc<dyn Filesystem> = Arc::new(wasixv2_vfs_mem::MemFs::new(
+                    Arc::new(wasixv2_kernel::HostClock(Arc::new(
+                        crate::TokioHost::default(),
+                    ))),
+                    0o755,
+                    0,
+                    0,
+                ));
+                crate::populate_directory(
+                    fs.clone(),
+                    &[
+                        crate::DirectoryEntry::Directory {
+                            path: String::new(),
+                            mode: 0o755,
+                        },
+                        crate::DirectoryEntry::File {
+                            path: "value".into(),
+                            mode: 0o644,
+                            data: b"before".to_vec(),
+                        },
+                    ],
+                    0,
+                    0,
+                )
+                .await
+                .unwrap();
+                for memory_first in [true, false] {
+                    let memory = PackageInstallSource::Memory {
+                        commands: &commands,
+                        root: Some(fs.clone()),
+                    };
+                    let webc = PackageInstallSource::Webc(&archive);
+                    let sources = if memory_first {
+                        [memory, webc]
+                    } else {
+                        [webc, memory]
+                    };
+                    let mut machine = Machine::new();
+                    install_package_sources(&mut machine, &sources)
+                        .await
+                        .unwrap();
+                    for (name, expected) in [
+                        ("hello", if memory_first { 99 } else { 23 }),
+                        ("memory-only", 99),
+                    ] {
+                        let config = crate::ProcessConfig {
+                            args: vec![name.into()],
+                            env: vec![],
+                            stdio: crate::Stdio::from_fns(|_| {}, |_| {}),
+                        };
+                        assert_eq!(
+                            machine
+                                .run_file(
+                                    &crate::Engine::default(),
+                                    &format!("/bin/{name}"),
+                                    config
+                                )
+                                .await
+                                .unwrap(),
+                            expected
+                        );
+                    }
+                    // The memory source remains the same live filesystem below the
+                    // Machine's writable overlay; it is not copied during install.
+                    let vfs = Vfs::new(fs.clone());
+                    let root = vfs.root();
+                    let cred = Cred::root();
+                    let cx = Ctx {
+                        cred: &cred,
+                        root: &root,
+                        umask: 0,
+                        task: 0,
+                        leases: None,
+                    };
+                    let file = vfs
+                        .open(
+                            &cx,
+                            &root,
+                            b"value",
+                            &OpenHow {
+                                flags: wasixv2_abi::OpenFlags::O_WRONLY,
+                                mode: 0,
+                                lookup: LookupFlags::follow(),
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(file.write_at(b"shared", 0).await.unwrap(), 6);
+                    let guest = machine.vfs();
+                    let root = guest.root();
+                    let cx = Ctx {
+                        cred: &cred,
+                        root: &root,
+                        umask: 0,
+                        task: 0,
+                        leases: None,
+                    };
+                    let file = guest
+                        .open(
+                            &cx,
+                            &root,
+                            b"/value",
+                            &OpenHow {
+                                flags: wasixv2_abi::OpenFlags::O_RDONLY,
+                                mode: 0,
+                                lookup: LookupFlags::follow(),
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    let mut value = [0; 6];
+                    assert_eq!(file.read_at(&mut value, 0).await.unwrap(), 6);
+                    assert_eq!(&value, b"shared");
+                    machine.shutdown().await;
+                }
+            })
+            .await;
+    }
+
     #[tokio::test]
     async fn supplied_dependency_atoms_survive_the_package_sources() {
         tokio::task::LocalSet::new().run_until(async {

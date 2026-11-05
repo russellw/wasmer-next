@@ -3,7 +3,8 @@
 //! whose command runs one of them.
 
 use std::{
-    collections::{HashMap, hash_map::Entry},
+    cell::RefCell,
+    collections::HashMap,
     io,
     net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
@@ -12,8 +13,10 @@ use std::{
 
 use anyhow::{Context, Error, bail};
 use wasixv2::{
-    CommandDefaults, Console, Credentials, Dns, Image, ImageId, Layer, LoadError, Loader,
-    LocalFuture, Machine, OwnedBuffer, ProcessConfig, Signaller, Stdio, Uname, wasix1_http,
+    CommandDefaults, Console, Credentials, Dns, Image, ImageId, LoadError, Loader, LocalFuture,
+    Machine, OwnedBuffer, PackageInstallSource, ProcessConfig, ResolvedCommand as PackageCommand,
+    ResolvedLayout, ResolvedReaderVolume, ResolvedVolumeRequest, Signaller, Stdio, Uname,
+    prepare_package_sources, wasix1_http,
 };
 use wasmer::{Engine, Module};
 use wasmer_cache::module_cache::HashedModuleData;
@@ -69,9 +72,7 @@ pub(super) struct MachineProgram {
     /// The command's `wasi` annotation, for a package.
     wasi: Option<WasiAnnotation>,
     /// The package volumes to mount, each over the ones before it.
-    volumes: Vec<PackageVolume>,
-    /// The package tree's commands, for `/bin` and `/usr/bin`.
-    commands: Vec<PackageCommand>,
+    layout: ResolvedLayout,
     /// A host directory to map read-only to [`SCRIPT_DIR`]: that of a host script no
     /// `--volume` holds.
     script_dir: Option<PathBuf>,
@@ -90,30 +91,13 @@ enum Start {
     File(String),
 }
 
-/// A command of the package tree: `/bin/<name>` and `/usr/bin/<name>` hold its atom.
-struct PackageCommand {
-    name: String,
-    atom: OwnedBuffer,
-    /// What WASIX v1 programs that start it pass along, from its `wasi` annotation.
-    defaults: CommandDefaults,
-}
-
-/// A volume of a package in the tree, and where it goes.
-struct PackageVolume {
-    reader: Arc<OwnedReader>,
-    name: String,
-    /// An absolute guest path; `/` makes the volume a layer of the root filesystem.
-    mount_path: String,
-}
-
 impl MachineProgram {
     pub(super) fn module(path: &Path, engine: Engine, module: Module) -> Self {
         Self {
             argv0: path.display().to_string(),
             start: Start::Module { engine, module },
             wasi: None,
-            volumes: Vec::new(),
-            commands: Vec::new(),
+            layout: ResolvedLayout::default(),
             script_dir: None,
         }
     }
@@ -125,8 +109,7 @@ impl MachineProgram {
             argv0: guest.clone(),
             start: Start::File(guest),
             wasi: None,
-            volumes: Vec::new(),
-            commands: Vec::new(),
+            layout: ResolvedLayout::default(),
             script_dir,
         }
     }
@@ -151,23 +134,16 @@ impl MachineProgram {
     /// after the program's package's, so a name that has stays its, and their volumes before
     /// its volumes, which obscure them.
     pub(super) fn using(mut self, used: Vec<UsedPackage>) -> Self {
-        let mut volumes = Vec::new();
-        for package in used {
-            volumes.extend(package.volumes);
-            self.commands.extend(package.commands);
-        }
-        volumes.append(&mut self.volumes);
-        // A stable sort keeps the obscuring order among mounts at the same depth.
-        volumes.sort_by_key(|v| Path::new(&v.mount_path).components().count());
-        self.volumes = volumes;
+        self.layout = self
+            .layout
+            .using(used.into_iter().map(|package| package.layout));
         self
     }
 }
 
 /// A package `--use` names: its tree's commands and volumes.
 pub(super) struct UsedPackage {
-    volumes: Vec<PackageVolume>,
-    commands: Vec<PackageCommand>,
+    layout: ResolvedLayout,
 }
 
 /// Whether the host file at `path` is a `#!` script, which runs as its interpreter on the
@@ -608,36 +584,6 @@ impl wasix1_http::HttpProvider for GuestHttpProvider {
     }
 }
 
-/// The commands of the package tree, in the order the resolver gave them: it made each name
-/// that of the first package in the tree (the root, then its dependencies) that has it.
-///
-/// Every command becomes a file, whatever its runner, as v1 installed them: running one is
-/// `execve` of the file, which starts what some ABI serves and fails with `ENOEXEC` for
-/// anything else, as Linux's binary formats decide. A WCGI command's atom is a WASI program
-/// and runs as one, as a CGI program run by hand does; a WASM-4 cartridge is `ENOEXEC`. Only
-/// the program `wasmer run` starts itself must have the WASI runner.
-fn package_commands(pkg: &LoadedPackage) -> Result<Vec<PackageCommand>, Error> {
-    pkg.commands
-        .iter()
-        .map(|cmd| {
-            let wasi = cmd
-                .metadata()
-                .annotation::<WasiAnnotation>(WasiAnnotation::KEY)
-                .with_context(|| format!("invalid annotations on the \"{}\" command", cmd.name()))?
-                .unwrap_or_else(|| WasiAnnotation::new(cmd.name()));
-            Ok(PackageCommand {
-                name: cmd.name().to_string(),
-                atom: cmd.atom(),
-                defaults: CommandDefaults {
-                    argv0: wasi.exec_name,
-                    args: wasi.main_args.unwrap_or_default(),
-                    env: wasi.env.unwrap_or_default(),
-                },
-            })
-        })
-        .collect()
-}
-
 /// Whether the machine runs `module`, a precompiled module: one importing WASIX v2, or WASIX v1
 /// or WASI preview1. A module with neither is plain WebAssembly; a v1 flavour the kernel
 /// cannot serve is an error.
@@ -695,12 +641,13 @@ impl Run {
             CliPackageSource::File(path) => Some(path.as_path()),
             _ => None,
         };
+        let layout = self.package_layout(tree, pkg, file)?;
+        ResolvedLayout::validate_command_annotations(pkg)?;
         Ok(MachineProgram {
             argv0: wasi.exec_name.clone().unwrap_or_else(|| name.to_string()),
             start: Start::File(format!("/bin/{name}")),
             wasi: Some(wasi),
-            volumes: self.package_volumes(tree, file)?,
-            commands: package_commands(pkg)?,
+            layout,
             script_dir: None,
         })
     }
@@ -719,84 +666,60 @@ impl Run {
             let pkg = context
                 .block_on(context.load_registry(&specifier))
                 .with_context(|| format!("Unable to load \"{name}\""))?;
-            used.push(UsedPackage {
-                volumes: self.package_volumes(&pkg.tree, None)?,
-                commands: package_commands(&pkg.package)?,
-            });
+            let layout = self.package_layout(&pkg.tree, &pkg.package, None)?;
+            ResolvedLayout::validate_command_annotations(&pkg.package)?;
+            used.push(UsedPackage { layout });
         }
         Ok(used)
     }
 
-    /// The volumes of the tree's filesystem table, each after the ones it obscures and parents
-    /// before what is mounted inside them. A package directory's own table maps host
-    /// directories instead; they arrive as `--volume`s. `file` is the file the tree's root was
-    /// loaded from, when it was not downloaded.
-    fn package_volumes(
+    /// Supply only the selected mapping's known reader. A selected read/parse error
+    /// is final; the shared installer never substitutes an opaque backing after it.
+    fn package_layout(
         &self,
         tree: &PackageTree,
+        package: &LoadedPackage,
         file: Option<&Path>,
-    ) -> Result<Vec<PackageVolume>, Error> {
-        let mut volumes = Vec::new();
-        let mut readers: HashMap<&PackageId, Reader> = HashMap::new();
-        // Mappings earlier in the table obscure later ones, so they are mounted last.
-        for mapping in tree.filesystem.iter().rev() {
-            let is_root = tree.root.as_ref() == Some(&mapping.package);
-            if is_root && tree.root_is_local_dir {
-                continue;
-            }
-            let mount_path = mapping.mount_path.to_str().with_context(|| {
-                format!(
-                    "the mount path {} is not UTF-8",
-                    mapping.mount_path.display()
-                )
-            })?;
-            if !mount_path.starts_with('/') {
-                bail!(
-                    "the package \"{}\" mounts a volume at a relative path, {mount_path}",
-                    mapping.package
-                );
-            }
-            let reader = match readers.entry(&mapping.package) {
-                Entry::Occupied(entry) => entry.into_mut(),
-                Entry::Vacant(entry) => {
-                    let container = tree.containers.get(&mapping.package).with_context(|| {
-                        format!(
-                            "the package \"{}\" is not in the dependency tree",
-                            mapping.package
+    ) -> Result<ResolvedLayout, Error> {
+        let readers: RefCell<HashMap<PackageId, Reader>> = RefCell::new(HashMap::new());
+        let provider =
+            |request: ResolvedVolumeRequest<'_>| -> io::Result<Option<ResolvedReaderVolume>> {
+                let mut readers = readers.borrow_mut();
+                let reader = match readers.entry(request.package.clone()) {
+                    std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let selected_file =
+                            match (file, tree.root.as_ref() == Some(request.package)) {
+                                (Some(path), true) => Some(path),
+                                _ => tree.files.get(request.package).map(PathBuf::as_path),
+                            };
+                        entry.insert(
+                            Reader::open(request.package, request.container, selected_file)
+                                .map_err(io::Error::other)?,
                         )
-                    })?;
-                    let file = match (file, is_root) {
-                        (Some(path), true) => Some(path),
-                        _ => tree.files.get(&mapping.package).map(PathBuf::as_path),
-                    };
-                    entry.insert(Reader::open(&mapping.package, container, file)?)
-                }
+                    }
+                };
+                let name = if reader.migrated {
+                    request.source_path.unwrap_or(request.volume_name)
+                } else {
+                    request.volume_name
+                };
+                Ok(Some(ResolvedReaderVolume {
+                    reader: reader.v3.clone(),
+                    volume_name: name.to_owned(),
+                    source_path: if reader.migrated {
+                        None
+                    } else {
+                        request.source_path.map(str::to_owned)
+                    },
+                    migrated_from_v2: reader.migrated,
+                }))
             };
-            // A v2 mapping names the "atom" volume and a path in it, which migration made a
-            // volume of its own.
-            let name = match (reader.migrated, &mapping.original_path) {
-                (true, Some(path)) => path.clone(),
-                _ => mapping.volume_name.clone(),
-            };
-            // Migration keeps only the parts of "atom" an `fs` table names, so a v2 package
-            // without one (whose "atom" v1 mounted at `/`) has nothing to mount.
-            if reader.migrated && reader.v3.get_volume(&name).is_err() {
-                tracing::warn!(
-                    package = %mapping.package,
-                    volume = %name,
-                    "the webc v2 package has no `fs` table; its \"atom\" volume is not mounted",
-                );
-                continue;
-            }
-            volumes.push(PackageVolume {
-                reader: reader.v3.clone(),
-                name,
-                mount_path: mount_path.to_string(),
-            });
-        }
-        // A stable sort keeps the obscuring order among mounts at the same depth.
-        volumes.sort_by_key(|v| Path::new(&v.mount_path).components().count());
-        Ok(volumes)
+        Ok(ResolvedLayout::new(
+            package,
+            tree.root_is_local_dir,
+            Some(&provider),
+        )?)
     }
 
     /// Runs `program` on a machine whose images compile with `loader`, driven on the tokio
@@ -840,57 +763,34 @@ impl Run {
             env: self.machine_env(machine.default_env(), wasi)?,
             stdio,
         };
-        let (root_volumes, volumes): (Vec<_>, Vec<_>) = program
-            .volumes
-            .iter()
-            .partition(|v| Path::new(&v.mount_path) == Path::new("/"));
+        let mut layout = program.layout.clone();
+        layout.override_commands(mapped_commands);
+        let sources = [PackageInstallSource::Resolved(&layout)];
+        let mut prepared = handle.block_on(
+            tokio::task::LocalSet::new().run_until(prepare_package_sources(&machine, &sources)),
+        )?;
         let (have_current_dir, host_dirs) = self.wasi.build_mapped_directories()?;
         // Nothing can be mounted over the root, so a host directory for `/` joins its layers,
         // over the package's.
         let (root_dirs, host_dirs): (Vec<_>, Vec<_>) = host_dirs
             .into_iter()
             .partition(|dir| Path::new(&dir.guest) == Path::new("/"));
-        let mounts = volumes.iter().map(|v| v.mount_path.clone());
+        let mounts = prepared.mount_paths().map(str::to_owned);
         let hiding = program
-            .mount_hiding_the_command(mounts.chain(host_dirs.iter().map(|d| d.guest.clone())));
-        // Each volume becomes a filesystem once, wherever it is mounted.
-        let mut layers = VolumeLayers::default();
+            .mount_hiding_the_command(mounts.chain(host_dirs.iter().map(|dir| dir.guest.clone())));
+        handle
+            .block_on(tokio::task::LocalSet::new().run_until(prepared.prepare_roots(&machine)))?;
         let mut root_layers = Vec::new();
-        for volume in root_volumes {
-            let layer = layers.get(&machine, volume).with_context(|| {
-                format!("cannot mount the package volume \"{}\" at /", volume.name)
-            })?;
-            root_layers.push(layer);
-        }
-        // Over the package's volumes, as v1 wrote them into the root after merging those.
-        let commands = mapped_commands
-            .iter()
-            .chain(&program.commands)
-            .map(|cmd| (cmd.name.clone(), cmd.atom.clone()));
-        root_layers.extend(
-            machine
-                .commands_layer(commands)
-                .context("cannot install the package's commands in /bin and /usr/bin")?,
-        );
         for dir in root_dirs {
             let layer = machine
                 .host_dir_layer(&dir.host)
                 .with_context(|| format!("cannot map {} to /", dir.host.display()))?;
             root_layers.push(layer);
         }
-        handle
-            .block_on(
-                tokio::task::LocalSet::new().run_until(machine.mount_root_layers(root_layers)),
-            )
-            .context("cannot stack the root filesystem's layers")?;
-        let defaults = program
-            .commands
-            .iter()
-            .chain(&mapped_commands)
-            .map(|cmd| (cmd.name.clone(), cmd.defaults.clone()));
-        machine
-            .set_wasix1_command_defaults(defaults)
-            .context("cannot configure the package's commands")?;
+        handle.block_on(
+            tokio::task::LocalSet::new()
+                .run_until(prepared.mount_roots(&mut machine, &root_layers)),
+        )?;
         // v1's precedence: the command's `cwd` annotation, then `--cwd`, then the mapped current
         // directory.
         let cwd = wasi
@@ -907,20 +807,7 @@ impl Run {
         // The machine's host calls are not `Send`, so drive it on this thread, in a `LocalSet`
         // for the host work it spawns.
         let run = handle.block_on(tokio::task::LocalSet::new().run_until(async {
-            for volume in volumes {
-                let context = || {
-                    format!(
-                        "cannot mount the package volume \"{}\" at {}",
-                        volume.name, volume.mount_path
-                    )
-                };
-                let layer = layers.get(&machine, volume).with_context(context)?;
-                // Writable like v1's package mounts; changes stay in memory.
-                machine
-                    .mount_layer(&volume.mount_path, &layer, true)
-                    .await
-                    .with_context(context)?;
-            }
+            prepared.mount_volumes(&machine).await?;
             // `--volume`s go on top, so they win over a package volume at the same path.
             for dir in &host_dirs {
                 machine
@@ -1380,23 +1267,6 @@ fn forward(signaller: &Signaller, sig: i32, terminal: bool) -> bool {
         tracing::warn!(sig, %err, "cannot forward a signal to the guest");
         false
     })
-}
-
-/// The layer of each package volume mounted so far, by its package's reader and its name.
-#[derive(Default)]
-struct VolumeLayers(HashMap<(*const OwnedReader, String), Layer>);
-
-impl VolumeLayers {
-    /// The layer of `volume`, made the first time.
-    fn get(&mut self, machine: &Machine, volume: &PackageVolume) -> Result<Layer, Error> {
-        let key = (Arc::as_ptr(&volume.reader), volume.name.clone());
-        if let Some(layer) = self.0.get(&key) {
-            return Ok(layer.clone());
-        }
-        let layer = machine.package_layer(&volume.reader, &volume.name)?;
-        self.0.insert(key, layer.clone());
-        Ok(layer)
-    }
 }
 
 /// A package's webc v3 reader, which the machine's package volumes need.

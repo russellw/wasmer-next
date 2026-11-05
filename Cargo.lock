@@ -7130,6 +7130,8 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-bindgen-test",
  "wasmer",
+ "wasmer-config",
+ "wasmer-package",
  "wasmparser 0.259.0",
  "wat",
  "webc",

@@ -147,6 +147,7 @@ wasixv2 = { path = "../wasix/api", default-features = false, features = [
   "tokio",
   "host-network",
   "wasix1",
+  "resolved-packages",
 ] }
 # Wasmer-owned dependencies.
 
