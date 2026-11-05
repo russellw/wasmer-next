@@ -15,7 +15,7 @@ use std::{
 
 use anyhow::{Context as _, Result, bail};
 use url::Url;
-use wasmer_wasix::runners::MappedDirectory;
+use wasmer_config::filesystem::MappedDirectory;
 
 pub(crate) const WAPM_SOURCE_CACHE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 

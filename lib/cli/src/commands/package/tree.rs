@@ -3,7 +3,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use semver::{Op, Version, VersionReq};
 use wasmer_config::package::{PackageId, PackageIdent, PackageSource, Tag};
-use wasmer_wasix::runtime::resolver::{
+use wasmer_package::resolver::{
     BackendSource, Dependency, DependencyGraph, FileSystemSource, MultiSource, Source, WebSource,
 };
 
@@ -36,14 +36,14 @@ impl AsyncCliCommand for PackageTree {
         let package = PackageSource::Ident(self.package);
 
         let root_summary = source.latest(&package).await.map_err(|error| {
-            wasmer_wasix::runtime::resolver::ResolveError::Registry {
+            wasmer_package::resolver::ResolveError::Registry {
                 package: package.clone(),
                 error,
             }
         })?;
         let root_id = root_summary.package_id();
 
-        let graph = wasmer_wasix::runtime::resolver::resolve_dependency_graph(
+        let graph = wasmer_package::resolver::resolve_dependency_graph(
             &root_id,
             &root_summary.pkg,
             &source,
@@ -54,7 +54,7 @@ impl AsyncCliCommand for PackageTree {
         println!("{}", format_root(&package, graph.id()));
         print_dependencies(&graph, graph.id(), "");
 
-        wasmer_wasix::runtime::resolver::validate_dependency_graph(&graph)
+        wasmer_package::resolver::validate_dependency_graph(&graph)
             .context("Dependency graph cannot be unified")?;
 
         Ok(())
@@ -63,9 +63,7 @@ impl AsyncCliCommand for PackageTree {
 
 impl PackageTree {
     fn prepare_source(&self) -> Result<MultiSource> {
-        let client =
-            wasmer_wasix::http::default_http_client().context("No HTTP client available")?;
-        let client = Arc::new(client);
+        let client = Arc::new(wasmer_package::http::reqwest::ReqwestHttpClient::default());
 
         let mut source = MultiSource::default();
 

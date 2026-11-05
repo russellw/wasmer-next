@@ -1,11 +1,10 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
     sync::Arc,
 };
 
 use anyhow::{Context, Error};
-use futures::{StreamExt, TryStreamExt};
 use once_cell::sync::OnceCell;
 use virtual_fs::{FileSystem, WebcVolumeFileSystem};
 use wasmer_config::package::PackageId;
@@ -15,14 +14,9 @@ use crate::{
     bin_factory::{BinaryPackage, BinaryPackageMount, BinaryPackageMounts},
     runtime::{
         package_loader::PackageLoader,
-        resolver::{
-            DependencyGraph, PackageSummary, Resolution, ResolvedFileSystemMapping, ResolvedPackage,
-        },
+        resolver::{Resolution, ResolvedFileSystemMapping, ResolvedPackage},
     },
 };
-
-/// The maximum number of packages that will be loaded in parallel.
-const MAX_PARALLEL_DOWNLOADS: usize = 32;
 
 /// Given a fully resolved package, load it into memory for execution.
 #[tracing::instrument(level = "debug", skip_all)]
@@ -33,7 +27,12 @@ pub async fn load_package_tree(
     root_is_local_dir: bool,
 ) -> Result<BinaryPackage, Error> {
     let webc_version = root.version();
-    let mut containers = fetch_dependencies(loader, &resolution.package, &resolution.graph).await?;
+    let mut containers = wasmer_package::loader::fetch_dependencies(
+        &resolution.package,
+        &resolution.graph,
+        |summary| async move { loader.load(&summary).await },
+    )
+    .await?;
     containers.insert(resolution.package.root_package.clone(), root.clone());
     let package_ids = containers.keys().cloned().collect();
     let fs_opt = filesystem(&containers, &resolution.package, root_is_local_dir)?;
@@ -68,52 +67,6 @@ pub async fn load_package_tree(
     };
 
     Ok(loaded)
-}
-
-async fn fetch_dependencies(
-    loader: &dyn PackageLoader,
-    pkg: &ResolvedPackage,
-    graph: &DependencyGraph,
-) -> Result<HashMap<PackageId, Container>, Error> {
-    let packages = packages_needed_for_load(pkg);
-
-    let packages = packages.into_iter().filter_map(|id| {
-        let crate::runtime::resolver::Node { pkg, dist, .. } = &graph[&id];
-        let summary = PackageSummary {
-            pkg: pkg.clone(),
-            dist: dist.clone()?,
-        };
-        Some((id, summary))
-    });
-    let packages: HashMap<PackageId, Container> = futures::stream::iter(packages)
-        .map(|(id, s)| async move {
-            match loader.load(&s).await {
-                Ok(webc) => Ok((id, webc)),
-                Err(e) => Err(e),
-            }
-        })
-        .buffer_unordered(MAX_PARALLEL_DOWNLOADS)
-        .try_collect()
-        .await?;
-
-    Ok(packages)
-}
-
-fn packages_needed_for_load(pkg: &ResolvedPackage) -> HashSet<PackageId> {
-    let mut packages = HashSet::new();
-
-    for loc in pkg.commands.values() {
-        packages.insert(loc.package.clone());
-    }
-
-    for mapping in &pkg.filesystem {
-        packages.insert(mapping.package.clone());
-    }
-
-    // We don't need to download the root package
-    packages.remove(&pkg.root_package);
-
-    packages
 }
 
 /// How many bytes worth of files does a directory contain?

@@ -16,14 +16,12 @@ use wasixv2::{
     LocalFuture, Machine, OwnedBuffer, ProcessConfig, Signaller, Stdio, Uname, wasix1_http,
 };
 use wasmer::{Engine, Module};
+use wasmer_cache::module_cache::HashedModuleData;
+use wasmer_config::filesystem::MAPPED_CURRENT_DIR_DEFAULT_PATH;
 use wasmer_config::package::{PackageId, PackageSource};
+use wasmer_package::loader::LoadedPackage;
 use wasmer_types::{ModuleHash, target::Target};
-use wasmer_wasix::{
-    Runtime,
-    bin_factory::BinaryPackage,
-    runners::MAPPED_CURRENT_DIR_DEFAULT_PATH,
-    runtime::{module_cache::HashedModuleData, task_manager::VirtualTaskManagerExt as _},
-};
+
 use webc::{
     Container,
     metadata::annotations::{WASI_RUNNER_URI, Wasi as WasiAnnotation},
@@ -34,7 +32,7 @@ use webc::{
 use super::terminal::{self, HostTerminal};
 use super::{
     CliPackageSource, GuestExit, Run, exit_with_wasi_exit_code,
-    runtime::{MonitoringRuntime, PackageTree},
+    runtime::{ModuleCompiler, PackageTree, RunContext, RunPackage},
     wasi::{DnsMode, utf8_env_part},
 };
 use crate::backend::{BackendType, RuntimeOptions};
@@ -189,7 +187,7 @@ pub(super) fn is_script(path: &Path) -> bool {
 /// the same image find the module by the image's identity (a package file's buffer) or, for a
 /// copy, by a hash of its bytes, without looking at them again.
 pub(super) struct CachedLoader {
-    runtime: Arc<dyn Runtime + Send + Sync>,
+    compiler: Arc<dyn ModuleCompiler>,
     options: RuntimeOptions,
     deny_multiple_wasi_versions: bool,
     /// One engine per backend: the one `wasmer run` picked, and others made when an image
@@ -217,13 +215,13 @@ impl CachedLoader {
     /// A loader that compiles on `engine`, the backend `wasmer run` picked, whatever needs
     /// no other.
     pub(super) fn new(
-        runtime: Arc<dyn Runtime + Send + Sync>,
+        compiler: Arc<dyn ModuleCompiler>,
         options: RuntimeOptions,
         engine: (BackendType, Engine),
         deny_multiple_wasi_versions: bool,
     ) -> Self {
         Self {
-            runtime,
+            compiler,
             options,
             deny_multiple_wasi_versions,
             engines: Mutex::new(vec![engine]),
@@ -259,7 +257,7 @@ impl CachedLoader {
         // Key the persistent cache by the actual compiler input, never the source's
         // legacy instrument-only hash or a package atom's unprepared hash.
         let wasm = HashedModuleData::new(instrumented);
-        let module = self.runtime.load_hashed_module(wasm, Some(&engine)).await?;
+        let module = self.compiler.compile(wasm, &engine).await?;
         validate_wasi_versions(&module, self.deny_multiple_wasi_versions)?;
         if let Some(err) = failed {
             wasixv2::warn_not_preemptible(&err);
@@ -310,42 +308,30 @@ impl Loader for CachedLoader {
 mod loader_tests {
     use super::*;
     use futures::{executor::block_on, future::BoxFuture};
-    use wasmer_wasix::{SpawnError, VirtualTaskManager, runtime::resolver::Source};
+    use wasmer_cache::module_cache::ModuleCompileError;
 
     #[derive(Debug, Default)]
-    struct RecordingRuntime {
+    struct RecordingCompiler {
         requests: Mutex<Vec<HashedModuleData>>,
         cache: Mutex<HashMap<ModuleHash, Module>>,
     }
 
-    impl Runtime for RecordingRuntime {
-        fn networking(&self) -> &virtual_net::DynVirtualNetworking {
-            unreachable!("compiling an image needs no networking")
-        }
-
-        fn task_manager(&self) -> &Arc<dyn VirtualTaskManager> {
-            unreachable!("compiling an image needs no task manager")
-        }
-
-        fn source(&self) -> Arc<dyn Source + Send + Sync> {
-            unreachable!("compiling an image needs no package resolver")
-        }
-
-        fn load_hashed_module(
-            &self,
+    impl ModuleCompiler for RecordingCompiler {
+        fn compile<'a>(
+            &'a self,
             data: HashedModuleData,
-            engine: Option<&Engine>,
-        ) -> BoxFuture<'_, Result<Module, SpawnError>> {
+            engine: &'a Engine,
+        ) -> BoxFuture<'a, Result<Module, ModuleCompileError>> {
             self.requests.lock().unwrap().push(data.clone());
             let hash = *data.hash();
             let mut cache = self.cache.lock().unwrap();
             let module = match cache.get(&hash) {
                 Some(module) => Ok(module.clone()),
-                None => Module::new(engine.unwrap(), data.wasm())
+                None => Module::new(engine, data.wasm())
                     .inspect(|module| {
                         cache.insert(hash, module.clone());
                     })
-                    .map_err(|error| SpawnError::CompileError {
+                    .map_err(|error| ModuleCompileError {
                         module_hash: hash,
                         error,
                     }),
@@ -354,11 +340,11 @@ mod loader_tests {
         }
     }
 
-    fn loader() -> (CachedLoader, Arc<RecordingRuntime>, Engine) {
+    fn loader() -> (CachedLoader, Arc<RecordingCompiler>, Engine) {
         let options = RuntimeOptions::default();
         let backend = options.get_available_backends().unwrap()[0];
         let engine = backend.get_engine(&Target::default(), &options).unwrap();
-        let runtime = Arc::new(RecordingRuntime::default());
+        let runtime = Arc::new(RecordingCompiler::default());
         let loader = CachedLoader::new(runtime.clone(), options, (backend, engine.clone()), false);
         (loader, runtime, engine)
     }
@@ -514,23 +500,27 @@ mod loader_tests {
     }
 }
 
-/// Keep version recognition in the existing WASI detector: unrelated import modules do
-/// not count, and multiple functions from one version still name only one version.
+/// Recognize function namespaces in the historical version order; HTTP is an extension.
 fn validate_wasi_versions(module: &Module, deny_multiple: bool) -> Result<(), Error> {
-    if deny_multiple && let Some(mut versions) = wasmer_wasix::get_wasi_versions(module, false) {
-        // The legacy detector also labels the HTTP extension Wasix64v1. Only an actual
-        // wasix_64v1 function namespace constitutes that WASI version for this option.
-        if !module
-            .imports()
-            .functions()
-            .any(|import| import.module() == "wasix_64v1")
-        {
-            versions.remove(&wasmer_wasix::WasiVersion::Wasix64v1);
-        }
+    if deny_multiple {
+        let versions: Vec<_> = [
+            "wasi_unstable",
+            "wasi_snapshot_preview1",
+            "wasix_32v1",
+            "wasix_64v1",
+        ]
+        .into_iter()
+        .filter(|namespace| {
+            module
+                .imports()
+                .functions()
+                .any(|import| import.module() == *namespace)
+        })
+        .collect();
         if versions.len() >= 2 {
             let names = versions
                 .iter()
-                .map(|version| format!("`{}`", version.get_namespace_str()))
+                .map(|version| format!("`{version}`"))
                 .collect::<Vec<_>>()
                 .join(", ");
             bail!(
@@ -575,7 +565,7 @@ fn mapped_commands(mappings: &[String]) -> Result<Vec<PackageCommand>, Error> {
 /// The historical guest HTTP capability, distinct from package downloads. Like v1's
 /// client_impl, use the runtime HTTP client's defaults for timeout/redirects and report no
 /// redirect URL list. The flag grants all hosts; without it no provider is installed.
-struct GuestHttpProvider(wasmer_wasix::http::DynHttpClient);
+struct GuestHttpProvider(wasmer_package::http::DynHttpClient);
 
 impl wasix1_http::HttpProvider for GuestHttpProvider {
     fn send(
@@ -595,12 +585,12 @@ impl wasix1_http::HttpProvider for GuestHttpProvider {
             }
             let response = self
                 .0
-                .request(wasmer_wasix::http::HttpRequest {
+                .request(wasmer_package::http::HttpRequest {
                     url,
                     method,
                     headers,
                     body: request.body,
-                    options: wasmer_wasix::http::HttpRequestOptions::default(),
+                    options: wasmer_package::http::HttpRequestOptions::default(),
                 })
                 .await
                 .map_err(|e| e.to_string())?;
@@ -626,7 +616,7 @@ impl wasix1_http::HttpProvider for GuestHttpProvider {
 /// anything else, as Linux's binary formats decide. A WCGI command's atom is a WASI program
 /// and runs as one, as a CGI program run by hand does; a WASM-4 cartridge is `ENOEXEC`. Only
 /// the program `wasmer run` starts itself must have the WASI runner.
-fn package_commands(pkg: &BinaryPackage) -> Result<Vec<PackageCommand>, Error> {
+fn package_commands(pkg: &LoadedPackage) -> Result<Vec<PackageCommand>, Error> {
     pkg.commands
         .iter()
         .map(|cmd| {
@@ -681,11 +671,9 @@ pub(super) fn wasm_runs_on_machine(wasm: &[u8]) -> Result<bool, Error> {
 impl Run {
     /// The program to run for the package's selected command, chosen as `--entrypoint` or the
     /// package's entrypoint says. `tree` is the package tree `pkg` was loaded from.
-    pub(super) fn machine_program(
-        &self,
-        pkg: &BinaryPackage,
-        tree: &PackageTree,
-    ) -> Result<MachineProgram, Error> {
+    pub(super) fn machine_program(&self, package: &RunPackage) -> Result<MachineProgram, Error> {
+        let pkg = &package.package;
+        let tree = &package.tree;
         let name = match self.entrypoint.as_deref() {
             Some(name) => name,
             None => pkg.infer_entrypoint()?,
@@ -719,31 +707,21 @@ impl Run {
 
     /// The packages `--use` names, loaded through `runtime`, each with its dependencies, as
     /// v1 loaded them.
-    pub(super) fn used_packages<R>(
+    pub(super) fn used_packages(
         &self,
-        runtime: &Arc<MonitoringRuntime<R>>,
-    ) -> Result<Vec<UsedPackage>, Error>
-    where
-        R: Runtime + Send + Sync + 'static,
-    {
+        context: &Arc<RunContext>,
+    ) -> Result<Vec<UsedPackage>, Error> {
         let mut used = Vec::new();
         for name in &self.wasi.uses {
             let specifier = name
                 .parse::<PackageSource>()
                 .with_context(|| format!("Unable to parse \"{name}\" as a package specifier"))?;
-            let rt = runtime.clone();
-            let pkg = runtime
-                .task_manager()
-                .spawn_and_block_on(async move {
-                    BinaryPackage::from_registry(&specifier, rt.as_ref()).await
-                })
-                .with_context(|| format!("Unable to load \"{name}\""))?
+            let pkg = context
+                .block_on(context.load_registry(&specifier))
                 .with_context(|| format!("Unable to load \"{name}\""))?;
-            // The tree the runtime loaded last is this package's.
-            let tree = runtime.package_tree();
             used.push(UsedPackage {
-                volumes: self.package_volumes(&tree, None)?,
-                commands: package_commands(&pkg)?,
+                volumes: self.package_volumes(&pkg.tree, None)?,
+                commands: package_commands(&pkg.package)?,
             });
         }
         Ok(used)
@@ -1060,8 +1038,7 @@ impl Run {
             builder = builder.network_policy(Arc::new(NetworkRules(rules)));
         }
         if wasi.http_client {
-            let client =
-                wasmer_wasix::http::default_http_client().context("No HTTP client available")?;
+            let client = wasmer_package::http::reqwest::ReqwestHttpClient::default();
             builder = builder.wasix1_http_provider(Arc::new(GuestHttpProvider(Arc::new(client))));
         }
         if let Some((console, fds)) = console {

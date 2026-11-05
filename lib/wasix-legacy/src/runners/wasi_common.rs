@@ -21,7 +21,7 @@ use crate::{
     journal::{DynJournal, DynReadableJournal, SnapshotTrigger},
 };
 
-pub const MAPPED_CURRENT_DIR_DEFAULT_PATH: &str = "/home";
+pub use wasmer_config::filesystem::MAPPED_CURRENT_DIR_DEFAULT_PATH;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ExistingMountConflictBehavior {
@@ -394,14 +394,7 @@ pub struct MountedDirectory {
 /// Converting a [`MappedDirectory`] to a [`MountedDirectory`] requires enabling
 /// the `host-fs` feature flag. Using the [`From`] implementation without
 /// enabling this feature will result in a runtime panic.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct MappedDirectory {
-    /// The absolute path for a directory on the host filesystem.
-    pub host: std::path::PathBuf,
-    /// The absolute path specifying where the host directory should be mounted
-    /// inside the guest.
-    pub guest: String,
-}
+pub use wasmer_config::filesystem::MappedDirectory;
 
 impl From<MappedDirectory> for MountedDirectory {
     fn from(value: MappedDirectory) -> Self {

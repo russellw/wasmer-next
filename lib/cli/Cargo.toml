@@ -49,12 +49,12 @@ default = [
 journal = ["dep:wasmer-journal", "wasmer-journal/log-file"]
 backend = []
 coredump = ["wasm-coredump-builder"]
-sys = ["compiler", "dep:wasmer-vm", "wasixv2/sys"]
+sys = ["compiler", "dep:wasmer-vm", "wasixv2/sys", "wasmer-cache/module-cache-sys"]
 v8 = ["backend", "wasmer/v8"]
 # Enable V8 and explicitly select it as the default backend.
 v8-default = ["v8", "wasmer/v8-default"]
 wast = ["wasmer-wast"]
-host-net = ["virtual-net/host-net"]
+host-net = ["wasixv2/host-network"]
 wat = ["wasmer/wat"]
 compiler = [
   "backend",
@@ -103,10 +103,11 @@ llvm = [
   "wasmer/llvm",
 ]
 disable-all-logging = [
-  "wasmer-wasix/disable-all-logging",
+  "tracing/release_max_level_off",
+  "tracing/max_level_off",
   "log/release_max_level_off",
 ]
-headless = ["dep:wasmer-vm", "wasmer/sys", "wasixv2/sys"]
+headless = ["dep:wasmer-vm", "wasmer/sys", "wasixv2/sys", "wasmer-cache/module-cache-sys"]
 headless-minimal = ["headless", "disable-all-logging"]
 telemetry = []
 
@@ -115,7 +116,6 @@ enable-serde = [
   "wasmer/enable-serde",
   "wasmer-vm/enable-serde",
   "wasmer-compiler/enable-serde",
-  "wasmer-wasix/enable-serde",
 ]
 
 tokio-subscriber = ["dep:console-subscriber", "tokio/tracing"]
@@ -132,14 +132,9 @@ wasmer-compiler = { version = "=7.5.0", path = "../compiler", features = [
 wasmer-compiler-cranelift = { version = "=7.5.0", path = "../compiler-cranelift", optional = true }
 wasmer-compiler-singlepass = { version = "=7.5.0", path = "../compiler-singlepass", optional = true }
 wasmer-compiler-llvm = { version = "=7.5.0", path = "../compiler-llvm", optional = true }
-wasmer-package = { workspace = true, features = ["authoring"] }
+wasmer-package = { workspace = true, features = ["authoring", "acquisition-thread", "http-client"] }
 wasmer-vm = { version = "=7.5.0", path = "../vm", optional = true }
-wasmer-wasix = { path = "../wasix-legacy", version = "=0.705.0", features = [
-  "logging",
-  "host-fs",
-  "ctrlc",
-  "sys",
-], default-features = false }
+wasmer-cache = { path = "../cache", version = "=7.5.0", default-features = false, features = ["module-cache", "module-cache-filesystem"] }
 wasmer-journal = { path = "../journal", version = "0.705.0", default-features = false, optional = true }
 wasmer-wast = { version = "=7.5.0", path = "../../tests/lib/wast", optional = true }
 wasmer-types = { version = "=7.5.0", path = "../types", features = [
@@ -153,12 +148,6 @@ wasixv2 = { path = "../wasix/api", default-features = false, features = [
   "host-network",
   "wasix1",
 ] }
-virtual-fs = { version = "0.705.0", path = "../virtual-fs", default-features = false, features = [
-  "host-fs",
-] }
-virtual-net = { version = "0.705.0", path = "../virtual-net" }
-virtual-mio = { version = "0.705.0", path = "../virtual-io" }
-
 # Wasmer-owned dependencies.
 
 webc.workspace = true
@@ -199,7 +188,7 @@ log.workspace = true
 semver.workspace = true
 sha2.workspace = true
 wasm-coredump-builder = { workspace = true, optional = true }
-tracing.workspace = true
+tracing = { workspace = true, features = ["log"] }
 tracing-subscriber = { workspace = true, features = [
   "env-filter",
   "fmt",

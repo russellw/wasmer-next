@@ -2,6 +2,7 @@
 
 pub mod app;
 pub mod cargo_annotations;
+pub mod filesystem;
 pub mod hash;
 #[cfg(feature = "network-rules")]
 pub mod network_rules;
