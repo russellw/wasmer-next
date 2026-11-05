@@ -142,6 +142,7 @@ wasmer-types = { version = "=7.5.0", path = "../types", features = [
 wasixv2-dylink = { path = "../wasix/dylink", default-features = false }
 wasixv2 = { path = "../wasix/api", default-features = false, features = [
   "tokio",
+  "terminal",
   "host-network",
   "wasix1",
   "resolved-packages",

@@ -4,6 +4,8 @@ mod runtime;
 mod target;
 #[cfg(unix)]
 mod terminal;
+#[cfg(unix)]
+mod terminal_signals;
 mod wasi;
 
 use std::{io::Write, path::PathBuf, sync::Arc, time::Duration};

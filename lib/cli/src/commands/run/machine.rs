@@ -31,13 +31,13 @@ use webc::{
     v3::read::OwnedReader,
 };
 
-#[cfg(unix)]
-use super::terminal::{self, HostTerminal};
 use super::{
     CliPackageSource, GuestExit, Run, exit_with_wasi_exit_code,
     runtime::{ModuleCompiler, PackageTree, RunContext, RunPackage},
     wasi::{DnsMode, utf8_env_part},
 };
+#[cfg(unix)]
+use super::{terminal::HostTerminal, terminal_signals::TerminalSignals};
 use crate::backend::{BackendType, RuntimeOptions};
 use crate::utils::PublishedProtocol;
 
@@ -748,6 +748,7 @@ impl Run {
         let terminal = (!self.wasi.no_tty).then(HostTerminal::detect).flatten();
         #[cfg(unix)]
         let console = terminal
+            .as_ref()
             .map(|terminal| terminal.console(&stdio))
             .transpose()
             .context("cannot use the terminal as the guest's console")?;
@@ -845,24 +846,38 @@ impl Run {
                 .collect::<Result<Vec<_>, Error>>()?;
             // Installed before the guest starts, so no signal takes the host's default action.
             #[cfg(unix)]
-            forward_signals(handle, machine.signaller(), terminal)
+            let forwarders = forward_signals(handle, machine.signaller(), terminal.clone())
                 .context("cannot install signal handlers")?;
             #[cfg(not(unix))]
-            forward_signals(handle, machine.signaller())
+            let forwarders = forward_signals(handle, machine.signaller())
                 .context("cannot install signal handlers")?;
             // Restored when the run ends, before `wasmer` reports anything or exits.
             #[cfg(unix)]
-            let _raw = terminal
-                .map(|terminal| terminal.raw())
-                .transpose()
-                .context("cannot put the terminal in raw mode")?;
-            let status = match &program.start {
-                Start::Module { engine, module } => {
-                    machine.run_module(engine, module, config).await
+            let raw = match terminal.as_ref().map(|terminal| terminal.raw()).transpose() {
+                Ok(raw) => raw,
+                Err(err) => {
+                    forwarders.shutdown().await;
+                    return Err(Error::new(err).context("cannot put the terminal in raw mode"));
                 }
-                Start::File(path) => machine.run_file(engine, path, config).await,
             };
-            Ok::<_, Error>(status)
+            use futures_util::FutureExt as _;
+            let status = std::panic::AssertUnwindSafe(async {
+                match &program.start {
+                    Start::Module { engine, module } => {
+                        machine.run_module(engine, module, config).await
+                    }
+                    Start::File(path) => machine.run_file(engine, path, config).await,
+                }
+            })
+            .catch_unwind()
+            .await;
+            forwarders.shutdown().await;
+            #[cfg(unix)]
+            drop(raw);
+            match status {
+                Ok(status) => Ok::<_, Error>(status),
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
         }));
         let result = match run {
             Ok(Ok(0)) => Ok(()),
@@ -1147,12 +1162,35 @@ fn raise_open_file_limit() {
     }
 }
 
+/// Every forwarder is retired before its run releases raw mode. Drop also aborts tasks
+/// on an unexpected outer unwind; ordinary errors and guest panics use shutdown's join.
+#[derive(Default)]
+struct SignalForwarders(Vec<tokio::task::JoinHandle<()>>);
+
+impl SignalForwarders {
+    async fn shutdown(mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+        for task in self.0.drain(..) {
+            let _ = task.await;
+        }
+    }
+}
+impl Drop for SignalForwarders {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
+}
+
 #[cfg(unix)]
 fn forward_signals(
     runtime: &tokio::runtime::Handle,
     signaller: Signaller,
     terminal: Option<HostTerminal>,
-) -> io::Result<()> {
+) -> io::Result<SignalForwarders> {
     use tokio::signal::unix::{SignalKind, signal};
 
     // Host signal, its number in the guest's ABI, and whether a terminal sends it.
@@ -1166,11 +1204,22 @@ fn forward_signals(
     ];
 
     let _context = runtime.enter();
+    // Complete every fallible registration before starting any task.
+    let streams = FORWARDED
+        .into_iter()
+        .map(|(host, guest, from_terminal)| {
+            signal(SignalKind::from_raw(host)).map(|stream| (host, guest, from_terminal, stream))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let changes = terminal
+        .as_ref()
+        .map(|_| TerminalSignals::new())
+        .transpose()?;
     let console = terminal.is_some();
-    for (host, guest, from_terminal) in FORWARDED {
-        let mut stream = signal(SignalKind::from_raw(host))?;
+    let mut tasks = SignalForwarders::default();
+    for (host, guest, from_terminal, mut stream) in streams {
         let signaller = signaller.clone();
-        runtime.spawn(async move {
+        tasks.0.push(runtime.spawn(async move {
             let mut interrupts = Interrupts::default();
             while stream.recv().await.is_some() {
                 if console && host == libc::SIGHUP {
@@ -1186,55 +1235,31 @@ fn forward_signals(
                 }
                 interrupts.forward(&signaller);
             }
-        });
+        }));
     }
-    if let Some(terminal) = terminal {
-        forward_terminal_changes(runtime, signaller, terminal)?;
-    }
-    Ok(())
-}
-
-/// What happens to the host's `terminal` while the guest has it as its console: a new window
-/// size goes to the console (SIGWINCH), and a stop of `wasmer` (SIGTSTP) gives the terminal
-/// its settings back until `wasmer` is continued (SIGCONT), when it is raw again, at the size
-/// it has then.
-#[cfg(unix)]
-fn forward_terminal_changes(
-    runtime: &tokio::runtime::Handle,
-    signaller: Signaller,
-    terminal: HostTerminal,
-) -> io::Result<()> {
-    use tokio::signal::unix::{SignalKind, signal};
-
-    for host in [libc::SIGWINCH, libc::SIGTSTP, libc::SIGCONT] {
-        let mut stream = signal(SignalKind::from_raw(host))?;
-        let signaller = signaller.clone();
-        runtime.spawn(async move {
-            while stream.recv().await.is_some() {
-                if host == libc::SIGTSTP {
-                    terminal::suspend();
-                    // The stop SIGTSTP would have been, now that the terminal is restored. To
-                    // this thread, which stops before it goes on to raw mode again: a signal
-                    // to the process might be taken by another thread, later.
-                    // SAFETY: a signal to the calling thread.
-                    unsafe { libc::raise(libc::SIGSTOP) };
-                }
-                if host != libc::SIGWINCH {
-                    terminal::resume();
+    if let Some((terminal, mut changes)) = terminal.zip(changes) {
+        tasks.0.push(runtime.spawn(async move {
+            loop {
+                if let Err(err) = changes.recv().await {
+                    tracing::warn!(%err, "cannot forward terminal changes");
+                    break;
                 }
                 signaller.console_resize(terminal.size());
             }
-        });
+        }));
     }
-    Ok(())
+    Ok(tasks)
 }
 
 /// Forwards Ctrl-C as `SIGINT`; see the Unix version. Exits with 3, as the C runtime does.
 #[cfg(windows)]
-fn forward_signals(runtime: &tokio::runtime::Handle, signaller: Signaller) -> io::Result<()> {
+fn forward_signals(
+    runtime: &tokio::runtime::Handle,
+    signaller: Signaller,
+) -> io::Result<SignalForwarders> {
     let _context = runtime.enter();
     let mut ctrl_c = tokio::signal::windows::ctrl_c()?;
-    runtime.spawn(async move {
+    Ok(SignalForwarders(vec![runtime.spawn(async move {
         let mut interrupts = Interrupts::default();
         while ctrl_c.recv().await.is_some() {
             if interrupts.press(&signaller) {
@@ -1242,8 +1267,7 @@ fn forward_signals(runtime: &tokio::runtime::Handle, signaller: Signaller) -> io
             }
             interrupts.forward(&signaller);
         }
-    });
-    Ok(())
+    })]))
 }
 
 /// Sends `sig` to the guest; for a terminal's signal, returns whether some process has it
