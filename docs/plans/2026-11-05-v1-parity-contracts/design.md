@@ -1,7 +1,8 @@
 # Remaining v1 compatibility contracts
 
-Status: proposed; independently reviewed by Sol 6.1 high subagents. Production
-implementation of the changes below awaits user agreement. This is bounded
+Status: independently reviewed by Sol 6.1 high subagents. The user approved the
+macOS observation/capability separation and explicitly deferred configured guest
+parallelism. Implement only the approved macOS contract. This is bounded
 compatibility work, not a commitment to the complete Linux surface.
 
 ## macOS pathname metadata and inode capabilities
@@ -59,6 +60,10 @@ default to the pinned path. Review and test the core interfaces before the Darwi
 implementation, then run real macOS mode-000 metadata and open/mutation cases.
 
 ## Configured guest parallelism
+
+Deferred by the user; this proposal is retained for later consideration and is
+not an implementation requirement for the current delivery. Guest-advertised
+parallelism may follow the kernel default rather than the requested SDK value.
 
 Required behavior: the retained SDK accepts integer parallelism values from 1
 through `u32::MAX`, rejects zero/nonintegers, and returns the configured value to
