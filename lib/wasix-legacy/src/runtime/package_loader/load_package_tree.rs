@@ -7,45 +7,19 @@ use std::{
 use anyhow::{Context, Error};
 use futures::{StreamExt, TryStreamExt};
 use once_cell::sync::OnceCell;
-use petgraph::visit::EdgeRef;
 use virtual_fs::{FileSystem, WebcVolumeFileSystem};
 use wasmer_config::package::PackageId;
-use wasmer_package::utils::wasm_annotations_to_features;
-use webc::metadata::annotations::Atom as AtomAnnotation;
 use webc::{Container, Volume};
 
 use crate::{
-    bin_factory::{BinaryPackage, BinaryPackageCommand, BinaryPackageMount, BinaryPackageMounts},
+    bin_factory::{BinaryPackage, BinaryPackageMount, BinaryPackageMounts},
     runtime::{
         package_loader::PackageLoader,
         resolver::{
-            DependencyGraph, ItemLocation, PackageSummary, Resolution, ResolvedFileSystemMapping,
-            ResolvedPackage,
+            DependencyGraph, PackageSummary, Resolution, ResolvedFileSystemMapping, ResolvedPackage,
         },
     },
 };
-
-use super::to_module_hash;
-
-/// Convert WebAssembly feature annotations to a Features object
-fn wasm_annotation_to_features(
-    wasm_annotation: &webc::metadata::annotations::Wasm,
-) -> Option<wasmer_types::Features> {
-    Some(wasm_annotations_to_features(&wasm_annotation.features))
-}
-
-/// Extract WebAssembly features from atom metadata if available
-fn extract_features_from_atom_metadata(
-    atom_metadata: &webc::metadata::Atom,
-) -> Option<wasmer_types::Features> {
-    if let Ok(Some(wasm_annotation)) = atom_metadata
-        .annotation::<webc::metadata::annotations::Wasm>(webc::metadata::annotations::Wasm::KEY)
-    {
-        wasm_annotation_to_features(&wasm_annotation)
-    } else {
-        None
-    }
-}
 
 /// The maximum number of packages that will be loaded in parallel.
 const MAX_PARALLEL_DOWNLOADS: usize = 32;
@@ -65,7 +39,7 @@ pub async fn load_package_tree(
     let fs_opt = filesystem(&containers, &resolution.package, root_is_local_dir)?;
 
     let root = &resolution.package.root_package;
-    let commands = commands(&resolution.package.commands, &containers, resolution)?;
+    let commands = wasmer_package::commands::load_commands(&containers, resolution)?;
 
     let file_system_memory_footprint = if let Some(fs) = &fs_opt {
         count_package_mounts(fs)
@@ -94,228 +68,6 @@ pub async fn load_package_tree(
     };
 
     Ok(loaded)
-}
-
-fn commands(
-    commands: &BTreeMap<String, ItemLocation>,
-    containers: &HashMap<PackageId, Container>,
-    resolution: &Resolution,
-) -> Result<Vec<BinaryPackageCommand>, Error> {
-    let mut pkg_commands = Vec::new();
-
-    for (
-        name,
-        ItemLocation {
-            name: original_name,
-            package,
-        },
-    ) in commands
-    {
-        let webc = containers.get(package).with_context(|| {
-            format!("Unable to find the \"{package}\" package for the \"{name}\" command")
-        })?;
-        let manifest = webc.manifest();
-        let command_metadata = manifest.commands.get(original_name).with_context(|| {
-            format!(
-                "Unable to find the \"{original_name}\" command metadata in the \"{package}\" package"
-            )
-        })?;
-
-        if let Some(cmd) =
-            load_binary_command(package, name, command_metadata, containers, resolution)?
-        {
-            pkg_commands.push(cmd);
-        }
-    }
-
-    Ok(pkg_commands)
-}
-
-/// Given a [`webc::metadata::Command`], figure out which atom it uses and load
-/// that atom into a [`BinaryPackageCommand`].
-#[tracing::instrument(skip_all, fields(%package_id, %command_name))]
-fn load_binary_command(
-    package_id: &PackageId,
-    command_name: &str,
-    cmd: &webc::metadata::Command,
-    containers: &HashMap<PackageId, Container>,
-    resolution: &Resolution,
-) -> Result<Option<BinaryPackageCommand>, anyhow::Error> {
-    let AtomAnnotation {
-        name: atom_name,
-        dependency,
-        ..
-    } = match atom_name_for_command(command_name, cmd)? {
-        Some(name) => name,
-        None => {
-            tracing::warn!(
-                cmd.name=command_name,
-                cmd.runner=%cmd.runner,
-                "Skipping unsupported command",
-            );
-            return Ok(None);
-        }
-    };
-
-    let package = containers
-        .get(package_id)
-        .with_context(|| format!("Unable to find the \"{package_id}\" package"))?;
-
-    let (webc, resolved_package_id) = match dependency {
-        Some(dep) => {
-            let ix = resolution
-                .graph
-                .packages()
-                .get(package_id)
-                .copied()
-                .unwrap();
-            let graph = resolution.graph.graph();
-            let edge_reference = graph
-                .edges_directed(ix, petgraph::Direction::Outgoing)
-                .find(|edge| edge.weight().alias == dep)
-                .with_context(|| format!("Unable to find the \"{dep}\" dependency for the \"{command_name}\" command in \"{package_id}\""))?;
-
-            let other_package = graph.node_weight(edge_reference.target()).unwrap();
-            let id = &other_package.id;
-
-            tracing::debug!(
-                dependency=%dep,
-                resolved_package_id=%id,
-                "command atom resolution: resolved dependency",
-            );
-            let container = containers.get(id).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "The \"{command_name}\" command in \"{package_id}\" shadows an entry/command of the \"{dep}\" dependency. Rename the local command."
-                )
-            })?;
-
-            (container, id)
-        }
-        None => (package, package_id),
-    };
-
-    let atom = webc.get_atom(&atom_name);
-
-    if atom.is_none() && cmd.annotations.is_empty() {
-        tracing::info!("applying legacy atom hack");
-        return legacy_atom_hack(webc, package_id, command_name, cmd);
-    }
-
-    let hash = to_module_hash(webc.manifest().atom_signature(&atom_name)?);
-
-    let atom = atom.with_context(|| {
-
-        let available_atoms = webc.atoms().keys().map(|x| x.as_str()).collect::<Vec<_>>().join(",");
-
-        tracing::warn!(
-            %atom_name,
-            %resolved_package_id,
-            %available_atoms,
-            "invalid command: could not find atom in package",
-        );
-
-        format!(
-            "The '{command_name}' command uses the '{atom_name}' atom, but it isn't present in the package: {resolved_package_id})"
-        )
-    })?;
-
-    // Get WebAssembly features from manifest atom annotations
-    let features = if let Some(atom_metadata) = webc.manifest().atoms.get(&atom_name) {
-        extract_features_from_atom_metadata(atom_metadata)
-    } else {
-        None
-    };
-
-    let cmd = BinaryPackageCommand::new(
-        command_name.to_string(),
-        cmd.clone(),
-        atom,
-        hash,
-        features,
-        package_id.clone(),
-        resolved_package_id.clone(),
-    );
-
-    Ok(Some(cmd))
-}
-
-fn atom_name_for_command(
-    command_name: &str,
-    cmd: &webc::metadata::Command,
-) -> Result<Option<AtomAnnotation>, anyhow::Error> {
-    use webc::metadata::annotations::{WASI_RUNNER_URI, WCGI_RUNNER_URI};
-
-    if let Some(atom) = cmd
-        .atom()
-        .context("Unable to deserialize atom annotations")?
-    {
-        return Ok(Some(atom));
-    }
-
-    if [WASI_RUNNER_URI, WCGI_RUNNER_URI]
-        .iter()
-        .any(|uri| cmd.runner.starts_with(uri))
-    {
-        // Note: We use the command name as the atom name as a special case
-        // for known runner types because sometimes people will construct
-        // a manifest by hand instead of using wapm2pirita.
-        tracing::debug!(
-            command = command_name,
-            "No annotations specifying the atom name found. Falling back to the command name"
-        );
-        return Ok(Some(AtomAnnotation::new(command_name, None)));
-    }
-
-    Ok(None)
-}
-
-/// HACK: Some older packages like `sharrattj/bash` and `sharrattj/coreutils`
-/// contain commands with no annotations. When this happens, you can just assume
-/// it wants to use the first atom in the WEBC file.
-///
-/// That works because most of these packages only have a single atom (e.g. in
-/// `sharrattj/coreutils` there are commands for `ls`, `pwd`, and so on, but
-/// under the hood they all use the `coreutils` atom).
-///
-/// See <https://github.com/wasmerio/wasmer/commit/258903140680716da1431d92bced67d486865aeb>
-/// for more.
-fn legacy_atom_hack(
-    webc: &Container,
-    package_id: &PackageId,
-    command_name: &str,
-    metadata: &webc::metadata::Command,
-) -> Result<Option<BinaryPackageCommand>, anyhow::Error> {
-    let (name, atom) = webc
-        .atoms()
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow::Error::msg("container does not have any atom"))?;
-
-    tracing::debug!(
-        command_name,
-        atom.name = name.as_str(),
-        atom.len = atom.len(),
-        "(hack) The command metadata is malformed. Falling back to the first atom in the WEBC file",
-    );
-
-    let hash = to_module_hash(webc.manifest().atom_signature(&name)?);
-
-    // Get WebAssembly features from manifest atom annotations
-    let features = if let Some(atom_metadata) = webc.manifest().atoms.get(&name) {
-        extract_features_from_atom_metadata(atom_metadata)
-    } else {
-        None
-    };
-
-    Ok(Some(BinaryPackageCommand::new(
-        command_name.to_string(),
-        metadata.clone(),
-        atom,
-        hash,
-        features,
-        package_id.clone(),
-        package_id.clone(),
-    )))
 }
 
 async fn fetch_dependencies(

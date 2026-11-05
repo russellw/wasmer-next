@@ -8131,6 +8131,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "ciborium",
+ "derive_more",
  "flate2",
  "futures",
  "hex",

@@ -45,6 +45,7 @@ walkdir = { workspace = true, optional = true }
 web-time = { workspace = true, optional = true }
 pin-utils = { workspace = true, optional = true }
 wasm-bindgen-futures = { workspace = true, optional = true }
+derive_more = { workspace = true, optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 zstd = { workspace = true, optional = true }
@@ -79,6 +80,7 @@ acquisition = [
   "execution",
   "dep:anyhow",
   "dep:async-trait",
+  "dep:derive_more",
   "dep:futures",
   "dep:flate2",
   "dep:hex",
