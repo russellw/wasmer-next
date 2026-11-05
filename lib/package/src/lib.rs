@@ -7,6 +7,8 @@ mod error;
 #[cfg(feature = "acquisition")]
 pub mod http;
 #[cfg(feature = "acquisition")]
+pub mod loader;
+#[cfg(feature = "acquisition")]
 pub mod resolver;
 
 #[cfg(feature = "authoring")]

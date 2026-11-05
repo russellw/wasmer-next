@@ -8139,8 +8139,10 @@ dependencies = [
  "itertools 0.15.0",
  "libc",
  "petgraph",
+ "pin-utils",
  "pretty_assertions",
  "regex",
+ "reqwest",
  "semver 1.0.28",
  "serde",
  "serde_json",
@@ -8155,10 +8157,12 @@ dependencies = [
  "ureq 3.4.2",
  "url",
  "walkdir",
+ "wasm-bindgen-futures",
  "wasmer-config",
  "wasmer-types",
  "web-time",
  "webc",
+ "zstd",
 ]
 
 [[package]]
@@ -8321,7 +8325,6 @@ dependencies = [
  "pretty_assertions",
  "rand 0.10.3",
  "rayon",
- "reqwest",
  "rkyv",
  "rusty_pool",
  "semver 1.0.28",

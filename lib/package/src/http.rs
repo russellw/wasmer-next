@@ -1,4 +1,7 @@
 //! HTTP request/response contracts for package acquisition and embedder providers.
+#[cfg(feature = "http-client")]
+pub mod reqwest;
+
 use std::{collections::BTreeSet, ops::Deref, sync::Arc};
 
 use futures::future::BoxFuture;
