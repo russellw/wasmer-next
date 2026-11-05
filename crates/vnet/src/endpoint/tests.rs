@@ -57,17 +57,35 @@ struct Registration {
 }
 enum Frame {
     Withdraw(Target),
-    Tcp(
-        Target,
-        SocketAddr,
-        SocketAddr,
-        Arc<dyn BackendStream>,
-        WaitQueue,
-    ),
+    Tcp(TcpOffer),
     Udp(Target, SocketAddr, SocketAddr, Vec<u8>),
     Configure(Arc<Tx>, UdpTxConfig),
-    Bytes(usize, Vec<u8>),
+    Bytes(usize, usize, Vec<u8>),
+    Credit(usize, usize),
     Fin(usize),
+}
+const PENDING_TCP_LIMIT: usize = 8;
+const STREAM_CAPACITY: usize = 16;
+struct TcpOffer {
+    target: Target,
+    src: SocketAddr,
+    dst: SocketAddr,
+    stream: Arc<dyn BackendStream>,
+    wq: WaitQueue,
+    client: usize,
+}
+struct HeldTcp {
+    offer: TcpOffer,
+    wake: Arc<RoomWake>,
+    _registrations: Vec<wasixv2_wait::WaitRegistration>,
+}
+#[derive(Default)]
+struct RoomWake(AtomicBool);
+impl wasixv2_wait::WaitEntry for RoomWake {
+    fn wake(&self, _: PollMask) -> bool {
+        self.0.store(true, Ordering::SeqCst);
+        false
+    }
 }
 #[derive(Default)]
 struct Broker {
@@ -76,6 +94,8 @@ struct Broker {
     deliveries: Mutex<Vec<DatagramDelivery>>,
     streams: Mutex<HashMap<usize, std::sync::Weak<WireStream>>>,
     next_stream: AtomicUsize,
+    pending_tcp: Mutex<Vec<HeldTcp>>,
+    accepted_tcp: AtomicUsize,
 }
 impl Broker {
     fn queue(&self, frame: Frame) {
@@ -89,7 +109,77 @@ impl Broker {
             .find(|r| r.target == target)
             .cloned()
     }
+    fn stream(&self, id: usize) -> Option<Arc<WireStream>> {
+        self.streams
+            .lock()
+            .unwrap()
+            .get(&id)
+            .and_then(std::sync::Weak::upgrade)
+    }
+    fn connecting(&self, id: usize) -> bool {
+        self.stream(id)
+            .is_some_and(|s| s.status.load(Ordering::SeqCst) == 0)
+    }
+    fn complete(&self, id: usize, error: Option<Errno>) {
+        if let Some(stream) = self.stream(id) {
+            *stream.error.lock().unwrap() = error;
+            stream
+                .status
+                .store(if error.is_some() { 2 } else { 1 }, Ordering::SeqCst);
+            stream.wq.wake(PollMask::empty());
+        }
+    }
+    fn offer_tcp(&self, offer: TcpOffer) {
+        if !self.connecting(offer.client) {
+            return;
+        }
+        let Some(Registration {
+            sink: Sink::Tcp(sink),
+            ..
+        }) = self.registration(offer.target)
+        else {
+            self.complete(offer.client, Some(Errno::ECONNREFUSED));
+            return;
+        };
+        let wake = Arc::new(RoomWake::default());
+        let mut registrations = Vec::new();
+        let mut register = |queue: &WaitQueue, _| registrations.push(queue.add(wake.clone()));
+        let mut table = PollTable::new(PollMask::OUT, &mut register);
+        match sink.poll_room_to(offer.src, offer.dst, Some(&mut table)) {
+            Room::Ready => {
+                let accepted = sink.incoming_to(offer.src, offer.dst, offer.stream, offer.wq);
+                if accepted {
+                    self.accepted_tcp.fetch_add(1, Ordering::SeqCst);
+                }
+                self.complete(offer.client, (!accepted).then_some(Errno::ECONNREFUSED));
+            }
+            Room::Full => {
+                let mut held = self.pending_tcp.lock().unwrap();
+                if held.len() < PENDING_TCP_LIMIT {
+                    held.push(HeldTcp {
+                        offer,
+                        wake,
+                        _registrations: registrations,
+                    });
+                } else {
+                    drop(held);
+                    self.complete(offer.client, Some(Errno::ECONNREFUSED));
+                }
+            }
+            Room::Gone => self.complete(offer.client, Some(Errno::ECONNREFUSED)),
+        }
+    }
     fn drive(&self) {
+        // PollTable wakes only mark work. Move custody out of the broker mutex before
+        // querying a listener or retrying a previously unaccepted connection.
+        let pending = std::mem::take(&mut *self.pending_tcp.lock().unwrap());
+        for held in pending {
+            if held.wake.0.swap(false, Ordering::SeqCst) || !self.connecting(held.offer.client) {
+                self.offer_tcp(held.offer);
+            } else {
+                self.pending_tcp.lock().unwrap().push(held);
+            }
+        }
         loop {
             let frame = self.frames.lock().unwrap().pop_front();
             let Some(frame) = frame else { break };
@@ -97,16 +187,7 @@ impl Broker {
                 Frame::Withdraw(target) => {
                     self.records.lock().unwrap().retain(|r| r.target != target)
                 }
-                Frame::Tcp(target, src, dst, stream, wq) => {
-                    if let Some(Registration {
-                        sink: Sink::Tcp(sink),
-                        ..
-                    }) = self.registration(target)
-                    {
-                        assert_eq!(sink.poll_room_to(src, dst, None), Room::Ready);
-                        assert!(sink.incoming_to(src, dst, stream, wq));
-                    }
-                }
+                Frame::Tcp(offer) => self.offer_tcp(offer),
                 Frame::Udp(target, src, dst, bytes) => {
                     let disposition = match self.registration(target) {
                         Some(Registration {
@@ -118,16 +199,21 @@ impl Broker {
                     self.deliveries.lock().unwrap().push(disposition);
                 }
                 Frame::Configure(tx, config) => tx.apply(config),
-                Frame::Bytes(id, bytes) => {
-                    let stream = self
-                        .streams
-                        .lock()
-                        .unwrap()
-                        .get(&id)
-                        .and_then(std::sync::Weak::upgrade);
-                    if let Some(stream) = stream {
-                        stream.input.lock().unwrap().extend(bytes);
+                Frame::Bytes(from, id, bytes) => {
+                    if let Some(stream) = self.stream(id) {
+                        let mut input = stream.input.lock().unwrap();
+                        assert!(input.len() + bytes.len() <= STREAM_CAPACITY);
+                        input.extend(bytes);
+                        drop(input);
                         stream.wq.wake(PollMask::IN);
+                    } else {
+                        self.complete(from, Some(Errno::ECONNRESET));
+                    }
+                }
+                Frame::Credit(id, bytes) => {
+                    if let Some(stream) = self.stream(id) {
+                        stream.outstanding.fetch_sub(bytes, Ordering::SeqCst);
+                        stream.wq.wake(PollMask::OUT);
                     }
                 }
                 Frame::Fin(id) => {
@@ -150,8 +236,12 @@ impl Broker {
 /// crosses the driver queue; no data-plane operation calls any namespace or ingress.
 struct WireStream {
     broker: std::sync::Weak<Broker>,
+    id: usize,
     peer_id: usize,
     peer: SocketAddr,
+    status: AtomicUsize,
+    error: Mutex<Option<Errno>>,
+    outstanding: AtomicUsize,
     input: Mutex<VecDeque<u8>>,
     eof: AtomicBool,
     wq: WaitQueue,
@@ -166,8 +256,12 @@ impl WireStream {
         let pair = [0, 1].map(|side| {
             Arc::new(Self {
                 broker: Arc::downgrade(broker),
+                id: first + side,
                 peer_id: first + 1 - side,
                 peer: addresses[1 - side],
+                status: AtomicUsize::new(side), // client Connecting; accepted side Established
+                error: Mutex::new(None),
+                outstanding: AtomicUsize::new(0),
                 input: Mutex::new(VecDeque::new()),
                 eof: AtomicBool::new(false),
                 wq: queues[side].clone(),
@@ -192,7 +286,15 @@ impl Drop for WireStream {
 }
 impl Pollable for WireStream {
     fn poll(&self, _: Option<&mut PollTable<'_>>) -> PollMask {
-        let mut mask = PollMask::OUT;
+        let mut mask = PollMask::empty();
+        if self.status.load(Ordering::SeqCst) == 1
+            && self.outstanding.load(Ordering::SeqCst) < STREAM_CAPACITY
+        {
+            mask |= PollMask::OUT;
+        }
+        if self.status.load(Ordering::SeqCst) == 2 {
+            mask |= PollMask::ERR | PollMask::HUP | PollMask::OUT;
+        }
         if !self.input.lock().unwrap().is_empty() {
             mask |= PollMask::IN;
         }
@@ -204,7 +306,11 @@ impl Pollable for WireStream {
 }
 impl BackendStream for WireStream {
     fn state(&self) -> crate::StreamState {
-        crate::StreamState::Established
+        match self.status.load(Ordering::SeqCst) {
+            0 => crate::StreamState::Connecting,
+            1 => crate::StreamState::Established,
+            _ => crate::StreamState::Closed,
+        }
     }
     fn read(&self, out: &mut [u8], peek: bool) -> Result<usize, Errno> {
         let mut input = self.input.lock().unwrap();
@@ -218,11 +324,35 @@ impl BackendStream for WireStream {
         if !peek {
             input.drain(..len);
         }
+        drop(input);
+        if !peek && len != 0 {
+            self.queue(Frame::Credit(self.peer_id, len));
+        }
         Ok(len)
     }
     fn write(&self, data: &[u8]) -> Result<usize, Errno> {
-        self.queue(Frame::Bytes(self.peer_id, data.to_vec()));
-        Ok(data.len())
+        if self.status.load(Ordering::SeqCst) != 1 {
+            return Err(Errno::EAGAIN);
+        }
+        let mut queued = self.outstanding.load(Ordering::SeqCst);
+        loop {
+            let len = data.len().min(STREAM_CAPACITY - queued);
+            if len == 0 && !data.is_empty() {
+                return Err(Errno::EAGAIN);
+            }
+            match self.outstanding.compare_exchange(
+                queued,
+                queued + len,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    self.queue(Frame::Bytes(self.id, self.peer_id, data[..len].to_vec()));
+                    return Ok(len);
+                }
+                Err(current) => queued = current,
+            }
+        }
     }
     fn write_urgent(&self, _: &[u8]) -> Result<usize, Errno> {
         Err(Errno::EOPNOTSUPP)
@@ -238,7 +368,7 @@ impl BackendStream for WireStream {
         Ok(())
     }
     fn take_error(&self) -> Option<Errno> {
-        None
+        self.error.lock().unwrap().take()
     }
     fn peer_addr(&self) -> SocketAddr {
         self.peer
@@ -266,8 +396,8 @@ impl Pollable for Lease {
     }
 }
 impl EndpointLease for Lease {
-    fn reporter(&self) -> PublicationReporter {
-        self.status.clone()
+    fn reporter(&self) -> &PublicationReporter {
+        &self.status
     }
     fn set_backlog(&self, revision: u64, backlog: u32) {
         Provider::hook(&self.hint_hook);
@@ -562,8 +692,14 @@ impl EndpointProvider for Provider {
         let server_wq = WaitQueue::new();
         let [client, server] =
             WireStream::pair(&self.broker, [local, remote], [wq, server_wq.clone()]);
-        self.broker
-            .queue(Frame::Tcp(target, local, remote, server, server_wq));
+        self.broker.queue(Frame::Tcp(TcpOffer {
+            target,
+            src: local,
+            dst: remote,
+            stream: server,
+            wq: server_wq,
+            client: client.id,
+        }));
         Ok(client)
     }
     fn datagram(
@@ -1271,4 +1407,302 @@ fn provider_gso_never_replays_a_segment_accepted_before_capacity_failure() {
     broker.drive();
     assert_eq!(tx.sent.load(Ordering::SeqCst), 2);
     assert_eq!(receiver.recv(&mut [0; 64], MsgFlags(0)), Err(Errno::EAGAIN));
+}
+
+#[test]
+fn udp_retirement_wakes_registered_socket_waiter_for_every_source_reset() {
+    for action in ["disconnect", "reassociate", "addrform"] {
+        let (_, left, provider, right, _) = pair();
+        let receiver = socket(&right, SocketKind::Datagram);
+        let peer = addr("127.0.0.1:8250");
+        receiver.bind(peer, false).unwrap();
+        let domain = if action == "addrform" {
+            Domain::Inet6
+        } else {
+            Domain::Inet
+        };
+        let sender = left.socket(domain, SocketKind::Datagram, 0, 1).unwrap();
+        sender.connect(peer).unwrap();
+        send(&*sender, b"start", None).unwrap();
+        provider.tx().writable.store(false, Ordering::SeqCst);
+        assert_eq!(send(&*sender, b"blocked", None), Err(Errno::EAGAIN));
+        let wakes = Arc::new(WakeCount::default());
+        let mut registrations = Vec::new();
+        let mut register = |queue: &WaitQueue, _| registrations.push(queue.add(wakes.clone()));
+        let mut table = PollTable::new(PollMask::OUT, &mut register);
+        assert!(!sender.poll(Some(&mut table)).contains(PollMask::OUT));
+        let before = wakes.0.load(Ordering::SeqCst);
+        match action {
+            "disconnect" => sender.disconnect().unwrap(),
+            "reassociate" => sender.connect(peer).unwrap(),
+            _ => sender.set_option(41, 1, &2i32.to_le_bytes()).unwrap(),
+        }
+        assert!(
+            wakes.0.load(Ordering::SeqCst) > before,
+            "no socket wake for {action}"
+        );
+        assert!(
+            sender.poll(None).contains(PollMask::OUT),
+            "stale blocked focus for {action}"
+        );
+    }
+}
+
+#[test]
+fn udp_selection_shutdown_prevents_both_namespace_and_provider_dispatch() {
+    for local in [false, true] {
+        let (broker, left, provider, right, _) = pair();
+        let receiver = socket(if local { &left } else { &right }, SocketKind::Datagram);
+        let peer = addr("127.0.0.1:8260");
+        receiver.bind(peer, false).unwrap();
+        provider.local_first.store(local, Ordering::SeqCst);
+        let sender = socket(&left, SocketKind::Datagram);
+        let during_select = sender.clone();
+        *provider.select_hook.lock().unwrap() = Some(Box::new(move || {
+            assert_eq!(
+                during_select.shutdown(crate::Shutdown::Write),
+                Err(Errno::ENOTCONN)
+            );
+        }));
+        assert_eq!(
+            send(&*sender, b"must-not-arrive", Some(peer)),
+            Err(Errno::EPIPE)
+        );
+        broker.drive();
+        assert_eq!(receiver.recv(&mut [0; 64], MsgFlags(0)), Err(Errno::EAGAIN));
+        assert!(provider.txs.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn udp_stale_selection_route_consumes_no_payload_and_never_reappends_cork() {
+    let (broker, left, provider, right, _) = pair();
+    let receiver = socket(&right, SocketKind::Datagram);
+    let peer = addr("127.0.0.1:8270");
+    receiver.bind(peer, false).unwrap();
+    let sender = socket(&left, SocketKind::Datagram);
+    assert_eq!(
+        sender.send(SendMsg {
+            data: b"first",
+            to: Some(peer),
+            flags: MsgFlags::MSG_MORE,
+            control: &[],
+            net_raw: false,
+            now: Duration::ZERO
+        }),
+        Ok(5)
+    );
+    let during_select = Arc::downgrade(&left);
+    *provider.select_hook.lock().unwrap() = Some(Box::new(move || {
+        during_select.upgrade().unwrap().change_flags(1, 0).unwrap();
+    }));
+    assert_eq!(send(&*sender, b"second", None), Err(Errno::EAGAIN));
+    assert!(provider.txs.lock().unwrap().is_empty());
+    left.change_flags(1, 1).unwrap();
+    send(&*sender, b"new", Some(peer)).unwrap();
+    broker.drive();
+    assert_eq!(recv(&*receiver).0, b"new");
+    assert_eq!(provider.tx().sent.load(Ordering::SeqCst), 1);
+    assert_eq!(receiver.recv(&mut [0; 64], MsgFlags(0)), Err(Errno::EAGAIN));
+}
+
+#[test]
+fn udp_source_or_route_change_during_unlocked_factory_cannot_accept_payload() {
+    for change_source in [false, true] {
+        let (broker, left, provider, right, _) = pair();
+        let receiver = socket(&right, SocketKind::Datagram);
+        let peer = addr("127.0.0.1:8280");
+        receiver.bind(peer, false).unwrap();
+        let sender = socket(&left, SocketKind::Datagram);
+        let socket_hook = sender.clone();
+        let net_hook = Arc::downgrade(&left);
+        *provider.factory_hook.lock().unwrap() = Some(Box::new(move || {
+            if change_source {
+                socket_hook.disconnect().unwrap();
+            } else {
+                net_hook.upgrade().unwrap().change_flags(1, 0).unwrap();
+            }
+        }));
+        assert_eq!(
+            send(&*sender, b"stale", Some(peer)),
+            Err(if change_source {
+                Errno::ECANCELED
+            } else {
+                Errno::EAGAIN
+            })
+        );
+        assert_eq!(provider.tx().sent.load(Ordering::SeqCst), 0);
+        broker.drive();
+        assert_eq!(receiver.recv(&mut [0; 64], MsgFlags(0)), Err(Errno::EAGAIN));
+    }
+}
+
+#[test]
+fn queued_tcp_full_wakes_once_after_accept_and_stream_capacity_never_spins() {
+    let (broker, left, _, right, _) = pair();
+    let listener = socket(&right, SocketKind::Stream);
+    let peer = addr("127.0.0.1:8290");
+    listener.bind(peer, false).unwrap();
+    listener.listen(0).unwrap(); // Linux's accept queue allows backlog + one.
+    let first = socket(&left, SocketKind::Stream);
+    let second = socket(&left, SocketKind::Stream);
+    assert_eq!(first.connect(peer), Err(Errno::EINPROGRESS));
+    assert_eq!(second.connect(peer), Err(Errno::EINPROGRESS));
+    broker.drive();
+    assert_eq!(broker.accepted_tcp.load(Ordering::SeqCst), 1);
+    assert_eq!(broker.pending_tcp.lock().unwrap().len(), 1);
+    assert!(!second.poll(None).contains(PollMask::OUT));
+    let connection_wakes = Arc::new(WakeCount::default());
+    let mut connection_registrations = Vec::new();
+    let mut register_connection =
+        |queue: &WaitQueue, _| connection_registrations.push(queue.add(connection_wakes.clone()));
+    assert!(
+        !second
+            .poll(Some(&mut PollTable::new(
+                PollMask::OUT,
+                &mut register_connection
+            )))
+            .contains(PollMask::OUT)
+    );
+    let connection_before = connection_wakes.0.load(Ordering::SeqCst);
+    broker.drive();
+    assert_eq!(broker.pending_tcp.lock().unwrap().len(), 1);
+    let accepted_first = listener.accept().unwrap().socket;
+    assert!(
+        broker.pending_tcp.lock().unwrap()[0]
+            .wake
+            .0
+            .load(Ordering::SeqCst)
+    );
+    broker.drive();
+    assert!(broker.pending_tcp.lock().unwrap().is_empty());
+    assert_eq!(broker.accepted_tcp.load(Ordering::SeqCst), 2);
+    assert!(connection_wakes.0.load(Ordering::SeqCst) > connection_before);
+    assert!(second.poll(None).contains(PollMask::OUT));
+    let accepted_second = listener.accept().unwrap().socket;
+    assert_eq!(listener.accept().unwrap_err(), Errno::EAGAIN);
+    assert_eq!(
+        send(&*second, &[7; STREAM_CAPACITY], None),
+        Ok(STREAM_CAPACITY)
+    );
+    assert_eq!(send(&*second, b"full", None), Err(Errno::EAGAIN));
+    let wakes = Arc::new(WakeCount::default());
+    let mut registrations = Vec::new();
+    let mut register = |queue: &WaitQueue, _| registrations.push(queue.add(wakes.clone()));
+    assert!(
+        !second
+            .poll(Some(&mut PollTable::new(PollMask::OUT, &mut register)))
+            .contains(PollMask::OUT)
+    );
+    broker.drive();
+    assert_eq!(accepted_second.input_len().unwrap(), STREAM_CAPACITY);
+    let mut bytes = [0; STREAM_CAPACITY];
+    assert_eq!(
+        accepted_second.recv(&mut bytes, MsgFlags(0)).unwrap().len,
+        STREAM_CAPACITY
+    );
+    assert_eq!(bytes, [7; STREAM_CAPACITY]);
+    assert!(!second.poll(None).contains(PollMask::OUT)); // credits still on driver
+    let before = wakes.0.load(Ordering::SeqCst);
+    broker.drive();
+    assert!(wakes.0.load(Ordering::SeqCst) > before);
+    assert!(second.poll(None).contains(PollMask::OUT));
+    assert_eq!(broker.accepted_tcp.load(Ordering::SeqCst), 2);
+    assert_eq!(accepted_first.input_len().unwrap(), 0);
+}
+
+#[test]
+fn queued_tcp_full_drops_cancelled_source_and_closed_listener_without_ghost_accept() {
+    for cancel_source in [false, true] {
+        let (broker, left, _, right, _) = pair();
+        let listener = socket(&right, SocketKind::Stream);
+        let peer = addr("127.0.0.1:8300");
+        listener.bind(peer, false).unwrap();
+        listener.listen(0).unwrap();
+        let first = socket(&left, SocketKind::Stream);
+        let blocked = socket(&left, SocketKind::Stream);
+        first.connect(peer).unwrap_err();
+        blocked.connect(peer).unwrap_err();
+        broker.drive();
+        assert_eq!(broker.pending_tcp.lock().unwrap().len(), 1);
+        if cancel_source {
+            blocked.disconnect().unwrap();
+        } else {
+            listener.disconnect().unwrap();
+        }
+        broker.drive();
+        assert!(broker.pending_tcp.lock().unwrap().is_empty());
+        assert_eq!(broker.accepted_tcp.load(Ordering::SeqCst), 1);
+        if cancel_source {
+            listener.accept().unwrap();
+            assert_eq!(listener.accept().unwrap_err(), Errno::EAGAIN);
+            assert_eq!(blocked.peer_addr(), Err(Errno::ENOTCONN));
+        } else {
+            assert_eq!(blocked.take_error(), Some(Errno::ECONNREFUSED));
+        }
+    }
+}
+
+/// Used by the runtime's private handoff test to hold admission while final owner refs drop.
+pub(super) fn teardown_namespace() -> (Arc<Net>, Arc<dyn Socket>) {
+    let (_, _, _, net, _) = pair();
+    let listener = socket(&net, SocketKind::Stream);
+    listener.bind(addr("127.0.0.1:8310"), false).unwrap();
+    listener.listen(1).unwrap();
+    (net, listener)
+}
+
+#[test]
+fn udp_source_change_during_pure_selection_does_not_open_transport() {
+    let (_, left, provider, right, _) = pair();
+    let receiver = socket(&right, SocketKind::Datagram);
+    let peer = addr("127.0.0.1:8320");
+    receiver.bind(peer, false).unwrap();
+    let sender = socket(&left, SocketKind::Datagram);
+    let during_select = sender.clone();
+    *provider.select_hook.lock().unwrap() = Some(Box::new(move || {
+        during_select.disconnect().unwrap();
+    }));
+    assert_eq!(
+        send(&*sender, b"stale-source", Some(peer)),
+        Err(Errno::ECANCELED)
+    );
+    assert!(provider.txs.lock().unwrap().is_empty());
+    assert_eq!(receiver.recv(&mut [0; 64], MsgFlags(0)), Err(Errno::EAGAIN));
+}
+
+#[test]
+fn tcp_room_and_arrival_race_last_namespace_references_without_panic() {
+    for _ in 0..16 {
+        let (_, _, _, net, provider) = pair();
+        let listener = socket(&net, SocketKind::Stream);
+        let dst = addr("127.0.0.1:8330");
+        let src = addr("127.0.0.1:40000");
+        listener.bind(dst, false).unwrap();
+        listener.listen(1).unwrap();
+        let record = provider.records().pop().unwrap();
+        let Sink::Tcp(sink) = record.sink else {
+            unreachable!()
+        };
+        let worker_sink = sink.clone();
+        let start = Arc::new(std::sync::Barrier::new(2));
+        let worker_start = start.clone();
+        let worker = std::thread::spawn(move || {
+            worker_start.wait();
+            for _ in 0..32 {
+                let _ = worker_sink.poll_room_to(src, dst, None);
+                let [stream, _] =
+                    crate::MemoryStream::pair([dst, src], [WaitQueue::new(), WaitQueue::new()]);
+                let _ = worker_sink.incoming_to(src, dst, stream, WaitQueue::new());
+            }
+        });
+        start.wait();
+        drop(listener);
+        drop(net);
+        worker.join().unwrap();
+        assert_eq!(sink.poll_room_to(src, dst, None), Room::Gone);
+        let [stream, _] =
+            crate::MemoryStream::pair([dst, src], [WaitQueue::new(), WaitQueue::new()]);
+        assert!(!sink.incoming_to(src, dst, stream, WaitQueue::new()));
+    }
 }

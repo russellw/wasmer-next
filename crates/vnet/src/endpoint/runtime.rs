@@ -496,7 +496,7 @@ impl EndpointStreamIngress for Ingress {
         destination: SocketAddr,
         table: Option<&mut PollTable<'_>>,
     ) -> Room {
-        let Some((_, group)) = self.capture(destination) else {
+        let Some((namespace, group)) = self.capture(destination) else {
             return Room::Gone;
         };
         let mut table = table;
@@ -504,7 +504,6 @@ impl EndpointStreamIngress for Ingress {
             return room;
         }
         let mut room = Room::Gone;
-        let namespace = self.namespace.upgrade().unwrap();
         for (weak, epoch) in self.tcp_members(&namespace, &group, source, destination) {
             if let Some(socket) = weak.upgrade() {
                 match socket.endpoint_room(epoch, source, destination, table.as_deref_mut()) {
@@ -523,13 +522,12 @@ impl EndpointStreamIngress for Ingress {
         stream: Arc<dyn BackendStream>,
         wq: WaitQueue,
     ) -> bool {
-        let Some((_, group)) = self.capture(destination) else {
+        let Some((namespace, group)) = self.capture(destination) else {
             return false;
         };
         if canonical(stream.peer_addr()) != canonical(source) || self.gate.room(None).is_some() {
             return false;
         }
-        let namespace = self.namespace.upgrade().unwrap();
         let mut members = self.tcp_members(&namespace, &group, source, destination);
         if !members.is_empty() {
             let count = members.len();
@@ -605,5 +603,57 @@ impl EndpointDatagramIngress for Ingress {
             .map_or(DatagramDelivery::Unreachable, |socket| {
                 socket.deliver_endpoint(member.source, &self.gate, bytes, from, destination)
             })
+    }
+}
+
+#[cfg(test)]
+mod teardown_tests {
+    use super::*;
+
+    #[test]
+    fn admitted_tcp_handoff_fails_closed_after_last_socket_and_net_retire() {
+        let (net, listener) = super::super::tests::teardown_namespace();
+        let namespace = net.endpoints().unwrap();
+        let group = namespace
+            .groups
+            .lock()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+        let (gate, attempt) = {
+            let control = group.control.lock().unwrap();
+            let attempt = control.attempt.as_ref().unwrap();
+            (attempt.gate.clone(), attempt.id)
+        };
+        let ingress = Ingress {
+            namespace: Arc::downgrade(&namespace),
+            group: Arc::downgrade(&group),
+            gate,
+            attempt,
+        };
+        let src = "127.0.0.1:40000".parse().unwrap();
+        let dst = "127.0.0.1:8310".parse().unwrap();
+        // This is the same captured capability and admission step the public methods use.
+        // Retain it across the deterministic final-reference teardown before candidate lookup.
+        let (captured, captured_group) = ingress.capture(dst).unwrap();
+        assert_eq!(ingress.gate.room(None), None);
+        drop(listener);
+        drop(net);
+        drop(namespace);
+        assert!(captured.net.upgrade().is_none());
+        assert!(
+            ingress
+                .tcp_members(&captured, &captured_group, src, dst)
+                .is_empty()
+        );
+        assert_eq!(ingress.poll_room_to(src, dst, None), Room::Gone);
+        let [stream, _] =
+            crate::MemoryStream::pair([dst, src], [WaitQueue::new(), WaitQueue::new()]);
+        assert!(!ingress.incoming_to(src, dst, stream, WaitQueue::new()));
+        drop(captured);
+        assert!(ingress.namespace.upgrade().is_none());
+        assert_eq!(ingress.poll_room_to(src, dst, None), Room::Gone);
     }
 }

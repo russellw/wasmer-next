@@ -254,6 +254,52 @@ impl UdpSocket {
         g.endpoint_connection = None;
         g.endpoint_blocked = None;
         g.endpoint_write_revision = 0;
+        // This is the socket queue, not the publication gate queue. WaitEntry only records
+        // readiness; it must not reenter socket state even when a wake holds its lock.
+        self.wq.wake(PollMask::empty());
+    }
+    fn endpoint_same_route(previous: &UdpRoute, current: &UdpRoute) -> bool {
+        match (previous, current) {
+            (
+                UdpRoute::Local {
+                    from: a,
+                    to: ta,
+                    at: na,
+                    iif: ia,
+                    back_iif: ba,
+                },
+                UdpRoute::Local {
+                    from: b,
+                    to: tb,
+                    at: nb,
+                    iif: ib,
+                    back_iif: bb,
+                },
+            ) => {
+                a == b
+                    && Arc::ptr_eq(na, nb)
+                    && ia == ib
+                    && ba == bb
+                    && match (ta, tb) {
+                        (None, None) => true,
+                        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                        _ => false,
+                    }
+            }
+            (UdpRoute::Backend { host_dst: a }, UdpRoute::Backend { host_dst: b }) => a == b,
+            (UdpRoute::Dns { from: a }, UdpRoute::Dns { from: b }) => a == b,
+            (
+                UdpRoute::Nowhere {
+                    from: a,
+                    unresolved: ua,
+                },
+                UdpRoute::Nowhere {
+                    from: b,
+                    unresolved: ub,
+                },
+            ) => a == b && ua == ub,
+            _ => false,
+        }
     }
     /// Explicit unlocked factory/configuration path; no accepted payload is retried here.
     fn endpoint_prepare_tx(
@@ -1050,6 +1096,20 @@ impl UdpSocket {
             if source != self.endpoint.source() || g.local != local_binding {
                 return Err(Errno::ECANCELED);
             }
+            // Publication refresh and pure selection may reenter this socket or change its
+            // route. Both choices must pass current validation before any dispatch accepts
+            // data. The cork has already been gathered: a stale snapshot fails unaccepted
+            // rather than recursively appending or replaying the message.
+            if let Some(error) = Self::take_err(&mut g) {
+                return Err(error);
+            }
+            if g.wr_shut {
+                return Err(Errno::EPIPE);
+            }
+            let current_route = self.net.udp_route(local, dst, &ctl)?;
+            if !Self::endpoint_same_route(&route, &current_route) {
+                return Err(Errno::EAGAIN);
+            }
             if let EndpointChoice::Provider(target) = choice {
                 g.endpoint_blocked = None;
                 g.endpoint_write_revision = g.endpoint_write_revision.saturating_add(1);
@@ -1075,11 +1135,15 @@ impl UdpSocket {
                     if source != self.endpoint.source() {
                         return Err(Errno::ECANCELED);
                     }
+                    if let Some(error) = Self::take_err(&mut g) {
+                        return Err(error);
+                    }
                     if g.wr_shut {
                         return Err(Errno::EPIPE);
                     }
-                    if let Some(error) = Self::take_err(&mut g) {
-                        return Err(error);
+                    let current_route = self.net.udp_route(local, dst, &ctl)?;
+                    if !Self::endpoint_same_route(&route, &current_route) {
+                        return Err(Errno::EAGAIN);
                     }
                     g.endpoint_revision
                 };
