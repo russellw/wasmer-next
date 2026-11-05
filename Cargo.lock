@@ -7054,6 +7054,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasix1-io-reference"
+version = "0.0.0"
+dependencies = [
+ "futures",
+ "mio",
+ "parking",
+ "serde",
+ "tracing",
+]
+
+[[package]]
+name = "wasix1-net-reference"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bincode 2.0.1",
+ "bytes",
+ "derive_more",
+ "futures-util",
+ "libc",
+ "mio",
+ "pin-project-lite",
+ "serde",
+ "socket2",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-serde",
+ "tokio-util",
+ "tracing",
+ "wasix1-io-reference",
+]
+
+[[package]]
 name = "wasixv2"
 version = "0.0.0"
 dependencies = [
@@ -7067,7 +7101,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
- "virtual-net",
+ "wasix1-net-reference",
  "wasixv2-abi",
  "wasixv2-checkpoint",
  "wasixv2-dylink",
@@ -7395,6 +7429,7 @@ dependencies = [
  "wasixv2-kernel",
  "wasixv2-syscalls",
  "wasixv2-vfs-mem",
+ "wasixv2-vnet",
  "wasm-bindgen",
  "wasm-bindgen-test",
  "wasmer",
