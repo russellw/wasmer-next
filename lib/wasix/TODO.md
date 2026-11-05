@@ -49,8 +49,9 @@ establish full parity or an integrated release result.
 
 Proposed macOS pathname-observation and configured-CPU contracts are documented in
 [WLK's reviewed design](https://github.com/wasmerio/wlk/blob/main/docs/plans/2026-11-05-v1-parity-contracts/design.md).
-They require architectural agreement before implementation. Native NAPI/V8 stack
-integration and its supported macOS profile remain mandatory work.
+The user approved the macOS observation/capability separation and deferred the
+configured-CPU proposal. Native NAPI/V8 stack integration and its supported macOS
+profile remain mandatory work.
 
 ## Scope and snapshot
 
@@ -239,6 +240,9 @@ Additional reference-lifetime test draft:
 
 - Snapshot/restore: intentionally excluded; unused legacy feature to be redesigned.
 - Windows and nominal WASIX64: deferred by the user; not current parity blockers.
+- SDK `parallelism` configuration: deferred by the user. Guest-advertised parallelism
+  currently follows the kernel default rather than the requested SDK value. Do not
+  block this delivery on per-Machine CPU/affinity/procfs configuration.
 - macOS support targets 13 and newer, explicitly approved by the user. The
   descriptor-safe host-filesystem port and its validation remain required.
 - RTLD_NEXT: deferred. Full Linux compatibility is not the completion criterion.
