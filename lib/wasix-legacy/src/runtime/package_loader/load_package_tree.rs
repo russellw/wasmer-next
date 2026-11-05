@@ -320,7 +320,6 @@ mod tests {
 
     use anyhow::Error;
     use ciborium::value::Value;
-    use petgraph::graph::DiGraph;
     use virtual_fs::FileSystem;
     use wasmer_config::package::PackageId;
     use webc::{
@@ -343,8 +342,8 @@ mod tests {
     use crate::runtime::{
         package_loader::PackageLoader,
         resolver::{
-            Command, DependencyGraph, DistributionInfo, Edge, ItemLocation, Node, PackageInfo,
-            PackageSummary, Resolution, WebcHash,
+            Command, Dependency, DistributionInfo, InMemorySource, ItemLocation, PackageInfo,
+            PackageSummary, Resolution, WebcHash, resolve_dependency_graph,
         },
     };
 
@@ -446,7 +445,10 @@ mod tests {
                 name: "webserver".to_string(),
             }],
             entrypoint: Some("webserver".to_string()),
-            dependencies: Vec::new(),
+            dependencies: vec![Dependency {
+                alias: dep_alias.to_string(),
+                pkg: dep_id.to_string().parse().unwrap(),
+            }],
             filesystem: Vec::new(),
         };
         let dep_info = PackageInfo {
@@ -463,35 +465,19 @@ mod tests {
             command_for_atom("webserver", Some(dep_alias.to_string())),
         )]);
 
-        let mut graph = DiGraph::new();
-        let root = graph.add_node(Node {
-            id: root_id.clone(),
-            pkg: root_info,
-            dist: None,
-        });
-        let dep = graph.add_node(Node {
-            id: dep_id.clone(),
+        let mut source = InMemorySource::new();
+        source.add(PackageSummary {
             pkg: dep_info,
-            dist: Some(DistributionInfo {
+            dist: DistributionInfo {
                 webc: "http://localhost/wasmer-static-web-server.webc"
                     .parse()
                     .unwrap(),
                 webc_sha256: WebcHash::from([0; 32]),
-            }),
-        });
-        graph.add_edge(
-            root,
-            dep,
-            Edge {
-                alias: dep_alias.to_string(),
             },
-        );
-
-        let dependency_graph = DependencyGraph::new(
-            root,
-            graph,
-            BTreeMap::from([(root_id.clone(), root), (dep_id.clone(), dep)]),
-        );
+        });
+        let dependency_graph = resolve_dependency_graph(&root_id, &root_info, &source)
+            .await
+            .unwrap();
         let pkg = ResolvedPackage {
             root_package: root_id.clone(),
             commands: BTreeMap::from([(
