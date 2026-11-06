@@ -1,5 +1,6 @@
 //! Native WASI facade. Configuration and process ownership remain outside the Store.
 
+use super::{ConfigurationError, exit_trap, get_wasi_version, wasi_version_t};
 use crate::wasm_c_api::store::{
     CleanupRetirement, ContinuationEndpoint, LocalContinuation, StoreRef,
 };
@@ -25,7 +26,6 @@ use wasixv2_wasix1::{
     imports::{self, Module as Namespace},
 };
 use wasmer_api::{AsStoreAsync, AsStoreMut, Imports, Instance, Module, RuntimeError, StoreMut};
-use wasmer_wasix::{WasiError, WasiStateCreationError, WasiVersion, get_wasi_version};
 
 #[derive(Default)]
 struct Capture {
@@ -101,12 +101,10 @@ impl NativeWasi {
     ) -> anyhow::Result<Self> {
         for (key, _) in &env {
             if key.contains('=') {
-                return Err(
-                    WasiStateCreationError::EnvironmentVariableFormatError(format!(
-                        "found equal sign in env var key \"{key}\" (key=value)"
-                    ))
-                    .into(),
-                );
+                return Err(ConfigurationError::Environment(format!(
+                    "found equal sign in env var key \"{key}\" (key=value)"
+                ))
+                .into());
             }
         }
         validate_preopens(&preopens)?;
@@ -272,17 +270,21 @@ impl NativeWasi {
         store: &mut StoreMut<'_>,
         module: &Module,
     ) -> anyhow::Result<Imports> {
-        let version = get_wasi_version(module, false).ok_or(WasiError::UnknownWasiVersion)?;
+        let version = get_wasi_version(module)
+            .ok_or_else(|| anyhow::anyhow!("The WASI version could not be determined"))?;
         let namespace = match version {
-            WasiVersion::Snapshot0 => Namespace::Unstable,
-            WasiVersion::Snapshot1 | WasiVersion::Latest => Namespace::Preview1,
-            WasiVersion::Wasix32v1 => Namespace::Wasix32,
-            WasiVersion::Wasix64v1 => anyhow::bail!(
+            wasi_version_t::SNAPSHOT0 => Namespace::Unstable,
+            wasi_version_t::SNAPSHOT1 | wasi_version_t::LATEST => Namespace::Preview1,
+            wasi_version_t::WASIX32V1 => Namespace::Wasix32,
+            wasi_version_t::WASIX64V1 => anyhow::bail!(
                 "{}",
                 wasixv2_wasix1::V1Flavor::Wasm64
                     .unsupported_reason()
                     .unwrap()
             ),
+            wasi_version_t::INVALID_VERSION => {
+                anyhow::bail!("The WASI version could not be determined")
+            }
         };
         let mut result = imports::namespace(store, self.endpoint.env.environment(), namespace);
         result.extend(&imports::namespace(
@@ -359,11 +361,11 @@ impl Drop for NativeWasi {
     }
 }
 
-fn validate_preopens(preopens: &[(String, String)]) -> Result<(), WasiStateCreationError> {
+fn validate_preopens(preopens: &[(String, String)]) -> Result<(), ConfigurationError> {
     let mut aliases = HashSet::new();
     for (name, _) in preopens {
         if !aliases.insert(name) {
-            return Err(WasiStateCreationError::WasiFsCreationError(format!(
+            return Err(ConfigurationError::Filesystem(format!(
                 "Found duplicate entry for alias `{name}`"
             )));
         }
@@ -394,8 +396,8 @@ mod tests {
         .err()
         .expect("duplicate aliases must fail before mounting the missing directory");
         assert!(matches!(
-            error.downcast_ref::<WasiStateCreationError>(),
-            Some(WasiStateCreationError::WasiFsCreationError(message))
+            error.downcast_ref::<ConfigurationError>(),
+            Some(ConfigurationError::Filesystem(message))
                 if message == "Found duplicate entry for alias `same`"
         ));
         validate_preopens(&[
@@ -404,6 +406,90 @@ mod tests {
             ("same/.".into(), ".".into()),
         ])
         .expect("distinct legacy aliases remain accepted even when paths normalize equally");
+    }
+
+    #[test]
+    fn native_config_preserves_lossy_keys_raw_values_order_and_preopen_kinds() {
+        use super::super::{
+            wasi_config_arg, wasi_config_env, wasi_config_mapdir, wasi_config_new,
+            wasi_config_preopen_dir,
+        };
+        use std::ffi::CString;
+
+        let program = CString::new("program").unwrap();
+        let invalid = CString::new(vec![0xff]).unwrap();
+        let normalized = CString::new("\u{fffd}").unwrap();
+        let other = CString::new("other").unwrap();
+        let first = CString::new(vec![0xfe]).unwrap();
+        let replacement = CString::new(vec![0x80]).unwrap();
+        let root = CString::new("/").unwrap();
+        let alias = CString::new("////").unwrap();
+        let missing = CString::new("/missing-capi-config-directory").unwrap();
+        let mut config = unsafe { wasi_config_new(program.as_ptr()) }.unwrap();
+        unsafe {
+            wasi_config_arg(&mut config, invalid.as_ptr());
+            wasi_config_env(&mut config, invalid.as_ptr(), first.as_ptr());
+            wasi_config_env(&mut config, other.as_ptr(), first.as_ptr());
+            wasi_config_env(&mut config, normalized.as_ptr(), replacement.as_ptr());
+            assert!(wasi_config_preopen_dir(&mut config, root.as_ptr()));
+            assert!(wasi_config_mapdir(
+                &mut config,
+                alias.as_ptr(),
+                missing.as_ptr()
+            ));
+        }
+        assert_eq!(config.args, ["program", "\u{fffd}"]);
+        assert_eq!(
+            config.env,
+            [
+                ("\u{fffd}".to_owned(), vec![0x80]),
+                ("other".to_owned(), vec![0xfe])
+            ]
+        );
+        assert_eq!(config.preopens[0].announced(), "/");
+        assert!(config.preopens[0].alias.is_none());
+        assert_eq!(config.preopens[1].announced(), "");
+        assert_eq!(config.preopens[1].alias.as_deref(), Some(""));
+        // Config creation never opens or validates the host directory.
+        assert_eq!(config.preopens[1].host, "/missing-capi-config-directory");
+        assert!(unsafe { wasi_config_new(invalid.as_ptr()) }.is_none());
+    }
+
+    #[test]
+    fn native_version_detection_uses_the_first_recognized_function_namespace() {
+        let store = wasmer_api::Store::default();
+        let module = Module::new(
+            &store,
+            r#"(module
+            (import "wasix_64v1" "memory" (memory 1))
+            (import "wasi_unstable" "g" (global i32))
+            (import "other" "ignore" (func))
+            (import "wasi_snapshot_preview1" "first" (func))
+            (import "wasi_unstable" "later" (func)))"#,
+        )
+        .unwrap();
+        assert_eq!(get_wasi_version(&module), Some(wasi_version_t::SNAPSHOT1));
+        let memory_only = Module::new(
+            &store,
+            r#"(module
+            (import "wasi_unstable" "memory" (memory 1))
+            (import "wasix_32v1" "g" (global i32)))"#,
+        )
+        .unwrap();
+        assert_eq!(get_wasi_version(&memory_only), None);
+    }
+
+    #[test]
+    fn native_exit_trap_preserves_legacy_status_and_message_bytes() {
+        assert_eq!(exit_trap(0).message(), "WASI exited with code: ExitCode::0");
+        assert_eq!(
+            exit_trap(257).message(),
+            "WASI exited with code: ExitCode::1"
+        );
+        assert_eq!(
+            exit_trap(-1).message(),
+            "WASI exited with code: ExitCode::65535"
+        );
     }
 
     #[test]
@@ -1098,7 +1184,7 @@ impl Endpoint {
                 })
                 .await;
                 let error = match result {
-                    Ok(Ok(status)) => RuntimeError::user(Box::new(WasiError::Exit(status.into()))),
+                    Ok(Ok(status)) => exit_trap(status),
                     Ok(Err(error)) => RuntimeError::user(Box::new(error)),
                     Err(_) => RuntimeError::new("WASI completion owner disappeared"),
                 };

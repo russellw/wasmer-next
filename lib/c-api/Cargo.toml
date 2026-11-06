@@ -66,7 +66,7 @@ wat.workspace = true
 [features]
 default = ["wat", "sys-default", "cranelift", "compiler", "wasi", "middlewares"]
 wat = ["wasmer-api/wat", "wasmer-c-api-imports/wat"]
-wasi = ["wasmer-wasix", "dep:wasixv2", "dep:wasixv2-exec", "dep:wasixv2-wasix1"]
+wasi = ["sys", "wat", "dep:wasixv2", "dep:wasixv2-exec", "dep:wasixv2-wasix1"]
 middlewares = ["compiler", "wasmer-middlewares", "wasmer-api/wasmparser"]
 engine = ["compiler"]
 
@@ -117,8 +117,9 @@ compiler-headless = [
   "wasmer-compiler/compiler",
 ]
 
-# Enable the `v8` backend.
-v8 = ["wasmer-api/v8", "wasmer-c-api-imports/v8"]
+# Enable the `v8` backend. Its WASI bridge still needs the legacy runtime
+# until the separately tracked V8 async migration is complete.
+v8 = ["wasmer-api/v8", "wasmer-c-api-imports/v8", "dep:wasmer-wasix"]
 
 # Enable the `sys` backend and use it as default. Notice that this does not
 # enable a default compiler, and users should therefore add one (or more) of

@@ -13,14 +13,14 @@ use super::{
     store::{StoreRef, wasm_store_t},
 };
 use crate::error::update_last_error;
-use std::convert::TryFrom;
 use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::slice;
+#[cfg(feature = "v8")]
 use std::sync::Arc;
+#[cfg(feature = "v8")]
 use wasmer_wasix::{
-    Pipe, PluggableRuntime, WasiEnv, WasiEnvBuilder, WasiFunctionEnv, WasiVersion,
-    default_fs_backing, get_wasi_version,
+    Pipe, PluggableRuntime, WasiEnv, WasiFunctionEnv, default_fs_backing,
     runtime::task_manager::{block_on, tokio::TokioTaskManager},
     virtual_fs::AsyncReadExt,
     virtual_fs::VirtualFile,
@@ -32,9 +32,40 @@ pub struct wasi_config_t {
     inherit_stdout: bool,
     inherit_stderr: bool,
     inherit_stdin: bool,
-    builder: WasiEnvBuilder,
-    runtime: Option<tokio::runtime::Runtime>,
-    preopens: Vec<(String, String)>,
+    args: Vec<String>,
+    env: Vec<(String, Vec<u8>)>,
+    preopens: Vec<Preopen>,
+}
+
+#[derive(Debug)]
+struct Preopen {
+    host: String,
+    alias: Option<String>,
+}
+
+impl Preopen {
+    fn announced(&self) -> &str {
+        self.alias.as_deref().unwrap_or(&self.host)
+    }
+}
+
+#[cfg(feature = "sys")]
+#[derive(Debug, thiserror::Error)]
+pub(super) enum ConfigurationError {
+    #[error("bad environment variable format: `{0}`")]
+    Environment(String),
+    #[error("wasi filesystem creation error: `{0}`")]
+    Filesystem(String),
+}
+
+#[cfg(feature = "sys")]
+#[derive(Debug, thiserror::Error)]
+#[error("WASI exited with code: ExitCode::{0}")]
+struct Exit(u16);
+
+#[cfg(feature = "sys")]
+fn exit_trap(status: i32) -> wasmer_api::RuntimeError {
+    wasmer_api::RuntimeError::user(Box::new(Exit((status % 256) as u16)))
 }
 
 #[unsafe(no_mangle)]
@@ -46,18 +77,12 @@ pub unsafe extern "C" fn wasi_config_new(
     let name_c_str = unsafe { CStr::from_ptr(program_name) };
     let prog_name = c_try!(name_c_str.to_str());
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let _guard = runtime.enter();
-
     Some(Box::new(wasi_config_t {
         inherit_stdout: true,
         inherit_stderr: true,
         inherit_stdin: true,
-        builder: WasiEnv::builder(prog_name).fs(default_fs_backing()),
-        runtime: Some(runtime),
+        args: vec![prog_name.to_owned()],
+        env: Vec::new(),
         preopens: Vec::new(),
     }))
 }
@@ -76,7 +101,12 @@ pub unsafe extern "C" fn wasi_config_env(
     let value_cstr = unsafe { CStr::from_ptr(value) };
     let value_bytes = value_cstr.to_bytes();
 
-    config.builder.add_env(key_bytes, value_bytes);
+    let key = String::from_utf8_lossy(key_bytes).into_owned();
+    if let Some((_, value)) = config.env.iter_mut().find(|(existing, _)| existing == &key) {
+        *value = value_bytes.to_vec();
+    } else {
+        config.env.push((key, value_bytes.to_vec()));
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -86,7 +116,9 @@ pub unsafe extern "C" fn wasi_config_arg(config: &mut wasi_config_t, arg: *const
     let arg_cstr = unsafe { CStr::from_ptr(arg) };
     let arg_bytes = arg_cstr.to_bytes();
 
-    config.builder.add_arg(arg_bytes);
+    config
+        .args
+        .push(String::from_utf8_lossy(arg_bytes).into_owned());
 }
 
 #[unsafe(no_mangle)]
@@ -104,14 +136,10 @@ pub unsafe extern "C" fn wasi_config_preopen_dir(
         }
     };
 
-    if let Err(e) = config.builder.add_preopen_dir(dir_str) {
-        update_last_error(e);
-        return false;
-    }
-
-    config
-        .preopens
-        .push((dir_str.to_owned(), dir_str.to_owned()));
+    config.preopens.push(Preopen {
+        host: dir_str.to_owned(),
+        alias: None,
+    });
 
     true
 }
@@ -142,15 +170,10 @@ pub unsafe extern "C" fn wasi_config_mapdir(
         }
     };
 
-    if let Err(e) = config.builder.add_map_dir(alias_str, dir_str) {
-        update_last_error(e);
-        return false;
-    }
-
-    config.preopens.push((
-        alias_str.trim_start_matches('/').to_owned(),
-        dir_str.to_owned(),
-    ));
+    config.preopens.push(Preopen {
+        host: dir_str.to_owned(),
+        alias: Some(alias_str.trim_start_matches('/').to_owned()),
+    });
 
     true
 }
@@ -193,6 +216,7 @@ pub struct wasi_env_t {
 }
 
 pub(super) enum WasiBackend {
+    #[cfg(feature = "v8")]
     Legacy(WasiFunctionEnv),
     #[cfg(feature = "sys")]
     Native(native::NativeWasi),
@@ -205,6 +229,7 @@ impl WasiBackend {
         module: &wasmer_api::Module,
     ) -> anyhow::Result<wasmer_api::Imports> {
         match self {
+            #[cfg(feature = "v8")]
             Self::Legacy(env) => Ok(env.import_object(store, module)?),
             #[cfg(feature = "sys")]
             Self::Native(env) => env.import_object(store, module),
@@ -222,6 +247,7 @@ impl WasiBackend {
             .next()
             .map(|memory| *memory.ty());
         match self {
+            #[cfg(feature = "v8")]
             Self::Legacy(env) => {
                 let spawn = match ty {
                     Some(ty) => wasmer_wasix::runtime::SpawnType::CreateMemoryOfType(ty),
@@ -239,14 +265,16 @@ impl WasiBackend {
     }
 
     pub(super) fn tag_import(&self, value: &mut wasm_extern_t) {
-        #[cfg(feature = "sys")]
-        if let Self::Native(native) = self {
-            if matches!(value.inner, wasmer_api::Extern::Function(_)) {
-                value.wasi_origin = Some(native.environment().clone());
+        match self {
+            #[cfg(feature = "sys")]
+            Self::Native(native) => {
+                if matches!(value.inner, wasmer_api::Extern::Function(_)) {
+                    value.wasi_origin = Some(native.environment().clone());
+                }
             }
+            #[cfg(feature = "v8")]
+            Self::Legacy(_) => {}
         }
-        #[cfg(not(feature = "sys"))]
-        let _ = value;
     }
 
     fn initialize(
@@ -255,16 +283,18 @@ impl WasiBackend {
         instance: wasmer_api::Instance,
     ) -> anyhow::Result<()> {
         match self {
+            #[cfg(feature = "v8")]
             Self::Legacy(env) => Ok(env.initialize(store, instance)?),
             #[cfg(feature = "sys")]
             Self::Native(env) => env.initialize(store, &instance),
         }
     }
 
-    fn on_exit(&mut self, store: &mut wasmer_api::StoreMut<'_>) {
+    fn on_exit(&mut self, _store: &mut wasmer_api::StoreMut<'_>) {
         match self {
+            #[cfg(feature = "v8")]
             Self::Legacy(env) => {
-                env.on_exit(store, None);
+                env.on_exit(_store, None);
             }
             #[cfg(feature = "sys")]
             Self::Native(env) => env.close(),
@@ -278,16 +308,20 @@ impl WasiBackend {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wasi_env_new(
     store: Option<&mut wasm_store_t>,
-    mut config: Box<wasi_config_t>,
+    config: Box<wasi_config_t>,
 ) -> Option<Box<wasi_env_t>> {
     let store = &mut store?.inner;
     #[cfg(feature = "sys")]
     if store.is_native() {
         let env = c_try!(native::NativeWasi::new(
             store,
-            config.builder.get_args().to_vec(),
-            config.builder.get_env().to_vec(),
-            config.preopens.clone(),
+            config.args.clone(),
+            config.env.clone(),
+            config
+                .preopens
+                .iter()
+                .map(|preopen| (preopen.announced().to_owned(), preopen.host.clone()))
+                .collect(),
             !config.inherit_stdout,
             !config.inherit_stderr,
         ));
@@ -297,38 +331,46 @@ pub unsafe extern "C" fn wasi_env_new(
         }));
     }
 
-    let runtime = config.runtime.take();
+    #[cfg(feature = "v8")]
+    {
+        let env = c_try!(legacy_environment(store, *config));
+        return Some(Box::new(wasi_env_t {
+            inner: WasiBackend::Legacy(env),
+            store: store.clone(),
+        }));
+    }
+    #[cfg(not(feature = "v8"))]
+    {
+        update_last_error("this C API build has no WASI backend for the Store");
+        None
+    }
+}
 
-    let runtime = runtime.unwrap_or_else(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-    });
-
+#[cfg(feature = "v8")]
+fn legacy_environment(store: &StoreRef, config: wasi_config_t) -> anyhow::Result<WasiFunctionEnv> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
     let handle = runtime.handle().clone();
     let _guard = handle.enter();
+    let mut builder = WasiEnv::builder(&config.args[0]).fs(default_fs_backing());
+    builder.add_args(config.args.iter().skip(1));
+    builder.add_envs(config.env);
+    for preopen in config.preopens {
+        match preopen.alias {
+            Some(alias) => builder.add_map_dir(&alias, preopen.host)?,
+            None => builder.add_preopen_dir(preopen.host)?,
+        }
+    }
     let mut rt = PluggableRuntime::new(Arc::new(TokioTaskManager::new(runtime)));
-    rt.set_engine(c_try!(store.with_mut(|store| store.engine().clone())));
-
+    rt.set_engine(store.with_mut(|store| store.engine().clone())?);
     if !config.inherit_stdout {
-        config.builder.set_stdout(Box::new(Pipe::new()));
+        builder.set_stdout(Box::new(Pipe::new()));
     }
-
     if !config.inherit_stderr {
-        config.builder.set_stderr(Box::new(Pipe::new()));
+        builder.set_stderr(Box::new(Pipe::new()));
     }
-
-    // TODO: impl capturer for stdin
-
-    let env = c_try!(c_try!(store.with_mut(|store| {
-        config.builder.runtime(Arc::new(rt)).finalize(store)
-    })));
-
-    Some(Box::new(wasi_env_t {
-        inner: WasiBackend::Legacy(env),
-        store: store.clone(),
-    }))
+    Ok(store.with_mut(|store| builder.runtime(Arc::new(rt)).finalize(store))??)
 }
 
 /// Delete a [`wasi_env_t`].
@@ -358,25 +400,26 @@ pub unsafe extern "C" fn wasi_env_read_stdout(
 ) -> isize {
     let inner_buffer = unsafe { slice::from_raw_parts_mut(buffer as *mut _, buffer_len) };
 
-    #[cfg(feature = "sys")]
-    if let WasiBackend::Native(native) = &env.inner {
-        return native.read(false, inner_buffer);
-    }
-    let WasiBackend::Legacy(legacy) = &env.inner else {
-        unreachable!()
-    };
-    let stdout = c_try!(env.store.with_mut(|store| legacy.data(store).stdout()); otherwise -1);
+    match &env.inner {
+        #[cfg(feature = "sys")]
+        WasiBackend::Native(native) => native.read(false, inner_buffer),
+        #[cfg(feature = "v8")]
+        WasiBackend::Legacy(legacy) => {
+            let stdout =
+                c_try!(env.store.with_mut(|store| legacy.data(store).stdout()); otherwise -1);
 
-    if let Ok(mut stdout) = stdout {
-        if let Some(stdout) = stdout.as_mut() {
-            read_inner(stdout, inner_buffer)
-        } else {
-            update_last_error("could not find a file handle for `stdout`");
-            -1
+            if let Ok(mut stdout) = stdout {
+                if let Some(stdout) = stdout.as_mut() {
+                    read_inner(stdout, inner_buffer)
+                } else {
+                    update_last_error("could not find a file handle for `stdout`");
+                    -1
+                }
+            } else {
+                update_last_error("could not find a file handle for `stdout`");
+                -1
+            }
         }
-    } else {
-        update_last_error("could not find a file handle for `stdout`");
-        -1
     }
 }
 
@@ -387,27 +430,29 @@ pub unsafe extern "C" fn wasi_env_read_stderr(
     buffer_len: usize,
 ) -> isize {
     let inner_buffer = unsafe { slice::from_raw_parts_mut(buffer as *mut _, buffer_len) };
-    #[cfg(feature = "sys")]
-    if let WasiBackend::Native(native) = &env.inner {
-        return native.read(true, inner_buffer);
-    }
-    let WasiBackend::Legacy(legacy) = &env.inner else {
-        unreachable!()
-    };
-    let stderr = c_try!(env.store.with_mut(|store| legacy.data(store).stderr()); otherwise -1);
-    if let Ok(mut stderr) = stderr {
-        if let Some(stderr) = stderr.as_mut() {
-            read_inner(stderr, inner_buffer)
-        } else {
-            update_last_error("could not find a file handle for `stderr`");
-            -1
+    match &env.inner {
+        #[cfg(feature = "sys")]
+        WasiBackend::Native(native) => native.read(true, inner_buffer),
+        #[cfg(feature = "v8")]
+        WasiBackend::Legacy(legacy) => {
+            let stderr =
+                c_try!(env.store.with_mut(|store| legacy.data(store).stderr()); otherwise -1);
+            if let Ok(mut stderr) = stderr {
+                if let Some(stderr) = stderr.as_mut() {
+                    read_inner(stderr, inner_buffer)
+                } else {
+                    update_last_error("could not find a file handle for `stderr`");
+                    -1
+                }
+            } else {
+                update_last_error("could not find a file handle for `stderr`");
+                -1
+            }
         }
-    } else {
-        update_last_error("could not find a file handle for `stderr`");
-        -1
     }
 }
 
+#[cfg(feature = "v8")]
 fn read_inner(
     wasi_file: &mut Box<dyn VirtualFile + Send + Sync + 'static>,
     inner_buffer: &mut [u8],
@@ -457,38 +502,22 @@ pub enum wasi_version_t {
     WASIX64V1 = 4,
 }
 
-impl From<WasiVersion> for wasi_version_t {
-    fn from(other: WasiVersion) -> Self {
-        match other {
-            WasiVersion::Snapshot0 => wasi_version_t::SNAPSHOT0,
-            WasiVersion::Snapshot1 => wasi_version_t::SNAPSHOT1,
-            WasiVersion::Wasix32v1 => wasi_version_t::WASIX32V1,
-            WasiVersion::Wasix64v1 => wasi_version_t::WASIX64V1,
-            WasiVersion::Latest => wasi_version_t::LATEST,
-        }
-    }
-}
-
-impl TryFrom<wasi_version_t> for WasiVersion {
-    type Error = &'static str;
-
-    fn try_from(other: wasi_version_t) -> Result<Self, Self::Error> {
-        Ok(match other {
-            wasi_version_t::INVALID_VERSION => return Err("Invalid WASI version cannot be used"),
-            wasi_version_t::SNAPSHOT0 => WasiVersion::Snapshot0,
-            wasi_version_t::SNAPSHOT1 => WasiVersion::Snapshot1,
-            wasi_version_t::WASIX32V1 => WasiVersion::Wasix32v1,
-            wasi_version_t::WASIX64V1 => WasiVersion::Wasix64v1,
-            wasi_version_t::LATEST => WasiVersion::Latest,
+fn get_wasi_version(module: &wasmer_api::Module) -> Option<wasi_version_t> {
+    module
+        .imports()
+        .functions()
+        .find_map(|import| match import.module() {
+            "wasi_unstable" => Some(wasi_version_t::SNAPSHOT0),
+            "wasi_snapshot_preview1" => Some(wasi_version_t::SNAPSHOT1),
+            "wasix_32v1" => Some(wasi_version_t::WASIX32V1),
+            "wasix_64v1" => Some(wasi_version_t::WASIX64V1),
+            _ => None,
         })
-    }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wasi_get_wasi_version(module: &wasm_module_t) -> wasi_version_t {
-    get_wasi_version(&module.inner, false)
-        .map(Into::into)
-        .unwrap_or(wasi_version_t::INVALID_VERSION)
+    get_wasi_version(&module.inner).unwrap_or(wasi_version_t::INVALID_VERSION)
 }
 
 /// Non-standard function to get the imports needed for the WASI
