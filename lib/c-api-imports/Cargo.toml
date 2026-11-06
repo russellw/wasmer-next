@@ -38,7 +38,7 @@ v8 = ["wasmer-api/v8"]
 sys-default = ["sys", "wasmer-api/sys-default"]
 v8-default = ["v8", "wasmer-api/v8-default"]
 # Published compatibility feature names use the v2 execution hook.
-wasix = ["wasixv2"]
+wasix = ["wasixv2", "sys"]
 wasixv2 = ["dep:wasixv2-exec"]
 wasi = ["wasix"]
 
