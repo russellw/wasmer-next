@@ -971,7 +971,15 @@ mod tests {
                 assert(result[0].of.i32 == 0);
 
                 // The old instance still reaches the shared env's latest memory.
-                assert(wasi_env_read_stdout(wasi_env, output, sizeof(output)) == 3);
+                size_t received = 0;
+                while (received < 3) {
+                    intptr_t count = wasi_env_read_stdout(
+                        wasi_env, output + received, 3 - received
+                    );
+                    assert(count > 0);
+                    assert((size_t)count <= 3 - received);
+                    received += (size_t)count;
+                }
                 assert(output[0] == 'A' && output[1] == 'Z' && output[2] == 'Z');
 
                 assert(wasi_env_initialize_instance(wasi_env, store, instance_a));
