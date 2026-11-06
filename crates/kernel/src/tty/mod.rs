@@ -31,7 +31,7 @@ pub(crate) use jobctl::Jobs;
 pub(crate) use pty::{PTMX, PTY_SLAVE_MAJOR};
 use pty::{Pty, Side};
 use wasixv2_abi::{SiCode, Signal, Termios, TermiosCflag, TiocpktFlags, Winsize};
-use wasixv2_host::Host;
+use wasixv2_host::{ByteSink, Host};
 use wasixv2_syscalls::{Errno, LocalFuture, SysErr, SysResult};
 use wasixv2_vfs::Device;
 use wasixv2_wait::{PollMask, PollTable, Pollable, WaitQueue, Waiter, Wakeup};
@@ -276,6 +276,7 @@ impl Tty {
         Ok(TtyFile {
             tty: self.clone(),
             generation: self.hangups.load(Ordering::Acquire),
+            console_output: None,
         })
     }
 
@@ -502,6 +503,7 @@ impl Tty {
         let _registration = waiter.register(&self.write_wait, PollMask::WRITABLE);
         let mut done = 0;
         let mut out = Vec::new();
+        let mut echoes = Vec::new();
         loop {
             if file.hung_up() || self.driver.link_gone() {
                 break;
@@ -515,14 +517,27 @@ impl Tty {
                 let mut ldisc = self.ldisc.lock_or_recover();
                 (room && !ldisc.stopped()).then(|| {
                     out.clear();
-                    ldisc.take_echoes(&mut out);
+                    if file.console_output.is_some() {
+                        echoes.clear();
+                        ldisc.take_echoes(&mut echoes);
+                    } else {
+                        ldisc.take_echoes(&mut out);
+                    }
                     let n = (data.len() - done).min(WRITE_CHUNK);
                     ldisc.output(&data[done..done + n], &mut out);
                     n
                 })
             };
             if let Some(n) = step {
-                if let Err(err) = self.driver.write(&out).await {
+                let written = if let Some(sink) = &file.console_output {
+                    match self.driver.write(&echoes).await {
+                        Ok(()) => console::write_all(sink.as_ref(), &out).await,
+                        Err(error) => Err(error),
+                    }
+                } else {
+                    self.driver.write(&out).await
+                };
+                if let Err(err) = written {
                     return match done {
                         0 => Err(crate::stdio::io_errno(err).into()),
                         _ => Ok(done),
@@ -653,6 +668,8 @@ pub(crate) struct TtyFile {
     tty: Arc<Tty>,
     /// The hangups there were when it was opened.
     generation: u64,
+    /// A configured console descriptor's sink, fixed before publication.
+    console_output: Option<Arc<dyn ByteSink>>,
 }
 
 impl TtyFile {

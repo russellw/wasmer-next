@@ -7,6 +7,7 @@
 //! and acquires it as its controlling terminal.
 
 use std::{
+    any::Any,
     io,
     sync::{
         Arc, Mutex, Weak,
@@ -22,8 +23,13 @@ use wasixv2_syscalls::{Caller, Errno, Fd, SysErr, TaskId};
 use wasixv2_vfs::{Device, LookupFlags, OpenHow};
 use wasixv2_wait::{NoInterrupt, PollMask, WaitQueue, Waiter};
 
-use super::{Driver, Tty};
-use crate::{Kernel, file::OpenFile, stdio::QueueWaker, sync::MutexExt};
+use super::{Driver, Tty, TtyFile};
+use crate::{
+    Kernel,
+    file::{Backing, OpenFile},
+    stdio::QueueWaker,
+    sync::MutexExt,
+};
 
 /// `HVC_MAJOR`: the hypervisor consoles, `/dev/hvc0` first.
 pub(crate) const HVC_MAJOR: u32 = 229;
@@ -77,19 +83,28 @@ impl Console {
     }
 
     /// Writes all of `data` to the host.
-    pub(super) async fn write(&self, mut data: &[u8]) -> io::Result<()> {
-        while !data.is_empty() {
-            match self.output.write(data).await? {
-                0 => return Err(io::ErrorKind::WriteZero.into()),
-                n => data = &data[n..],
-            }
-        }
-        Ok(())
+    pub(super) async fn write(&self, data: &[u8]) -> io::Result<()> {
+        write_all(self.output.as_ref(), data).await
     }
 
     pub(super) fn unthrottle(&self) {
         self.pump_wait.wake(PollMask::READABLE);
     }
+}
+
+/// One bounded tty write step, including short-writing or failing host sinks.
+/// A failed step is never replayed: each successful call advances its suffix.
+pub(super) async fn write_all(sink: &dyn ByteSink, mut data: &[u8]) -> io::Result<()> {
+    while !data.is_empty() {
+        let count = sink.write(data).await?;
+        if count == 0 {
+            return Err(io::ErrorKind::WriteZero.into());
+        }
+        data = data
+            .get(count..)
+            .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
+    }
+    Ok(())
 }
 
 fn winsize(size: WindowSize) -> Winsize {
@@ -234,6 +249,21 @@ impl Kernel {
     /// group in the foreground. Starts moving the host's input to the console. Fails with
     /// `ENODEV` without a console, and with `ENOENT` when its node was never made.
     pub async fn attach_console(&self, task: TaskId, fds: [bool; 3]) -> Result<(), Errno> {
+        self.attach_console_outputs(task, fds, [None, None, None])
+            .await
+    }
+
+    /// Attach the same console with optional per-open output sinks. Routed
+    /// descriptors keep the console's line discipline, job control and ioctl
+    /// identity; dup and fork carry their existing open-file sink identity.
+    /// Echo always goes to the configured Console output. Unselected overrides
+    /// are ignored. All canonical opens finish before any descriptor changes.
+    pub async fn attach_console_outputs(
+        &self,
+        task: TaskId,
+        fds: [bool; 3],
+        outputs: [Option<Arc<dyn ByteSink>>; 3],
+    ) -> Result<(), Errno> {
         let tty = self.console.as_ref().ok_or(Errno::ENODEV)?;
         let node = tty.console().node.lock_or_recover().clone();
         let node = node.ok_or(Errno::ENOENT)?;
@@ -245,28 +275,68 @@ impl Kernel {
             mode: 0,
             lookup: LookupFlags::follow(),
         };
-        let file = self.vfs.open(&env.cx(), &env.fs.root, &node, &how).await?;
-        let backing = self
-            .attach(&caller, file, OpenFlags::O_RDWR)
-            .await
-            .map_err(|err| match err {
-                SysErr::Errno(errno) => errno,
-                _ => Errno::EINTR,
-            })?;
-        let file = Arc::new(OpenFile::new(backing, OpenFlags::O_RDWR));
+        let shared: Vec<_> = (0..3)
+            .filter(|&fd| fds[fd] && outputs[fd].is_none())
+            .collect();
+        let mut routes = Vec::new();
+        // Preserve the old all-unselected attach's canonical open/acquisition,
+        // and one shared open-file description for every default descriptor.
+        if !shared.is_empty() || !fds.iter().any(|selected| *selected) {
+            routes.push((shared, None));
+        }
+        for (fd, output) in outputs.into_iter().enumerate() {
+            if fds[fd] && output.is_some() {
+                routes.push((vec![fd], output));
+            }
+        }
+        let mut prepared: [Option<Arc<OpenFile>>; 3] = [None, None, None];
+        let mut unattached = None;
+        for (descriptors, output) in routes {
+            let file = self.vfs.open(&env.cx(), &env.fs.root, &node, &how).await?;
+            let mut backing = self
+                .attach(&caller, file, OpenFlags::O_RDWR)
+                .await
+                .map_err(|error| match error {
+                    SysErr::Errno(errno) => errno,
+                    _ => Errno::EINTR,
+                })?;
+            if let Some(output) = output {
+                let Backing::Stream(object, _) = &mut backing else {
+                    return Err(Errno::ENOTTY);
+                };
+                let object = Arc::get_mut(object).ok_or(Errno::EIO)?;
+                let object: &mut dyn Any = object;
+                let file = object.downcast_mut::<TtyFile>().ok_or(Errno::ENOTTY)?;
+                if !Arc::ptr_eq(file.tty(), tty) {
+                    return Err(Errno::ENOTTY);
+                }
+                file.console_output = Some(output);
+            }
+            let file = Arc::new(OpenFile::new(backing, OpenFlags::O_RDWR));
+            if descriptors.is_empty() {
+                unattached = Some(file.clone());
+            }
+            for fd in descriptors {
+                prepared[fd] = Some(file.clone());
+            }
+        }
         let pid = self.process(task).pid;
         let replaced: Vec<_> = {
             let files = self.files(task);
             let mut files = files.lock_or_recover();
-            (0..3)
-                .filter(|&fd| fds[fd])
-                .filter_map(|fd| files.install_at(Fd(fd as i32), file.clone(), false))
+            prepared
+                .into_iter()
+                .enumerate()
+                .filter_map(|(fd, file)| {
+                    file.and_then(|file| files.install_at(Fd(fd as i32), file, false))
+                })
                 .collect()
         };
         for old in replaced {
             self.closed_by(pid, &old);
         }
         start_pump(tty);
+        drop(unattached);
         Ok(())
     }
 

@@ -149,9 +149,16 @@ fn finite_console() -> Console {
 }
 
 fn console_with_input_eof(input_eof: Option<ConsoleInputEof>) -> Console {
+    console_with_outputs(input_eof, [None, None, None], Arc::new(ThreadHost))
+}
+
+fn console_with_outputs(
+    input_eof: Option<ConsoleInputEof>,
+    outputs: [Option<Arc<dyn ByteSink>>; 3],
+    host: Arc<dyn Host>,
+) -> Console {
     let keyboard = Arc::new(Keyboard::default());
     let screen = Arc::new(Capture::default());
-    let host: Arc<dyn Host> = Arc::new(ThreadHost);
     let clock = Arc::new(HostClock(host.clone()));
     let root = MemFs::new(clock.clone(), 0o755, 1, 1);
     let shm = MemFs::new(clock.clone(), 0o1777, 0, 0);
@@ -179,7 +186,11 @@ fn console_with_input_eof(input_eof: Option<ConsoleInputEof>) -> Console {
     block_on(kernel.create_device_nodes(b"/dev")).unwrap();
     let stdin = Arc::new(Input(Mutex::new(Vec::new())));
     let (kernel, leader, _) = spawn_on(kernel, stdin, &[], &[]);
-    block_on(kernel.attach_console(leader, [true; 3])).unwrap();
+    if outputs.iter().all(Option::is_none) {
+        block_on(kernel.attach_console(leader, [true; 3])).unwrap();
+    } else {
+        block_on(kernel.attach_console_outputs(leader, [true; 3], outputs)).unwrap();
+    }
     Console {
         kernel,
         leader,
@@ -636,7 +647,10 @@ fn finite_console_eof_commits_a_long_partial_canonical_line() {
     eventually("finite EOF commits the partial canonical line", || {
         wasixv2_wait::Pollable::poll(&*file, None).contains(wasixv2_wait::PollMask::READABLE)
     });
-    assert_eq!(c.ioctl_int(&caller, IoctlRequest::TIOCINQ), Ok(line.len() as i32));
+    assert_eq!(
+        c.ioctl_int(&caller, IoctlRequest::TIOCINQ),
+        Ok(line.len() as i32)
+    );
     assert_eq!(c.read(&caller, 16), Ok(line[..16].to_vec()));
     assert_eq!(c.read(&caller, 16), Ok(line[16..].to_vec()));
     assert_eq!(c.read(&caller, 16), Ok(Vec::new()));
@@ -692,9 +706,7 @@ fn finite_console_eof_wakes_raw_vmin_poll_after_read_cancellation() {
         c.ioctl_int(&caller, IoctlRequest::TIOCINQ) == Ok(2)
     });
     let file = c.kernel.file(c.leader, Fd(0)).unwrap();
-    assert!(
-        !wasixv2_wait::Pollable::poll(&*file, None).contains(wasixv2_wait::PollMask::READABLE)
-    );
+    assert!(!wasixv2_wait::Pollable::poll(&*file, None).contains(wasixv2_wait::PollMask::READABLE));
 
     c.keyboard.unplug();
     eventually("finite EOF makes sub-VMIN input readable", || {
@@ -719,7 +731,9 @@ fn finite_console_input_error_still_hangs_up() {
 
     c.keyboard.fail();
 
-    eventually("source error sends SIGHUP", || c.pending(c.leader, Signal::SIGHUP));
+    eventually("source error sends SIGHUP", || {
+        c.pending(c.leader, Signal::SIGHUP)
+    });
     assert_eq!(block_on(read), Ok(0));
     assert_eq!(errno(c.write(&caller, 1, b"x")), Errno::EIO);
 }
@@ -861,4 +875,358 @@ fn ctrl_s_holds_writes_until_ctrl_q() {
     assert_eq!(written, Some(Ok(4)));
     eventually("the echo", || c.shown().len() == 5);
     assert!(c.shown() == b"xheld" || c.shown() == b"heldx");
+}
+
+/// Script actual host writes while the kernel owns termios and descriptor routing.
+#[derive(Clone, Copy)]
+enum OutputStep {
+    Take(usize),
+    Block,
+    Fail(io::ErrorKind),
+    Report(usize),
+}
+#[derive(Default)]
+struct ScriptedOutput(Mutex<OutputState>);
+#[derive(Default)]
+struct OutputState {
+    steps: VecDeque<OutputStep>,
+    accepted: Vec<u8>,
+    requests: Vec<Vec<u8>>,
+    waker: Option<Waker>,
+}
+impl ScriptedOutput {
+    fn new(steps: impl IntoIterator<Item = OutputStep>) -> Self {
+        Self(Mutex::new(OutputState {
+            steps: steps.into_iter().collect(),
+            ..Default::default()
+        }))
+    }
+    fn release(&self) {
+        let wake = {
+            let mut state = self.0.lock_or_recover();
+            assert!(matches!(state.steps.pop_front(), Some(OutputStep::Block)));
+            state.waker.take()
+        };
+        if let Some(wake) = wake {
+            wake.wake();
+        }
+    }
+    fn accepted(&self) -> Vec<u8> {
+        self.0.lock_or_recover().accepted.clone()
+    }
+    fn requests(&self) -> Vec<Vec<u8>> {
+        self.0.lock_or_recover().requests.clone()
+    }
+}
+impl ByteSink for ScriptedOutput {
+    fn write<'a>(&'a self, data: &'a [u8]) -> LocalFuture<'a, io::Result<usize>> {
+        Box::pin(futures::future::poll_fn(move |cx| {
+            let mut state = self.0.lock_or_recover();
+            if matches!(state.steps.front(), Some(OutputStep::Block)) {
+                state.waker = Some(cx.waker().clone());
+                return Poll::Pending;
+            }
+            let step = state
+                .steps
+                .pop_front()
+                .unwrap_or(OutputStep::Take(usize::MAX));
+            state.requests.push(data.to_vec());
+            Poll::Ready(match step {
+                OutputStep::Take(limit) => {
+                    let count = limit.min(data.len());
+                    state.accepted.extend_from_slice(&data[..count]);
+                    Ok(count)
+                }
+                OutputStep::Report(count) => Ok(count),
+                OutputStep::Fail(error) => Err(error.into()),
+                OutputStep::Block => unreachable!(),
+            })
+        }))
+    }
+}
+
+/// A controlled test timer: the console output fence cannot time out underneath
+/// the blocked-output assertion. Execution and input pumping use the existing host.
+struct PendingTimerHost;
+impl Host for PendingTimerHost {
+    fn realtime(&self) -> Duration {
+        ThreadHost.realtime()
+    }
+    fn monotonic(&self) -> Duration {
+        ThreadHost.monotonic()
+    }
+    fn sleep(&self, _: Duration) -> LocalFuture<'_, ()> {
+        Box::pin(std::future::pending())
+    }
+    fn sleep_until(&self, _: Duration) -> LocalFuture<'_, ()> {
+        Box::pin(std::future::pending())
+    }
+    fn random(&self, buffer: &mut [u8]) {
+        ThreadHost.random(buffer);
+    }
+    fn executor(&self) -> &dyn Executor {
+        &ThreadHost
+    }
+}
+
+#[test]
+fn console_output_overrides_preserve_echo_termios_and_descriptor_identity() {
+    let errors = Arc::new(Capture::default());
+    let c = console_with_outputs(
+        None,
+        [None, None, Some(errors.clone())],
+        Arc::new(ThreadHost),
+    );
+    let memory = memory();
+    let caller = Caller::new(c.leader, &memory);
+    let stdin = c.kernel.file(c.leader, Fd(0)).unwrap();
+    let stdout = c.kernel.file(c.leader, Fd(1)).unwrap();
+    let stderr = c.kernel.file(c.leader, Fd(2)).unwrap();
+    assert!(Arc::ptr_eq(&stdin, &stdout));
+    assert!(!Arc::ptr_eq(&stdout, &stderr));
+    assert_eq!(c.ioctl(&caller, 2, IoctlRequest::TCGETS, 0x40), Ok(0));
+    let termios: Termios = block_on(read_value(caller.memory(), GuestPtr::new(0x40))).unwrap();
+    assert!(termios.c_lflag.0 & TermiosLflag::ICANON.0 != 0);
+    assert!(termios.c_lflag.0 & TermiosLflag::ECHO.0 != 0);
+    c.keyboard.type_in(b"typed\r");
+    eventually("console echo stays on its screen", || {
+        c.shown() == b"typed\r\n"
+    });
+    assert_eq!(c.write(&caller, 1, b"stdout\n"), Ok(7));
+    assert_eq!(c.write(&caller, 2, b"stderr\n"), Ok(7));
+    assert_eq!(c.shown(), b"typed\r\nstdout\r\n");
+    assert_eq!(*errors.0.lock_or_recover(), b"stderr\r\n");
+    // dup3 with zero flags is dup2's replacement operation, and copies the
+    // selected open-file identity rather than a numeric descriptor policy.
+    assert_eq!(
+        block_on(c.kernel.dup3(&caller, Fd(2), Fd(1), OpenFlags(0))),
+        Ok(Fd(1))
+    );
+    assert_eq!(c.write(&caller, 1, b"dup\n"), Ok(4));
+    let child = c.fork(&caller);
+    let child_memory = self::memory();
+    let child_caller = Caller::new(child, &child_memory);
+    assert_eq!(c.write(&child_caller, 2, b"child\n"), Ok(6));
+    assert_eq!(*errors.0.lock_or_recover(), b"stderr\r\ndup\r\nchild\r\n");
+    assert_eq!(c.shown(), b"typed\r\nstdout\r\n");
+    c.keyboard.unplug();
+}
+
+#[test]
+fn default_console_keeps_one_open_file_and_ignores_unselected_overrides() {
+    let c = console();
+    let memory = memory();
+    let caller = Caller::new(c.leader, &memory);
+    let stdin = c.kernel.file(c.leader, Fd(0)).unwrap();
+    assert!(Arc::ptr_eq(
+        &stdin,
+        &c.kernel.file(c.leader, Fd(1)).unwrap()
+    ));
+    assert!(Arc::ptr_eq(
+        &stdin,
+        &c.kernel.file(c.leader, Fd(2)).unwrap()
+    ));
+    let ignored = Arc::new(ScriptedOutput::new([OutputStep::Fail(
+        io::ErrorKind::BrokenPipe,
+    )]));
+    block_on(c.kernel.attach_console_outputs(
+        c.leader,
+        [false, true, false],
+        [None, None, Some(ignored.clone())],
+    ))
+    .unwrap();
+    assert!(Arc::ptr_eq(
+        &stdin,
+        &c.kernel.file(c.leader, Fd(2)).unwrap()
+    ));
+    assert_eq!(c.write(&caller, 2, b"default\n"), Ok(8));
+    assert_eq!(c.shown(), b"default\r\n");
+    assert!(ignored.requests().is_empty());
+    c.keyboard.unplug();
+}
+
+#[test]
+fn exclusive_console_open_failure_preserves_existing_descriptors_and_output_routes() {
+    let errors = Arc::new(Capture::default());
+    let c = console_with_outputs(
+        None,
+        [None, None, Some(errors.clone())],
+        Arc::new(ThreadHost),
+    );
+    let memory = memory();
+    let caller = Caller::new(c.leader, &memory);
+    assert!(
+        !c.kernel
+            .cred(&caller)
+            .capable_init(wasixv2_vfs::Cap::SysAdmin)
+    );
+    let old = [0, 1, 2].map(|fd| c.kernel.file(c.leader, Fd(fd)).unwrap());
+    assert_eq!(c.ioctl(&caller, 0, IoctlRequest::TIOCEXCL, 0), Ok(0));
+    assert_eq!(c.ioctl_int(&caller, IoctlRequest::TIOCGEXCL), Ok(1));
+    let rejected = Arc::new(Capture::default());
+    assert_eq!(
+        block_on(c.kernel.attach_console_outputs(
+            c.leader,
+            [true; 3],
+            [None, None, Some(rejected.clone())],
+        )),
+        Err(Errno::EBUSY)
+    );
+    for (fd, file) in old.iter().enumerate() {
+        assert!(Arc::ptr_eq(
+            file,
+            &c.kernel.file(c.leader, Fd(fd as i32)).unwrap()
+        ));
+    }
+    assert_eq!(c.write(&caller, 1, b"stdout\n"), Ok(7));
+    assert_eq!(c.write(&caller, 2, b"stderr\n"), Ok(7));
+    assert_eq!(c.shown(), b"stdout\r\n");
+    assert_eq!(*errors.0.lock_or_recover(), b"stderr\r\n");
+    assert!(rejected.0.lock_or_recover().is_empty());
+    c.keyboard.type_in(b"input\n");
+    assert_eq!(c.read(&caller, 6), Ok(b"input\n".to_vec()));
+    c.keyboard.unplug();
+}
+
+#[test]
+fn routed_console_completes_short_writes_after_one_output_processing_step() {
+    let sink = Arc::new(ScriptedOutput::new([
+        OutputStep::Take(1),
+        OutputStep::Take(2),
+        OutputStep::Take(2),
+    ]));
+    let c = console_with_outputs(None, [None, None, Some(sink.clone())], Arc::new(ThreadHost));
+    let memory = memory();
+    let caller = Caller::new(c.leader, &memory);
+    assert_eq!(c.write(&caller, 2, b"a\nb\n"), Ok(4));
+    assert_eq!(sink.accepted(), b"a\r\nb\r\n");
+    assert_eq!(
+        sink.requests(),
+        vec![
+            b"a\r\nb\r\n".to_vec(),
+            b"\r\nb\r\n".to_vec(),
+            b"b\r\n".to_vec(),
+            b"\n".to_vec()
+        ]
+    );
+    c.keyboard.unplug();
+}
+
+#[test]
+fn routed_console_short_writes_are_processed_once_and_never_replayed_after_error() {
+    let errors = Arc::new(ScriptedOutput::new([
+        OutputStep::Take(2),
+        OutputStep::Fail(io::ErrorKind::BrokenPipe),
+    ]));
+    let c = console_with_outputs(
+        None,
+        [None, None, Some(errors.clone())],
+        Arc::new(ThreadHost),
+    );
+    let memory = memory();
+    let caller = Caller::new(c.leader, &memory);
+    c.kernel
+        .task_signals(c.leader)
+        .replace_blocked(blocked(Signal::SIGPIPE));
+    assert_eq!(errno(c.write(&caller, 2, b"abcd")), Errno::EPIPE);
+    assert!(c.pending(c.leader, Signal::SIGPIPE));
+    ignore(&c.kernel, &caller, Signal::SIGPIPE);
+    assert_eq!(errors.accepted(), b"ab");
+    assert_eq!(c.write(&caller, 2, b"q\n"), Ok(2));
+    assert_eq!(errors.accepted(), b"abq\r\n");
+    assert_eq!(
+        errors.requests(),
+        vec![b"abcd".to_vec(), b"cd".to_vec(), b"q\r\n".to_vec()]
+    );
+    assert!(c.shown().is_empty());
+    c.keyboard.unplug();
+}
+
+#[test]
+fn routed_console_rejects_zero_and_oversized_host_write_counts() {
+    for count in [0, usize::MAX] {
+        let sink = Arc::new(ScriptedOutput::new([OutputStep::Report(count)]));
+        let c = console_with_outputs(None, [None, Some(sink.clone()), None], Arc::new(ThreadHost));
+        let memory = memory();
+        let caller = Caller::new(c.leader, &memory);
+        assert_eq!(errno(c.write(&caller, 1, b"x")), Errno::EIO);
+        assert!(sink.accepted().is_empty());
+        c.keyboard.unplug();
+    }
+}
+
+#[test]
+fn routed_console_blocked_write_holds_sent_fence_until_completion_or_cancellation() {
+    for canceled in [false, true] {
+        let sink = Arc::new(ScriptedOutput::new([
+            OutputStep::Take(2),
+            OutputStep::Block,
+        ]));
+        let c = console_with_outputs(
+            None,
+            [None, None, Some(sink.clone())],
+            Arc::new(PendingTimerHost),
+        );
+        let memory = memory();
+        let caller = Caller::new(c.leader, &memory);
+        put(&memory.0, 0x200, b"abcd");
+        let mut write = Box::pin(c.kernel.write(&caller, Fd(2), UserSlice::new(0x200, 4)));
+        assert_eq!(write.as_mut().now_or_never(), None);
+        assert_eq!(sink.accepted(), b"ab");
+        let mut sent = Box::pin(c.kernel.console_wait_until_sent());
+        assert_eq!(sent.as_mut().now_or_never(), None);
+        if canceled {
+            drop(write);
+            sink.release();
+        } else {
+            sink.release();
+            assert_eq!(write.as_mut().now_or_never(), Some(Ok(4)));
+            drop(write);
+        }
+        assert_eq!(sent.as_mut().now_or_never(), Some(()));
+        assert_eq!(c.write(&caller, 2, b"q"), Ok(1));
+        if canceled {
+            assert_eq!(sink.accepted(), b"abq");
+            assert_eq!(sink.requests(), vec![b"abcd".to_vec(), b"q".to_vec()]);
+        } else {
+            assert_eq!(sink.accepted(), b"abcdq");
+            assert_eq!(
+                sink.requests(),
+                vec![b"abcd".to_vec(), b"cd".to_vec(), b"q".to_vec()]
+            );
+        }
+        c.keyboard.unplug();
+    }
+}
+
+#[test]
+fn routed_console_does_not_change_pty_output() {
+    let errors = Arc::new(Capture::default());
+    let c = console_with_outputs(
+        None,
+        [None, None, Some(errors.clone())],
+        Arc::new(ThreadHost),
+    );
+    block_on(
+        c.kernel
+            .vfs()
+            .mount(b"/dev/pts", c.kernel.devpts(), MountFlags::default(), true),
+    )
+    .unwrap();
+    let memory = memory();
+    let caller = Caller::new(c.leader, &memory);
+    let flags = OpenFlags(OpenFlags::O_RDWR.0 | OpenFlags::O_NOCTTY.0);
+    let master = open(&c.kernel, &caller, b"/dev/ptmx", flags);
+    put(&memory.0, 0x10, &0i32.to_le_bytes());
+    assert_eq!(
+        c.ioctl(&caller, master.0, IoctlRequest::TIOCSPTLCK, 0x10),
+        Ok(0)
+    );
+    let slave = open(&c.kernel, &caller, b"/dev/pts/0", flags);
+    assert_eq!(c.write(&caller, slave.0, b"pty\n"), Ok(4));
+    let n = block_on(c.kernel.read(&caller, master, UserSliceMut::new(0x300, 16))).unwrap();
+    assert_eq!(get(&memory.0, 0x300, n as usize), b"pty\r\n");
+    assert!(errors.0.lock_or_recover().is_empty());
+    assert!(c.shown().is_empty());
+    c.keyboard.unplug();
 }
