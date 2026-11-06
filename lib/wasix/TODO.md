@@ -55,7 +55,7 @@ establish full parity or an integrated release result.
 
 | Work | Private source | Remaining gate |
 | --- | --- | --- |
-| Contexts/closures | [Runtime](https://github.com/wasmerio/wasmer-next/tree/wasixv2/native-contexts-recovery), [WLK](https://github.com/wasmerio/wlk/tree/parity/contexts-core) | Native consumers and physical cleanup tests pass; canonical generation, complete JS companions and startup/cancellation integration remain. |
+| Contexts/closures | Native foundation integrated as `6e9876f90e3`, WLK `fc3b2b99821` | Reviewed native custody, startup/cancellation, owned generator and base preparation are integrated. Composed check, canonical equality (3), preparation (3), contexts (3) and cancellation (6) pass. Nonmain `posix_spawn` and browser work remain separate. |
 | Shared resolved installer | Integrated on `main`; [component source](https://github.com/wasmerio/wasmer-next/tree/wasixv2/parity-cli-resolved-install) | Combined installer tests pass (15); remaining consumer integration is tracked separately. |
 | Download progress | Integrated on `main`; [component source](https://github.com/wasmerio/wasmer-next/tree/wasixv2/parity-cli-package-progress) | Acquisition/progress tests pass (75); SDK subscriber integration remains. |
 | Browser isolation | [SDK `a5be3a955f9`](https://github.com/wasmerio/wasmer-next/tree/parity/sdk-isolation-20261105) | One Chromium/Firefox busy-module and live-directory batch passed on WLK `8bce49d4`; a later repeated teardown probe retained two coordinators. Stable retirement, current public API assembly and Node remain. |
