@@ -278,6 +278,10 @@ impl NativeWasi {
     }
 
     pub(super) fn read(&self, stderr: bool, buffer: &mut [u8]) -> isize {
+        if self.process.is_none() {
+            crate::error::update_last_error("WASI environment is closed");
+            return -1;
+        }
         let capture = if stderr { &self.stderr } else { &self.stdout };
         match capture {
             Some(capture) => capture.read(buffer) as isize,

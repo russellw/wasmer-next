@@ -2178,4 +2178,411 @@ mod tests {
         .success();
         eprintln!("{}", String::from_utf8_lossy(&output.get_output().stderr));
     }
+    // Measured original reference: child completion succeeds, then shared fd1
+    // removal makes its public capture lookup fail. Keep the body unchanged.
+    #[allow(
+        unexpected_cfgs,
+        reason = "tools like cargo-llvm-coverage pass --cfg coverage"
+    )]
+    #[cfg(unix)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    #[test]
+    #[ignore = "legacy reference: native intentionally retains the original configured capture consumer"]
+    fn test_wasi_public_exec_preserves_namespace_and_reports_an_exit_trap() {
+        let output = (assert_c! {
+            #include "tests/wasmer.h"
+            #include <stdint.h>
+            #include <stdio.h>
+            #include <stdlib.h>
+            #include <string.h>
+            #include <sys/stat.h>
+            #include <unistd.h>
+
+            int main() {
+                wasm_engine_t* engine = wasm_engine_new();
+                wasm_store_t* store = wasm_store_new(engine);
+                assert(engine && store);
+                char directory[] = "/tmp/wasmer-capi-exec-contract-XXXXXX";
+                assert(mkdtemp(directory));
+                char child_path[512], result_path[512];
+                assert(snprintf(child_path, sizeof(child_path), "%s/child.wasm", directory) > 0);
+                assert(snprintf(result_path, sizeof(result_path), "%s/result", directory) > 0);
+                wasm_byte_vec_t child_wat, child_wasm;
+                wasmer_byte_vec_new_from_string(&child_wat, "(module\n"
+                    "(import \"wasix_32v1\" \"args_sizes_get\" (func $argc (param i32 i32) (result i32)))\n"
+                    "(import \"wasix_32v1\" \"args_get\" (func $argv (param i32 i32) (result i32)))\n"
+                    "(import \"wasix_32v1\" \"environ_sizes_get\" (func $envc (param i32 i32) (result i32)))\n"
+                    "(import \"wasix_32v1\" \"environ_get\" (func $env (param i32 i32) (result i32)))\n"
+                    "(import \"wasix_32v1\" \"fd_prestat_get\" (func $prestat (param i32 i32) (result i32)))\n"
+                    "(import \"wasix_32v1\" \"fd_prestat_dir_name\" (func $name (param i32 i32 i32) (result i32)))\n"
+                    "(import \"wasix_32v1\" \"fd_fdstat_get\" (func $stat (param i32 i32) (result i32)))\n"
+                    "(import \"wasix_32v1\" \"fd_fdflags_get\" (func $flags (param i32 i32) (result i32)))\n"
+                    "(import \"wasix_32v1\" \"fd_readdir\" (func $readdir (param i32 i32 i32 i64 i32) (result i32)))\n"
+                    "(import \"wasix_32v1\" \"path_open\" (func $open (param i32 i32 i32 i32 i32 i64 i64 i32 i32) (result i32)))\n"
+                    "(import \"wasix_32v1\" \"fd_write\" (func $write (param i32 i32 i32 i32) (result i32)))\n"
+                    "(import \"wasix_32v1\" \"fd_close\" (func $close (param i32) (result i32)))\n"
+                    "(import \"wasix_32v1\" \"proc_exit2\" (func $exit (param i32)))\n"
+                    "(memory (export \"memory\") 1)\n"
+                    "(data (i32.const 3000) \"/opaque//alias/prog\")\n"
+                    "(data (i32.const 3040) \"result\")\n"
+                    "(data (i32.const 3080) \"donefail\")\n"
+                    "(func $fail\n"
+                    " (i32.store (i32.const 200) (i32.const 3084))\n"
+                    " (i32.store (i32.const 204) (i32.const 4))\n"
+                    " (drop (call $write (i32.const 1) (i32.const 200) (i32.const 1) (i32.const 208)))\n"
+                    " (call $exit (i32.const 2)) unreachable)\n"
+                    "(func $check (param $actual i32) (param $expected i32)\n"
+                    " (if (i32.ne (local.get $actual) (local.get $expected)) (then (call $fail))))\n"
+                    "(func $bytes (param $actual i32) (param $expected i32) (param $len i32) (local $i i32)\n"
+                    " (loop $next (if (i32.lt_u (local.get $i) (local.get $len)) (then\n"
+                    "  (call $check (i32.load8_u (i32.add (local.get $actual) (local.get $i)))\n"
+                    "               (i32.load8_u (i32.add (local.get $expected) (local.get $i))))\n"
+                    "  (local.set $i (i32.add (local.get $i) (i32.const 1))) (br $next)))))\n"
+                    "(func (export \"_start\")\n"
+                    " (call $check (call $argc (i32.const 0) (i32.const 4)) (i32.const 0))\n"
+                    " (call $check (i32.load (i32.const 0)) (i32.const 1))\n"
+                    " (call $check (i32.load (i32.const 4)) (i32.const 6))\n"
+                    " (call $check (call $argv (i32.const 8) (i32.const 64)) (i32.const 0))\n"
+                    " (call $check (i32.load (i32.const 64)) (i32.const 0x6c696863))\n"
+                    " (call $check (i32.load8_u (i32.const 68)) (i32.const 100))\n"
+                    " (call $check (call $envc (i32.const 0) (i32.const 4)) (i32.const 0))\n"
+                    " (call $check (i32.load (i32.const 0)) (i32.const 2))\n"
+                    " (call $check (i32.load (i32.const 4)) (i32.const 19))\n"
+                    " (call $check (call $env (i32.const 8) (i32.const 64)) (i32.const 0))\n"
+                    " (call $check (i32.load (i32.const 8)) (i32.const 64))\n"
+                    " (call $check (i32.load (i32.const 12)) (i32.const 75))\n"
+                    " (call $check (i32.load (i32.const 64)) (i32.const 0x3d444c4f))\n"
+                    " (call $check (i32.load (i32.const 68)) (i32.const 0x65726170))\n"
+                    " (call $check (i32.load16_u (i32.const 72)) (i32.const 0x746e))\n"
+                    " (call $check (i32.load8_u (i32.const 74)) (i32.const 0))\n"
+                    " (call $check (i32.load (i32.const 75)) (i32.const 0x3d57454e))\n"
+                    " (call $check (i32.load (i32.const 79)) (i32.const 0x00736579))\n"
+                    " (call $check (call $prestat (i32.const 20) (i32.const 0)) (i32.const 0))\n"
+                    " (call $check (i32.load (i32.const 4)) (i32.const 13))\n"
+                    " (call $check (call $name (i32.const 20) (i32.const 64) (i32.const 13)) (i32.const 0))\n"
+                    " (call $bytes (i32.const 64) (i32.const 3001) (i32.const 13))\n"
+                    " (call $check (call $stat (i32.const 20) (i32.const 128)) (i32.const 0))\n"
+                    " (if (i64.ne (i64.load (i32.const 136)) (i64.const 2097160)) (then (call $fail)))\n"
+                    " (if (i64.ne (i64.load (i32.const 144)) (i64.const 0)) (then (call $fail)))\n"
+                    " (call $check (call $flags (i32.const 20) (i32.const 0)) (i32.const 0))\n"
+                    " (call $check (i32.load16_u (i32.const 0)) (i32.const 1))\n"
+                    " (call $check (call $readdir (i32.const 3) (i32.const 1000) (i32.const 256) (i64.const 0) (i32.const 0)) (i32.const 0))\n"
+                    " (call $check (i32.load (i32.const 0)) (i32.const 67))\n"
+                    " (call $check (i32.load (i32.const 1016)) (i32.const 14))\n"
+                    " (call $bytes (i32.const 1024) (i32.const 3000) (i32.const 14))\n"
+                    " (call $check (i32.load (i32.const 1054)) (i32.const 5))\n"
+                    " (call $bytes (i32.const 1062) (i32.const 3014) (i32.const 5))\n"
+                    " (call $check (call $open (i32.const 5) (i32.const 1) (i32.const 3040) (i32.const 6)\n"
+                    "    (i32.const 1) (i64.const 64) (i64.const 0) (i32.const 0) (i32.const 256)) (i32.const 0))\n"
+                    " (i32.store (i32.const 200) (i32.const 3080))\n"
+                    " (i32.store (i32.const 204) (i32.const 4))\n"
+                    " (call $check (call $write (i32.load (i32.const 256)) (i32.const 200) (i32.const 1) (i32.const 208)) (i32.const 0))\n"
+                    " (call $check (call $close (i32.load (i32.const 256))) (i32.const 0))\n"
+                    " (call $check (call $write (i32.const 1) (i32.const 200) (i32.const 1) (i32.const 208)) (i32.const 0))))\n");
+                wat2wasm(&child_wat, &child_wasm);
+                assert(child_wasm.size > 0);
+                FILE* child = fopen(child_path, "wb");
+                assert(child);
+                assert(fwrite(child_wasm.data, 1, child_wasm.size, child) == child_wasm.size);
+                assert(fclose(child) == 0 && chmod(child_path, 0755) == 0);
+                wasm_byte_vec_t wat, wasm;
+                wasmer_byte_vec_new_from_string(&wat, "(module\n"
+                    "(import \"wasix_32v1\" \"fd_renumber\" (func $renumber (param i32 i32) (result i32)))\n"
+                    "(import \"wasix_32v1\" \"fd_fdstat_set_rights\" (func $reduce (param i32 i64 i64) (result i32)))\n"
+                    "(import \"wasix_32v1\" \"fd_fdflags_set\" (func $flags (param i32 i32) (result i32)))\n"
+                    "(import \"wasix_32v1\" \"proc_exec3\" (func $exec (param i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))\n"
+                    "(memory (export \"memory\") 1)\n"
+                    "(data (i32.const 1000) \"/prog/child.wasm\")\n"
+                    "(data (i32.const 1040) \"child\\n\")\n"
+                    "(data (i32.const 1080) \"NEW=yes\\n\")\n"
+                    "(func (export \"run\") (result i64)\n"
+                    "(if (call $renumber (i32.const 4) (i32.const 20)) (then unreachable))\n"
+                    "(if (call $reduce (i32.const 20) (i64.const 2097160) (i64.const 0)) (then unreachable))\n"
+                    "(if (call $flags (i32.const 20) (i32.const 1)) (then unreachable))\n"
+                    "(drop (call $exec (i32.const 1000) (i32.const 16) (i32.const 1040) (i32.const 6)\n"
+                    " (i32.const 1080) (i32.const 8) (i32.const 0) (i32.const 0) (i32.const 0)))\n"
+                    "i64.const -1))\n");
+                wat2wasm(&wat, &wasm);
+                wasm_module_t* module = wasm_module_new(store, &wasm);
+                assert(module);
+                wasi_config_t* config = wasi_config_new("old-parent");
+                assert(config);
+                wasi_config_env(config, "OLD", "parent");
+                wasi_config_capture_stdout(config);
+                assert(wasi_config_mapdir(config, "opaque//alias", directory));
+                assert(wasi_config_mapdir(config, "prog", directory));
+                wasi_env_t* env = wasi_env_new(store, config);
+                assert(env);
+                wasm_extern_vec_t imports = WASM_EMPTY_VEC;
+                assert(wasi_get_imports(store, env, module, &imports));
+                wasm_instance_t* instance = wasm_instance_new(store, module, &imports, NULL);
+                assert(instance && wasi_env_initialize_instance(env, store, instance));
+                wasm_extern_vec_t exports = WASM_EMPTY_VEC;
+                wasm_instance_exports(instance, &exports);
+                assert(exports.size == 2);
+                wasm_func_t* original = wasm_extern_as_func(exports.data[1]);
+                assert(original);
+                wasm_func_t* copied = wasm_func_copy(original);
+                assert(copied);
+                wasm_val_vec_t args = WASM_EMPTY_VEC, results;
+                wasm_val_vec_new_uninitialized(&results, 1);
+                results.data[0] = (wasm_val_t)WASM_I64_VAL(0x123456789);
+                wasm_trap_t* trap = wasm_func_call(copied, &args, &results);
+                assert(trap);
+                assert(results.data[0].kind == WASM_I64);
+                assert(results.data[0].of.i64 == 0x123456789);
+                wasm_message_t message;
+                wasm_trap_message(trap, &message);
+                const char expected_exit[] = "WASI exited with code: ExitCode::0";
+                assert(message.size == sizeof(expected_exit));
+                assert(memcmp(message.data, expected_exit, sizeof(expected_exit)) == 0);
+                fprintf(stderr, "public-exec-trap: %.*s\n", (int)message.size, message.data);
+                // A missing completion must fail before any potentially blocking stream read.
+                FILE* result = fopen(result_path, "rb");
+                assert(result);
+                char bytes[4];
+                assert(fread(bytes, 1, sizeof(bytes), result) == sizeof(bytes));
+                assert(memcmp(bytes, "done", sizeof(bytes)) == 0);
+                assert(fclose(result) == 0);
+                // The legacy child's on_exit closes shared fd1. The public
+                // reader therefore fails even though the positive host marker
+                // above proves the child completed and wrote its captured output.
+                assert(wasi_env_read_stdout(env, bytes, sizeof(bytes)) == -1);
+                wasm_byte_vec_delete(&message);
+                wasm_trap_delete(trap);
+                wasm_val_vec_delete(&results);
+                wasm_func_delete(copied);
+                wasm_extern_vec_delete(&exports);
+                wasm_instance_delete(instance);
+                wasm_extern_vec_delete(&imports);
+                wasi_env_delete(env);
+                wasm_module_delete(module);
+                wasm_byte_vec_delete(&wasm);
+                wasm_byte_vec_delete(&wat);
+                wasm_byte_vec_delete(&child_wasm);
+                wasm_byte_vec_delete(&child_wat);
+                wasm_store_delete(store);
+                wasm_engine_delete(engine);
+                assert(unlink(result_path) == 0 && unlink(child_path) == 0);
+                assert(rmdir(directory) == 0);
+                return 0;
+            }
+        }).success();
+        eprintln!("{}", String::from_utf8_lossy(&output.get_output().stderr));
+    }
+
+    // Intentional native correction: drain the original configured capture and EOF
+    // after fd1 redirection/closure; the redirected host file is a distinct consumer.
+    #[allow(
+        unexpected_cfgs,
+        reason = "tools like cargo-llvm-coverage pass --cfg coverage"
+    )]
+    #[cfg(unix)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    #[test]
+    fn test_wasi_native_exec_retains_configured_capture_after_child_fd1_closes() {
+        let output = (assert_c! {
+            #include "tests/wasmer.h"
+            #include <stdint.h>
+            #include <stdio.h>
+            #include <stdlib.h>
+            #include <string.h>
+            #include <sys/stat.h>
+            #include <unistd.h>
+
+            int main() {
+                wasm_engine_t* engine = wasm_engine_new();
+                wasm_store_t* store = wasm_store_new(engine);
+                assert(engine && store);
+                char directory[] = "/tmp/wasmer-capi-exec-contract-XXXXXX";
+                assert(mkdtemp(directory));
+                char child_path[512], result_path[512], redirect_path[512];
+                assert(snprintf(child_path, sizeof(child_path), "%s/child.wasm", directory) > 0);
+                assert(snprintf(result_path, sizeof(result_path), "%s/result", directory) > 0);
+                assert(snprintf(redirect_path, sizeof(redirect_path), "%s/redirect", directory) > 0);
+                wasm_byte_vec_t child_wat, child_wasm;
+                wasmer_byte_vec_new_from_string(&child_wat, "(module\n"
+                    "(import \"wasix_32v1\" \"args_sizes_get\" (func $argc (param i32 i32) (result i32)))\n"
+                    "(import \"wasix_32v1\" \"args_get\" (func $argv (param i32 i32) (result i32)))\n"
+                    "(import \"wasix_32v1\" \"environ_sizes_get\" (func $envc (param i32 i32) (result i32)))\n"
+                    "(import \"wasix_32v1\" \"environ_get\" (func $env (param i32 i32) (result i32)))\n"
+                    "(import \"wasix_32v1\" \"fd_prestat_get\" (func $prestat (param i32 i32) (result i32)))\n"
+                    "(import \"wasix_32v1\" \"fd_prestat_dir_name\" (func $name (param i32 i32 i32) (result i32)))\n"
+                    "(import \"wasix_32v1\" \"fd_fdstat_get\" (func $stat (param i32 i32) (result i32)))\n"
+                    "(import \"wasix_32v1\" \"fd_fdflags_get\" (func $flags (param i32 i32) (result i32)))\n"
+                    "(import \"wasix_32v1\" \"fd_readdir\" (func $readdir (param i32 i32 i32 i64 i32) (result i32)))\n"
+                    "(import \"wasix_32v1\" \"path_open\" (func $open (param i32 i32 i32 i32 i32 i64 i64 i32 i32) (result i32)))\n"
+                    "(import \"wasix_32v1\" \"fd_write\" (func $write (param i32 i32 i32 i32) (result i32)))\n"
+                    "(import \"wasix_32v1\" \"fd_close\" (func $close (param i32) (result i32)))\n"
+                    "(import \"wasix_32v1\" \"fd_renumber\" (func $renumber (param i32 i32) (result i32)))\n"
+                    "(import \"wasix_32v1\" \"proc_exit2\" (func $exit (param i32)))\n"
+                    "(memory (export \"memory\") 1)\n"
+                    "(data (i32.const 3000) \"/opaque//alias/prog\")\n"
+                    "(data (i32.const 3040) \"result\")\n"
+                    "(data (i32.const 3080) \"donefail\")\n"
+                    "(data (i32.const 3120) \"redirect\")\n"
+                    "(data (i32.const 3160) \"file\")\n"
+                    "(func $fail\n"
+                    " (i32.store (i32.const 200) (i32.const 3084))\n"
+                    " (i32.store (i32.const 204) (i32.const 4))\n"
+                    " (drop (call $write (i32.const 1) (i32.const 200) (i32.const 1) (i32.const 208)))\n"
+                    " (call $exit (i32.const 2)) unreachable)\n"
+                    "(func $check (param $actual i32) (param $expected i32)\n"
+                    " (if (i32.ne (local.get $actual) (local.get $expected)) (then (call $fail))))\n"
+                    "(func $bytes (param $actual i32) (param $expected i32) (param $len i32) (local $i i32)\n"
+                    " (loop $next (if (i32.lt_u (local.get $i) (local.get $len)) (then\n"
+                    "  (call $check (i32.load8_u (i32.add (local.get $actual) (local.get $i)))\n"
+                    "               (i32.load8_u (i32.add (local.get $expected) (local.get $i))))\n"
+                    "  (local.set $i (i32.add (local.get $i) (i32.const 1))) (br $next)))))\n"
+                    "(func (export \"_start\")\n"
+                    " (call $check (call $argc (i32.const 0) (i32.const 4)) (i32.const 0))\n"
+                    " (call $check (i32.load (i32.const 0)) (i32.const 1))\n"
+                    " (call $check (i32.load (i32.const 4)) (i32.const 6))\n"
+                    " (call $check (call $argv (i32.const 8) (i32.const 64)) (i32.const 0))\n"
+                    " (call $check (i32.load (i32.const 64)) (i32.const 0x6c696863))\n"
+                    " (call $check (i32.load8_u (i32.const 68)) (i32.const 100))\n"
+                    " (call $check (call $envc (i32.const 0) (i32.const 4)) (i32.const 0))\n"
+                    " (call $check (i32.load (i32.const 0)) (i32.const 2))\n"
+                    " (call $check (i32.load (i32.const 4)) (i32.const 19))\n"
+                    " (call $check (call $env (i32.const 8) (i32.const 64)) (i32.const 0))\n"
+                    " (call $check (i32.load (i32.const 8)) (i32.const 64))\n"
+                    " (call $check (i32.load (i32.const 12)) (i32.const 75))\n"
+                    " (call $check (i32.load (i32.const 64)) (i32.const 0x3d444c4f))\n"
+                    " (call $check (i32.load (i32.const 68)) (i32.const 0x65726170))\n"
+                    " (call $check (i32.load16_u (i32.const 72)) (i32.const 0x746e))\n"
+                    " (call $check (i32.load8_u (i32.const 74)) (i32.const 0))\n"
+                    " (call $check (i32.load (i32.const 75)) (i32.const 0x3d57454e))\n"
+                    " (call $check (i32.load (i32.const 79)) (i32.const 0x00736579))\n"
+                    " (call $check (call $prestat (i32.const 20) (i32.const 0)) (i32.const 0))\n"
+                    " (call $check (i32.load (i32.const 4)) (i32.const 13))\n"
+                    " (call $check (call $name (i32.const 20) (i32.const 64) (i32.const 13)) (i32.const 0))\n"
+                    " (call $bytes (i32.const 64) (i32.const 3001) (i32.const 13))\n"
+                    " (call $check (call $stat (i32.const 20) (i32.const 128)) (i32.const 0))\n"
+                    " (if (i64.ne (i64.load (i32.const 136)) (i64.const 2097160)) (then (call $fail)))\n"
+                    " (if (i64.ne (i64.load (i32.const 144)) (i64.const 0)) (then (call $fail)))\n"
+                    " (call $check (call $flags (i32.const 20) (i32.const 0)) (i32.const 0))\n"
+                    " (call $check (i32.load16_u (i32.const 0)) (i32.const 1))\n"
+                    " (call $check (call $readdir (i32.const 3) (i32.const 1000) (i32.const 256) (i64.const 0) (i32.const 0)) (i32.const 0))\n"
+                    " (call $check (i32.load (i32.const 0)) (i32.const 67))\n"
+                    " (call $check (i32.load (i32.const 1016)) (i32.const 14))\n"
+                    " (call $bytes (i32.const 1024) (i32.const 3000) (i32.const 14))\n"
+                    " (call $check (i32.load (i32.const 1054)) (i32.const 5))\n"
+                    " (call $bytes (i32.const 1062) (i32.const 3014) (i32.const 5))\n"
+                    " (call $check (call $open (i32.const 5) (i32.const 1) (i32.const 3040) (i32.const 6)\n"
+                    "    (i32.const 1) (i64.const 64) (i64.const 0) (i32.const 0) (i32.const 256)) (i32.const 0))\n"
+                    " (i32.store (i32.const 200) (i32.const 3080))\n"
+                    " (i32.store (i32.const 204) (i32.const 4))\n"
+                    " (call $check (call $write (i32.load (i32.const 256)) (i32.const 200) (i32.const 1) (i32.const 208)) (i32.const 0))\n"
+                    " (call $check (call $close (i32.load (i32.const 256))) (i32.const 0))\n"
+                    " (call $check (call $write (i32.const 1) (i32.const 200) (i32.const 1) (i32.const 208)) (i32.const 0))\n"
+                    " (call $check (call $open (i32.const 5) (i32.const 1) (i32.const 3120) (i32.const 8)\n"
+                    "    (i32.const 1) (i64.const 64) (i64.const 0) (i32.const 0) (i32.const 256)) (i32.const 0))\n"
+                    " (call $check (call $renumber (i32.load (i32.const 256)) (i32.const 1)) (i32.const 0))\n"
+                    " (i32.store (i32.const 200) (i32.const 3160))\n"
+                    " (call $check (call $write (i32.const 1) (i32.const 200) (i32.const 1) (i32.const 208)) (i32.const 0))\n"
+                    " (call $check (call $close (i32.load (i32.const 256))) (i32.const 0))))\n");
+                wat2wasm(&child_wat, &child_wasm);
+                assert(child_wasm.size > 0);
+                FILE* child = fopen(child_path, "wb");
+                assert(child);
+                assert(fwrite(child_wasm.data, 1, child_wasm.size, child) == child_wasm.size);
+                assert(fclose(child) == 0 && chmod(child_path, 0755) == 0);
+                wasm_byte_vec_t wat, wasm;
+                wasmer_byte_vec_new_from_string(&wat, "(module\n"
+                    "(import \"wasix_32v1\" \"fd_renumber\" (func $renumber (param i32 i32) (result i32)))\n"
+                    "(import \"wasix_32v1\" \"fd_fdstat_set_rights\" (func $reduce (param i32 i64 i64) (result i32)))\n"
+                    "(import \"wasix_32v1\" \"fd_fdflags_set\" (func $flags (param i32 i32) (result i32)))\n"
+                    "(import \"wasix_32v1\" \"proc_exec3\" (func $exec (param i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))\n"
+                    "(memory (export \"memory\") 1)\n"
+                    "(data (i32.const 1000) \"/prog/child.wasm\")\n"
+                    "(data (i32.const 1040) \"child\\n\")\n"
+                    "(data (i32.const 1080) \"NEW=yes\\n\")\n"
+                    "(func (export \"run\") (result i64)\n"
+                    "(if (call $renumber (i32.const 4) (i32.const 20)) (then unreachable))\n"
+                    "(if (call $reduce (i32.const 20) (i64.const 2097160) (i64.const 0)) (then unreachable))\n"
+                    "(if (call $flags (i32.const 20) (i32.const 1)) (then unreachable))\n"
+                    "(drop (call $exec (i32.const 1000) (i32.const 16) (i32.const 1040) (i32.const 6)\n"
+                    " (i32.const 1080) (i32.const 8) (i32.const 0) (i32.const 0) (i32.const 0)))\n"
+                    "i64.const -1))\n");
+                wat2wasm(&wat, &wasm);
+                wasm_module_t* module = wasm_module_new(store, &wasm);
+                assert(module);
+                wasi_config_t* config = wasi_config_new("old-parent");
+                assert(config);
+                wasi_config_env(config, "OLD", "parent");
+                wasi_config_capture_stdout(config);
+                assert(wasi_config_mapdir(config, "opaque//alias", directory));
+                assert(wasi_config_mapdir(config, "prog", directory));
+                wasi_env_t* env = wasi_env_new(store, config);
+                assert(env);
+                wasm_extern_vec_t imports = WASM_EMPTY_VEC;
+                assert(wasi_get_imports(store, env, module, &imports));
+                wasm_instance_t* instance = wasm_instance_new(store, module, &imports, NULL);
+                assert(instance && wasi_env_initialize_instance(env, store, instance));
+                wasm_extern_vec_t exports = WASM_EMPTY_VEC;
+                wasm_instance_exports(instance, &exports);
+                assert(exports.size == 2);
+                wasm_func_t* original = wasm_extern_as_func(exports.data[1]);
+                assert(original);
+                wasm_func_t* copied = wasm_func_copy(original);
+                assert(copied);
+                wasm_val_vec_t args = WASM_EMPTY_VEC, results;
+                wasm_val_vec_new_uninitialized(&results, 1);
+                results.data[0] = (wasm_val_t)WASM_I64_VAL(0x123456789);
+                wasm_trap_t* trap = wasm_func_call(copied, &args, &results);
+                assert(trap);
+                assert(results.data[0].kind == WASM_I64);
+                assert(results.data[0].of.i64 == 0x123456789);
+                wasm_message_t message;
+                wasm_trap_message(trap, &message);
+                const char expected_exit[] = "WASI exited with code: ExitCode::0";
+                assert(message.size == sizeof(expected_exit));
+                assert(memcmp(message.data, expected_exit, sizeof(expected_exit)) == 0);
+                fprintf(stderr, "public-exec-trap: %.*s\n", (int)message.size, message.data);
+                // A missing completion must fail before any potentially blocking stream read.
+                FILE* result = fopen(result_path, "rb");
+                assert(result);
+                char bytes[4];
+                assert(fread(bytes, 1, sizeof(bytes), result) == sizeof(bytes));
+                assert(memcmp(bytes, "done", sizeof(bytes)) == 0);
+                assert(fclose(result) == 0);
+                // The original configured consumer remains readable even after
+                // the child redirects fd1 to a file and then closes all its fds.
+                size_t count = 0;
+                while (count < sizeof(bytes)) {
+                    intptr_t read = wasi_env_read_stdout(env, bytes + count, sizeof(bytes) - count);
+                    assert(read > 0 && (size_t)read <= sizeof(bytes) - count);
+                    count += (size_t)read;
+                }
+                assert(memcmp(bytes, "done", sizeof(bytes)) == 0);
+                assert(wasi_env_read_stdout(env, bytes, sizeof(bytes)) == 0);
+                assert(wasi_env_read_stdout(env, bytes, 0) == 0);
+                assert(wasi_env_read_stderr(env, bytes, sizeof(bytes)) == -1);
+                FILE* redirected = fopen(redirect_path, "rb");
+                assert(redirected);
+                assert(fread(bytes, 1, sizeof(bytes), redirected) == sizeof(bytes));
+                assert(memcmp(bytes, "file", sizeof(bytes)) == 0);
+                assert(fclose(redirected) == 0);
+                wasm_byte_vec_delete(&message);
+                wasm_trap_delete(trap);
+                wasm_val_vec_delete(&results);
+                wasm_func_delete(copied);
+                wasm_extern_vec_delete(&exports);
+                wasm_instance_delete(instance);
+                wasm_extern_vec_delete(&imports);
+                wasi_env_delete(env);
+                wasm_module_delete(module);
+                wasm_byte_vec_delete(&wasm);
+                wasm_byte_vec_delete(&wat);
+                wasm_byte_vec_delete(&child_wasm);
+                wasm_byte_vec_delete(&child_wat);
+                wasm_store_delete(store);
+                wasm_engine_delete(engine);
+                assert(unlink(result_path) == 0 && unlink(child_path) == 0 && unlink(redirect_path) == 0);
+                assert(rmdir(directory) == 0);
+                return 0;
+            }
+        }).success();
+        eprintln!("{}", String::from_utf8_lossy(&output.get_output().stderr));
+    }
 }
