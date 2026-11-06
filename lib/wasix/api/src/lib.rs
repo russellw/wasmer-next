@@ -61,7 +61,9 @@ pub use wasixv2_host::{
     ByteSink, ByteSource, Console, EmptySource, Executor, FnSink, Host, LocalFuture, ThreadStart,
     WindowSize,
 };
-pub use wasixv2_kernel::{Credentials, PowerRequest, ProcessConfig, Stdio, Uname, UnameError};
+pub use wasixv2_kernel::{
+    ConsoleInputEof, Credentials, PowerRequest, ProcessConfig, Stdio, Uname, UnameError,
+};
 use wasixv2_kernel::{FilesystemType, FsParam, HostClock, Kernel, SyscallEntry, Timekeeper};
 use wasixv2_pages::{Provider, SharedPages};
 use wasixv2_syscalls::{Layered, TaskId};
@@ -223,6 +225,8 @@ pub struct Machine {
     in_use: AtomicBool,
     /// The host's console, and which descriptors of a new process are on it.
     console: Option<(Console, [bool; 3])>,
+    console_input_eof: ConsoleInputEof,
+    console_stdio_outputs: bool,
 }
 
 #[cfg(feature = "tokio")]
@@ -264,6 +268,8 @@ pub struct MachineBuilder {
     #[cfg(feature = "wasix1")]
     wasix1_limits: wasixv2_wasix1::Limits,
     console: Option<(Console, [bool; 3])>,
+    console_input_eof: ConsoleInputEof,
+    console_stdio_outputs: bool,
     dns: Dns,
     #[cfg(all(feature = "host-network", unix))]
     vsock: Option<VsockConfig>,
@@ -308,6 +314,8 @@ impl MachineBuilder {
             #[cfg(feature = "wasix1")]
             wasix1_limits: wasixv2_wasix1::Limits::default(),
             console: None,
+            console_input_eof: ConsoleInputEof::Hangup,
+            console_stdio_outputs: false,
             dns: Dns::default(),
             #[cfg(all(feature = "host-network", unix))]
             vsock: None,
@@ -438,6 +446,20 @@ impl MachineBuilder {
         self
     }
 
+    /// Handles the console input source ending as a hangup by default, or as
+    /// finite input without a hangup. Retained when root layers rebuild the kernel.
+    pub fn console_input_eof(mut self, policy: ConsoleInputEof) -> Self {
+        self.console_input_eof = policy;
+        self
+    }
+
+    /// Routes selected console stdout/stderr descriptors to each new process's
+    /// original Stdio sinks. Echo remains on Console.output. Defaults to false.
+    pub fn console_stdio_outputs(mut self, enabled: bool) -> Self {
+        self.console_stdio_outputs = enabled;
+        self
+    }
+
     pub fn build(self) -> Machine {
         let Self {
             host,
@@ -458,6 +480,8 @@ impl MachineBuilder {
             #[cfg(feature = "wasix1")]
             wasix1_limits,
             console,
+            console_input_eof,
+            console_stdio_outputs,
             dns,
             #[cfg(all(feature = "host-network", unix))]
             vsock,
@@ -503,7 +527,9 @@ impl MachineBuilder {
             &user,
             &uname,
             init,
-            console.as_ref().map(|(console, _)| console),
+            console
+                .as_ref()
+                .map(|(console, _)| (console, console_input_eof)),
             abis.clone(),
         )
         .with_guest_task_limit(max_guest_tasks);
@@ -535,6 +561,8 @@ impl MachineBuilder {
             root_lowers: Vec::new(),
             in_use: AtomicBool::new(false),
             console,
+            console_input_eof,
+            console_stdio_outputs,
         }
     }
 }
@@ -660,7 +688,9 @@ impl Machine {
             &self.user,
             &self.uname,
             self.init,
-            self.console.as_ref().map(|(console, _)| console),
+            self.console
+                .as_ref()
+                .map(|(console, _)| (console, self.console_input_eof)),
             self.abis.clone(),
         )
         .with_guest_task_limit(self.max_guest_tasks);
@@ -1034,6 +1064,19 @@ impl Machine {
         self.in_use.store(true, Ordering::Relaxed);
         #[cfg(feature = "wasix1")]
         self.resolve_wasix1_commands().await;
+        // Capture each admission's original sinks before spawn consumes config;
+        // no process sink becomes machine-wide console state.
+        let outputs = self
+            .console
+            .as_ref()
+            .filter(|_| self.console_stdio_outputs)
+            .map(|(_, fds)| {
+                [
+                    None,
+                    fds[1].then(|| config.stdio.stdout.clone()),
+                    fds[2].then(|| config.stdio.stderr.clone()),
+                ]
+            });
         let task = (self.syscalls.inner.spawn(config))
             .map_err(|errno| RunError::Spawn(errno_to_io(errno)))?;
         self.running.lock().unwrap().push(task);
@@ -1050,11 +1093,16 @@ impl Machine {
                 .map_err(|errno| RunError::WorkingDir(errno_to_io(errno)))?;
         }
         if let Some((_, fds)) = &self.console {
-            self.syscalls
-                .inner
-                .attach_console(task, *fds)
-                .await
-                .map_err(|errno| RunError::Console(errno_to_io(errno)))?;
+            match outputs {
+                Some(outputs) => {
+                    self.syscalls
+                        .inner
+                        .attach_console_outputs(task, *fds, outputs)
+                        .await
+                }
+                None => self.syscalls.inner.attach_console(task, *fds).await,
+            }
+            .map_err(|errno| RunError::Console(errno_to_io(errno)))?;
         }
         Ok((task, running))
     }
@@ -1195,7 +1243,7 @@ fn boot(
     user: &Credentials,
     uname: &Uname,
     init: bool,
-    console: Option<&Console>,
+    console: Option<(&Console, ConsoleInputEof)>,
     abis: Arc<Abis<Stack>>,
 ) -> Kernel {
     let host: Arc<dyn Host> = time.clone();
@@ -1219,7 +1267,7 @@ fn boot(
         kernel = kernel.with_init();
     }
     match console {
-        Some(console) => kernel.with_console(console.clone()),
+        Some((console, policy)) => kernel.with_console_eof(console.clone(), policy),
         None => kernel,
     }
 }

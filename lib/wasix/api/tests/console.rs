@@ -359,3 +359,230 @@ async fn admitted_observer_preserves_exit_while_console_delivery_is_pending() {
         })
         .await;
 }
+
+/// Console output processing is retained while each process owns its original
+/// stdout/stderr destinations; echo belongs only to the host console.
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+#[tokio::test]
+async fn console_stdio_outputs_use_each_admissions_original_sinks_and_keep_echo_separate() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let screen = Arc::new(Capture::default());
+            let (keys, input) = mpsc::unbounded_channel();
+            let machine = Arc::new(
+                Machine::builder()
+                    .console(
+                        Console {
+                            input: Arc::new(Keyboard(Mutex::new(input))),
+                            output: screen.clone(),
+                            size: WindowSize::default(),
+                        },
+                        [true; 3],
+                    )
+                    .console_stdio_outputs(true)
+                    .build(),
+            );
+            let engine = wasmer::Engine::default();
+            let wasm = wat::parse_str(
+                r#"(module
+                (import "wasixv2" "read" (func $read (param i32 i32 i32) (result i32)))
+                (import "wasixv2" "write" (func $write (param i32 i32 i32) (result i32)))
+                (import "wasixv2" "exit_group" (func $exit (param i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 16) "ready\nerror\n")
+                (func (export "_start") (local $n i32)
+                    (drop(call $write (i32.const 1)(i32.const 16)(i32.const 6)))
+                    (drop(call $write (i32.const 2)(i32.const 22)(i32.const 6)))
+                    (local.set $n (call $read (i32.const 0)(i32.const 64)(i32.const 32)))
+                    (drop(call $write (i32.const 1)(i32.const 64)(local.get $n)))
+                    (call $exit (i32.const 0))))"#,
+            )
+            .unwrap();
+            let module = wasixv2::load(&engine, &wasm).unwrap();
+            let mut retained = Vec::new();
+            for line in [b"first\n".as_slice(), b"second\n".as_slice()] {
+                let stdout = Arc::new(Capture::default());
+                let stderr = Arc::new(Capture::default());
+                let run = wasixv2::spawn(
+                    machine.clone(),
+                    engine.clone(),
+                    module.clone(),
+                    wasixv2::ProcessConfig {
+                        args: vec![],
+                        env: vec![],
+                        stdio: Stdio {
+                            stdin: Arc::new(EmptySource),
+                            stdout: stdout.clone(),
+                            stderr: stderr.clone(),
+                        },
+                    },
+                )
+                .await
+                .unwrap();
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    shown(&stdout, b"ready\r\n").await;
+                    shown(&stderr, b"error\r\n").await;
+                    keys.send(line.to_vec()).unwrap();
+                    assert_eq!(run.wait().await.unwrap(), 0);
+                })
+                .await
+                .expect("admitted guest must read the console and retire its output");
+                let expected = [b"ready\r\n".as_slice(), &line[..line.len() - 1], b"\r\n"].concat();
+                assert_eq!(stdout.contents(), expected);
+                assert_eq!(stderr.contents(), b"error\r\n");
+                retained.push((stdout, expected, stderr));
+            }
+            assert_eq!(screen.contents(), b"first\r\nsecond\r\n");
+            for (stdout, expected, stderr) in retained {
+                assert_eq!(
+                    stdout.contents(),
+                    expected,
+                    "a later admission must not reuse an earlier sink"
+                );
+                assert_eq!(stderr.contents(), b"error\r\n");
+            }
+            machine.shutdown().await;
+        })
+        .await;
+}
+
+/// Root layering reboots the kernel; both console policies must survive that
+/// reboot, while an unselected descriptor keeps ordinary Stdio semantics.
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+#[tokio::test]
+async fn finite_console_input_and_selected_stdio_outputs_survive_root_layering() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let screen = Arc::new(Capture::default());
+            let mut machine = Machine::builder()
+                .console_input_eof(wasixv2::ConsoleInputEof::Finite)
+                .console_stdio_outputs(true)
+                .console(
+                    Console {
+                        input: Arc::new(EmptySource),
+                        output: screen.clone(),
+                        size: WindowSize::default(),
+                    },
+                    [true, true, false],
+                )
+                .build();
+            let wasm = wat::parse_str(
+                r#"(module
+                (import "wasixv2" "read" (func $read (param i32 i32 i32) (result i32)))
+                (import "wasixv2" "write" (func $write (param i32 i32 i32) (result i32)))
+                (import "wasixv2" "exit_group" (func $exit (param i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 16) "out\nerr\n")
+                (func (export "_start")
+                    (if (call $read (i32.const 0)(i32.const 64)(i32.const 32))
+                        (then(call $exit (i32.const 99))))
+                    (drop(call $write (i32.const 1)(i32.const 16)(i32.const 4)))
+                    (drop(call $write (i32.const 2)(i32.const 20)(i32.const 4)))
+                    (call $exit (i32.const 42))))"#,
+            )
+            .unwrap();
+            let layer = machine
+                .commands_layer([("eof".into(), wasm.into())])
+                .unwrap()
+                .unwrap();
+            machine.mount_root_layers([layer]).await.unwrap();
+            let machine = Arc::new(machine);
+            let stdout = Arc::new(Capture::default());
+            let stderr = Arc::new(Capture::default());
+            let run = wasixv2::spawn_file(
+                machine.clone(),
+                wasmer::Engine::default(),
+                "/bin/eof".into(),
+                wasixv2::ProcessConfig {
+                    args: vec!["eof".into()],
+                    env: vec![],
+                    stdio: Stdio {
+                        stdin: Arc::new(EmptySource),
+                        stdout: stdout.clone(),
+                        stderr: stderr.clone(),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+            let status = tokio::time::timeout(Duration::from_secs(10), run.wait())
+                .await
+                .expect("finite console input must reach EOF without SIGHUP")
+                .unwrap();
+            assert_eq!(status, 42);
+            assert_eq!(stdout.contents(), b"out\r\n");
+            assert_eq!(stderr.contents(), b"err\n");
+            assert!(screen.contents().is_empty());
+            machine.shutdown().await;
+        })
+        .await;
+}
+
+/// A canonical console-open failure must retire both the ordinary admission and
+/// the pre-spawn sink clones; canceling the live owner releases its routes too.
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+#[tokio::test]
+async fn console_output_admission_failure_and_owner_cancel_release_process_sinks() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let screen = Arc::new(Capture::default());
+            let (_keys, input) = mpsc::unbounded_channel();
+            let machine = Arc::new(Machine::builder()
+                .max_guest_tasks(Some(2))
+                .console(Console {
+                    input: Arc::new(Keyboard(Mutex::new(input))),
+                    output: screen.clone(),
+                    size: WindowSize::default(),
+                }, [true; 3])
+                .console_stdio_outputs(true)
+                .build());
+            let engine = wasmer::Engine::default();
+            let wasm = wat::parse_str(r#"(module
+                (import "wasixv2" "ioctl" (func $ioctl (param i32 i32 i32) (result i32)))
+                (import "wasixv2" "read" (func $read (param i32 i32 i32) (result i32)))
+                (import "wasixv2" "write" (func $write (param i32 i32 i32) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 16) "ready\n")
+                (func (export "_start")
+                    ;; TIOCEXCL: further canonical opens fail for the default nonadmin user.
+                    (drop(call $ioctl (i32.const 0)(i32.const 0x540c)(i32.const 0)))
+                    (drop(call $write (i32.const 1)(i32.const 16)(i32.const 6)))
+                    (drop(call $read (i32.const 0)(i32.const 64)(i32.const 32)))))"#).unwrap();
+            let module = wasixv2::load(&engine, &wasm).unwrap();
+            let stdout = Arc::new(Capture::default());
+            let stderr = Arc::new(Capture::default());
+            let live_stdout = Arc::downgrade(&stdout);
+            let live_stderr = Arc::downgrade(&stderr);
+            let owner = wasixv2::spawn(machine.clone(), engine.clone(), module.clone(),
+                wasixv2::ProcessConfig {
+                    args: vec![], env: vec![],
+                    stdio: Stdio { stdin: Arc::new(EmptySource), stdout: stdout.clone(), stderr: stderr.clone() },
+                }).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(10), shown(&stdout, b"ready\r\n"))
+                .await.expect("live guest must establish exclusive console access");
+            for _ in 0..2 {
+                let stdout = Arc::new(Capture::default());
+                let stderr = Arc::new(Capture::default());
+                let failed_stdout = Arc::downgrade(&stdout);
+                let failed_stderr = Arc::downgrade(&stderr);
+                let result = wasixv2::spawn(machine.clone(), engine.clone(), module.clone(),
+                    wasixv2::ProcessConfig { args: vec![], env: vec![],
+                        stdio: Stdio { stdin: Arc::new(EmptySource), stdout, stderr },
+                    }).await;
+                assert!(matches!(result, Err(wasixv2::RunError::Console(error)) if error.raw_os_error() == Some(16)),
+                    "the second slot must reach canonical EBUSY again, without a leaked admission");
+                assert!(failed_stdout.upgrade().is_none());
+                assert!(failed_stderr.upgrade().is_none());
+            }
+            drop(stdout);
+            drop(stderr);
+            drop(owner);
+            tokio::time::timeout(Duration::from_secs(10), async {
+                machine.shutdown().await;
+                while live_stdout.upgrade().is_some() || live_stderr.upgrade().is_some() {
+                    tokio::task::yield_now().await;
+                }
+            }).await.expect("canceled owner must release all process sinks");
+            assert!(screen.contents().is_empty());
+        }).await;
+}
