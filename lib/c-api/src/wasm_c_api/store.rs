@@ -447,7 +447,16 @@ impl StoreRef {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .take();
-            return value.map(Ok).unwrap_or(Err(error));
+            return match value {
+                Some(Err(instance_error)) => Ok(Err(instance_error)),
+                // The call can fail after the trampoline saved success, during
+                // its final unlock/retirement. That instance was never admitted.
+                Some(Ok(instance)) => {
+                    drop(instance);
+                    Err(error)
+                }
+                None => Err(error),
+            };
         }
         let value = result
             .lock()
@@ -1500,6 +1509,108 @@ mod tests {
         a.with_mut(|loan| assert_eq!(loan.objects_mut().id(), a.inner.id))
             .unwrap();
         b.with_mut(|loan| assert_eq!(loan.objects_mut().id(), b.inner.id))
+            .unwrap();
+    }
+
+    #[cfg(feature = "wasi")]
+    #[test]
+    fn native_instantiation_never_publishes_saved_success_after_call_owner_failure() {
+        let mut store = wasm_store_t {
+            inner: StoreRef::new(Store::default()).unwrap(),
+        };
+        let weak = store.inner.downgrade();
+        let completed = Rc::new(std::cell::Cell::new(0));
+        let observed = completed.clone();
+        let error = RuntimeError::user(Box::new(std::io::Error::other(
+            "exact post-instantiation continuation failure",
+        )));
+        let expected = error.to_string();
+        let arm = store
+            .inner
+            .with_mut(|store| {
+                Function::new_async(store, wasmer_api::FunctionType::new([], []), move |_| {
+                    let owner = wasmer_api::sys::current_native_local_owner::<CallOwner>().unwrap();
+                    let store = weak.upgrade().unwrap();
+                    let weak = weak.clone();
+                    let completed = completed.clone();
+                    let error = error.clone();
+                    owner.pending.borrow_mut().push_back(LocalContinuation {
+                        store,
+                        run: Some(Box::new(move || {
+                            Box::pin(async move {
+                                // drain runs AFTER the native trampoline saved Ok(instance)
+                                // and the original Store guard physically unlocked.
+                                let store = weak.upgrade().unwrap();
+                                store.with_mut(|loan| {
+                                    assert_eq!(loan.objects_mut().id(), store.inner.id)
+                                })?;
+                                completed.set(completed.get() + 1);
+                                Err(error)
+                            })
+                        })),
+                        cancel: None,
+                    });
+                    std::future::ready(Ok(Vec::new()))
+                })
+            })
+            .unwrap();
+        let module = wasm_module_t {
+            inner: store
+                .inner
+                .with_mut(|store| {
+                    Module::new(
+                        store,
+                        wat::parse_str(
+                            r#"(module
+                (import "test" "arm" (func $arm))
+                (func $init call $arm) (start $init)
+                (func (export "value") (result i32) i32.const 42))"#,
+                        )
+                        .unwrap(),
+                    )
+                })
+                .unwrap()
+                .unwrap(),
+        };
+        let imports: wasm_extern_vec_t = vec![Some(Box::new(wasm_extern_t::new(
+            store.inner.clone(),
+            arm.into(),
+        )))]
+        .into();
+        let mut trap = std::ptr::null_mut();
+        let instance = unsafe {
+            wasm_instance_new(
+                Some(&mut store),
+                Some(&module),
+                Some(&imports),
+                Some(&mut trap),
+            )
+        };
+        assert!(
+            instance.is_none(),
+            "saved success must not override the enclosing call failure"
+        );
+        assert!(
+            trap.is_null(),
+            "host completion errors keep their existing last-error phase"
+        );
+        assert_eq!(observed.get(), 1);
+        let length = crate::error::wasmer_last_error_length();
+        assert_eq!(length as usize, expected.len() + 1);
+        let mut message = vec![0u8; length as usize];
+        let written = unsafe {
+            crate::error::wasmer_last_error_message(
+                std::ptr::NonNull::new(message.as_mut_ptr().cast()),
+                length,
+            )
+        };
+        assert_eq!(written, length);
+        let mut expected = expected.into_bytes();
+        expected.push(0);
+        assert_eq!(message, expected);
+        store
+            .inner
+            .with_mut(|loan| assert_eq!(loan.objects_mut().id(), store.inner.inner.id))
             .unwrap();
     }
 
