@@ -198,27 +198,10 @@ impl SandboxBuilder {
         }
 
         let provider_runtime = ProviderRuntime::new(self.client.inner.services.clone());
-        let (workspace, workspace_provider): (
-            Arc<dyn virtual_fs::FileSystem + Send + Sync>,
-            Arc<dyn FileSystem>,
-        ) = if let Some(provider) = self.workspace_provider {
-            (
-                Arc::new(crate::provider_fs::ProviderAdapter::new(
-                    provider.clone(),
-                    MountMode::ReadWrite,
-                    provider_runtime.clone(),
-                )),
-                provider,
-            )
-        } else {
-            let storage = Arc::new(virtual_fs::mem_fs::FileSystem::default())
-                as Arc<dyn virtual_fs::FileSystem + Send + Sync>;
-            (
-                storage.clone(),
-                Arc::new(crate::Directory::from_virtual(storage)),
-            )
-        };
-        let fs = SandboxFileSystem::new(workspace.clone());
+        let workspace = self
+            .workspace_provider
+            .unwrap_or_else(|| Arc::new(crate::Directory::new()));
+        let fs = SandboxFileSystem::new(workspace.clone(), provider_runtime.clone());
         for (path, bytes) in self.files {
             fs.write(path, bytes).await?;
         }
@@ -254,7 +237,6 @@ impl SandboxBuilder {
                 client: self.client,
                 packages: RwLock::new(packages),
                 workspace,
-                workspace_provider,
                 provider_runtime,
                 fs,
                 env: self.env,
@@ -304,11 +286,10 @@ pub struct Sandbox {
 pub(crate) struct SandboxInner {
     pub(crate) client: Wasmer,
     pub(crate) packages: RwLock<Vec<Package>>,
-    pub(crate) workspace: Arc<dyn virtual_fs::FileSystem + Send + Sync>,
+    pub(crate) workspace: Arc<dyn FileSystem>,
     pub(crate) fs: SandboxFileSystem,
     pub(crate) env: BTreeMap<String, String>,
     pub(crate) mounts: Vec<MountSpec>,
-    pub(crate) workspace_provider: Arc<dyn FileSystem>,
     pub(crate) provider_runtime: ProviderRuntime,
     network_provider: Option<DynVirtualNetworking>,
     probe_network: Option<Arc<ProviderNetwork>>,

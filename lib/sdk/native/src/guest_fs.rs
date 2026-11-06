@@ -600,7 +600,7 @@ impl Handle for GuestHandle {
             .node
             .inner
             .runtime
-            .call(async move { file.write_at(offset, bytes).await })
+            .call(async move { file.write_positioned_at(offset, bytes).await })
             .await
             .map_err(errno)?;
         if count > data.len() {
@@ -675,5 +675,64 @@ impl Handle for GuestHandle {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Replace the removed ProviderAdapter timestamp unit at the actual live
+    /// SDK provider/guest boundary; readonly failures must not alter the provider.
+    #[tokio::test]
+    async fn provider_timestamps_stay_shared_and_readonly_guest_mounts_reject_updates() {
+        let services = crate::service::Services::new().unwrap();
+        let runtime = ProviderRuntime::new(services.clone());
+        let directory = crate::Directory::new();
+        directory.write_text("file", "contents").await.unwrap();
+        directory
+            .create_dir(&RelativePath::new("folder").unwrap())
+            .await
+            .unwrap();
+        let provider: Arc<dyn FileSystem> = Arc::new(directory.clone());
+        let writable = GuestFs::new(provider.clone(), MountMode::ReadWrite, runtime.clone())
+            .await
+            .unwrap();
+        let readonly = GuestFs::new(provider, MountMode::ReadOnly, runtime.clone())
+            .await
+            .unwrap();
+        assert!(readonly.info().read_only);
+        for name in [b"file".as_slice(), b"folder".as_slice()] {
+            let file = writable.root().lookup(name).await.unwrap();
+            let protected = readonly.root().lookup(name).await.unwrap();
+            file.setattr(&SetAttr {
+                atime: Some(TimeSet::At(timestamp(10))),
+                mtime: Some(TimeSet::At(timestamp(20))),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            file.setattr(&SetAttr {
+                mtime: Some(TimeSet::At(timestamp(30))),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            let attr = protected.getattr().await.unwrap();
+            assert_eq!(attr.atime, timestamp(10));
+            assert_eq!(attr.mtime, timestamp(30));
+            assert!(matches!(
+                protected
+                    .setattr(&SetAttr {
+                        mtime: Some(TimeSet::At(timestamp(0))),
+                        ..Default::default()
+                    })
+                    .await,
+                Err(Errno::EROFS)
+            ));
+            assert_eq!(protected.getattr().await.unwrap().mtime, timestamp(30));
+        }
+        runtime.close().await.unwrap();
+        services.close().await.unwrap();
     }
 }

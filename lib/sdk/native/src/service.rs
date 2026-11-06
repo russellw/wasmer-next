@@ -193,27 +193,55 @@ impl Services {
         work: impl Future<Output = T> + Send + 'static,
         abandon: impl FnOnce(T) -> A + Send + 'static,
     ) -> Result<T> {
-        self.start_callback(work, abandon)?
-            .await
-            .map_err(|_| Error::Task {
-                message: "filesystem callback did not complete".into(),
-            })
+        let (send, result) = oneshot::channel();
+        self.submit_callback(work, abandon, |output| send.send(output))?;
+        result.await.map_err(|_| Error::Task {
+            message: "filesystem callback did not complete".into(),
+        })
     }
-    fn start_callback<T: Send + 'static, A: Future<Output = ()> + Send + 'static>(
+    /// A synchronous subscription to the same callback owner. Capacity one and
+    /// one delivery mean the completion send never waits for the subscriber.
+    pub(crate) fn callback_blocking<T: Send + 'static, A: Future<Output = ()> + Send + 'static>(
         &self,
         work: impl Future<Output = T> + Send + 'static,
         abandon: impl FnOnce(T) -> A + Send + 'static,
-    ) -> Result<oneshot::Receiver<T>> {
+    ) -> Result<T> {
+        if self.on_service_thread() {
+            return Err(Error::InternalState {
+                message: "synchronous filesystem access cannot block SDK services".into(),
+            });
+        }
+        let (send, result) = std::sync::mpsc::sync_channel(1);
+        self.submit_callback(work, abandon, move |output| {
+            send.send(output).map_err(|error| error.0)
+        })?;
+        let receive = || {
+            result.recv().map_err(|_| Error::Task {
+                message: "filesystem callback did not complete".into(),
+            })
+        };
+        match Handle::try_current() {
+            Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(receive)
+            }
+            _ => receive(),
+        }
+    }
+    fn submit_callback<T: Send + 'static, A: Future<Output = ()> + Send + 'static>(
+        &self,
+        work: impl Future<Output = T> + Send + 'static,
+        abandon: impl FnOnce(T) -> A + Send + 'static,
+        deliver: impl FnOnce(T) -> std::result::Result<(), T> + Send + 'static,
+    ) -> Result<()> {
         let lease = self.lease(true)?;
-        let (send, result) = oneshot::channel();
         self.0.runtime.spawn(async move {
             let output = work.await;
-            if let Err(output) = send.send(output) {
+            if let Err(output) = deliver(output) {
                 abandon(output).await;
             }
             drop(lease);
         });
-        Ok(result)
+        Ok(())
     }
     pub(crate) fn cleanup(
         &self,
@@ -282,5 +310,101 @@ impl Drop for Lease {
 impl Drop for Inner {
     fn drop(&mut self) {
         let _ = self.sender.try_send(Message::Stop);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
+
+    #[tokio::test]
+    async fn unpolled_callback_never_admits_work_and_releases_its_captured_owner() {
+        let services = Services::new().unwrap();
+        let owner = Arc::new(());
+        let weak = Arc::downgrade(&owner);
+        let called = Arc::new(AtomicUsize::new(0));
+        let count = called.clone();
+        let callback = services.callback(
+            async move {
+                let _owner = owner;
+                count.fetch_add(1, Ordering::SeqCst);
+            },
+            |()| async {},
+        );
+        drop(callback);
+        assert_eq!(called.load(Ordering::SeqCst), 0);
+        assert!(weak.upgrade().is_none());
+        services.close().await.unwrap();
+    }
+    #[tokio::test]
+    async fn canceled_callback_subscription_keeps_work_and_abandoned_result_cleanup_owned() {
+        let services = Services::new().unwrap();
+        let (release, work) = oneshot::channel();
+        let (finish_cleanup, cleanup) = oneshot::channel();
+        let entered = Arc::new(AtomicUsize::new(0));
+        let cleanup_entered = entered.clone();
+        let mut waiting = Box::pin(services.callback(
+            async move {
+                work.await.unwrap();
+                7
+            },
+            move |value| async move {
+                assert_eq!(value, 7);
+                cleanup_entered.store(1, Ordering::SeqCst);
+                cleanup.await.unwrap();
+                cleanup_entered.store(2, Ordering::SeqCst);
+            },
+        ));
+        assert!(futures::poll!(&mut waiting).is_pending());
+        drop(waiting);
+        let mut closing = Box::pin(services.close());
+        assert!(futures::poll!(&mut closing).is_pending());
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while entered.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(futures::poll!(&mut closing).is_pending());
+        finish_cleanup.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), closing)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(entered.load(Ordering::SeqCst), 2);
+    }
+    #[test]
+    fn closed_external_runtime_rejects_callback_without_losing_its_unpolled_owner() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let services = {
+            let _entered = runtime.enter();
+            Services::new().unwrap()
+        };
+        drop(runtime);
+        let owner = Arc::new(());
+        let weak = Arc::downgrade(&owner);
+        let called = Arc::new(AtomicUsize::new(0));
+        let count = called.clone();
+        let result = services.callback_blocking(
+            async move {
+                let _owner = owner;
+                count.fetch_add(1, Ordering::SeqCst);
+            },
+            |()| async {},
+        );
+        assert!(matches!(result, Err(Error::Task { .. })));
+        assert_eq!(called.load(Ordering::SeqCst), 0);
+        assert!(weak.upgrade().is_none());
+        futures::executor::block_on(services.close()).unwrap();
     }
 }

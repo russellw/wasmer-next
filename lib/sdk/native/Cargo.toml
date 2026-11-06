@@ -10,7 +10,7 @@ publish = false
 
 [features]
 default = ["sys"]
-sys = ["virtual-fs/host-fs", "virtual-net/host-net", "wasmer/cranelift", "wasixv2/sys", "wasixv2/tokio", "wasixv2/host-network", "wasixv2/wasix1"]
+sys = ["virtual-net/host-net", "wasmer/cranelift", "wasixv2/sys", "wasixv2/tokio", "wasixv2/host-network", "wasixv2/wasix1"]
 napi-v8 = ["sys", "dep:wasmer-napi", "wasmer-napi/wasix"]
 
 [dependencies]
@@ -21,12 +21,12 @@ crossbeam-queue.workspace = true
 futures.workspace = true
 http.workspace = true
 instant = "0.1"
+parking.workspace = true
 serde = { workspace = true, features = ["derive"] }
 sha2.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
 toml.workspace = true
-virtual-fs = { path = "../../virtual-fs", default-features = false }
 virtual-net = { path = "../../virtual-net", default-features = false }
 wasmer = { path = "../../api", default-features = false }
 wasmer-cache = { path = "../../cache", default-features = false, features = ["module-cache-filesystem", "module-cache-sys"] }
@@ -39,6 +39,7 @@ wasixv2-dylink = { path = "../../wasix/dylink", default-features = false, featur
 wasixv2-abi.workspace = true
 wasixv2-host = { workspace = true, features = ["tokio"] }
 wasixv2-vfs.workspace = true
+wasixv2-vfs-mem.workspace = true
 wasixv2-vnet.workspace = true
 wasixv2-vnet-host.workspace = true
 wasixv2-wait.workspace = true

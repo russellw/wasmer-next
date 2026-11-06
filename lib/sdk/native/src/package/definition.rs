@@ -2,7 +2,6 @@ use std::{collections::BTreeMap, path::Path, sync::Arc};
 
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
-use virtual_fs::{AsyncWriteExt, FileSystem};
 use wasmer_config::package::{PackageHash, PackageId};
 use wasmer_package::commands::BinaryPackageCommand;
 use wasmer_types::ModuleHash;
@@ -82,8 +81,7 @@ impl PackageDefinition {
         let root = if self.files.is_empty() {
             None
         } else {
-            Some(Arc::new(build_filesystem(self.files).await?)
-                as Arc<dyn virtual_fs::FileSystem + Send + Sync>)
+            Some(Arc::new(build_filesystem(self.files).await?) as Arc<dyn crate::FileSystem>)
         };
         Ok(Package::from_binary(PackageData {
             id,
@@ -225,29 +223,22 @@ fn module_has_start(name: &str, bytes: &[u8]) -> Result<bool> {
     Ok(has_start)
 }
 
-async fn build_filesystem(
-    files: BTreeMap<String, Bytes>,
-) -> Result<virtual_fs::mem_fs::FileSystem> {
-    let fs = virtual_fs::mem_fs::FileSystem::default();
+async fn build_filesystem(files: BTreeMap<String, Bytes>) -> Result<crate::Directory> {
+    let directory = crate::Directory::new();
     for (path, bytes) in files {
         let guest = Path::new(&path);
-        let fail = |error: virtual_fs::FsError| Error::FileSystem {
-            operation: "create package file",
-            path: guest.to_owned(),
-            message: error.to_string(),
-        };
-        if let Some(parent) = guest.parent() {
-            virtual_fs::create_dir_all(&fs, parent).map_err(fail)?;
-        }
-        let mut file = fs
-            .new_open_options()
-            .write(true)
-            .create_new(true)
-            .open(guest)
-            .map_err(fail)?;
-        file.write_all(&bytes).await?;
+        // Definition paths are already validated canonical guest paths; Directory
+        // accepts the same path relative to this immutable package root.
+        directory
+            .write(guest.strip_prefix("/").unwrap(), bytes)
+            .await
+            .map_err(|error| Error::FileSystem {
+                operation: "create package file",
+                path: guest.to_owned(),
+                message: error.to_string(),
+            })?;
     }
-    Ok(fs)
+    Ok(directory)
 }
 
 fn invalid(message: impl Into<String>) -> Error {

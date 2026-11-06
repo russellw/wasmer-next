@@ -98,24 +98,85 @@ impl ProviderRuntime {
             .failure
             .get_or_insert(error);
     }
+    fn call_work<T: Send + 'static>(
+        &self,
+        future: impl Future<Output = FsResult<T>> + Send + 'static,
+    ) -> FsResult<impl Future<Output = FsResult<T>> + Send + 'static> {
+        let lease = self.lease()?;
+        Ok(async move {
+            let result = future.await;
+            drop(lease);
+            result
+        })
+    }
     pub(crate) async fn call<T: Send + 'static>(
         &self,
         future: impl Future<Output = FsResult<T>> + Send + 'static,
     ) -> FsResult<T> {
-        let lease = self.lease()?;
         self.services
-            .callback(
-                async move {
-                    let result = future.await;
-                    drop(lease);
-                    result
-                },
-                |output| async move {
-                    drop(output);
-                },
-            )
+            .callback(self.call_work(future)?, |output| async move {
+                drop(output);
+            })
             .await
             .map_err(|error| FsError::Io(error.to_string()))?
+    }
+    fn open_work(
+        &self,
+        provider: Arc<dyn FileSystem>,
+        path: RelativePath,
+        options: FileOpenOptions,
+    ) -> FsResult<impl Future<Output = FsResult<Arc<OpenFile>>> + Send + 'static> {
+        let lease = self.lease()?;
+        let runtime = self.clone();
+        Ok(async move {
+            let result = match provider.open(&path, options).await {
+                Ok(file) => {
+                    let opened = (|| {
+                        let mut state = runtime.scope.state.lock().unwrap();
+                        if state.closed {
+                            return Ok(None);
+                        }
+                        let active = state.active.checked_add(1).ok_or_else(|| {
+                            FsError::Io("provider operation count exhausted".into())
+                        })?;
+                        let service_lease = runtime
+                            .services
+                            .retain_cleanup()
+                            .map_err(|error| FsError::Io(error.to_string()))?;
+                        let opened = Arc::new(OpenFile {
+                            file: file.clone(),
+                            service_lease: Mutex::new(Some(service_lease)),
+                            runtime: runtime.clone(),
+                            lease: Mutex::new(Some(CallbackLease {
+                                scope: runtime.scope.clone(),
+                                operation: false,
+                            })),
+                            closed: AtomicBool::new(false),
+                            completed: tokio::sync::watch::channel(None).0,
+                        });
+                        state.active = active;
+                        state.files.retain(|file| file.strong_count() != 0);
+                        state.files.push(Arc::downgrade(&opened));
+                        Ok(Some(opened))
+                    })();
+                    match opened {
+                        Ok(Some(opened)) => Ok(opened),
+                        failed => {
+                            if let Err(error) = file.close().await {
+                                runtime.failure(error);
+                            }
+                            match failed {
+                                Err(error) => Err(error),
+                                _ => Err(FsError::Io("filesystem provider is closed".into())),
+                            }
+                        }
+                    }
+                }
+                Err(error) => Err(error),
+            };
+            drop(lease);
+            result
+        })
     }
     pub(crate) async fn open(
         &self,
@@ -123,57 +184,9 @@ impl ProviderRuntime {
         path: RelativePath,
         options: FileOpenOptions,
     ) -> FsResult<Arc<OpenFile>> {
-        let lease = self.lease()?;
-        let runtime = self.clone();
         self.services
             .callback(
-                async move {
-                    let result = match provider.open(&path, options).await {
-                        Ok(file) => {
-                            let opened = {
-                                let mut state = runtime.scope.state.lock().unwrap();
-                                if state.closed {
-                                    None
-                                } else {
-                                    let service_lease = runtime
-                                        .services
-                                        .retain_cleanup()
-                                        .map_err(|error| FsError::Io(error.to_string()))?;
-                                    state.active =
-                                        state.active.checked_add(1).ok_or_else(|| {
-                                            FsError::Io("provider operation count exhausted".into())
-                                        })?;
-                                    let opened = Arc::new(OpenFile {
-                                        file: file.clone(),
-                                        service_lease: Mutex::new(Some(service_lease)),
-                                        runtime: runtime.clone(),
-                                        lease: Mutex::new(Some(CallbackLease {
-                                            scope: runtime.scope.clone(),
-                                            operation: false,
-                                        })),
-                                        closed: AtomicBool::new(false),
-                                        completed: tokio::sync::watch::channel(None).0,
-                                    });
-                                    state.files.retain(|file| file.strong_count() != 0);
-                                    state.files.push(Arc::downgrade(&opened));
-                                    Some(opened)
-                                }
-                            };
-                            match opened {
-                                Some(opened) => Ok(opened),
-                                None => {
-                                    if let Err(error) = file.close().await {
-                                        runtime.failure(error);
-                                    }
-                                    Err(FsError::Io("filesystem provider is closed".into()))
-                                }
-                            }
-                        }
-                        Err(error) => Err(error),
-                    };
-                    drop(lease);
-                    result
-                },
+                self.open_work(provider, path, options)?,
                 |output| async move {
                     drop(output);
                 },
@@ -190,32 +203,11 @@ impl ProviderRuntime {
                 "synchronous filesystem access cannot block SDK services".into(),
             ));
         }
-        let run = || futures::executor::block_on(self.call(future));
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-                tokio::task::block_in_place(run)
-            }
-            _ => run(),
-        }
-    }
-    pub(crate) fn blocking_open(
-        &self,
-        provider: Arc<dyn FileSystem>,
-        path: RelativePath,
-        options: FileOpenOptions,
-    ) -> FsResult<Arc<OpenFile>> {
-        if self.services.on_service_thread() {
-            return Err(FsError::Io(
-                "synchronous filesystem access cannot block SDK services".into(),
-            ));
-        }
-        let run = || futures::executor::block_on(self.open(provider, path, options));
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-                tokio::task::block_in_place(run)
-            }
-            _ => run(),
-        }
+        self.services
+            .callback_blocking(self.call_work(future)?, |output| async move {
+                drop(output);
+            })
+            .map_err(|error| FsError::Io(error.to_string()))?
     }
     pub(crate) async fn close(&self) -> FsResult<()> {
         let start = {
@@ -306,6 +298,9 @@ impl File for OpenFile {
     async fn write_at(&self, offset: u64, data: Bytes) -> FsResult<usize> {
         self.file.write_at(offset, data).await
     }
+    async fn write_positioned_at(&self, offset: u64, data: Bytes) -> FsResult<usize> {
+        self.file.write_positioned_at(offset, data).await
+    }
     async fn try_atomic_append(&self, data: Bytes) -> FsResult<Option<(u64, usize)>> {
         self.file.try_atomic_append(data).await
     }
@@ -380,5 +375,172 @@ async fn wait_close(completed: &tokio::sync::watch::Sender<Option<FsResult<()>>>
             .changed()
             .await
             .map_err(|_| FsError::Io("provider close owner stopped".into()))?;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        Directory, DirectoryEntry, FileMetadata, FileSystemCapabilities, SandboxFileSystem,
+    };
+    use std::{sync::atomic::AtomicUsize, time::Duration};
+    use tokio::sync::Semaphore;
+
+    #[derive(Debug)]
+    struct GatedProvider {
+        directory: Directory,
+        entered: Semaphore,
+        release: Semaphore,
+        closed: Arc<AtomicUsize>,
+        readonly: bool,
+        close_failure: bool,
+    }
+    #[derive(Debug)]
+    struct GatedFile {
+        file: Arc<dyn File>,
+        closed: Arc<AtomicUsize>,
+        close_failure: bool,
+    }
+    #[async_trait::async_trait]
+    impl File for GatedFile {
+        async fn read_at(&self, offset: u64, length: usize) -> FsResult<Bytes> {
+            self.file.read_at(offset, length).await
+        }
+        async fn write_at(&self, offset: u64, data: Bytes) -> FsResult<usize> {
+            self.file.write_at(offset, data).await
+        }
+        async fn write_positioned_at(&self, offset: u64, data: Bytes) -> FsResult<usize> {
+            self.file.write_positioned_at(offset, data).await
+        }
+        async fn set_len(&self, length: u64) -> FsResult<()> {
+            self.file.set_len(length).await
+        }
+        async fn flush(&self) -> FsResult<()> {
+            self.file.flush().await
+        }
+        async fn close(&self) -> FsResult<()> {
+            self.closed.fetch_add(1, Ordering::SeqCst);
+            self.file.close().await?;
+            if self.close_failure {
+                Err(FsError::Io("late open close failure".into()))
+            } else {
+                Ok(())
+            }
+        }
+        async fn metadata(&self) -> FsResult<FileMetadata> {
+            self.file.metadata().await
+        }
+    }
+    #[async_trait::async_trait]
+    impl FileSystem for GatedProvider {
+        fn capabilities(&self) -> FileSystemCapabilities {
+            if self.readonly {
+                FileSystemCapabilities::READ_ONLY
+            } else {
+                FileSystemCapabilities::READ_WRITE
+            }
+        }
+        async fn stat(&self, path: &RelativePath) -> FsResult<FileMetadata> {
+            self.directory.stat(path).await
+        }
+        async fn read_dir(&self, path: &RelativePath) -> FsResult<Vec<DirectoryEntry>> {
+            self.directory.read_dir(path).await
+        }
+        async fn open(
+            &self,
+            path: &RelativePath,
+            options: FileOpenOptions,
+        ) -> FsResult<Arc<dyn File>> {
+            self.entered.add_permits(1);
+            self.release.acquire().await.unwrap().forget();
+            Ok(Arc::new(GatedFile {
+                file: self.directory.open(path, options).await?,
+                closed: self.closed.clone(),
+                close_failure: self.close_failure,
+            }))
+        }
+        async fn create_dir(&self, path: &RelativePath) -> FsResult<()> {
+            self.directory.create_dir(path).await
+        }
+        async fn remove(&self, path: &RelativePath, recursive: bool) -> FsResult<()> {
+            self.directory.remove(path, recursive).await
+        }
+        async fn rename(&self, from: &RelativePath, to: &RelativePath) -> FsResult<()> {
+            self.directory.rename(from, to).await
+        }
+        async fn flush(&self) -> FsResult<()> {
+            self.directory.flush().await
+        }
+    }
+    async fn provider(readonly: bool, close_failure: bool) -> Arc<GatedProvider> {
+        let directory = Directory::new();
+        directory.write_text("file", "original").await.unwrap();
+        Arc::new(GatedProvider {
+            directory,
+            entered: Semaphore::new(0),
+            release: Semaphore::new(0),
+            closed: Arc::new(AtomicUsize::new(0)),
+            readonly,
+            close_failure,
+        })
+    }
+    #[tokio::test]
+    async fn late_open_and_close_failure_remain_owned_after_both_waiters_cancel() {
+        let services = Services::new().unwrap();
+        let runtime = ProviderRuntime::new(services.clone());
+        let provider = provider(false, true).await;
+        let opening = runtime.clone();
+        let source = provider.clone();
+        let waiter = tokio::spawn(async move {
+            opening
+                .open(
+                    source,
+                    RelativePath::new("file").unwrap(),
+                    FileOpenOptions {
+                        read: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), provider.entered.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        waiter.abort();
+        let _ = waiter.await;
+        let mut closing = Box::pin(runtime.close());
+        assert!(futures::poll!(&mut closing).is_pending());
+        drop(closing);
+        provider.release.add_permits(1);
+        let result = tokio::time::timeout(Duration::from_secs(2), runtime.close())
+            .await
+            .unwrap();
+        assert_eq!(result, Err(FsError::Io("late open close failure".into())));
+        assert_eq!(provider.closed.load(Ordering::SeqCst), 1);
+        services.close().await.unwrap();
+    }
+    #[tokio::test]
+    async fn workspace_sync_subscriber_preserves_readonly_metadata_and_open_close_custody() {
+        let services = Services::new().unwrap();
+        let runtime = ProviderRuntime::new(services.clone());
+        let provider = provider(true, false).await;
+        provider.release.add_permits(1);
+        let filesystem = SandboxFileSystem::new(provider.clone(), runtime.clone());
+        assert!(filesystem.stat("file").unwrap().readonly);
+        assert!(filesystem.read_dir(".").unwrap()[0].metadata.readonly);
+        assert!(filesystem.create_dir("denied").is_err());
+        assert!(filesystem.write_text("file", "wrong").await.is_err());
+        assert_eq!(filesystem.read_text("file").await.unwrap(), "original");
+        assert_eq!(provider.closed.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            provider.directory.read_text("file").await.unwrap(),
+            "original"
+        );
+        runtime.close().await.unwrap();
+        assert!(filesystem.stat("file").is_err());
+        services.close().await.unwrap();
     }
 }

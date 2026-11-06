@@ -112,7 +112,7 @@ pub(crate) struct PackageData {
     pub(crate) commands: Vec<BinaryPackageCommand>,
     pub(crate) entrypoint_cmd: Option<String>,
     pub(crate) layout: Option<ResolvedLayout>,
-    pub(crate) root: Option<Arc<dyn virtual_fs::FileSystem + Send + Sync>>,
+    pub(crate) root: Option<Arc<dyn crate::FileSystem>>,
     pub(crate) host_mounts: Vec<(String, PathBuf)>,
 }
 impl PackageData {

@@ -13,12 +13,17 @@ while each run and the independent Ports probe group retain their own I/O jobs. 
 filesystem callbacks run on the existing Tokio runtime and retain their actual
 completion and close custody independently of public wait subscriptions.
 
-The portable Directory and SandboxFileSystem storage still use virtual-fs, and
-the public network_provider type still uses virtual-net with a live canonical
-network adapter. This support-crate retention is INTERMEDIATE for the first
-runnable port. Retirement of virtual-fs, virtual-net and virtual-io is required
-in the following minimal native SDK/WLK slice; this port is not that retirement.
-These dependencies do not restore the old WASIX Runtime/runner.
+The filesystem/stdio retirement replaces Directory's private virtual-fs
+storage with closed canonical MemFs/Vfs and uses SDK providers directly for the
+workspace and package root. Stdio uses ByteSink, the retained PipeWriter and
+capture storage directly. See MEMORY-STORAGE.md for the closed progress proof and
+positioned/append seam. Independent source review and actual
+retirement validation pass: 41 library tests, 40 integration tests and the N-API
+V8 test's eight original guest executions. The normal SDK closure excludes
+virtual-fs; the SDK dependency record is the only changed lock record.
+The public network_provider type still uses virtual-net and a live canonical
+network adapter, retaining virtual-io transitively. Their separate retirement is
+not implemented in this slice. No old WASIX Runtime/runner is reintroduced.
 Compiled modules and their allocating feature engines share one cache owner.
 Plain runs reuse the client owner; N-API creates a separate owner and budget per
 run. Persistent artifact bytes use the existing versioned cache directories.
@@ -26,24 +31,20 @@ run. Persistent artifact bytes use the existing versioned cache directories.
 Only WEBC v3 is supported. Journaling is excluded and configured guest CPU
 parallelism is deferred. Browser/Node/macOS are held. Canonical opt-in legacy
 append offsets use the reviewed WLK main API. Host network endpoint policy is
-pending its reviewed WLK main integration. Import-free raw `_start` modules may
-hit the current facade's NoAbi policy; no direct-instance fallback is provided.
-The native compiler check and all 23 original integration contracts pass on the
-recorded WLK 7cb98a1 graph. This includes actual repeated and persisted-cache
-execution, writable package overlays, readonly provider mounts, process control
-and direct Ports. All 29 SDK library regressions also pass, including streamed
-registry progress, alias resolution and cancellation. Four targeted shared
-resolver/loader boundary checks and the temporary timestamp helper test pass
-using the original pinned fixtures. These results do
-not establish N-API execution, configured-provider guest loopback/pre-bind,
-separate terminal output routing, finite terminal EOF, or legacy-provider retirement.
+pending its reviewed WLK main integration. Import-free raw `_start` modules with
+exported memory remain a parity gap: the old native runner could execute them,
+while the facade reports NoAbi. A narrow initial-entry profile fix is pending;
+no direct-instance fallback is provided.
+The accepted pre-retirement base is d0b6c749f373 on WLK
+049156e0b7a92588f4827c1915d722b182f97a75. Its default native suite passed
+62 tests, and the optional N-API success gate passed all eight original fixture
+executions. This includes the original 23 integration contracts, package/cache
+and provider ownership, separate terminal stdout/stderr and finite terminal EOF.
+The retirement validation above covers the changed storage and stdio paths on
+the same coherent WLK revision. Configured-provider guest pre-bind/endpoint policy and the remaining
+network/support-crate retirement are still separate unfinished work.
 
-## Integrated native union
-
-The final union `d0b6c749f37` uses WLK `049156e0b7a`, preserving the
-Python fixes and root C API imports changes. All 29 default library and 33
-integration tests passed on that tuple. The N-API acceptance case passed eight
-original guest executions through public SDK commands. Finite console EOF,
-separate stdout/stderr, cached waits and per-run close/cancellation cases passed.
-Host/custom provider physical bind/loopback fidelity and retirement of the
-interim virtual-fs/net/io adapters remain required; this is not full SDK parity.
+The integration preserves the Python compatibility fixes, root C API imports
+changes and WLK console/append policies already on main. The legacy filesystem
+crate still exists for other consumers; this slice removes it from the native SDK
+dependency closure.

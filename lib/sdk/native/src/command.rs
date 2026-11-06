@@ -1,11 +1,11 @@
 use crate::{
     CommandSelector, Error, Package, Process, ProcessExitError, ProcessStderr, ProcessStdin,
     ProcessStdout, Result, Sandbox,
-    capture::{CaptureFile, CaptureHandle},
+    capture::CaptureHandle,
     compiler::NativeLoader,
     fs::validate_guest_path,
     guest_fs::GuestFs,
-    stream::{PipeReader, PipeWriter, RetainedOutput, bounded_pipe},
+    stream::{PipeReader, PipeWriter, bounded_pipe},
     terminal::TerminalOptions,
 };
 use bytes::Bytes;
@@ -345,13 +345,9 @@ impl Command {
                 );
                 let root = if let Some(root) = &package.inner.binary.root {
                     Some(
-                        GuestFs::new(
-                            Arc::new(crate::Directory::from_virtual(root.clone())),
-                            crate::MountMode::ReadOnly,
-                            providers.clone(),
-                        )
-                        .await
-                        .map_err(vfs_error)?
+                        GuestFs::new(root.clone(), crate::MountMode::ReadOnly, providers.clone())
+                            .await
+                            .map_err(vfs_error)?
                             as Arc<dyn wasixv2::Filesystem>,
                     )
                 } else {
@@ -396,7 +392,7 @@ impl Command {
                 }
             }
             let workspace = GuestFs::new(
-                self.sandbox.inner.workspace_provider.clone(),
+                self.sandbox.inner.workspace.clone(),
                 crate::MountMode::ReadWrite,
                 providers.clone(),
             )
@@ -643,11 +639,28 @@ impl ByteSource for Input {
         }
     }
 }
-struct OutputSink(Mutex<Box<dyn virtual_fs::VirtualFile + Send + Sync>>);
+enum OutputSink {
+    Pipe(Mutex<PipeWriter>, CaptureHandle),
+    Capture(CaptureHandle),
+    Null,
+}
 impl ByteSink for OutputSink {
     fn write<'a>(&'a self, data: &'a [u8]) -> LocalFuture<'a, std::io::Result<usize>> {
-        Box::pin(futures::future::poll_fn(move |cx| {
-            Pin::new(&mut **self.0.lock().unwrap()).poll_write(cx, data)
+        Box::pin(futures::future::poll_fn(move |cx| match self {
+            Self::Pipe(writer, capture) => {
+                match Pin::new(&mut *writer.lock().unwrap()).poll_write(cx, data) {
+                    Poll::Ready(Ok(accepted)) => {
+                        capture.retain(&data[..accepted]);
+                        Poll::Ready(Ok(accepted))
+                    }
+                    result => result,
+                }
+            }
+            Self::Capture(capture) => {
+                capture.retain(data);
+                Poll::Ready(Ok(data.len()))
+            }
+            Self::Null => Poll::Ready(Ok(data.len())),
         }))
     }
 }
@@ -660,19 +673,18 @@ fn guest_output(
     Option<PipeReader>,
     Option<crate::stream::PipeCloser>,
 ) {
-    let (file, user, closer): (Box<dyn virtual_fs::VirtualFile + Send + Sync>, _, _) = match mode {
+    match mode {
         Stdio::Piped => {
             let (user, guest, closer) = bounded_pipe(capacity);
             (
-                Box::new(RetainedOutput::new(guest, capture.clone())),
+                Arc::new(OutputSink::Pipe(Mutex::new(guest), capture.clone())),
                 Some(user),
                 Some(closer),
             )
         }
-        Stdio::Capture => (Box::new(CaptureFile::new(capture.clone())), None, None),
-        Stdio::Null => (Box::<virtual_fs::NullFile>::default(), None, None),
-    };
-    (Arc::new(OutputSink(Mutex::new(file))), user, closer)
+        Stdio::Capture => (Arc::new(OutputSink::Capture(capture.clone())), None, None),
+        Stdio::Null => (Arc::new(OutputSink::Null), None, None),
+    }
 }
 
 /// A guest that exits before consuming all of its stdin is not a failure:
@@ -795,6 +807,52 @@ impl Output {
 #[cfg(test)]
 mod tests {
     use super::{CapturedOutput, ExitReason, ExitStatus, Output, deduplicate_environment};
+
+    #[tokio::test]
+    async fn direct_output_sinks_retain_only_accepted_pipe_prefixes() {
+        use super::guest_output;
+        use crate::{Stdio, capture::CaptureHandle};
+        use tokio::io::AsyncReadExt;
+
+        let capture = CaptureHandle::new(6);
+        let (sink, reader, closer) = guest_output(Stdio::Piped, &capture, 4);
+        let mut reader = reader.unwrap();
+        assert_eq!(sink.write(b"abcdefgh").await.unwrap(), 4);
+        assert_eq!(capture.snapshot(), (b"abcd".to_vec(), false));
+        let mut pending = sink.write(b"efgh");
+        assert!(futures::poll!(&mut pending).is_pending());
+        drop(pending);
+        assert_eq!(capture.snapshot(), (b"abcd".to_vec(), false));
+        let mut accepted = [0; 4];
+        reader.read_exact(&mut accepted).await.unwrap();
+        assert_eq!(&accepted, b"abcd");
+        assert_eq!(sink.write(b"efgh").await.unwrap(), 4);
+        let mut revoked = sink.write(b"ij");
+        assert!(futures::poll!(&mut revoked).is_pending());
+        closer.unwrap().close();
+        assert_eq!(
+            revoked.await.unwrap_err().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+        assert_eq!(capture.snapshot(), (b"abcdef".to_vec(), true));
+        let mut rest = Vec::new();
+        reader.read_to_end(&mut rest).await.unwrap();
+        assert_eq!(rest, b"efgh");
+        for mode in [Stdio::Capture, Stdio::Null] {
+            let capture = CaptureHandle::new(2);
+            let (sink, reader, closer) = guest_output(mode, &capture, 1);
+            assert!(reader.is_none() && closer.is_none());
+            assert_eq!(sink.write(b"full output").await.unwrap(), 11);
+            assert_eq!(
+                capture.snapshot(),
+                if mode == Stdio::Capture {
+                    (b"fu".to_vec(), true)
+                } else {
+                    (Vec::new(), false)
+                }
+            );
+        }
+    }
 
     #[test]
     fn environment_overrides_are_unique_and_last_one_wins() {

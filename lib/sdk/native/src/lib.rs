@@ -10,6 +10,7 @@ mod client;
 mod command;
 mod error;
 mod fs;
+mod memory;
 mod package;
 mod package_progress;
 pub use package_progress::{
