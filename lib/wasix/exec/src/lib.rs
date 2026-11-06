@@ -44,7 +44,8 @@ use std::{
 };
 
 pub use abi::{
-    Abi, AbiInstance, Abis, Entry, EntryReturn, PreparedImage, Role, Sigreturn, VforkResume,
+    Abi, AbiInstance, Abis, Entry, EntryReturn, ExecProcessLease, PreparedImage, Role, Sigreturn,
+    VforkResume,
 };
 pub use cleanup::local_cleanup_runner;
 pub use contexts::{context_operations_supported, process_fork_allowed};
@@ -597,7 +598,7 @@ pub(crate) enum Ended {
     /// The task's thread group, or for a thread the task itself, exited.
     Exited(i32),
     /// `execve` replaced the image.
-    Exec(Image),
+    Exec(process::ExecImage),
     /// The guest trapped while the instance ran as `task`: a hardware fault, signal `signal`.
     /// `report` says what happened, for the host when the fault kills the process.
     Fault {
@@ -1040,6 +1041,9 @@ where
             }
             None => abi.bind(&instance, &mut store.as_store_mut(), task, Role::Process)?,
         };
+        handoff
+            .retain_process(task, &*bound)
+            .map_err(ExecError::CustomBinding)?;
         let shared = memory.as_shared(&store);
         if let Some(shared) = &shared {
             // Browser C1 posts registration here before attachment; foreign requests
@@ -1621,15 +1625,20 @@ pub async fn complete<S: Syscalls + Control + 'static, T>(
                 GuestAction::Exec { vfork_parent } => {
                     // The kernel queues the image with the action; without one, the empty image
                     // fails to load and the process dies as past any `execve`'s point of no return.
+                    let process = syscalls.tgid(task);
                     let image = syscalls
-                        .take_image(task)
+                        .take_image(process)
                         .unwrap_or_else(|| Image::copied(Vec::new()));
+                    let image = match process::exec_image(env, process, image).await {
+                        Ok(image) => image,
+                        Err(error) => return Outcome::Unwind(error),
+                    };
                     let Some(parent) = vfork_parent else {
                         return Outcome::Unwind(RuntimeError::user(Box::new(process::ExecNew(
                             image,
                         ))));
                     };
-                    process::spawn_image(env, task, image).await;
+                    process::spawn_image(env, process, image).await;
                     match vfork_resume(env, parent, task).await {
                         Some(VforkResume::Unwind(err)) => return Outcome::Unwind(err),
                         Some(VforkResume::ReturnSuccess) => {
@@ -1679,6 +1688,10 @@ pub async fn complete<S: Syscalls + Control + 'static, T>(
                     let image = syscalls
                         .take_image(leader)
                         .unwrap_or_else(|| Image::copied(Vec::new()));
+                    let image = match process::exec_image(env, leader, image).await {
+                        Ok(image) => image,
+                        Err(error) => return Outcome::Unwind(error),
+                    };
                     process::take_over(env, leader, image).await;
                 }
                 GuestAction::ExitMm { task: dead } => {

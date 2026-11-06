@@ -2,7 +2,7 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock, Weak},
 };
 
 use wasixv2_syscalls::{DescriptorAttachment, DescriptorSet, Fd, TaskId};
@@ -290,7 +290,87 @@ impl Startup {
 /// The compat state of every process that runs v1 code, by pid.
 #[derive(Default)]
 pub struct Procs {
-    procs: Mutex<HashMap<TaskId, Arc<ProcState>>>,
+    procs: Mutex<HashMap<TaskId, ProcEntry>>,
+}
+
+struct ProcEntry {
+    current: Arc<ProcState>,
+    host_owner: Weak<HostOwner>,
+    lease: Option<Arc<()>>,
+}
+impl Default for ProcEntry {
+    fn default() -> Self {
+        Self {
+            current: Arc::default(),
+            host_owner: Weak::new(),
+            lease: None,
+        }
+    }
+}
+
+/// The final owning host handle retires only this explicit registration.
+pub(crate) struct HostOwner {
+    procs: Weak<Procs>,
+    task: TaskId,
+}
+impl Drop for HostOwner {
+    fn drop(&mut self) {
+        if let Some(procs) = self.procs.upgrade() {
+            let removed = {
+                let mut entries = procs.procs.lock().unwrap();
+                let remove = entries.get_mut(&self.task).is_some_and(|entry| {
+                    if entry.host_owner.as_ptr() != self as *const Self {
+                        return false;
+                    }
+                    entry.host_owner = Weak::new();
+                    entry.lease.is_none()
+                });
+                if remove {
+                    entries.remove(&self.task)
+                } else {
+                    None
+                }
+            };
+            drop(removed);
+        }
+    }
+}
+
+struct ProcessTransfer {
+    procs: Arc<Procs>,
+    task: TaskId,
+    token: Arc<()>,
+}
+impl wasixv2_exec::ExecProcessLease for ProcessTransfer {}
+impl Drop for ProcessTransfer {
+    fn drop(&mut self) {
+        let (removed, owner) = {
+            let mut entries = self.procs.procs.lock().unwrap();
+            let mut owner = None;
+            let remove = entries.get_mut(&self.task).is_some_and(|entry| {
+                if !entry
+                    .lease
+                    .as_ref()
+                    .is_some_and(|lease| Arc::ptr_eq(lease, &self.token))
+                {
+                    return false;
+                }
+                entry.lease = None;
+                owner = entry.host_owner.upgrade();
+                owner.is_none()
+            });
+            (
+                if remove {
+                    entries.remove(&self.task)
+                } else {
+                    None
+                },
+                owner,
+            )
+        };
+        drop(removed);
+        drop(owner);
+    }
 }
 
 /// The package commands v1 programs start with their [`CommandDefaults`], by the file each
@@ -362,68 +442,250 @@ impl CommandDefaults {
 }
 
 impl Procs {
-    pub(crate) fn next_image(&self, task: TaskId) -> Arc<ProcState> {
-        let previous = self.procs.lock().unwrap().get(&task).cloned();
-        let state = Arc::new(previous.map_or_else(ProcState::default, |state| state.next_image()));
-        self.replace(task, state.clone());
-        state
+    pub(crate) fn host_owner(self: &Arc<Self>, task: TaskId) -> Arc<HostOwner> {
+        let mut entries = self.procs.lock().unwrap();
+        let entry = entries.entry(task).or_default();
+        if let Some(owner) = entry.host_owner.upgrade() {
+            return owner;
+        }
+        let owner = Arc::new(HostOwner {
+            procs: Arc::downgrade(self),
+            task,
+        });
+        entry.host_owner = Arc::downgrade(&owner);
+        owner
     }
 
-    pub(crate) fn owned_state(&self, task: TaskId, lineage: &Arc<()>) -> Option<Arc<ProcState>> {
+    pub(crate) fn retain_process(
+        self: &Arc<Self>,
+        task: TaskId,
+        expected: &Arc<ProcState>,
+    ) -> Result<Box<dyn wasixv2_exec::ExecProcessLease>, wasmer::RuntimeError> {
+        let token = Arc::new(());
+        {
+            let mut entries = self.procs.lock().unwrap();
+            let entry = entries
+                .get_mut(&task)
+                .ok_or_else(|| wasmer::RuntimeError::new("process registration is missing"))?;
+            if !Arc::ptr_eq(&entry.current, expected) {
+                return Err(wasmer::RuntimeError::new(
+                    "process image registration was replaced",
+                ));
+            }
+            if entry.lease.is_some() {
+                return Err(wasmer::RuntimeError::new(
+                    "process registration already has execution custody",
+                ));
+            }
+            entry.lease = Some(token.clone());
+        }
+        Ok(Box::new(ProcessTransfer {
+            procs: self.clone(),
+            task,
+            token,
+        }))
+    }
+
+    pub(crate) fn fork_child(
+        self: &Arc<Self>,
+        task: TaskId,
+        state: Arc<ProcState>,
+    ) -> Result<Box<dyn wasixv2_exec::ExecProcessLease>, wasmer::RuntimeError> {
+        let token = Arc::new(());
+        {
+            let mut entries = self.procs.lock().unwrap();
+            if entries.contains_key(&task) {
+                return Err(wasmer::RuntimeError::new(
+                    "fork child process registration already exists",
+                ));
+            }
+            entries.insert(
+                task,
+                ProcEntry {
+                    current: state,
+                    host_owner: Weak::new(),
+                    lease: Some(token.clone()),
+                },
+            );
+        }
+        Ok(Box::new(ProcessTransfer {
+            procs: self.clone(),
+            task,
+            token,
+        }))
+    }
+
+    pub(crate) fn next_image(&self, task: TaskId) -> Arc<ProcState> {
+        let (old, current) = {
+            let mut entries = self.procs.lock().unwrap();
+            let entry = entries.entry(task).or_default();
+            let next = Arc::new(entry.current.next_image());
+            entry.lease = None;
+            (std::mem::replace(&mut entry.current, next.clone()), next)
+        };
+        drop(old);
+        current
+    }
+
+    pub(crate) fn owned_state(
+        &self,
+        task: TaskId,
+        owner: &Arc<HostOwner>,
+    ) -> Option<Arc<ProcState>> {
         self.procs
             .lock()
             .unwrap()
             .get(&task)
-            .filter(|state| Arc::ptr_eq(&state.lineage, lineage))
-            .cloned()
+            .filter(|entry| Weak::ptr_eq(&entry.host_owner, &Arc::downgrade(owner)))
+            .map(|entry| entry.current.clone())
     }
 
-    pub(crate) fn remove_lineage(&self, task: TaskId, lineage: &Arc<()>) {
-        let removed = {
-            let mut procs = self.procs.lock().unwrap();
-            if procs
-                .get(&task)
-                .is_some_and(|state| Arc::ptr_eq(&state.lineage, lineage))
-            {
-                procs.remove(&task)
-            } else {
-                None
-            }
+    /// The current compat state of a process.
+    pub fn get_or_create(&self, task: TaskId) -> Arc<ProcState> {
+        self.procs
+            .lock()
+            .unwrap()
+            .entry(task)
+            .or_default()
+            .current
+            .clone()
+    }
+
+    /// Adopts inherited fork state while preserving the child's registration owner.
+    pub(crate) fn adopt(&self, task: TaskId, inherited: &ProcState) -> Arc<ProcState> {
+        let (old, current) = {
+            let mut entries = self.procs.lock().unwrap();
+            let entry = entries.entry(task).or_default();
+            let mut state = inherited.fork();
+            state.lineage = entry.current.lineage.clone();
+            let current = Arc::new(state);
+            (
+                std::mem::replace(&mut entry.current, current.clone()),
+                current,
+            )
         };
-        drop(removed);
-    }
-    /// The state of `pid`, created empty if the process has none yet (a vfork child before its
-    /// parent's state was copied, a process whose image another ABI loaded).
-    pub fn get_or_create(&self, pid: TaskId) -> Arc<ProcState> {
-        self.procs.lock().unwrap().entry(pid).or_default().clone()
+        drop(old);
+        current
     }
 
-    /// Starts `pid` over with `state`, as a new process image does.
-    pub fn replace(&self, pid: TaskId, state: Arc<ProcState>) {
-        let old = self.procs.lock().unwrap().insert(pid, state);
+    /// Starts an independent process registration, as a fresh fork/vfork child does.
+    pub fn replace(&self, task: TaskId, state: Arc<ProcState>) {
+        let old = self.procs.lock().unwrap().insert(
+            task,
+            ProcEntry {
+                current: state,
+                ..ProcEntry::default()
+            },
+        );
         drop(old);
     }
 
-    /// Drops `pid`'s state if it still is `state`, when the image that made it ends.
-    pub fn remove(&self, pid: TaskId, state: &Arc<ProcState>) {
-        let removed = {
-            let mut procs = self.procs.lock().unwrap();
-            if procs
-                .get(&pid)
-                .is_some_and(|current| Arc::ptr_eq(current, state))
-            {
-                procs.remove(&pid)
-            } else {
-                None
-            }
+    /// Image cleanup cannot remove a process owned by a host or an execution lease.
+    pub fn remove(&self, task: TaskId, state: &Arc<ProcState>) {
+        let (removed, owner) = {
+            let mut entries = self.procs.lock().unwrap();
+            let owner = entries
+                .get(&task)
+                .and_then(|entry| entry.host_owner.upgrade());
+            let remove = entries.get(&task).is_some_and(|entry| {
+                Arc::ptr_eq(&entry.current, state) && entry.lease.is_none() && owner.is_none()
+            });
+            (if remove { entries.remove(&task) } else { None }, owner)
         };
         drop(removed);
+        drop(owner);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_execution_custody_outlives_the_old_image_and_releases_exact_successors() {
+        let procs = Arc::new(Procs::default());
+        let task = TaskId(41);
+        let original = procs.get_or_create(task);
+        original.set_startup_input(StartupInput::default()).unwrap();
+        original.seal_startup_input();
+        let original_lineage = original.lineage.clone();
+        let lease = procs.retain_process(task, &original).unwrap();
+        assert!(
+            procs.retain_process(task, &original).is_err(),
+            "never overwrite custody"
+        );
+        let weak = Arc::downgrade(&original);
+        // The real runner drops its old image BEFORE binding its replacement.
+        procs.remove(task, &original);
+        drop(original);
+        assert!(weak.upgrade().is_some());
+        let next = procs.next_image(task);
+        assert!(
+            weak.upgrade().is_none(),
+            "a transfer must not pin the obsolete state"
+        );
+        assert!(Arc::ptr_eq(&next.lineage, &original_lineage));
+        assert_eq!(
+            next.set_startup_input(StartupInput::default()),
+            Err(wasixv2_abi::Errno::EBUSY)
+        );
+        let successor = procs.retain_process(task, &next).unwrap();
+        drop(lease);
+        assert!(Arc::ptr_eq(&procs.get_or_create(task), &next));
+        let third = procs.next_image(task);
+        let final_lease = procs.retain_process(task, &third).unwrap();
+        drop(successor);
+        procs.remove(task, &third);
+        assert!(Arc::ptr_eq(&procs.get_or_create(task), &third));
+        drop(final_lease);
+        assert!(!Arc::ptr_eq(&procs.get_or_create(task), &third));
+    }
+
+    #[test]
+    fn fork_adoption_preserves_child_execution_token_without_host_ownership() {
+        let procs = Arc::new(Procs::default());
+        let parent = TaskId(42);
+        let child = TaskId(43);
+        let host_owner = procs.host_owner(parent);
+        let state = procs.get_or_create(parent);
+        let initial_child = procs.next_image(child);
+        let child_lineage = initial_child.lineage.clone();
+        let child_lease = procs.retain_process(child, &initial_child).unwrap();
+        let inherited = state.fork();
+        let adopted = procs.adopt(child, &inherited);
+        assert!(Arc::ptr_eq(&adopted.lineage, &child_lineage));
+        assert!(!Arc::ptr_eq(&adopted.lineage, &state.lineage));
+        assert!(procs.owned_state(child, &host_owner).is_none());
+        assert!(
+            procs.retain_process(child, &adopted).is_err(),
+            "adoption retains the installed token"
+        );
+        procs.remove(child, &initial_child);
+        procs.remove(child, &adopted);
+        assert!(Arc::ptr_eq(&procs.get_or_create(child), &adopted));
+        drop(child_lease);
+        assert!(!Arc::ptr_eq(&procs.get_or_create(child), &adopted));
+        assert!(Arc::ptr_eq(&procs.get_or_create(parent), &state));
+        drop(host_owner);
+        assert!(!Arc::ptr_eq(&procs.get_or_create(parent), &state));
+    }
+
+    #[test]
+    fn retiring_host_owner_keeps_a_pending_transfer_until_cancellation_drops_it() {
+        let procs = Arc::new(Procs::default());
+        let task = TaskId(44);
+        let first = procs.host_owner(task);
+        let second = procs.host_owner(task);
+        assert!(Arc::ptr_eq(&first, &second));
+        let state = procs.get_or_create(task);
+        let lease = procs.retain_process(task, &state).unwrap();
+        drop(first);
+        drop(second);
+        assert!(Arc::ptr_eq(&procs.get_or_create(task), &state));
+        procs.remove(task, &state);
+        drop(lease);
+        assert!(!Arc::ptr_eq(&procs.get_or_create(task), &state));
+    }
 
     #[test]
     fn prepared_policy_releases_bootstrap_binding_and_keeps_only_immutable_exec_metadata() {

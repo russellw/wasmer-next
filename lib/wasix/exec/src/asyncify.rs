@@ -891,13 +891,18 @@ mod tests {
     struct NoSpawn;
 
     impl crate::process::Spawn for NoSpawn {
-        fn spawn(&self, _: TaskId, _: crate::Image) {
+        fn spawn(&self, _: TaskId, _: crate::process::ExecImage) {
             unreachable!("the test spawns nothing")
         }
         fn fork(&self, _: TaskId, _: ForkImage) {
             unreachable!("the test forks nothing")
         }
-        fn take_over(&self, _: TaskId, _: crate::Image, _: Arc<crate::process::Handoff>) {
+        fn take_over(
+            &self,
+            _: TaskId,
+            _: crate::process::ExecImage,
+            _: Arc<crate::process::Handoff>,
+        ) {
             unreachable!("the test starts no image")
         }
     }

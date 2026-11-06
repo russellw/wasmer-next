@@ -1366,7 +1366,7 @@ mod tests {
             ));
             let error = if exec {
                 RuntimeError::user(Box::new(crate::process::ExecNew(
-                    wasixv2_syscalls::Image::copied(vec![17, 23]),
+                    wasixv2_syscalls::Image::copied(vec![17, 23]).into(),
                 )))
             } else {
                 RuntimeError::user(Box::new(crate::Exited(37)))

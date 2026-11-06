@@ -1001,6 +1001,8 @@ fn prepared_host_namespace_survives_exec_with_live_names_rights_and_new_argument
         format!(
             r#"(module
       (import "wasix_32v1" "proc_exec3" (func $exec (param i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+      (import "wasix_32v1" "proc_fork_env" (func $vfork (param i32) (result i32)))
+      (import "wasix_32v1" "proc_join" (func $join (param i32 i32 i32) (result i32)))
       (import "wasix_32v1" "fd_renumber" (func $renumber (param i32 i32) (result i32)))
       (import "wasix_32v1" "fd_close" (func $close (param i32) (result i32)))
       (import "wasix_32v1" "fd_pipe" (func $pipe (param i32 i32) (result i32)))
@@ -1021,6 +1023,10 @@ fn prepared_host_namespace_survives_exec_with_live_names_rights_and_new_argument
       (data (i32.const 3040) "/prog/child.wasm")
       (data (i32.const 3080) "child\n")
       (data (i32.const 3100) "NEW=yes\n")
+      (data (i32.const 3140) "/prog/grand.wasm")
+      (data (i32.const 3180) "again\n")
+      (data (i32.const 3200) "NEXT=ok\n")
+      (data (i32.const 3240) "OLD=kernel")
       (func $check (param $step i32) (param $actual i32) (param $expected i32)
         (if (i32.ne (local.get $actual) (local.get $expected))
           (then (call $exit (local.get $step)))))
@@ -1072,10 +1078,11 @@ fn prepared_host_namespace_survives_exec_with_live_names_rights_and_new_argument
         (call $check (i32.const 43) (call $argv (i32.const 8) (i32.const 64)) (i32.const 0))
         (call $bytes (i32.const 44) (i32.load (i32.const 8)) (i32.const 3080) (i32.const 5))
         (call $check (i32.const 45) (call $envc (i32.const 0) (i32.const 4)) (i32.const 0))
-        (call $check (i32.const 46) (i32.load (i32.const 0)) (i32.const 1))
-        (call $check (i32.const 47) (i32.load (i32.const 4)) (i32.const 8))
+        (call $check (i32.const 46) (i32.load (i32.const 0)) (i32.const 2))
+        (call $check (i32.const 47) (i32.load (i32.const 4)) (i32.const 19))
         (call $check (i32.const 48) (call $env (i32.const 8) (i32.const 64)) (i32.const 0))
-        (call $bytes (i32.const 49) (i32.load (i32.const 8)) (i32.const 3100) (i32.const 7))
+        (call $bytes (i32.const 49) (i32.load (i32.const 8)) (i32.const 3240) (i32.const 10))
+        (call $bytes (i32.const 100) (i32.load (i32.const 12)) (i32.const 3100) (i32.const 7))
         (call $check (i32.const 50) (call $readdir (i32.const 3) (i32.const 1000) (i32.const 256) (i64.const 0) (i32.const 0)) (i32.const 0))
         (call $check (i32.const 51) (i32.load (i32.const 0)) (i32.const 38))
         (call $check (i32.const 52) (i32.load (i32.const 1016)) (i32.const 14))
@@ -1102,15 +1109,57 @@ fn prepared_host_namespace_survives_exec_with_live_names_rights_and_new_argument
         ;; Reusing a former stdio slot must not resurrect its previous announced name.
         (call $check (i32.const 73) (call $pipe (i32.const 0) (i32.const 4)) (i32.const 0))
         (call $check (i32.const 74) (call $renumber (i32.load (i32.const 0)) (i32.const 22)) (i32.const 0))
-        (call $check (i32.const 75) (call $prestat (i32.const 22) (i32.const 64)) (i32.const 8))"#
+        (call $check (i32.const 75) (call $prestat (i32.const 22) (i32.const 64)) (i32.const 8))
+        (drop (call $exec (i32.const 3140) (i32.const 16) (i32.const 3180) (i32.const 6)
+          (i32.const 3200) (i32.const 8) (i32.const 0) (i32.const 0) (i32.const 0)))
+        (call $exit (i32.const 76))"#
     ));
-    let programs = Programs::new("prepared-exec", &[("child.wasm", &child)]);
+    let grandchild = module(&format!(
+        r#"
+        (call $check (i32.const 80) (call $argc (i32.const 0) (i32.const 4)) (i32.const 0))
+        (call $check (i32.const 81) (i32.load (i32.const 0)) (i32.const 1))
+        (call $check (i32.const 82) (call $argv (i32.const 8) (i32.const 64)) (i32.const 0))
+        (call $bytes (i32.const 83) (i32.load (i32.const 8)) (i32.const 3180) (i32.const 5))
+        (call $check (i32.const 84) (call $envc (i32.const 0) (i32.const 4)) (i32.const 0))
+        (call $check (i32.const 85) (i32.load (i32.const 0)) (i32.const 3))
+        (call $check (i32.const 101) (i32.load (i32.const 4)) (i32.const 27))
+        (call $check (i32.const 86) (call $env (i32.const 8) (i32.const 64)) (i32.const 0))
+        (call $bytes (i32.const 102) (i32.load (i32.const 8)) (i32.const 3240) (i32.const 10))
+        (call $bytes (i32.const 103) (i32.load (i32.const 12)) (i32.const 3100) (i32.const 7))
+        (call $bytes (i32.const 87) (i32.load (i32.const 16)) (i32.const 3200) (i32.const 7))
+        (call $check (i32.const 88) (call $readdir (i32.const 3) (i32.const 1000) (i32.const 256) (i64.const 0) (i32.const 0)) (i32.const 0))
+        (call $check (i32.const 89) (i32.load (i32.const 0)) (i32.const 38))
+        (call $bytes (i32.const 90) (i32.const 1024) (i32.const 3000) (i32.const 14))
+        (call $check (i32.const 91) (call $name (i32.const 20) (i32.const 64) (i32.const 13)) (i32.const 0))
+        (call $bytes (i32.const 92) (i32.const 64) (i32.const 3001) (i32.const 13))
+        (call $check (i32.const 93) (call $stat (i32.const 20) (i32.const 128)) (i32.const 0))
+        (if (i64.ne (i64.load (i32.const 136)) (i64.const {reduced})) (then (call $exit (i32.const 94))))
+        (if (i64.ne (i64.load (i32.const 144)) (i64.const 0)) (then (call $exit (i32.const 95))))
+        (call $check (i32.const 96) (call $getflags (i32.const 20) (i32.const 0)) (i32.const 0))
+        (call $check (i32.const 97) (i32.load16_u (i32.const 0)) (i32.const 1))
+        (call $check (i32.const 98) (call $prestat (i32.const 22) (i32.const 0)) (i32.const 8))
+        (call $check (i32.const 99) (call $stat (i32.const 30) (i32.const 128)) (i32.const 8))"#
+    ));
+    let programs = Programs::new(
+        "prepared-exec",
+        &[("child.wasm", &child), ("grand.wasm", &grandchild)],
+    );
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
     let local = tokio::task::LocalSet::new();
     local.block_on(&runtime, async {
+      for vfork in [false, true] {
+        let parent = if vfork {
+            parent.replace("(drop (call $exec", "(call $check (i32.const 15) (call $vfork (i32.const 400)) (i32.const 0)) (drop (call $exec")
+                .replace("(call $exit (i32.const 13))", r#"
+                    (i32.store8 (i32.const 420) (i32.const 1))
+                    (i32.store (i32.const 424) (i32.load (i32.const 400)))
+                    (call $check (i32.const 16) (call $join (i32.const 420) (i32.const 0) (i32.const 440)) (i32.const 0))
+                    (call $check (i32.const 17) (i32.load16_u (i32.const 442)) (i32.const 0))
+                    (call $exit (i32.const 0))"#)
+        } else { parent.clone() };
         let machine = Arc::new(Machine::new());
         let source = machine.capture_host_directory(&programs.0, false).unwrap();
         let (mut process, boot) = machine
@@ -1223,7 +1272,8 @@ fn prepared_host_namespace_survives_exec_with_live_names_rights_and_new_argument
         .await;
         process.close();
         machine.shutdown().await;
-        assert_eq!(result.unwrap(), 0);
+        assert_eq!(result.unwrap(), 0, "vfork child: {vfork}");
+      }
     });
 }
 

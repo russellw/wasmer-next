@@ -65,6 +65,26 @@ impl<S: Syscalls + Control + Send + Sync + 'static> HostEnvironment<S> {
         self.initialized.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Retains the bound process registration before this environment is published.
+    pub fn retain_exec_process(
+        &self,
+        store: &mut StoreMut<'_>,
+    ) -> Result<(), wasmer::RuntimeError> {
+        if store.objects_mut().id() != self.store_id {
+            return Err(wasmer::RuntimeError::new(
+                "environment belongs to another Store",
+            ));
+        }
+        let data = self.env.as_ref(store);
+        let abi = data
+            .abi
+            .as_ref()
+            .ok_or_else(|| wasmer::RuntimeError::new("process custody before ABI binding"))?;
+        data.proc
+            .handoff
+            .retain_process(data.syscalls.tgid(data.task), &**abi)
+    }
+
     /// The same loader scope used by this environment and its future images.
     pub fn loader_cleanup(&self) -> &Arc<LoaderCleanup> {
         &self.cleanup
@@ -148,6 +168,7 @@ impl<S: Syscalls + Control + Send + Sync + 'static> HostEnvironment<S> {
             hooks.deactivate(store);
         }
         let data = self.env.as_mut(store);
+        data.proc.handoff.retire_process();
         data.memory = None;
         data.abi = None;
         data.imports = wasmer::Imports::new();

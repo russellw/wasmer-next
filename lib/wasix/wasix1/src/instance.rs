@@ -5,7 +5,7 @@ use std::{
     any::Any,
     collections::HashMap,
     sync::{
-        Arc, Mutex, RwLock,
+        Arc, Mutex, RwLock, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
@@ -17,7 +17,7 @@ use wasixv2_exec::{
 use wasixv2_syscalls::{LocalFuture, SignalFrame, TaskId};
 use wasmer::{AsyncFunctionEnvMut, Exports, Function, Instance, RuntimeError, Value};
 
-use crate::process::{Commands, ProcState, Procs};
+use crate::process::{Commands, HostOwner, ProcState, Procs};
 
 #[derive(Debug)]
 pub enum StartupPreparationError {
@@ -61,6 +61,7 @@ pub struct Wasix1Instance {
     /// For a process image: its pid and the compat state it started with (or took over from
     /// its parent, for a fork child).
     image: Mutex<Option<(TaskId, Arc<ProcState>)>>,
+    host_owner: Option<Weak<HostOwner>>,
     exports: Exports,
     initialize: Option<Function>,
     /// `_start` of a process image, `wasi_thread_start` of a thread.
@@ -95,7 +96,7 @@ struct HostProcess {
     http: Arc<crate::http::State>,
     limits: crate::Limits,
     task: TaskId,
-    lineage: Arc<()>,
+    owner: Arc<HostOwner>,
 }
 
 impl HostProcessState {
@@ -106,14 +107,14 @@ impl HostProcessState {
         limits: crate::Limits,
         task: TaskId,
     ) -> Self {
-        let state = procs.get_or_create(task);
+        let owner = procs.host_owner(task);
         Self(Arc::new(HostProcess {
             procs,
             commands,
             http: Arc::new(crate::http::State::new(http)),
             limits,
             task,
-            lineage: state.lineage.clone(),
+            owner,
         }))
     }
 
@@ -135,7 +136,7 @@ impl HostProcessState {
     fn current_state(&self) -> Result<Arc<ProcState>, wasixv2_abi::Errno> {
         self.0
             .procs
-            .owned_state(self.0.task, &self.0.lineage)
+            .owned_state(self.0.task, &self.0.owner)
             .ok_or(wasixv2_abi::Errno::ESRCH)
     }
 
@@ -191,6 +192,9 @@ impl HostProcessState {
                 .set_startup_input_with_descriptors(input, descriptors)
                 .map_err(Error::Configuration)?;
             admission.admitted = true;
+            environment
+                .retain_exec_process(&mut guard.as_store_mut())
+                .map_err(Error::Engine)?;
             Function::new_typed_with_env_async(
                 &mut guard.as_store_mut(),
                 environment.environment(),
@@ -230,14 +234,16 @@ impl HostProcessState {
 
     /// The process's import binding before the engine has produced an instance.
     pub fn unattached<S: Send + Sync + 'static>(&self) -> Arc<dyn AbiInstance<S>> {
-        Arc::new(Wasix1Instance::from_exports(
+        let mut binding = Wasix1Instance::from_exports(
             self.0.procs.clone(),
             self.0.commands.clone(),
             self.0.http.clone(),
             self.0.limits,
             Exports::new(),
             false,
-        ))
+        );
+        binding.host_owner = Some(Arc::downgrade(&self.0.owner));
+        Arc::new(binding)
     }
 
     /// Captures an actual instance's handles without requiring or running `_start`.
@@ -248,20 +254,16 @@ impl HostProcessState {
         instance: &Instance,
         store: &mut wasmer::StoreMut<'_>,
     ) -> Arc<dyn AbiInstance<S>> {
-        Arc::new(Wasix1Instance::attach(
+        let mut binding = Wasix1Instance::attach(
             self.0.procs.clone(),
             self.0.commands.clone(),
             self.0.http.clone(),
             self.0.limits,
             instance,
             store,
-        ))
-    }
-}
-
-impl Drop for HostProcess {
-    fn drop(&mut self) {
-        self.procs.remove_lineage(self.task, &self.lineage);
+        );
+        binding.host_owner = Some(Arc::downgrade(&self.0.owner));
+        Arc::new(binding)
     }
 }
 
@@ -276,6 +278,7 @@ pub(crate) struct Vfork {
     /// the vfork point, which the parent resumes on. `None` for `proc_fork_env` and
     /// `proc_spawn`, whose parent resumes by returning from the child's last import.
     pub(crate) resume: Option<StackId>,
+    pub(crate) lease: Option<Box<dyn wasixv2_exec::ExecProcessLease>>,
 }
 
 impl Wasix1Instance {
@@ -294,8 +297,9 @@ impl Wasix1Instance {
         let function = |name: &str| exports.get_function(name).ok().cloned();
         let (entry, image) = match role {
             Role::Process => {
+                let entry = exports.get_function(START)?.clone();
                 let state = procs.next_image(task);
-                (exports.get_function(START)?.clone(), Some((task, state)))
+                (entry, Some((task, state)))
             }
             Role::Thread => (exports.get_function(THREAD_ENTRY)?.clone(), None),
         };
@@ -349,6 +353,7 @@ impl Wasix1Instance {
             procs,
             commands,
             image: Mutex::new(None),
+            host_owner: None,
             initialize: None,
             entry: None,
             table_cacheable,
@@ -419,7 +424,7 @@ impl Wasix1Instance {
     /// Makes `state`, a copy of the forking parent's, the compat state of this process image,
     /// a fork child, the process `pid`.
     pub(crate) fn adopt(&self, pid: TaskId, state: Arc<ProcState>) {
-        self.procs.replace(pid, state.clone());
+        let state = self.procs.adopt(pid, &state);
         let old = self.image.lock().unwrap().replace((pid, state));
         if let Some((pid, old)) = old {
             self.procs.remove(pid, &old);
@@ -451,6 +456,38 @@ impl Drop for Wasix1Instance {
 }
 
 impl<S: Send + Sync + 'static> AbiInstance<S> for Wasix1Instance {
+    fn retain_exec_process(
+        &self,
+        process: TaskId,
+    ) -> Result<Option<Box<dyn wasixv2_exec::ExecProcessLease>>, RuntimeError> {
+        if let Some(child) = self.vforks.lock().unwrap().get_mut(&process) {
+            return child.lease.take().map(Some).ok_or_else(|| {
+                RuntimeError::new("vfork child execution custody already transferred")
+            });
+        }
+        let image = self.image.lock().unwrap().clone();
+        if let Some((leader, state)) = image {
+            if leader != process {
+                return Err(RuntimeError::new(
+                    "process custody requires the image's leader",
+                ));
+            }
+            return self.procs.retain_process(process, &state).map(Some);
+        }
+        let owner = self
+            .host_owner
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .ok_or_else(|| {
+                RuntimeError::new("no exact process registration is held by this instance")
+            })?;
+        let state = self
+            .procs
+            .owned_state(process, &owner)
+            .ok_or_else(|| RuntimeError::new("host process registration was retired"))?;
+        self.procs.retain_process(process, &state).map(Some)
+    }
+
     fn function_table(&self) -> Option<&wasmer::Table> {
         self.exports
             .get_table("__wasix_exec_table")
@@ -567,6 +604,38 @@ mod tests {
     use wasmer::{AsStoreMut, Imports, Module, Store};
 
     #[test]
+    fn missing_start_does_not_consume_the_predecessors_process_registration() {
+        let mut store = Store::default();
+        let module = Module::new(
+            &store,
+            wat::parse_str("(module (memory (export \"memory\") 1))").unwrap(),
+        )
+        .unwrap();
+        let instance = Instance::new(&mut store, &module, &Imports::new()).unwrap();
+        let wasi = crate::Wasix1::new();
+        let task = TaskId(17);
+        let old = wasi.procs.get_or_create(task);
+        let lease = wasi.procs.retain_process(task, &old).unwrap();
+        wasi.procs.remove(task, &old);
+        assert!(
+            Wasix1Instance::bind(
+                wasi.procs.clone(),
+                Arc::default(),
+                None,
+                crate::Limits::default(),
+                &instance,
+                &mut store.as_store_mut(),
+                task,
+                Role::Process
+            )
+            .is_err()
+        );
+        assert!(Arc::ptr_eq(&wasi.procs.get_or_create(task), &old));
+        drop(lease);
+        assert!(!Arc::ptr_eq(&wasi.procs.get_or_create(task), &old));
+    }
+
+    #[test]
     fn host_owner_follows_only_its_exec_lineage_and_old_image_cleanup_cannot_remove_it() {
         let wasi = crate::Wasix1::new();
         let task = TaskId(11);
@@ -595,7 +664,7 @@ mod tests {
         drop(owner);
         assert!(Arc::ptr_eq(&last_owner.current_state().unwrap(), &current));
         drop(last_owner);
-        assert!(wasi.procs.owned_state(task, &current.lineage).is_none());
+        assert!(!Arc::ptr_eq(&wasi.procs.get_or_create(task), &current));
         assert!(Arc::ptr_eq(&wasi.procs.get_or_create(child), &fork));
         // A recycled task key with a new lineage cannot be removed by the old owner.
         let owner = wasi.host_process(task);
