@@ -273,7 +273,7 @@ impl<S: Syscalls + Control + Send + Sync + 'static> Image<S> {
                 maximum,
                 reserved: Vec::new(),
             };
-            let guard = if cfg!(all(unix, feature = "sys")) {
+            let guard = if self.base.low_guard() && cfg!(all(unix, feature = "sys")) {
                 65536
             } else {
                 0

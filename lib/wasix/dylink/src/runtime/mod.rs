@@ -708,10 +708,10 @@ impl<S: Syscalls + Control + Send + Sync + 'static> Abi<S> for Image<S> {
     fn guardable(&self, _: &Instance, _: &mut StoreMut<'_>) -> bool {
         // Match exec::memory::protect_low: JS and hosts without page protection
         // cannot claim a guard during pre-instantiation bootstrap.
-        cfg!(all(unix, feature = "sys"))
+        self.base.low_guard() && cfg!(all(unix, feature = "sys"))
     }
     fn low_guard(&self) -> bool {
-        true
+        self.base.low_guard()
     }
 }
 impl<S: Syscalls + Control + Send + Sync + 'static> Image<S> {

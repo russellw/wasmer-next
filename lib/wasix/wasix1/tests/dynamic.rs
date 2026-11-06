@@ -141,6 +141,21 @@ fn unannotated_direct_imports_still_fail_instantiation() {
 }
 
 #[test]
+fn dynamic_v1_keeps_the_static_v1_low_memory_contract() {
+    for (name, needed) in [("standalone", &[][..]), ("startup", &["side.so"][..])] {
+        let main = main_image("(i32.store (i32.const 0) (i32.const 123))", "", needed);
+        assert_eq!(
+            run(
+                &format!("low-memory-{name}"),
+                &main,
+                &[("side.so", side(1, &[]))]
+            ),
+            0,
+        );
+    }
+}
+
+#[test]
 fn side_undefined_weak_direct_imports_load_and_trap_only_when_called() {
     for (name, body, expected) in [("unused", "", 0), ("called", "call $optional", 132)] {
         let library = pic_with_import_flags(
