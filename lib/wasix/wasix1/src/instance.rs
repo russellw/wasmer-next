@@ -381,7 +381,7 @@ impl Wasix1Instance {
         );
     }
 
-    pub(crate) fn procs(&self) -> &Procs {
+    pub(crate) fn procs(&self) -> &Arc<Procs> {
         &self.procs
     }
 
