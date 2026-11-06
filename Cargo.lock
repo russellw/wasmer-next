@@ -8271,7 +8271,6 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "toml 1.1.6+spec-1.1.0",
- "virtual-net",
  "wasixv2",
  "wasixv2-abi",
  "wasixv2-dylink",

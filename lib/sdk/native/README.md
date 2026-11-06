@@ -171,6 +171,66 @@ let sandbox = wasmer
     .await?;
 ```
 
+Custom native transports implement [`network_api::NetworkProvider`](src/network_api.rs).
+This intentionally replaces the old nominal `virtual_net::VirtualNetworking` API:
+
+```rust
+use wasmer_sdk::network_api::HostNetwork;
+
+let provider = HostNetwork::new().expect("initialize native network reactor");
+let sandbox = wasmer.sandboxes().create()
+    .package(package)
+    .network_provider(provider)
+    .await?;
+```
+
+The SDK-owned factories use canonical WLK `BackendStream`, `BackendDatagram`,
+`Pollable` and `WaitQueue`, initialized receive buffers and exact `NetworkError`
+(errno) results. A factory may return a TCP handle still in `Connecting` state;
+readiness and error checks determine completion. Every resource has its actual
+local address and an asynchronous close that joins physical retirement. Explicit
+TCP bind returns one `BoundTcp` used by its subsequent connect or listen, while
+unbound connect and listen retain separate callbacks.
+
+Once a socket factory accepts work, it returns the existing owning handle in that
+poll. Bound sockets can report `EAGAIN` until ready; a pending listener reports it
+until it is listening. Their `Pollable` registrations wake the SDK, and their
+close futures cancel and join accepted work, including late results. Until a
+bound token returns its connected stream or listener, that token owns the pending
+operation. A dropped factory future must not leave untracked cleanup work.
+
+Resource `close(NetworkCloseMode::Normal)` preserves ordinary draining/linger.
+An explicit process kill/timeout can escalate the same resource with `Cancel` while
+both close futures remain owned and join the same actual retirement. Dropping a
+public wait subscription does not request cancellation. A consumed bound token's
+close retires only that token, leaving its transferred child to its own close owner.
+
+Providers must implement socket options and stream flush explicitly. Fresh UDP
+sockets start disconnected with receive-error flags disabled. `recv_packet`
+preserves the sender, actual destination and interface in canonical `DatagramInfo`,
+including wildcard binds, IPv4/IPv6, empty messages, full length and peek. Publication
+receive uses one installed `DatagramReceiver` on each physical socket, replacing pull
+reads until its registration is withdrawn. The existing provider driver reports Ready
+only after observing an empty receive queue and calls ingress outside transport locks,
+with the captured member and actual per-packet interface. This is observation-time
+admission, rather than a wire-arrival freshness guarantee. Each owned receive lease joins
+withdrawal and accepted callbacks; canceling a borrowed readiness wait does not withdraw it.
+Registration-level group readiness remains monotonic, while each member's packet admission
+requires its own current ready registration. Provider
+controls use the shared `NetworkControl`/`NetworkControlCompletion` DTOs, including
+original nanosecond route deadlines and reconciliation errors. Unsupported operations
+fail authoritatively; the SDK does not retry another transport. Browser and Node
+provider migration is separate.
+
+When migrating an existing provider, keep its unbound `connect_tcp` and
+`listen_tcp` callbacks separate from `bind_tcp` and the returned `BoundTcp`.
+Replace legacy interest handlers with the supplied `WaitQueue`, map failures to
+their exact errno, and implement close acknowledgement on the existing driver.
+UDP receive installation belongs on that same driver and socket. The
+[custom forwarding adapter](tests/network_host.rs) exercises these contracts
+against `HostNetwork`; [pending and DNS adapters](tests/network.rs) show
+cancellation and original lookup arguments without a legacy crate dependency.
+
 `Wasmer::new()` stores registry metadata, packages, and compiled artifacts in
 `.wasmer`. Use `Wasmer::with_config(...)` and `CacheConfig` to select another
 root. Registry and package data can be shared with Python and Node.js, while

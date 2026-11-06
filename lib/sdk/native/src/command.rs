@@ -458,6 +458,7 @@ impl Command {
                 machine.shutdown().await;
                 drop(machine);
                 if let Some(network) = &network_scope {
+                    network.cancel();
                     let _ = network.close().await;
                 }
                 let _ = providers.close().await;
@@ -478,6 +479,7 @@ impl Command {
                 machine.shutdown().await;
                 drop(machine);
                 if let Some(network) = &network_scope {
+                    network.cancel();
                     let _ = network.close().await;
                 }
                 let _ = providers.close().await;
@@ -490,6 +492,9 @@ impl Command {
             run.signaller(),
             stdin_closer,
             stdout_closer.into_iter().chain(stderr_closer).collect(),
+            network_scope
+                .as_ref()
+                .map(|network| network.cancel_handle()),
             #[cfg(feature = "napi-v8")]
             napi,
         );
@@ -501,6 +506,7 @@ impl Command {
             control.release_kernel();
             drop(machine);
             if let Some(network) = &network_scope {
+                network.cancel();
                 let _ = network.close().await;
             }
             let _ = providers.close().await;
@@ -513,11 +519,15 @@ impl Command {
             drop(run);
             supervisor.release_kernel();
             drop(machine);
-            if let Some(network) = network_scope
-                && let Err(error) = network.close().await
-                && result.is_ok()
-            {
-                result = Err(error.to_string());
+            if let Some(network) = network_scope {
+                if result.is_err() {
+                    network.cancel();
+                }
+                if let Err(error) = network.close().await
+                    && result.is_ok()
+                {
+                    result = Err(error.to_string());
+                }
             }
             if let Err(error) = providers.close().await
                 && result.is_ok()

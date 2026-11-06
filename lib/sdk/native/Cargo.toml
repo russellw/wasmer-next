@@ -10,7 +10,7 @@ publish = false
 
 [features]
 default = ["sys"]
-sys = ["virtual-net/host-net", "wasmer/cranelift", "wasixv2/sys", "wasixv2/tokio", "wasixv2/host-network", "wasixv2/wasix1"]
+sys = ["wasmer/cranelift", "wasixv2/sys", "wasixv2/tokio", "wasixv2/host-network", "wasixv2/wasix1"]
 napi-v8 = ["sys", "dep:wasmer-napi", "wasmer-napi/wasix"]
 
 [dependencies]
@@ -27,7 +27,6 @@ sha2.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
 toml.workspace = true
-virtual-net = { path = "../../virtual-net", default-features = false }
 wasmer = { path = "../../api", default-features = false }
 wasmer-cache = { path = "../../cache", default-features = false, features = ["module-cache-filesystem", "module-cache-sys"] }
 wasmer-c-api-imports = { path = "../../c-api-imports", default-features = false, features = ["sys", "wasixv2"] }

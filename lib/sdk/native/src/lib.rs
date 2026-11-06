@@ -11,6 +11,7 @@ mod command;
 mod error;
 mod fs;
 mod memory;
+pub mod network_api;
 mod package;
 mod package_progress;
 pub use package_progress::{
@@ -32,6 +33,7 @@ pub use client::{CacheConfig, Packages, Sandboxes, Wasmer, WasmerConfig};
 pub use command::{CapturedOutput, Command, ExitReason, ExitStatus, Output, Stdio};
 pub use error::{Error, ProcessExitError, Result};
 pub use fs::SandboxFileSystem;
+pub use network_api::{DynNetworkProvider, NetworkError, NetworkProvider, NetworkResult};
 pub use package::{
     CommandRef, CommandSelector, Package, PackageCommandDefinition, PackageDefinition,
     PackageSource,
