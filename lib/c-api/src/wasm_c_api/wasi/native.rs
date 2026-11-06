@@ -260,6 +260,7 @@ impl NativeWasi {
                     descriptors,
                 )
                 .await
+                .map_err(anyhow::Error::from)
         })??;
         let endpoint: Rc<dyn ContinuationEndpoint> = result.endpoint.clone();
         store.register_endpoint(Rc::downgrade(&endpoint))?;
