@@ -37,7 +37,7 @@ pub mod imports;
 mod instance;
 pub mod memory;
 pub mod process;
-pub use process::StartupInput;
+pub use process::{PreopenRights, StartupInput};
 mod rights;
 pub mod shim;
 

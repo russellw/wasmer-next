@@ -117,6 +117,145 @@ const PREVIEW1: &str = "wasi_snapshot_preview1";
 const RW: &str = "(i64.const 0x1fffffff)";
 
 #[test]
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+fn host_preopen_rights_reach_guest_fdstat_in_order_even_with_closed_stdio() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use wasixv2_abi::Fd;
+    use wasixv2_exec::{Abis, HostEnvironment, local_cleanup_runner};
+    use wasixv2_kernel::{Dispatch, HostClock, Kernel, SyscallEntry};
+    use wasixv2_syscalls::{
+        Caller, Layer, Layered, MaybeFuture, SysResult, Syscall, SyscallRet, Syscalls,
+    };
+    use wasixv2_wasix1::{PreopenRights, StartupInput, Wasix1, abi::fs::Rights, imports};
+    use wasmer::{AsStoreAsync, AsStoreMut, Instance, Module, Store, Value};
+
+    struct CloseStdio(AtomicBool);
+    impl Layer<Kernel> for CloseStdio {
+        fn call<'a>(
+            &'a self,
+            caller: &'a Caller<'_>,
+            call: Syscall,
+            next: &'a Kernel,
+        ) -> MaybeFuture<'a, SysResult<SyscallRet>> {
+            MaybeFuture::Future(Box::pin(async move {
+                if matches!(call, Syscall::Openat { .. }) && self.0.swap(false, Ordering::AcqRel) {
+                    let unbound = Caller::new(caller.task(), caller.memory());
+                    for fd in [0, 1, 2] {
+                        next.close(&unbound, Fd(fd)).await?;
+                    }
+                }
+                Dispatch.call(caller, call, next).await
+            }))
+        }
+    }
+    let rights = [
+        PreopenRights {
+            base: Rights::FD_READ.0,
+            inheriting: Rights::FD_WRITE.0,
+        },
+        PreopenRights {
+            base: Rights::PATH_OPEN.0,
+            inheriting: Rights::FD_FILESTAT_GET.0,
+        },
+    ];
+    let wasm = wat::parse_str(format!(
+        r#"(module
+      (import "wasi_snapshot_preview1" "fd_fdstat_get" (func $get (param i32 i32) (result i32)))
+      (memory (export "memory") 1)
+      (func (export "probe") (result i32)
+        (if (call $get (i32.const 3) (i32.const 0)) (then (return (i32.const 1))))
+        (if (call $get (i32.const 4) (i32.const 24)) (then (return (i32.const 2))))
+        (if (i64.ne (i64.load (i32.const 8)) (i64.const {})) (then (return (i32.const 3))))
+        (if (i64.ne (i64.load (i32.const 16)) (i64.const {})) (then (return (i32.const 4))))
+        (if (i64.ne (i64.load (i32.const 32)) (i64.const {})) (then (return (i32.const 5))))
+        (if (i64.ne (i64.load (i32.const 40)) (i64.const {})) (then (return (i32.const 6))))
+        i32.const 0))"#,
+        rights[0].base, rights[0].inheriting, rights[1].base, rights[1].inheriting,
+    ))
+    .unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, async {
+        for close_stdio in [false, true] {
+            let host: Arc<dyn wasixv2::Host> = Arc::new(wasixv2::TokioHost::default());
+            let root = Arc::new(wasixv2_vfs_mem::MemFs::new(
+                Arc::new(HostClock(host.clone())),
+                0o777,
+                1,
+                1,
+            ));
+            let wasi = Arc::new(Wasix1::new());
+            let mut abis = Abis::new();
+            abis.push(wasi.clone());
+            let abis = Arc::new(abis);
+            let kernel = Kernel::new(host.clone(), root).with_binfmt(abis.clone());
+            let task = kernel
+                .spawn(ProcessConfig {
+                    args: vec!["rights".into()],
+                    env: vec![],
+                    stdio: Stdio::from_fns(|_| {}, |_| {}),
+                })
+                .unwrap();
+            let process = wasi.host_process(task);
+            process
+                .set_startup_input_with_preopen_rights(
+                    StartupInput {
+                        preopens: vec![
+                            (b"/".to_vec(), b"first".to_vec()),
+                            (b"/".to_vec(), b"second".to_vec()),
+                        ],
+                        ..StartupInput::default()
+                    },
+                    rights.to_vec(),
+                )
+                .unwrap();
+            let syscalls = Arc::new(Layered::new(
+                SyscallEntry(CloseStdio(AtomicBool::new(close_stdio))),
+                kernel,
+            ));
+            let mut store = Store::default();
+            let owner = wasmer::sys::NativeCleanupOwner::new();
+            let mut generation =
+                wasmer::sys::NativeInvocationScope::bind_with_cleanup(&mut store, Some(owner))
+                    .unwrap();
+            let environment =
+                HostEnvironment::new(&mut store.as_store_mut(), syscalls, task, host, abis);
+            let imports = imports::namespace(
+                &mut store.as_store_mut(),
+                environment.environment(),
+                imports::Module::Preview1,
+            );
+            let module = Module::new(&store, &wasm).unwrap();
+            let instance = Instance::new(&mut store, &module, &imports).unwrap();
+            let binding = process.attach(&instance, &mut store.as_store_mut());
+            environment
+                .initialize(&mut store.as_store_mut(), &instance, binding)
+                .unwrap();
+            let probe = instance.exports.get_function("probe").unwrap().clone();
+            let asynchronous = store.into_async();
+            let cleanup =
+                local_cleanup_runner(&asynchronous, environment.loader_cleanup().clone()).unwrap();
+            let result = probe.call_async(&asynchronous, vec![]).await;
+            generation.close_and_wait().await.unwrap();
+            cleanup
+                .run(async {
+                    let mut guard = asynchronous.write_lock().await;
+                    environment.deactivate(&mut guard.as_store_mut());
+                })
+                .await;
+            assert_eq!(
+                result.unwrap().as_ref(),
+                &[Value::I32(0)],
+                "closed stdio: {close_stdio}"
+            );
+        }
+    });
+}
+
+#[test]
 fn descriptor_rights_reduce_independently_and_deny_path_effects_before_creation() {
     use wasixv2_wasix1::abi::fs::Rights;
     let read = (Rights::FD_READ | Rights::FD_FILESTAT_GET).0;

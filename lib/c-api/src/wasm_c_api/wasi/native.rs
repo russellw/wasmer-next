@@ -11,7 +11,7 @@ use wasixv2::{
 };
 use wasixv2_exec::HostEnvironment;
 use wasixv2_wasix1::{
-    StartupInput,
+    PreopenRights, StartupInput,
     imports::{self, Module as Namespace},
 };
 use wasmer_api::{AsStoreAsync, AsStoreMut, Imports, Instance, Module, StoreMut};
@@ -134,11 +134,21 @@ impl NativeWasi {
             let wasi = process
                 .wasix1()
                 .ok_or_else(|| anyhow::anyhow!("process owner is closed"))?;
-            wasi.set_startup_input(StartupInput {
-                args: startup_args,
-                env: startup_env,
-                preopens: input_preopens,
-            })
+            // Legacy read/write/create directory rights cover the original
+            // preview1 bits; later socket/WASIX rights are not inherited.
+            let mapped_rights = PreopenRights {
+                base: (1 << 29) - 1,
+                inheriting: (1 << 29) - 1,
+            };
+            let rights = vec![mapped_rights; input_preopens.len()];
+            wasi.set_startup_input_with_preopen_rights(
+                StartupInput {
+                    args: startup_args,
+                    env: startup_env,
+                    preopens: input_preopens,
+                },
+                rights,
+            )
             .map_err(|e| anyhow::anyhow!("{e:?}"))?;
             let environment = store.with_mut(|store| {
                 let environment = HostEnvironment::new(

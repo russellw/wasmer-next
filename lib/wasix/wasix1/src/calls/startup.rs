@@ -21,7 +21,7 @@ use crate::{
         Errno,
         fs::{Preopentype, Prestat},
     },
-    process::{Preopen, ProcState, Startup},
+    process::{Preopen, PreopenRights, ProcState, Startup},
     shim::{self, Env, Frame},
 };
 
@@ -38,7 +38,7 @@ pub(crate) async fn load<S: Syscalls + Control + 'static>(
     }
     let input = proc.seal_startup_input();
     let (args, env) = match &input {
-        Some(input) => (input.args.clone(), input.env.clone()),
+        Some(configured) => (configured.input.args.clone(), configured.input.env.clone()),
         None => read_block(frame).await.unwrap_or_else(|err| {
             tracing::warn!(
                 ?err,
@@ -48,14 +48,18 @@ pub(crate) async fn load<S: Syscalls + Control + 'static>(
         }),
     };
     let paths: Vec<(&[u8], &[u8])> = match &input {
-        Some(input) => input
+        Some(configured) => configured
+            .input
             .preopens
             .iter()
             .map(|(path, name)| (path.as_slice(), name.as_slice()))
             .collect(),
         None => PREOPENS.to_vec(),
     };
-    let opened = match open_preopens(frame, &paths, input.is_some()).await {
+    let rights = input
+        .as_ref()
+        .and_then(|configured| configured.rights.as_deref());
+    let opened = match open_preopens(frame, &paths, rights, input.is_some()).await {
         Ok(opened) => opened,
         Err(error) => return proc.startup.get().cloned().ok_or(error),
     };
@@ -117,11 +121,13 @@ fn parse_block(block: &[u8], base: u32) -> Option<(Strings, Strings)> {
 async fn open_preopens<S: Syscalls + Control + 'static>(
     frame: &Frame<'_, S>,
     paths: &[(&[u8], &[u8])],
+    rights: Option<&[PreopenRights]>,
     strict: bool,
 ) -> SysResult<Vec<(Preopen, DescriptorSet)>> {
     let mut preopens = Vec::new();
-    for &(path, name) in paths {
-        match open_dir(frame, path).await {
+    for (index, &(path, name)) in paths.iter().enumerate() {
+        let rights = rights.map_or(PreopenRights::ALL, |rights| rights[index]);
+        match open_dir(frame, path, rights).await {
             Ok((fd, binding)) => preopens.push((
                 Preopen {
                     fd,
@@ -154,11 +160,12 @@ async fn close_preopens<S: Syscalls + Control + 'static>(
 async fn open_dir<S: Syscalls + Control + 'static>(
     frame: &Frame<'_, S>,
     path: &[u8],
+    rights: PreopenRights,
 ) -> SysResult<(Fd, DescriptorSet)> {
     frame.syscalls.snapshot_descriptors(frame.task, &[])?;
     let record = crate::rights::Record {
-        base: crate::abi::fs::Rights::ALL,
-        inheriting: crate::abi::fs::Rights::ALL,
+        base: crate::abi::fs::Rights(rights.base),
+        inheriting: crate::abi::fs::Rights(rights.inheriting),
         preopen: true,
         socket: false,
     };

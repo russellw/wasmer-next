@@ -31,9 +31,30 @@ pub struct StartupInput {
     pub preopens: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
+/// WASI rights installed on one explicitly configured preopen descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreopenRights {
+    pub base: u64,
+    pub inheriting: u64,
+}
+
+impl PreopenRights {
+    /// The historical mask used by the ordinary startup-input setter.
+    pub const ALL: Self = Self {
+        base: crate::abi::fs::Rights::ALL.0,
+        inheriting: crate::abi::fs::Rights::ALL.0,
+    };
+}
+
+#[derive(Clone)]
+pub(crate) struct ConfiguredStartup {
+    pub(crate) input: Arc<StartupInput>,
+    pub(crate) rights: Option<Arc<[PreopenRights]>>,
+}
+
 #[derive(Default, Clone)]
 struct StartupPolicy {
-    input: Option<Arc<StartupInput>>,
+    configured: Option<ConfiguredStartup>,
     sealed: bool,
 }
 
@@ -41,8 +62,26 @@ impl ProcState {
     /// Configures a host environment once, before its first startup load begins.
     /// This controls only v1 startup buffers and preopens, not kernel procfs data.
     pub fn set_startup_input(&self, input: StartupInput) -> Result<(), wasixv2_abi::Errno> {
+        self.configure_startup_input(input, None)
+    }
+
+    /// Configures input and one rights pair per preopen in a single transaction.
+    /// Base and inheriting rights are independent masks of known WASI rights.
+    pub fn set_startup_input_with_preopen_rights(
+        &self,
+        input: StartupInput,
+        rights: Vec<PreopenRights>,
+    ) -> Result<(), wasixv2_abi::Errno> {
+        self.configure_startup_input(input, Some(rights))
+    }
+
+    fn configure_startup_input(
+        &self,
+        input: StartupInput,
+        rights: Option<Vec<PreopenRights>>,
+    ) -> Result<(), wasixv2_abi::Errno> {
         let mut policy = self.startup_input.lock().unwrap();
-        if policy.sealed || policy.input.is_some() {
+        if policy.sealed || policy.configured.is_some() {
             return Err(wasixv2_abi::Errno::EBUSY);
         }
         if input
@@ -54,17 +93,26 @@ impl ProcState {
                 .preopens
                 .iter()
                 .any(|(path, name)| path.contains(&0) || name.contains(&0))
+            || rights.as_ref().is_some_and(|rights| {
+                rights.len() != input.preopens.len()
+                    || rights.iter().any(|rights| {
+                        (rights.base | rights.inheriting) & !crate::abi::fs::Rights::ALL.0 != 0
+                    })
+            })
         {
             return Err(wasixv2_abi::Errno::EINVAL);
         }
-        policy.input = Some(Arc::new(input));
+        policy.configured = Some(ConfiguredStartup {
+            input: Arc::new(input),
+            rights: rights.map(Arc::from),
+        });
         Ok(())
     }
 
-    pub(crate) fn seal_startup_input(&self) -> Option<Arc<StartupInput>> {
+    pub(crate) fn seal_startup_input(&self) -> Option<ConfiguredStartup> {
         let mut policy = self.startup_input.lock().unwrap();
         policy.sealed = true;
-        policy.input.clone()
+        policy.configured.clone()
     }
 
     /// The state of a child that `fork` or `vfork` makes of this process: it has the same
@@ -212,6 +260,134 @@ mod tests {
     use super::*;
 
     #[test]
+    fn host_startup_input_rights_keep_their_index_and_fork_configuration() {
+        let state = ProcState::default();
+        let rights = vec![
+            PreopenRights {
+                base: crate::abi::fs::Rights::FD_READ.0,
+                inheriting: crate::abi::fs::Rights::FD_WRITE.0,
+            },
+            PreopenRights {
+                base: crate::abi::fs::Rights::PATH_OPEN.0,
+                inheriting: 0,
+            },
+        ];
+        state
+            .set_startup_input_with_preopen_rights(
+                StartupInput {
+                    preopens: vec![
+                        (b"/first".to_vec(), b"first".to_vec()),
+                        (b"/second".to_vec(), b"second".to_vec()),
+                    ],
+                    ..StartupInput::default()
+                },
+                rights.clone(),
+            )
+            .unwrap();
+        let child = state.fork();
+        let input = state.seal_startup_input().unwrap();
+        let child_input = child.seal_startup_input().unwrap();
+        assert_eq!(input.rights.as_deref(), Some(rights.as_slice()));
+        assert_eq!(child_input.rights.as_deref(), Some(rights.as_slice()));
+        assert!(Arc::ptr_eq(&input.input, &child_input.input));
+        let after_seal = state.fork().seal_startup_input().unwrap();
+        assert_eq!(after_seal.rights.as_deref(), Some(rights.as_slice()));
+        assert_eq!(
+            child.set_startup_input_with_preopen_rights(StartupInput::default(), vec![]),
+            Err(wasixv2_abi::Errno::EBUSY)
+        );
+    }
+
+    #[test]
+    fn host_startup_input_rights_reject_invalid_input_without_partial_configuration() {
+        let one = StartupInput {
+            preopens: vec![(b"/first".to_vec(), b"first".to_vec())],
+            ..StartupInput::default()
+        };
+        for rights in [
+            vec![],
+            vec![PreopenRights::ALL; 2],
+            vec![PreopenRights {
+                base: 1 << 39,
+                inheriting: 0,
+            }],
+            vec![PreopenRights {
+                base: 0,
+                inheriting: 1 << 39,
+            }],
+        ] {
+            let state = ProcState::default();
+            assert_eq!(
+                state.set_startup_input_with_preopen_rights(one.clone(), rights),
+                Err(wasixv2_abi::Errno::EINVAL)
+            );
+            // A failed masks validation must not consume the one configuration.
+            state.set_startup_input(one.clone()).unwrap();
+            let configured = state.seal_startup_input().unwrap();
+            assert_eq!(configured.input.preopens, one.preopens);
+            assert!(
+                configured.rights.is_none(),
+                "the old setter keeps ALL rights"
+            );
+        }
+        let state = ProcState::default();
+        let invalid = StartupInput {
+            args: vec![b"invalid\0".to_vec()],
+            ..one.clone()
+        };
+        assert_eq!(
+            state.set_startup_input_with_preopen_rights(invalid, vec![PreopenRights::ALL]),
+            Err(wasixv2_abi::Errno::EINVAL)
+        );
+        state
+            .set_startup_input_with_preopen_rights(one, vec![PreopenRights::ALL])
+            .unwrap();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn host_startup_input_rights_are_sealed_with_the_matching_input() {
+        for _ in 0..32 {
+            let state = Arc::new(ProcState::default());
+            let ready = Arc::new(std::sync::Barrier::new(2));
+            let rights = PreopenRights {
+                base: crate::abi::fs::Rights::FD_READ.0,
+                inheriting: 0,
+            };
+            let configure = std::thread::spawn({
+                let state = state.clone();
+                let ready = ready.clone();
+                move || {
+                    ready.wait();
+                    state.set_startup_input_with_preopen_rights(
+                        StartupInput {
+                            preopens: vec![(b"/configured".to_vec(), b"name".to_vec())],
+                            ..StartupInput::default()
+                        },
+                        vec![rights],
+                    )
+                }
+            });
+            ready.wait();
+            let configured = state.seal_startup_input();
+            match configure.join().unwrap() {
+                Ok(()) => {
+                    let configured = configured.unwrap();
+                    assert_eq!(
+                        configured.input.preopens,
+                        [(b"/configured".to_vec(), b"name".to_vec())]
+                    );
+                    assert_eq!(configured.rights.as_deref(), Some([rights].as_slice()));
+                }
+                Err(error) => {
+                    assert_eq!(error, wasixv2_abi::Errno::EBUSY);
+                    assert!(configured.is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn host_startup_input_preserves_bytes_and_fork_configuration() {
         let state = ProcState::default();
         state
@@ -223,14 +399,18 @@ mod tests {
             .unwrap();
         let child = state.fork();
         let input = child.seal_startup_input().unwrap();
-        assert_eq!(input.args[1], [0xff, b'x']);
-        assert_eq!(input.env[0], [b'K', b'=', 0xfe]);
-        assert!(input.preopens.is_empty());
+        assert_eq!(input.input.args[1], [0xff, b'x']);
+        assert_eq!(input.input.env[0], [b'K', b'=', 0xfe]);
+        assert!(input.input.preopens.is_empty());
+        assert!(input.rights.is_none());
         assert_eq!(
             child.set_startup_input(StartupInput::default()),
             Err(wasixv2_abi::Errno::EBUSY)
         );
-        assert!(Arc::ptr_eq(&input, &state.seal_startup_input().unwrap()));
+        assert!(Arc::ptr_eq(
+            &input.input,
+            &state.seal_startup_input().unwrap().input
+        ));
 
         let default = ProcState::default();
         assert!(default.seal_startup_input().is_none());
@@ -260,7 +440,7 @@ mod tests {
             ready.wait();
             let input = state.seal_startup_input();
             match configure.join().unwrap() {
-                Ok(()) => assert_eq!(input.unwrap().args, [b"configured".to_vec()]),
+                Ok(()) => assert_eq!(input.unwrap().input.args, [b"configured".to_vec()]),
                 Err(error) => {
                     assert_eq!(error, wasixv2_abi::Errno::EBUSY);
                     assert!(input.is_none());
