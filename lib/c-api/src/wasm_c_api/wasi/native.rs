@@ -132,9 +132,7 @@ impl NativeWasi {
                     && name.len() <= wasixv2::NAME_MAX)
                     .then(|| name.as_bytes().to_vec());
                 directories.push(DirectoryBootstrap {
-                    source: machine
-                        .capture_host_directory(std::path::Path::new(&host), false)
-                        .await?,
+                    source: machine.capture_host_directory(std::path::Path::new(&host), false)?,
                     lookup_name,
                     attachment: Some(
                         mapped_rights

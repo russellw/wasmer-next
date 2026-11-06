@@ -1385,4 +1385,281 @@ mod tests {
         })
         .success();
     }
+
+    #[allow(
+        unexpected_cfgs,
+        reason = "tools like cargo-llvm-coverage pass --cfg coverage"
+    )]
+    #[cfg(unix)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    #[test]
+    fn test_wasi_v2_configured_namespace_keeps_capabilities_private_and_root_errors_exact() {
+        (assert_c! {
+            #include "tests/wasmer.h"
+            #include <stdint.h>
+            #include <stdio.h>
+            #include <stdlib.h>
+            #include <string.h>
+            #include <sys/stat.h>
+            #include <unistd.h>
+
+            typedef struct {
+                wasi_env_t* env;
+                wasm_instance_t* instance;
+                wasm_extern_vec_t imports;
+                wasm_extern_vec_t exports;
+                uint8_t* data;
+                wasm_func_t* functions[9];
+            } guest;
+
+            static uint32_t u32(const uint8_t* p) {
+                return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+                    ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+            }
+            static uint64_t u64(const uint8_t* p) {
+                return (uint64_t)u32(p) | ((uint64_t)u32(p + 4) << 32);
+            }
+            static int invoke(wasm_func_t* function, size_t count, const int32_t* values) {
+                wasm_val_t args[6];
+                assert(count <= 6);
+                for (size_t i = 0; i < count; ++i) args[i] = WASM_I32_VAL(values[i]);
+                wasm_val_vec_t arguments = WASM_EMPTY_VEC;
+                arguments.size = count;
+                arguments.data = args;
+                wasm_val_t value[1] = { WASM_INIT_VAL };
+                wasm_val_vec_t results = WASM_ARRAY_VEC(value);
+                assert(wasm_func_call(function, &arguments, &results) == NULL);
+                return value[0].of.i32;
+            }
+            static int path(guest* g, int function, int fd, const char* name, int option) {
+                size_t len = strlen(name);
+                assert(len < 192);
+                memcpy(g->data + 256, name, len);
+                int32_t values[] = { fd, 256, (int32_t)len, option, 0 };
+                size_t count = function == 4 ? 3 : 4;
+                return invoke(g->functions[function], count, values);
+            }
+            static int open_path(guest* g, int fd, const char* name, int follow, int flags) {
+                size_t len = strlen(name);
+                assert(len < 192);
+                memcpy(g->data + 256, name, len);
+                int32_t values[] = { fd, 256, (int32_t)len, follow, flags };
+                return invoke(g->functions[0], 5, values);
+            }
+            static int pair(guest* g, int function, int oldfd, const char* old,
+                            int newfd, const char* new_name) {
+                size_t oldlen = strlen(old), newlen = strlen(new_name);
+                assert(oldlen < 192 && newlen < 192);
+                memcpy(g->data + 256, old, oldlen);
+                memcpy(g->data + 512, new_name, newlen);
+                int32_t values[] = { oldfd, 256, (int32_t)oldlen, newfd, 512, (int32_t)newlen };
+                return invoke(g->functions[function], 6, values);
+            }
+            static int symlink_status(guest* g, const char* name) {
+                size_t len = strlen(name);
+                assert(len < 192);
+                memcpy(g->data + 256, "marker", 6);
+                memcpy(g->data + 512, name, len);
+                int32_t values[] = { 256, 6, 3, 512, (int32_t)len };
+                return invoke(g->functions[8], 5, values);
+            }
+            static size_t listing(guest* g, int fd, uint64_t cookie, int limit) {
+                wasm_val_t args[] = { WASM_I32_VAL(fd), WASM_I64_VAL(cookie), WASM_I32_VAL(limit) };
+                wasm_val_vec_t arguments = WASM_ARRAY_VEC(args);
+                wasm_val_t result[] = { WASM_INIT_VAL };
+                wasm_val_vec_t results = WASM_ARRAY_VEC(result);
+                assert(wasm_func_call(g->functions[2], &arguments, &results) == NULL);
+                assert(result[0].of.i32 == 0);
+                return u32(g->data + 996);
+            }
+            static void assert_listing(guest* g, int fd, const char* const* names, size_t count) {
+                size_t size = listing(g, fd, 0, 2048), cursor = 0;
+                assert(size <= 2048);
+                for (size_t i = 0; i < count; ++i) {
+                    size_t len = strlen(names[i]);
+                    assert(cursor + 24 + len <= size);
+                    const uint8_t* record = g->data + 4096 + cursor;
+                    assert(u64(record) == i + 1);
+                    assert(u32(record + 16) == len && record[20] == 3);
+                    assert(memcmp(record + 24, names[i], len) == 0);
+                    cursor += 24 + len;
+                }
+                assert(cursor == size); /* no dots, default mounts or private anchors */
+                uint8_t saved[2048];
+                memcpy(saved, g->data + 4096, size);
+                assert(listing(g, fd, 0, 7) == 7);
+                assert(memcmp(saved, g->data + 4096, 7) == 0);
+                size_t first = 24 + strlen(names[0]);
+                assert(listing(g, fd, 1, 2048) == size - first);
+                assert(memcmp(saved + first, g->data + 4096, size - first) == 0);
+            }
+            static guest attach(wasm_store_t* store, wasm_module_t* module, wasi_config_t* config) {
+                guest g = {0};
+                g.env = wasi_env_new(store, config);
+                assert(g.env);
+                assert(wasi_get_imports(store, g.env, module, &g.imports));
+                g.instance = wasm_instance_new(store, module, &g.imports, NULL);
+                assert(g.instance);
+                assert(wasi_env_initialize_instance(g.env, store, g.instance));
+                wasm_instance_exports(g.instance, &g.exports);
+                assert(g.exports.size == 10);
+                g.data = (uint8_t*)wasm_memory_data(wasm_extern_as_memory(g.exports.data[0]));
+                assert(g.data);
+                for (size_t i = 0; i < 9; ++i) {
+                    g.functions[i] = wasm_extern_as_func(g.exports.data[i + 1]);
+                    assert(g.functions[i]);
+                }
+                return g;
+            }
+            static void retire(guest* g) {
+                wasm_extern_vec_delete(&g->exports);
+                wasm_instance_delete(g->instance);
+                wasm_extern_vec_delete(&g->imports);
+                wasi_env_delete(g->env);
+            }
+            static void write_marker(const char* dir, char value) {
+                char name[512];
+                assert(snprintf(name, sizeof(name), "%s/marker", dir) > 0);
+                FILE* file = fopen(name, "wb");
+                assert(file && fputc(value, file) == value && fclose(file) == 0);
+            }
+            int main() {
+                wasm_engine_t* engine = wasm_engine_new();
+                wasm_store_t* store = wasm_store_new(engine);
+                wasm_byte_vec_t wat;
+                wasmer_byte_vec_new_from_string(&wat,
+                "(module\n"
+                " (import \"wasi_snapshot_preview1\" \"path_open\" (func $open (param i32 i32 i32 i32 i32 i64 i64 i32 i32) (result i32)))\n"
+                " (import \"wasi_snapshot_preview1\" \"fd_read\" (func $read (param i32 i32 i32 i32) (result i32)))\n"
+                " (import \"wasi_snapshot_preview1\" \"fd_close\" (func $close (param i32) (result i32)))\n"
+                " (import \"wasi_snapshot_preview1\" \"fd_readdir\" (func $list (param i32 i32 i32 i64 i32) (result i32)))\n"
+                " (import \"wasi_snapshot_preview1\" \"path_create_directory\" (func $mkdir (param i32 i32 i32) (result i32)))\n"
+                " (import \"wasi_snapshot_preview1\" \"path_remove_directory\" (func $rmdir (param i32 i32 i32) (result i32)))\n"
+                " (import \"wasi_snapshot_preview1\" \"path_unlink_file\" (func $unlink (param i32 i32 i32) (result i32)))\n"
+                " (import \"wasi_snapshot_preview1\" \"path_link\" (func $link (param i32 i32 i32 i32 i32 i32 i32) (result i32)))\n"
+                " (import \"wasi_snapshot_preview1\" \"path_rename\" (func $rename (param i32 i32 i32 i32 i32 i32) (result i32)))\n"
+                " (import \"wasi_snapshot_preview1\" \"path_symlink\" (func $symlink (param i32 i32 i32 i32 i32) (result i32)))\n"
+                " (memory (export \"memory\") 1)\n"
+                " (func (export \"open\") (param $fd i32) (param $path i32) (param $len i32) (param $follow i32) (param $flags i32) (result i32)\n"
+                "   local.get $fd local.get $follow local.get $path local.get $len local.get $flags\n"
+                "   i64.const 536870911 i64.const 536870911 i32.const 0 i32.const 768 call $open)\n"
+                " (func (export \"read\") (param $fd i32) (param $path i32) (param $len i32) (param $follow i32) (result i32)\n"
+                "   (local $err i32) (local $file i32)\n"
+                "   local.get $fd local.get $follow local.get $path local.get $len i32.const 0\n"
+                "   i64.const 2 i64.const 0 i32.const 0 i32.const 768 call $open local.tee $err\n"
+                "   if local.get $err return end\n"
+                "   i32.const 768 i32.load local.set $file\n"
+                "   i32.const 800 i32.const 820 i32.store\n"
+                "   i32.const 804 i32.const 1 i32.store\n"
+                "   i32.const 820 i32.const 0 i32.store8\n"
+                "   local.get $file i32.const 800 i32.const 1 i32.const 824 call $read local.set $err\n"
+                "   local.get $file call $close drop\n"
+                "   local.get $err)\n"
+                " (func (export \"list\") (param $fd i32) (param $cookie i64) (param $limit i32) (result i32)\n"
+                "   local.get $fd i32.const 4096 local.get $limit local.get $cookie i32.const 996 call $list)\n"
+                " (func (export \"close\") (param $fd i32) (result i32) local.get $fd call $close)\n"
+                " (func (export \"mkdir\") (param $fd i32) (param $path i32) (param $len i32) (result i32)\n"
+                "   local.get $fd local.get $path local.get $len call $mkdir)\n"
+                " (func (export \"unlink\") (param $fd i32) (param $path i32) (param $len i32) (param $directory i32) (result i32)\n"
+                "   local.get $directory if (result i32)\n"
+                "     local.get $fd local.get $path local.get $len call $rmdir\n"
+                "   else local.get $fd local.get $path local.get $len call $unlink end)\n"
+                " (func (export \"link\") (param $oldfd i32) (param $old i32) (param $oldlen i32) (param $newfd i32) (param $new i32) (param $newlen i32) (result i32)\n"
+                "   local.get $oldfd i32.const 0 local.get $old local.get $oldlen local.get $newfd local.get $new local.get $newlen call $link)\n"
+                " (func (export \"rename\") (param $oldfd i32) (param $old i32) (param $oldlen i32) (param $newfd i32) (param $new i32) (param $newlen i32) (result i32)\n"
+                "   local.get $oldfd local.get $old local.get $oldlen local.get $newfd local.get $new local.get $newlen call $rename)\n"
+                " (func (export \"symlink\") (param $target i32) (param $targetlen i32) (param $fd i32) (param $path i32) (param $len i32) (result i32)\n"
+                "   local.get $target local.get $targetlen local.get $fd local.get $path local.get $len call $symlink))\n"
+                );
+                wasm_byte_vec_t wasm;
+                wat2wasm(&wat, &wasm);
+                wasm_module_t* module = wasm_module_new(store, &wasm);
+                assert(module);
+                char base[] = "/tmp/wasmer-capi-private-XXXXXX";
+                assert(mkdtemp(base));
+                char a[512], b[512], name[512];
+                assert(snprintf(a, sizeof(a), "%s/a", base) > 0 && mkdir(a, 0700) == 0);
+                assert(snprintf(b, sizeof(b), "%s/b", base) > 0 && mkdir(b, 0700) == 0);
+                write_marker(a, 'A');
+                write_marker(b, 'B');
+                const char* links[] = { "abs-out", "parent-out", "absolute-marker", "relative-marker", "hidden-guess" };
+                const char* targets[] = { "/proc/self/status", "../b/marker", "/visible/marker", "marker", "/.wasmer-c-api/preopens/0/marker" };
+                for (size_t i = 0; i < 5; ++i) {
+                    assert(snprintf(name, sizeof(name), "%s/%s", a, links[i]) > 0);
+                    assert(symlink(targets[i], name) == 0);
+                }
+                wasi_config_t* first = wasi_config_new("private-a");
+                assert(wasi_config_mapdir(first, "visible", a));
+                assert(wasi_config_mapdir(first, "/same//path", a));
+                assert(wasi_config_mapdir(first, "same/path", b));
+                guest ga = attach(store, module, first);
+                wasi_config_t* second = wasi_config_new("private-b");
+                assert(wasi_config_mapdir(second, "other", b));
+                guest gb = attach(store, module, second);
+                const char* names_a[] = { "/same//path", "/same/path", "/visible" };
+                const char* names_b[] = { "/other" };
+                assert_listing(&ga, 3, names_a, 3);
+                assert_listing(&gb, 3, names_b, 1);
+                assert(path(&ga, 1, 5, "marker", 0) == 0 && ga.data[820] == 'A');
+                assert(path(&ga, 1, 6, "marker", 0) == 0 && ga.data[820] == 'B');
+                assert(path(&gb, 1, 4, "marker", 0) == 0 && gb.data[820] == 'B');
+                assert(path(&ga, 1, 4, "missing", 0) == 44);
+                const char* denied[] = { "proc", "dev", "tmp", "other/marker", "same/path/marker",
+                    ".wasmer-c-api", ".wasmer-c-api/preopens/0", "__wasix_namespace_0", ".namespace/0", "0", "1" };
+                for (size_t i = 0; i < sizeof(denied) / sizeof(denied[0]); ++i)
+                    assert(open_path(&ga, 3, denied[i], 1, 0) == 76);
+                assert(path(&ga, 1, 4, "../other/marker", 1) == 76);
+                assert(path(&ga, 1, 4, "/other/marker", 1) == 76);
+                assert(path(&ga, 1, 4, "abs-out", 1) == 76);
+                assert(path(&ga, 1, 4, "parent-out", 1) == 76);
+                assert(path(&ga, 1, 4, "hidden-guess", 1) == 76);
+                assert(path(&ga, 1, 4, "absolute-marker", 1) == 0 && ga.data[820] == 'A');
+                assert(path(&ga, 1, 4, "relative-marker", 1) == 0 && ga.data[820] == 'A');
+                assert(open_path(&ga, 4, "..", 1, 2) == 0);
+                int root_alias = (int)u32(ga.data + 768);
+                assert(root_alias > 6);
+                assert_listing(&ga, root_alias, names_a, 3);
+                int32_t close_arg[] = { root_alias };
+                assert(invoke(ga.functions[3], 1, close_arg) == 0);
+                /* Structural mutation and an intermediate lookup denial are different verdicts. */
+                assert(path(&ga, 4, 3, "new", 0) == 2);
+                assert(path(&ga, 5, 3, "visible", 0) == 2);
+                assert(path(&ga, 5, 3, "visible", 1) == 2);
+                assert(pair(&ga, 6, 4, "marker", 3, "new") == 28);
+                assert(pair(&ga, 7, 3, "visible", 3, "renamed") == 76);
+                assert(symlink_status(&ga, "new") == 76);
+                assert(open_path(&ga, 3, "new", 0, 1) == 76);
+                assert(path(&ga, 4, 3, "absent/child", 0) == 76);
+                assert(path(&ga, 5, 3, "absent/child", 0) == 76);
+                assert(path(&ga, 5, 3, "absent/child", 1) == 76);
+                assert(pair(&ga, 6, 4, "marker", 3, "absent/child") == 76);
+                assert(pair(&ga, 7, 4, "marker", 3, "absent/child") == 76);
+                assert(symlink_status(&ga, "absent/child") == 76);
+                assert(open_path(&ga, 3, "visible/created", 0, 1) == 0);
+                close_arg[0] = (int32_t)u32(ga.data + 768);
+                assert(invoke(ga.functions[3], 1, close_arg) == 0);
+                assert(snprintf(name, sizeof(name), "%s/created", a) > 0);
+                assert(access(name, F_OK) == 0 && unlink(name) == 0);
+                assert_listing(&ga, 3, names_a, 3);
+                assert(open_path(&gb, 3, "visible/marker", 1, 0) == 76);
+                retire(&ga);
+                assert_listing(&gb, 3, names_b, 1);
+                assert(path(&gb, 1, 4, "marker", 0) == 0 && gb.data[820] == 'B');
+                retire(&gb);
+                wasm_module_delete(module);
+                wasm_byte_vec_delete(&wasm);
+                wasm_byte_vec_delete(&wat);
+                wasm_store_delete(store);
+                wasm_engine_delete(engine);
+                for (size_t i = 0; i < 5; ++i) {
+                    assert(snprintf(name, sizeof(name), "%s/%s", a, links[i]) > 0);
+                    assert(unlink(name) == 0);
+                }
+                assert(snprintf(name, sizeof(name), "%s/marker", a) > 0 && unlink(name) == 0);
+                assert(snprintf(name, sizeof(name), "%s/marker", b) > 0 && unlink(name) == 0);
+                assert(rmdir(a) == 0 && rmdir(b) == 0 && rmdir(base) == 0);
+                return 0;
+            }
+        }).success();
+    }
 }
