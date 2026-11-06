@@ -244,6 +244,9 @@ impl StoreRef {
                 let mut guard = store
                     .try_borrow_mut()
                     .map_err(|_| RuntimeError::new("Store is already borrowed"))?;
+                if guard.as_store_mut().objects_mut().id() != self.inner.id {
+                    return Err(RuntimeError::new("host loan belongs to another Store"));
+                }
                 Ok(f.take().unwrap()(&mut guard.as_store_mut()))
             }
             #[cfg(feature = "sys")]
@@ -253,7 +256,10 @@ impl StoreRef {
                     task::{Context, Poll, Waker},
                 };
                 use wasmer_api::AsStoreAsync;
-                let mut lock = std::pin::pin!(native.store.as_ref().unwrap().write_lock());
+                let expected = native.store.as_ref().unwrap();
+                let loan = wasmer_api::sys::current_native_store_loan(expected)?;
+                let capability = loan.as_ref().unwrap_or(expected);
+                let mut lock = std::pin::pin!(capability.write_lock());
                 let Poll::Ready(mut guard) =
                     lock.as_mut().poll(&mut Context::from_waker(Waker::noop()))
                 else {
@@ -274,9 +280,20 @@ impl StoreRef {
             if current.objects_mut().id() == self.inner.id {
                 function.call(current, &args)
             } else {
-                current.parked(|| {
-                    self.with_mut(|store| function.call(store, &args))
-                        .and_then(|result| result)
+                current.parked(|| match &self.inner.mode {
+                    #[cfg(feature = "sys")]
+                    StoreMode::Native(native) => {
+                        let driver = native.driver()?;
+                        wasmer_api::sys::call_native_descendant(
+                            function,
+                            native.store.as_ref().unwrap(),
+                            args.clone(),
+                            move |child| async move { driver.run_descendant(child).await },
+                        )
+                    }
+                    StoreMode::Plain(_) => self
+                        .with_mut(|store| function.call(store, &args))
+                        .and_then(|result| result),
                 })
             }
         }) {
@@ -340,8 +357,12 @@ impl StoreRef {
             if current.objects_mut().id() == self.inner.id {
                 Ok(Instance::new_by_index(current, module, &externs))
             } else {
-                current.parked(|| {
-                    self.with_mut(|store| Instance::new_by_index(store, module, &externs))
+                current.parked(|| match &self.inner.mode {
+                    #[cfg(feature = "sys")]
+                    StoreMode::Native(_) => self.instantiate_native(module, externs.clone()),
+                    StoreMode::Plain(_) => {
+                        self.with_mut(|store| Instance::new_by_index(store, module, &externs))
+                    }
                 })
             }
         }) {
@@ -359,59 +380,80 @@ impl StoreRef {
                 self.with_mut(|store| Instance::new_by_index(store, module, &externs))
             }
             #[cfg(feature = "sys")]
-            StoreMode::Native(native) => {
-                use std::sync::{Arc, Mutex};
-                let result = Arc::new(Mutex::new(None));
-                let output = Arc::downgrade(&result);
-                let request = Arc::new(Mutex::new(Some((module.clone(), externs))));
-                let input = Arc::downgrade(&request);
-                // Per-operation weak payloads own no Store/driver/module roots.
-                // Recursive calls have independent request and result custody.
-                let trampoline = self.with_mut(|store| {
-                    let env = wasmer_api::FunctionEnv::new(store, ());
-                    Function::new_with_env(
-                        store,
-                        &env,
-                        wasmer_api::FunctionType::new([], []),
-                        move |mut env, _| {
-                            let request = input.upgrade().ok_or_else(|| {
-                                RuntimeError::new("instantiation request expired")
-                            })?;
-                            let (module, externs) = request
-                                .lock()
-                                .unwrap_or_else(|error| error.into_inner())
-                                .take()
-                                .ok_or_else(|| {
-                                    RuntimeError::new("instantiation request already entered")
-                                })?;
-                            let output = output
-                                .upgrade()
-                                .ok_or_else(|| RuntimeError::new("instantiation result expired"))?;
-                            let instance =
-                                Instance::new_by_index(&mut env.as_store_mut(), &module, &externs);
-                            *output.lock().unwrap_or_else(|error| error.into_inner()) =
-                                Some(instance);
-                            Ok(Vec::new())
-                        },
-                    )
-                });
-                let trampoline = trampoline?;
-                if let Err(error) = self.native_call(native, &trampoline, Vec::new()) {
-                    #[cfg(feature = "wasi")]
-                    if wasixv2_exec::is_call_handoff(&error)
-                        || error.downcast_ref::<CompletedHandoff>().is_some()
-                    {
-                        return Ok(Err(InstantiationError::Start(error)));
-                    }
-                    return Err(error);
-                }
-                let value = result
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .take();
-                value.ok_or_else(|| RuntimeError::new("native instantiation did not settle"))
-            }
+            StoreMode::Native(_) => self.instantiate_native(module, externs),
         }
+    }
+
+    #[cfg(feature = "sys")]
+    fn instantiate_native(
+        &self,
+        module: &Module,
+        externs: Vec<Extern>,
+    ) -> Result<Result<Instance, InstantiationError>, RuntimeError> {
+        use std::sync::{Arc, Mutex};
+        let result = Arc::new(Mutex::new(None));
+        let output = Arc::downgrade(&result);
+        let request = Arc::new(Mutex::new(Some((module.clone(), externs))));
+        let input = Arc::downgrade(&request);
+        // Per-operation weak payloads own no Store/driver/module roots.
+        // Recursive calls have independent request and result custody.
+        let trampoline = self.with_mut(|store| {
+            let env = wasmer_api::FunctionEnv::new(store, ());
+            Function::new_with_env(
+                store,
+                &env,
+                wasmer_api::FunctionType::new([], []),
+                move |mut env, _| {
+                    let request = input
+                        .upgrade()
+                        .ok_or_else(|| RuntimeError::new("instantiation request expired"))?;
+                    let (module, externs) = request
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .take()
+                        .ok_or_else(|| {
+                            RuntimeError::new("instantiation request already entered")
+                        })?;
+                    let output = output
+                        .upgrade()
+                        .ok_or_else(|| RuntimeError::new("instantiation result expired"))?;
+                    let instance =
+                        Instance::new_by_index(&mut env.as_store_mut(), &module, &externs);
+                    let abort = match &instance {
+                        Err(InstantiationError::Start(error)) if error.is_host_abort() => {
+                            Some(error.clone())
+                        }
+                        _ => None,
+                    };
+                    *output.lock().unwrap_or_else(|error| error.into_inner()) = Some(instance);
+                    // Committed start cannot be swallowed by the trampoline
+                    // before the enclosing native caller latches its abort.
+                    match abort {
+                        Some(error) => Err(error),
+                        None => Ok(Vec::new()),
+                    }
+                },
+            )
+        });
+        let trampoline = trampoline?;
+        if let Err(error) = self.call(&trampoline, Vec::new()) {
+            #[cfg(feature = "wasi")]
+            if wasixv2_exec::is_call_handoff(&error)
+                || error.downcast_ref::<CompletedHandoff>().is_some()
+            {
+                return Ok(Err(InstantiationError::Start(error)));
+            }
+            let value = result
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take();
+            return value.map(Ok).unwrap_or(Err(error));
+        }
+        let value = result
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        value.ok_or_else(|| RuntimeError::new("native instantiation did not settle"))
     }
 
     pub(crate) fn is_native(&self) -> bool {
@@ -608,6 +650,37 @@ impl Driver {
             } else {
                 std::task::Poll::Pending
             }
+        })
+        .await
+    }
+
+    async fn run_descendant<R>(&self, future: impl std::future::Future<Output = R>) -> R {
+        if self.active.get() {
+            // An ancestor's LocalSet already has an outer poller. Enter only
+            // its spawn/runtime context; let that poller run its queued tasks.
+            let mut future = std::pin::pin!(future);
+            return std::future::poll_fn(|cx| {
+                let _runtime = self.runtime.enter();
+                let _local = self.local.enter();
+                let _ = self.owner.poll_idle(cx);
+                future.as_mut().poll(cx)
+            })
+            .await;
+        }
+        self.active.set(true);
+        struct Reset<'a>(&'a std::cell::Cell<bool>);
+        impl Drop for Reset<'_> {
+            fn drop(&mut self) {
+                self.0.set(false);
+            }
+        }
+        let _reset = Reset(&self.active);
+        // Nested guest completion must return to its still-parked ancestor.
+        // Global enrolled retirement joins belong to that outer call owner.
+        let mut run = std::pin::pin!(self.local.run_until(future));
+        std::future::poll_fn(|cx| {
+            let _runtime = self.runtime.enter();
+            std::future::Future::poll(run.as_mut(), cx)
         })
         .await
     }
@@ -1237,6 +1310,260 @@ mod tests {
             "managed work must finish before cancellation"
         );
         assert!(owner.is_idle());
+    }
+
+    #[test]
+    fn native_foreign_calls_reenter_the_exact_ancestor_loan_and_poll_its_queued_work() {
+        let a = StoreRef::new(Store::default()).unwrap();
+        let b = StoreRef::new(Store::default()).unwrap();
+        let queued = Rc::new(std::cell::Cell::new(0));
+        let observed = queued.clone();
+        let leaf = a
+            .with_mut(|store| {
+                Function::new_async(
+                    store,
+                    wasmer_api::FunctionType::new([], [wasmer_api::Type::I32]),
+                    move |_| {
+                        let queued = queued.clone();
+                        async move {
+                            let (send, receive) = tokio::sync::oneshot::channel();
+                            tokio::task::spawn_local(async move {
+                                tokio::task::yield_now().await;
+                                queued.set(queued.get() + 1);
+                                send.send(()).unwrap();
+                            });
+                            receive.await.unwrap();
+                            Ok(vec![Value::I32(37)])
+                        }
+                    },
+                )
+            })
+            .unwrap();
+        let module = a
+            .with_mut(|store| {
+                Module::new(
+                    store,
+                    wat::parse_str(
+                        r#"(module
+            (import "test" "wait" (func $wait (result i32)))
+            (global $value (mut i32) (i32.const 0))
+            (func $init call $wait global.set $value) (start $init)
+            (func (export "value") (result i32) global.get $value))"#,
+                    )
+                    .unwrap(),
+                )
+            })
+            .unwrap()
+            .unwrap();
+        let weak_a = a.downgrade();
+        let middle = b
+            .with_mut(|store| {
+                Function::new_async(
+                    store,
+                    wasmer_api::FunctionType::new([], [wasmer_api::Type::I32]),
+                    move |_| {
+                        let a = weak_a.upgrade().unwrap();
+                        a.with_mut(|store| assert_eq!(store.objects_mut().id(), a.inner.id))
+                            .unwrap();
+                        let result = a.call(&leaf, vec![]).and_then(|values| {
+                            assert_eq!(values[0].i32(), Some(37));
+                            let instance = a
+                                .instantiate(&module, vec![leaf.clone().into()])?
+                                .map_err(|error| RuntimeError::new(error.to_string()))?;
+                            a.call(instance.exports.get_function("value").unwrap(), vec![])
+                        });
+                        std::future::ready(result.map(Vec::from))
+                    },
+                )
+            })
+            .unwrap();
+        let weak_b = b.downgrade();
+        let root = a
+            .with_mut(|store| {
+                Function::new_async(
+                    store,
+                    wasmer_api::FunctionType::new([], [wasmer_api::Type::I32]),
+                    move |_| {
+                        let result = weak_b.upgrade().unwrap().call(&middle, vec![]);
+                        std::future::ready(result.map(Vec::from))
+                    },
+                )
+            })
+            .unwrap();
+        for expected in 1..=2 {
+            let result = a.call(&root, vec![]).unwrap();
+            assert_eq!(result[0].i32(), Some(37));
+            assert_eq!(observed.get(), 2 * expected);
+            assert_eq!(
+                a.with_mut(|store| store.objects_mut().id()).unwrap(),
+                a.inner.id
+            );
+            assert_eq!(
+                b.with_mut(|store| store.objects_mut().id()).unwrap(),
+                b.inner.id
+            );
+        }
+    }
+
+    #[cfg(feature = "wasi")]
+    #[test]
+    fn native_ancestor_handoff_matches_once_with_host_access_after_the_child_abort() {
+        struct Endpoint {
+            store: WeakStoreRef,
+            marker: RuntimeError,
+            claimed: Rc<std::cell::Cell<bool>>,
+            completed: Rc<std::cell::Cell<usize>>,
+        }
+        impl ContinuationEndpoint for Endpoint {
+            fn matches(&self, store: &mut StoreMut<'_>, error: &RuntimeError) -> bool {
+                store.objects_mut().id() == self.store.upgrade().unwrap().inner.id
+                    && !self.claimed.get()
+                    && std::ptr::eq(
+                        error.downcast_ref::<std::io::Error>().unwrap(),
+                        self.marker.downcast_ref::<std::io::Error>().unwrap(),
+                    )
+            }
+            fn prepare(
+                self: Rc<Self>,
+                store: &StoreRef,
+                _: &RuntimeError,
+            ) -> Result<LocalContinuation, RuntimeError> {
+                assert!(!self.claimed.replace(true));
+                // Original A is still parked. This must use its captured loan,
+                // including when current B has already latched the child abort.
+                store.with_mut(|loan| assert_eq!(loan.objects_mut().id(), store.inner.id))?;
+                let weak = self.store.clone();
+                let completed = self.completed.clone();
+                Ok(LocalContinuation {
+                    store: store.clone(),
+                    run: Some(Box::new(move || {
+                        Box::pin(async move {
+                            let a = weak.upgrade().unwrap();
+                            a.with_mut(|loan| assert_eq!(loan.objects_mut().id(), a.inner.id))?;
+                            completed.set(completed.get() + 1);
+                            Err(RuntimeError::new("completed exact ancestor continuation"))
+                        })
+                    })),
+                    cancel: None,
+                })
+            }
+            fn cancel_unclaimed(
+                self: Rc<Self>,
+                _: &StoreRef,
+                _: &RuntimeError,
+            ) -> Result<(), RuntimeError> {
+                panic!("the real outer call owner must be found")
+            }
+        }
+        let a = StoreRef::new(Store::default()).unwrap();
+        let b = StoreRef::new(Store::default()).unwrap();
+        let marker =
+            RuntimeError::host_abort(Box::new(std::io::Error::other("exact ancestor handoff")));
+        let claimed = Rc::new(std::cell::Cell::new(false));
+        let completed = Rc::new(std::cell::Cell::new(0));
+        let endpoint: Rc<dyn ContinuationEndpoint> = Rc::new(Endpoint {
+            store: a.downgrade(),
+            marker: marker.clone(),
+            claimed: claimed.clone(),
+            completed: completed.clone(),
+        });
+        a.register_endpoint(Rc::downgrade(&endpoint)).unwrap();
+        let leaf = a
+            .with_mut(|store| {
+                Function::new_async(store, wasmer_api::FunctionType::new([], []), move |_| {
+                    std::future::ready(Err(marker.clone()))
+                })
+            })
+            .unwrap();
+        let weak_a = a.downgrade();
+        let middle = b
+            .with_mut(|store| {
+                Function::new_async(store, wasmer_api::FunctionType::new([], []), move |_| {
+                    assert!(weak_a.upgrade().unwrap().call(&leaf, vec![]).is_err());
+                    std::future::ready(Ok(Vec::new())) // Deliberately swallow the trap.
+                })
+            })
+            .unwrap();
+        let weak_b = b.downgrade();
+        let root = a
+            .with_mut(|store| {
+                Function::new_async(store, wasmer_api::FunctionType::new([], []), move |_| {
+                    assert!(weak_b.upgrade().unwrap().call(&middle, vec![]).is_err());
+                    std::future::ready(Ok(Vec::new()))
+                })
+            })
+            .unwrap();
+        let error = a.call(&root, vec![]).unwrap_err();
+        assert_eq!(error.message(), "completed exact ancestor continuation");
+        assert!(claimed.get());
+        assert_eq!(completed.get(), 1);
+        a.with_mut(|loan| assert_eq!(loan.objects_mut().id(), a.inner.id))
+            .unwrap();
+        b.with_mut(|loan| assert_eq!(loan.objects_mut().id(), b.inner.id))
+            .unwrap();
+    }
+
+    #[test]
+    fn native_foreign_instantiation_suspends_start_and_preserves_the_callers_store() {
+        let a = StoreRef::new(Store::default()).unwrap();
+        let b = StoreRef::new(Store::default()).unwrap();
+        let wait = b
+            .with_mut(|store| {
+                Function::new_async(
+                    store,
+                    wasmer_api::FunctionType::new([], [wasmer_api::Type::I32]),
+                    |_| async {
+                        tokio::task::yield_now().await;
+                        Ok(vec![Value::I32(42)])
+                    },
+                )
+            })
+            .unwrap();
+        let module = b
+            .with_mut(|store| {
+                Module::new(
+                    store,
+                    wat::parse_str(
+                        r#"(module
+            (import "test" "wait" (func $wait (result i32)))
+            (global $value (mut i32) (i32.const 0))
+            (func $init call $wait global.set $value) (start $init)
+            (func (export "value") (result i32) global.get $value))"#,
+                    )
+                    .unwrap(),
+                )
+            })
+            .unwrap()
+            .unwrap();
+        let weak_b = b.downgrade();
+        let root = a
+            .with_mut(|store| {
+                Function::new_async(
+                    store,
+                    wasmer_api::FunctionType::new([], [wasmer_api::Type::I32]),
+                    move |_| {
+                        let b = weak_b.upgrade().unwrap();
+                        let result =
+                            b.instantiate(&module, vec![wait.clone().into()])
+                                .and_then(|result| {
+                                    let instance = result
+                                        .map_err(|error| RuntimeError::new(error.to_string()))?;
+                                    b.call(instance.exports.get_function("value").unwrap(), vec![])
+                                });
+                        std::future::ready(result.map(Vec::from))
+                    },
+                )
+            })
+            .unwrap();
+        assert_eq!(a.call(&root, vec![]).unwrap()[0].i32(), Some(42));
+        assert_eq!(
+            a.with_mut(|store| store.objects_mut().id()).unwrap(),
+            a.inner.id
+        );
+        assert_eq!(
+            b.with_mut(|store| store.objects_mut().id()).unwrap(),
+            b.inner.id
+        );
     }
 
     #[test]
