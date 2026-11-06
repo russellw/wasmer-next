@@ -6,7 +6,7 @@
 #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
 mod admitted;
 #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
-pub use admitted::{Run, spawn, spawn_file};
+pub use admitted::{Run, RunObserver, spawn, spawn_file};
 
 #[cfg(all(feature = "browser", target_arch = "wasm32"))]
 pub mod browser;

@@ -238,3 +238,124 @@ async fn the_signaller_reaches_the_console() {
         assert_eq!(run.unwrap(), status);
     }
 }
+
+/// Observing the guest exit is distinct from waiting for terminal delivery.
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+#[tokio::test]
+async fn admitted_observer_preserves_exit_while_console_delivery_is_pending() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    #[derive(Default)]
+    struct GuestGate(Mutex<Option<wasixv2::ThreadStart>>);
+    impl wasixv2::Executor for GuestGate {
+        fn spawn_local(&self, future: LocalFuture<'static, ()>) {
+            wasixv2::Executor::spawn_local(&wasixv2::TokioHost::default(), future);
+        }
+        fn spawn_thread(&self, start: wasixv2::ThreadStart) -> io::Result<()> {
+            assert!(self.0.lock().unwrap().replace(start).is_none());
+            Ok(())
+        }
+        fn spawn_blocking(&self, work: Box<dyn FnOnce() + Send>) -> LocalFuture<'static, ()> {
+            wasixv2::Executor::spawn_blocking(&wasixv2::TokioHost::default(), work)
+        }
+    }
+
+    struct GatedScreen {
+        entered: AtomicBool,
+        released: AtomicBool,
+        changed: tokio::sync::Notify,
+    }
+    impl ByteSink for GatedScreen {
+        fn write<'a>(&'a self, data: &'a [u8]) -> LocalFuture<'a, io::Result<usize>> {
+            Box::pin(async move {
+                self.entered.store(true, Ordering::Release);
+                loop {
+                    let changed = self.changed.notified();
+                    tokio::pin!(changed);
+                    changed.as_mut().enable();
+                    if self.released.load(Ordering::Acquire) {
+                        break;
+                    }
+                    changed.await;
+                }
+                Ok(data.len())
+            })
+        }
+    }
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let screen = Arc::new(GatedScreen {
+                entered: AtomicBool::new(false),
+                released: AtomicBool::new(false),
+                changed: tokio::sync::Notify::new(),
+            });
+            let (keys, input) = mpsc::unbounded_channel();
+            let console = Console {
+                input: Arc::new(Keyboard(Mutex::new(input))),
+                output: screen.clone(),
+                size: WindowSize::default(),
+            };
+            let gate = Arc::new(GuestGate::default());
+            let machine = Arc::new(
+                Machine::builder()
+                    .task_executor(gate.clone())
+                    .console(console, [true; 3])
+                    .build(),
+            );
+            let engine = wasmer::Engine::default();
+            let wasm = wat::parse_str(
+                r#"(module
+            (import "wasixv2" "read" (func $read (param i32 i32 i32) (result i32)))
+            (import "wasixv2" "exit_group" (func $exit (param i32)))
+            (memory (export "memory") 1)
+            (func (export "_start")
+                (drop(call $read (i32.const 0)(i32.const 16)(i32.const 16)))
+                (call $exit (i32.const 0))))"#,
+            )
+            .unwrap();
+            let module = wasixv2::load(&engine, &wasm).unwrap();
+            let (stdio, _) = unused_stdio();
+            let run = wasixv2::spawn(
+                machine.clone(),
+                engine,
+                module,
+                wasixv2::ProcessConfig {
+                    args: vec![],
+                    env: vec![],
+                    stdio,
+                },
+            )
+            .await
+            .unwrap();
+            let observer = run.observer();
+            // Admit the process, but let the input pump take the echo buffer
+            // before the guest can compete for it in Tty::read::flush_echoes.
+            keys.send(b"done\n".to_vec()).unwrap();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !screen.entered.load(Ordering::Acquire) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("console pump entered the gated echo write");
+            let factory = gate.0.lock().unwrap().take().unwrap();
+            wasixv2::Executor::spawn_thread(&wasixv2::TokioHost::default(), factory).unwrap();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while observer.observed_result().is_none() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("guest exited while only console delivery was pending");
+            assert_eq!(observer.observed_result().unwrap().unwrap(), 0);
+            let mut waiting = Box::pin(run.wait());
+            assert!(futures_util::poll!(&mut waiting).is_pending());
+            run.signaller().signal(9).unwrap();
+            assert_eq!(observer.observed_result().unwrap().unwrap(), 0);
+            assert!(futures_util::poll!(&mut waiting).is_pending());
+            screen.released.store(true, Ordering::Release);
+            screen.changed.notify_waiters();
+            assert_eq!(waiting.await.unwrap(), 0);
+            machine.shutdown().await;
+        })
+        .await;
+}

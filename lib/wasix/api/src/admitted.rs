@@ -1,11 +1,15 @@
 //! Target-independent ownership of an admitted initial process.
 use crate::{Engine, Executor, Machine, ProcessConfig, RunError};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use wasixv2_wait::{NoInterrupt, PollMask, WaitQueue, Waiter};
 use wasmer::Module;
 
 #[derive(Default)]
 struct Completion {
+    finished: AtomicBool,
     result: Mutex<Option<Result<i32, String>>>,
     changed: WaitQueue,
 }
@@ -23,7 +27,25 @@ pub struct Run {
     pid: u32,
 }
 
+/// An immutable-result observer with no process, Machine or executor ownership.
+#[derive(Clone)]
+pub struct RunObserver {
+    completion: Arc<Completion>,
+}
+impl RunObserver {
+    /// The initial execution result once observed, before console delivery ends.
+    /// This is not a cleanup or completion fence; retain and wait on the Run.
+    pub fn observed_result(&self) -> Option<Result<i32, String>> {
+        self.completion.result.lock().unwrap().clone()
+    }
+}
+
 impl Run {
+    pub fn observer(&self) -> RunObserver {
+        RunObserver {
+            completion: self.completion.clone(),
+        }
+    }
     /// Kernel PID of the admitted initial process.
     pub fn id(&self) -> u32 {
         self.pid
@@ -35,8 +57,14 @@ impl Run {
         let waiter = Waiter::new();
         let _registration = waiter.register(&self.completion.changed, PollMask::empty());
         loop {
-            if let Some(result) = self.completion.result.lock().unwrap().clone() {
-                return result;
+            if self.completion.finished.load(Ordering::Acquire) {
+                return self
+                    .completion
+                    .result
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .expect("finished admitted run has a result");
             }
             waiter.sleep(&NoInterrupt, None).await;
         }
@@ -190,8 +218,9 @@ pub(super) async fn spawn_program(
                     result.map_err(|error| error.to_string())
                 }
             };
-            running.console_sent().await;
             *output.result.lock().unwrap() = Some(result);
+            running.console_sent().await;
+            output.finished.store(true, Ordering::Release);
             output.changed.wake(PollMask::empty());
         })
     });
