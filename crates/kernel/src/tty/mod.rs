@@ -8,6 +8,7 @@
 //! their devices.
 
 mod console;
+pub use console::ConsoleInputEof;
 mod devpts;
 mod ioctl;
 mod jobctl;
@@ -442,6 +443,11 @@ impl Tty {
                 }
                 continue;
             }
+            // Finite embedding input has ended, including when a raw read
+            // copied fewer bytes than VMIN. Output remains connected.
+            if self.finite_input_ended() {
+                break;
+            }
             // `n_tty_wait_for_input`.
             if self.driver.other_closed() {
                 return match done {
@@ -681,7 +687,7 @@ impl Pollable for TtyFile {
         let mut mask = PollMask::empty();
         let stopped = {
             let ldisc = self.tty.ldisc.lock_or_recover();
-            if ldisc.input_available(true) {
+            if ldisc.input_available(true) || self.tty.finite_input_ended() {
                 mask |= PollMask::READABLE;
             }
             ldisc.stopped()

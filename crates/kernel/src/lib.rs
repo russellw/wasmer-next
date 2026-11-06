@@ -99,6 +99,7 @@ pub use ident::{Uname, UnameError};
 pub use printk::Level as LogLevel;
 pub use reboot::PowerRequest;
 pub use timekeeping::Timekeeper;
+pub use tty::ConsoleInputEof;
 use wasixv2_abi::{
     AccessMode, AtFlags, Buf, CallDynamicFlags, ClockId, CloseRangeFlags, ConstBuf,
     ConstFileHandlePtr, ConstGidArray, ConstIovecArray, ConstKernelItimerspecPtr,

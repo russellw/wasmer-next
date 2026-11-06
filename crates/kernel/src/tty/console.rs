@@ -36,8 +36,20 @@ const INPUT_CHUNK: usize = 4096;
 /// default `closing_wait` (`drivers/tty/tty_port.c`: `tty_port_init`), 30 seconds.
 const CLOSING_WAIT: Duration = Duration::from_secs(30);
 
+/// What end-of-input means for this configured console source.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ConsoleInputEof {
+    /// A disconnected terminal hangs up, preserving the normal console policy.
+    #[default]
+    Hangup,
+    /// A finite embedding input drains and returns EOF without disconnecting output.
+    Finite,
+}
+
 /// The console's device: the host streams.
 pub(crate) struct Console {
+    eof_policy: ConsoleInputEof,
+    input_ended: AtomicBool,
     input: Arc<dyn ByteSource>,
     output: Arc<dyn ByteSink>,
     /// The input pump waits here: for the source to have input, and for the discipline to
@@ -50,9 +62,11 @@ pub(crate) struct Console {
 }
 
 impl Console {
-    fn new(console: wasixv2_host::Console) -> Self {
+    fn new(console: wasixv2_host::Console, eof_policy: ConsoleInputEof) -> Self {
         let pump_wait = WaitQueue::new();
         Self {
+            eof_policy,
+            input_ended: AtomicBool::new(false),
             input: console.input,
             output: console.output,
             waker: Waker::from(Arc::new(QueueWaker(pump_wait.clone()))),
@@ -88,6 +102,10 @@ fn winsize(size: WindowSize) -> Winsize {
 }
 
 impl Tty {
+    pub(super) fn finite_input_ended(&self) -> bool {
+        matches!(&self.driver, Driver::Console(console) if console.input_ended.load(Ordering::Acquire))
+    }
+
     fn console(&self) -> &Console {
         match &self.driver {
             Driver::Console(console) => console,
@@ -127,7 +145,20 @@ async fn pump(tty: Weak<Tty>) {
             let console = live.console();
             let mut cx = Context::from_waker(&console.waker);
             match console.input.poll_read(&mut cx, &mut chunk) {
-                Poll::Ready(Ok(0) | Err(_)) => {
+                Poll::Ready(Ok(0)) => {
+                    if console.eof_policy == ConsoleInputEof::Finite {
+                        live.ldisc.lock_or_recover().finish_input();
+                        console.input_ended.store(true, Ordering::Release);
+                        live.received(super::ldisc::Received {
+                            readable: true,
+                            ..Default::default()
+                        });
+                    } else {
+                        live.hangup(false);
+                    }
+                    return;
+                }
+                Poll::Ready(Err(_)) => {
                     live.hangup(false);
                     return;
                 }
@@ -152,9 +183,19 @@ impl Kernel {
     /// Gives the kernel the host's console, `console`, a terminal (`/dev/hvc0`, device 229:0)
     /// with Linux's default settings and `console.size` as its window size. Processes reach it
     /// through [`Kernel::attach_console`]; [`Kernel::create_device_nodes`] makes its node.
-    pub fn with_console(mut self, console: wasixv2_host::Console) -> Self {
+    pub fn with_console(self, console: wasixv2_host::Console) -> Self {
+        self.with_console_eof(console, ConsoleInputEof::Hangup)
+    }
+
+    /// Configures this source's EOF meaning before console admission. Explicit
+    /// hangup and PTY peer closure retain their normal semantics under either policy.
+    pub fn with_console_eof(
+        mut self,
+        console: wasixv2_host::Console,
+        eof_policy: ConsoleInputEof,
+    ) -> Self {
         let size = winsize(console.size);
-        let driver = Driver::Console(Console::new(console));
+        let driver = Driver::Console(Console::new(console, eof_policy));
         let device = Device {
             major: HVC_MAJOR,
             minor: 0,

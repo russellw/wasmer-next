@@ -657,6 +657,13 @@ impl Ldisc {
 
     // ---- reading ----
 
+    /// Finishes the current fragment for a finite console source without adding
+    /// a character or changing termios. EOF itself belongs to the console driver.
+    pub(crate) fn finish_input(&mut self) {
+        self.canon = if self.icanon() { self.buf.len() } else { 0 };
+        self.lnext = false;
+    }
+
     /// `input_available_p`: in canonical mode a finished line, otherwise a byte, or `VMIN`
     /// bytes for `poll` when `VTIME` is 0.
     pub(crate) fn input_available(&self, poll: bool) -> bool {

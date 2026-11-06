@@ -23,8 +23,9 @@ use super::{
     signal::ignore,
     *,
 };
+use crate::ConsoleInputEof;
 
-/// What the host types: input arrives as the test types it, and its end is a hangup.
+/// Test input accepts typed bytes, then ends with EOF or a source error.
 #[derive(Default)]
 struct Keyboard(Mutex<Keys>);
 
@@ -32,6 +33,7 @@ struct Keyboard(Mutex<Keys>);
 struct Keys {
     typed: VecDeque<u8>,
     gone: bool,
+    failed: bool,
     waker: Option<Waker>,
 }
 
@@ -51,6 +53,14 @@ impl Keyboard {
             waker.wake();
         }
     }
+
+    fn fail(&self) {
+        let mut keys = self.0.lock_or_recover();
+        keys.failed = true;
+        if let Some(waker) = keys.waker.take() {
+            waker.wake();
+        }
+    }
 }
 
 impl ByteSource for Keyboard {
@@ -62,6 +72,9 @@ impl ByteSource for Keyboard {
                 *dst = src;
             }
             return Poll::Ready(Ok(n));
+        }
+        if keys.failed {
+            return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
         }
         if keys.gone {
             return Poll::Ready(Ok(0));
@@ -128,6 +141,14 @@ const ROWS: u16 = 24;
 const COLS: u16 = 80;
 
 fn console() -> Console {
+    console_with_input_eof(None)
+}
+
+fn finite_console() -> Console {
+    console_with_input_eof(Some(ConsoleInputEof::Finite))
+}
+
+fn console_with_input_eof(input_eof: Option<ConsoleInputEof>) -> Console {
     let keyboard = Arc::new(Keyboard::default());
     let screen = Arc::new(Capture::default());
     let host: Arc<dyn Host> = Arc::new(ThreadHost);
@@ -144,10 +165,13 @@ fn console() -> Console {
             ypixel: 0,
         },
     };
-    let kernel = Kernel::new(host, Arc::new(root))
+    let builder = Kernel::new(host, Arc::new(root))
         .with_shm(Arc::new(shm))
-        .with_init()
-        .with_console(console);
+        .with_init();
+    let kernel = match input_eof {
+        Some(input_eof) => builder.with_console_eof(console, input_eof),
+        None => builder.with_console(console),
+    };
     let vfs = kernel.vfs().clone();
     block_on(vfs.mount(b"/proc", kernel.procfs(), MountFlags::default(), true)).unwrap();
     let dev = MemFs::new(clock, 0o755, 0, 0);
@@ -595,6 +619,130 @@ fn the_end_of_the_hosts_input_is_a_hangup() {
 
     eventually("SIGHUP", || c.pending(c.leader, Signal::SIGHUP));
     assert_eq!(block_on(read), Ok(0));
+}
+
+/// Finite input commits a partial canonical line without adding a VEOF byte. Reads can drain
+/// it in chunks and then report EOF; the terminal itself remains open for output.
+#[test]
+fn finite_console_eof_commits_a_long_partial_canonical_line() {
+    let c = finite_console();
+    let memory = memory();
+    let caller = Caller::new(c.leader, &memory);
+    let line = b"0123456789abcdefghijklmnopqrst";
+    c.keyboard.type_in(line);
+    c.keyboard.unplug();
+
+    let file = c.kernel.file(c.leader, Fd(0)).unwrap();
+    eventually("finite EOF commits the partial canonical line", || {
+        wasixv2_wait::Pollable::poll(&*file, None).contains(wasixv2_wait::PollMask::READABLE)
+    });
+    assert_eq!(c.ioctl_int(&caller, IoctlRequest::TIOCINQ), Ok(line.len() as i32));
+    assert_eq!(c.read(&caller, 16), Ok(line[..16].to_vec()));
+    assert_eq!(c.read(&caller, 16), Ok(line[16..].to_vec()));
+    assert_eq!(c.read(&caller, 16), Ok(Vec::new()));
+    assert!(!c.pending(c.leader, Signal::SIGHUP));
+
+    assert_eq!(c.write(&caller, 1, b"after EOF\n"), Ok(10));
+    assert!(c.shown().ends_with(b"after EOF\r\n"));
+}
+
+/// Empty finite input is readable EOF without tty hangup, and stdout still reaches the host.
+#[test]
+fn finite_console_empty_eof_does_not_hang_up_the_terminal() {
+    let c = finite_console();
+    let memory = memory();
+    let caller = Caller::new(c.leader, &memory);
+    let mut read = Box::pin(c.kernel.read(&caller, Fd(0), UserSliceMut::new(0x200, 16)));
+    assert_eq!(read.as_mut().now_or_never(), None);
+    c.keyboard.unplug();
+
+    let file = c.kernel.file(c.leader, Fd(0)).unwrap();
+    eventually("empty finite EOF is readable", || {
+        wasixv2_wait::Pollable::poll(&*file, None).contains(wasixv2_wait::PollMask::READABLE)
+    });
+    let ready = wasixv2_wait::Pollable::poll(&*file, None);
+    assert!(ready.contains(wasixv2_wait::PollMask::READABLE));
+    assert!(!ready.contains(wasixv2_wait::PollMask::HUP));
+    assert!(!ready.contains(wasixv2_wait::PollMask::ERR));
+    assert_eq!(read.as_mut().now_or_never(), Some(Ok(0)));
+    assert!(!c.pending(c.leader, Signal::SIGHUP));
+
+    assert_eq!(c.write(&caller, 1, b"still open\n"), Ok(11));
+    assert!(c.shown().ends_with(b"still open\r\n"));
+}
+
+/// A canceled raw read with VMIN still waits for enough bytes. Finite EOF wakes poll and lets a
+/// later read return the bytes below VMIN, followed by zero once they are drained.
+#[test]
+fn finite_console_eof_wakes_raw_vmin_poll_after_read_cancellation() {
+    let c = finite_console();
+    let memory = memory();
+    let caller = Caller::new(c.leader, &memory);
+    let mut raw = c.tcgetattr(&caller);
+    raw.c_lflag.0 &= !(TermiosLflag::ICANON.0 | TermiosLflag::ECHO.0 | TermiosLflag::ISIG.0);
+    raw.c_cc[TermiosCcIndex::VMIN.0 as usize] = 3;
+    raw.c_cc[TermiosCcIndex::VTIME.0 as usize] = 0;
+    assert_eq!(c.tcsetattr(&caller, &raw), Ok(0));
+
+    let canceled = Box::pin(c.kernel.read(&caller, Fd(0), UserSliceMut::new(0x200, 16)));
+    assert_eq!(canceled.now_or_never(), None);
+
+    c.keyboard.type_in(b"xy");
+    eventually("raw input below VMIN", || {
+        c.ioctl_int(&caller, IoctlRequest::TIOCINQ) == Ok(2)
+    });
+    let file = c.kernel.file(c.leader, Fd(0)).unwrap();
+    assert!(
+        !wasixv2_wait::Pollable::poll(&*file, None).contains(wasixv2_wait::PollMask::READABLE)
+    );
+
+    c.keyboard.unplug();
+    eventually("finite EOF makes sub-VMIN input readable", || {
+        wasixv2_wait::Pollable::poll(&*file, None).contains(wasixv2_wait::PollMask::READABLE)
+    });
+    assert_eq!(c.read(&caller, 16), Ok(b"xy".to_vec()));
+    assert_eq!(c.read(&caller, 16), Ok(Vec::new()));
+    assert!(!c.pending(c.leader, Signal::SIGHUP));
+}
+
+/// Only `Ok(0)` is finite EOF. An input-source error still hangs up even under finite policy.
+#[test]
+fn finite_console_input_error_still_hangs_up() {
+    let c = finite_console();
+    let memory = memory();
+    let caller = Caller::new(c.leader, &memory);
+    c.kernel
+        .task_signals(c.leader)
+        .replace_blocked(blocked(Signal::SIGHUP));
+    let mut read = Box::pin(c.kernel.read(&caller, Fd(0), UserSliceMut::new(0x200, 16)));
+    assert_eq!(read.as_mut().now_or_never(), None);
+
+    c.keyboard.fail();
+
+    eventually("source error sends SIGHUP", || c.pending(c.leader, Signal::SIGHUP));
+    assert_eq!(block_on(read), Ok(0));
+    assert_eq!(errno(c.write(&caller, 1, b"x")), Errno::EIO);
+}
+
+/// Explicit hangup remains a hangup when the input source uses finite EOF semantics.
+#[test]
+fn finite_console_still_honors_explicit_hangup() {
+    let c = finite_console();
+    let memory = memory();
+    let caller = Caller::new(c.leader, &memory);
+    c.kernel
+        .task_signals(c.leader)
+        .replace_blocked(blocked(Signal::SIGHUP));
+
+    c.kernel.console_hangup();
+
+    assert!(c.pending(c.leader, Signal::SIGHUP));
+    let file = c.kernel.file(c.leader, Fd(0)).unwrap();
+    let poll = wasixv2_wait::Pollable::poll(&*file, None);
+    assert!(poll.contains(wasixv2_wait::PollMask::HUP));
+    assert!(poll.contains(wasixv2_wait::PollMask::ERR));
+    assert_eq!(c.read(&caller, 16), Ok(Vec::new()));
+    assert_eq!(errno(c.write(&caller, 1, b"x")), Errno::EIO);
 }
 
 /// `TIOCSTI` pushes input as if typed, for the terminal's own session.
