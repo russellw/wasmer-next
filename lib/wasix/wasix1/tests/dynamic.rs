@@ -542,6 +542,9 @@ fn missing_loader_uses_old_unknown_error_before_reading_open_arguments() {
       (import "wasix_32v1" "dlopen" (func $open (param i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
       (import "wasix_32v1" "dlsym" (func $sym (param i32 i32 i32 i32 i32 i32) (result i32)))
       (import "wasix_32v1" "dl_invalid_handle" (func $valid (param i32) (result i32)))
+      (import "wasix_32v1" "closure_allocate" (func $allocate (param i32) (result i32)))
+      (import "wasix_32v1" "closure_prepare" (func $prepare (param i32 i32 i32 i32 i32 i32 i32) (result i32)))
+      (import "wasix_32v1" "closure_free" (func $free (param i32) (result i32)))
       (import "wasix_32v1" "proc_exit2" (func $exit (param i32)))
       (memory (export "memory") 1)
       (data (i32.const 600) "value")
@@ -551,7 +554,14 @@ fn missing_loader_uses_old_unknown_error_before_reading_open_arguments() {
         (if (i32.load8_u (i32.const 256)) (then (call $exit (i32.const 2))))
         (if (i32.ne (call $sym (i32.const 1) (i32.const 600) (i32.const 5)
           (i32.const 256) (i32.const 1) (i32.const 512)) (i32.const 79)) (then (call $exit (i32.const 3))))
-        (if (i32.ne (call $valid (i32.const 1)) (i32.const 45)) (then (call $exit (i32.const 4))))))"#).unwrap();
+        (if (i32.ne (call $valid (i32.const 1)) (i32.const 45)) (then (call $exit (i32.const 4))))
+        ;; Static v1 images reject closures before inspecting pointers or slot IDs.
+        (if (i32.ne (call $allocate (i32.const -1)) (i32.const 58)) (then (call $exit (i32.const 5))))
+        (if (i32.ne (call $prepare (i32.const -1) (i32.const -1)
+          (i32.const -1) (i32.const -1) (i32.const -1) (i32.const -1) (i32.const -1))
+          (i32.const 58)) (then (call $exit (i32.const 6))))
+        (if (i32.ne (call $free (i32.const 0)) (i32.const 58)) (then (call $exit (i32.const 7))))
+        (if (i32.ne (call $free (i32.const -1)) (i32.const 58)) (then (call $exit (i32.const 8))))))"#).unwrap();
     assert_eq!(run("missing-loader", &image, &[]), 0);
 }
 
