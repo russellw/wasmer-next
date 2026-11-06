@@ -144,6 +144,37 @@ impl Kernel {
         }
     }
 
+    /// Check an explicitly captured replacement target while its table is locked.
+    /// The caller's provider and table identity must already have been validated.
+    /// Uncaptured targets retain the syscall's ordinary numeric replacement behavior.
+    pub(crate) fn check_bound_destination(
+        &self,
+        caller: &Caller<'_>,
+        files: &FdTable,
+        fd: Fd,
+    ) -> Result<(), Errno> {
+        let Some(set) = caller.descriptors() else {
+            return Ok(());
+        };
+        let bound = set.payload::<BoundDescriptors>().ok_or(Errno::EBADF)?;
+        let Some(expected) = bound.entries.get(&fd) else {
+            return Ok(());
+        };
+        let same = match (expected, files.bind(fd)) {
+            (None, None) => true,
+            (Some(expected), Some(current)) => {
+                Arc::ptr_eq(&expected.token, &current.token)
+                    && match (&expected.attachment, &current.attachment) {
+                        (None, None) => true,
+                        (Some(a), Some(b)) => a.ptr_eq(b),
+                        _ => false,
+                    }
+            }
+            _ => false,
+        };
+        if same { Ok(()) } else { Err(Errno::EAGAIN) }
+    }
+
     pub(crate) fn caller_file(&self, caller: &Caller<'_>, fd: Fd) -> Result<Arc<OpenFile>, Errno> {
         let Some(set) = caller.descriptors() else {
             return self.file(caller.task(), fd);

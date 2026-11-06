@@ -763,6 +763,7 @@ impl Kernel {
                 return Err(Errno::EBADF);
             }
             let slot = self.bound_slot(caller, table, old)?;
+            self.check_bound_destination(caller, table, new)?;
             // `expand_files`: a table that cannot grow to `new` is `EBADF` here, not `EMFILE`.
             if table.expand(new.0 as usize).is_err() {
                 return Err(Errno::EBADF);

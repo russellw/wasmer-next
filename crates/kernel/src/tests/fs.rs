@@ -998,6 +998,179 @@ fn descriptor_two_directory_operands_stay_bound_across_close_and_reuse() {
 }
 
 #[test]
+fn descriptor_dup3_rejects_replaced_or_removed_captured_destinations() {
+    for removed in [false, true] {
+        let (kernel, task, memory) = machine();
+        let t = T::new(&kernel, task, &memory);
+        t.create("/source", b"source");
+        t.create("/target", b"target");
+        let source = t.open("/source", OpenFlags::O_RDONLY).unwrap();
+        let target = t.open("/target", OpenFlags::O_RDONLY).unwrap();
+        let alias = block_on(kernel.dup(&t.caller, target)).unwrap();
+        let set = kernel
+            .snapshot_descriptors(task, &[source, target])
+            .unwrap();
+        t.close(target);
+        if !removed {
+            // Reinstalling the same open file is still a different slot identity (ABA).
+            block_on(kernel.dup3(&t.caller, alias, target, OpenFlags(0))).unwrap();
+        }
+        let plan = wasixv2_syscalls::DescriptorInstallations::new(vec![None]);
+        let caller = Caller::new(task, &memory)
+            .with_descriptors(&set)
+            .with_descriptor_installations(&plan);
+        assert_eq!(
+            block_on(kernel.dup3(&caller, source, target, OpenFlags(0))),
+            Err(Errno::EAGAIN.into())
+        );
+        assert!(plan.result(0).is_none());
+        if removed {
+            assert_eq!(errno(t.read(target, 6)), Errno::EBADF);
+        } else {
+            assert_eq!(t.read(target, 6).unwrap(), b"target");
+        }
+    }
+}
+
+#[test]
+fn descriptor_dup3_compares_destination_attachment_identity() {
+    use wasixv2_syscalls::{DescriptorAttachment, DescriptorUpdate};
+    for (before, after) in [(None, Some(7_u64)), (Some(7_u64), None), (Some(7), Some(7))] {
+        let (kernel, task, memory) = machine();
+        let t = T::new(&kernel, task, &memory);
+        t.create("/source", b"source");
+        t.create("/target", b"target");
+        let source = t.open("/source", OpenFlags::O_RDONLY).unwrap();
+        let target = t.open("/target", OpenFlags::O_RDONLY).unwrap();
+        let initial = kernel.snapshot_descriptors(task, &[target]).unwrap();
+        assert_eq!(
+            kernel.replace_descriptor_attachment(
+                task,
+                &initial,
+                target,
+                before.map(DescriptorAttachment::new)
+            ),
+            Ok(DescriptorUpdate::Replaced)
+        );
+        let set = kernel
+            .snapshot_descriptors(task, &[source, target])
+            .unwrap();
+        assert_eq!(
+            kernel.replace_descriptor_attachment(
+                task,
+                &set,
+                target,
+                after.map(DescriptorAttachment::new)
+            ),
+            Ok(DescriptorUpdate::Replaced)
+        );
+        let caller = Caller::new(task, &memory).with_descriptors(&set);
+        assert_eq!(
+            block_on(kernel.dup3(&caller, source, target, OpenFlags(0))),
+            Err(Errno::EAGAIN.into())
+        );
+        assert_eq!(descriptor_value(&kernel, task, target), after);
+        assert_eq!(t.read(target, 6).unwrap(), b"target");
+        let current = kernel
+            .snapshot_descriptors(task, &[source, target])
+            .unwrap();
+        let caller = Caller::new(task, &memory).with_descriptors(&current);
+        assert_eq!(
+            block_on(kernel.dup3(&caller, source, target, OpenFlags(0))),
+            Ok(target)
+        );
+        assert_eq!(t.read(target, 6).unwrap(), b"source");
+    }
+}
+
+#[test]
+fn descriptor_dup3_checks_captured_absence_but_keeps_uncaptured_replacement() {
+    let (kernel, task, memory) = machine();
+    let t = T::new(&kernel, task, &memory);
+    t.create("/source", b"source");
+    t.create("/other", b"other");
+    let source = t.open("/source", OpenFlags::O_RDONLY).unwrap();
+    let other = t.open("/other", OpenFlags::O_RDONLY).unwrap();
+    let target = Fd(20);
+    let set = kernel
+        .snapshot_descriptors(task, &[source, target])
+        .unwrap();
+    assert!(!set.get(target).unwrap().present);
+    // Another operation installs a file after absence was captured.
+    block_on(kernel.dup3(&t.caller, other, target, OpenFlags(0))).unwrap();
+    let caller = Caller::new(task, &memory).with_descriptors(&set);
+    assert_eq!(
+        block_on(kernel.dup3(&caller, source, target, OpenFlags(0))),
+        Err(Errno::EAGAIN.into())
+    );
+    assert_eq!(t.read(target, 5).unwrap(), b"other");
+    // Neither a source-only capture nor an ordinary caller constrains the destination.
+    let source_only = kernel.snapshot_descriptors(task, &[source]).unwrap();
+    let caller = Caller::new(task, &memory).with_descriptors(&source_only);
+    assert_eq!(
+        block_on(kernel.dup3(&caller, source, target, OpenFlags(0))),
+        Ok(target)
+    );
+    assert_eq!(t.read(target, 6).unwrap(), b"source");
+    assert_eq!(
+        block_on(kernel.dup3(&t.caller, other, target, OpenFlags(0))),
+        Ok(target)
+    );
+    // An unchanged absence remains a valid conditional installation.
+    let absent = Fd(21);
+    let set = kernel
+        .snapshot_descriptors(task, &[source, absent])
+        .unwrap();
+    let caller = Caller::new(task, &memory).with_descriptors(&set);
+    assert_eq!(
+        block_on(kernel.dup3(&caller, source, absent, OpenFlags::O_CLOEXEC)),
+        Ok(absent)
+    );
+    assert_eq!(
+        block_on(kernel.fcntl64(&t.caller, absent, FcntlCmd::F_GETFD, 0)),
+        Ok(1)
+    );
+    // An unchanged present target also remains replaceable.
+    let set = kernel.snapshot_descriptors(task, &[other, absent]).unwrap();
+    let caller = Caller::new(task, &memory).with_descriptors(&set);
+    assert_eq!(
+        block_on(kernel.dup3(&caller, other, absent, OpenFlags(0))),
+        Ok(absent)
+    );
+}
+
+#[test]
+fn descriptor_dup3_source_badf_precedes_destination_conflict() {
+    let (kernel, task, memory) = machine();
+    let t = T::new(&kernel, task, &memory);
+    t.create("/source", b"source");
+    t.create("/target", b"target");
+    t.create("/replacement", b"replacement");
+    let source = t.open("/source", OpenFlags::O_RDONLY).unwrap();
+    let target = t.open("/target", OpenFlags::O_RDONLY).unwrap();
+    let set = kernel
+        .snapshot_descriptors(task, &[source, target])
+        .unwrap();
+    t.close(source);
+    assert_eq!(t.open("/replacement", OpenFlags::O_RDONLY).unwrap(), source);
+    kernel
+        .replace_descriptor_attachment(
+            task,
+            &set,
+            target,
+            Some(wasixv2_syscalls::DescriptorAttachment::new(7_u64)),
+        )
+        .unwrap();
+    let caller = Caller::new(task, &memory).with_descriptors(&set);
+    assert_eq!(
+        block_on(kernel.dup3(&caller, source, target, OpenFlags(0))),
+        Err(Errno::EBADF.into())
+    );
+    assert_eq!(t.read(source, 11).unwrap(), b"replacement");
+    assert_eq!(t.read(target, 6).unwrap(), b"target");
+}
+
+#[test]
 fn descriptor_poll_keeps_captured_absence_after_installation_at_that_number() {
     use wasixv2_abi::{KernelTimespec, PollEvents, Pollfd, PollfdArray};
     use wasixv2_syscalls::{read_value, write_value};
