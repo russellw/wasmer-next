@@ -676,7 +676,7 @@ impl InstantiationHook<PendingControl> for LifecycleHook {
                     async move {
                         // The real thread instance inherited the original image's
                         // Handoff, despite having its own worker/Store/cleanup scope.
-                        process::take_over(&env, TaskId(1), Image::copied(image)).await;
+                        process::take_over(&env, TaskId(1), Image::copied(image).into()).await;
                         proof.event("transferred");
                         Err::<(), RuntimeError>(RuntimeError::user(Box::new(crate::Exited(0))))
                     }
