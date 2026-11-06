@@ -723,6 +723,78 @@ mod tests {
     )]
     #[cfg_attr(coverage_nightly, coverage(off))]
     #[test]
+    fn test_wasi_attaches_an_ordinary_same_store_instance_and_keeps_pure_functions_alive() {
+        (assert_c! {
+            #include "tests/wasmer.h"
+
+            int main() {
+                wasm_engine_t* engine = wasm_engine_new();
+                wasm_store_t* store = wasm_store_new(engine);
+                wasi_config_t* config = wasi_config_new("ordinary-instance");
+                wasi_env_t* wasi_env = wasi_env_new(store, config);
+                assert(wasi_env);
+
+                // No WASI imports, no import getter, no _start, and no memory-name convention.
+                wasm_byte_vec_t wat;
+                wasmer_byte_vec_new_from_string(
+                    &wat,
+                    "(module\n"
+                    "  (memory (export \"backing\") 1)\n"
+                    "  (data (i32.const 0) \"\\2a\\00\\00\\00\")\n"
+                    "  (func (export \"read\") (result i32) i32.const 0 i32.load))"
+                );
+                wasm_byte_vec_t wasm;
+                wat2wasm(&wat, &wasm);
+                wasm_module_t* module = wasm_module_new(store, &wasm);
+                assert(module);
+                wasm_extern_vec_t imports = WASM_EMPTY_VEC;
+                wasm_instance_t* instance = wasm_instance_new(store, module, &imports, NULL);
+                assert(instance);
+                assert(wasi_env_initialize_instance(wasi_env, store, instance));
+                assert(wasi_env_initialize_instance(wasi_env, store, instance));
+
+                wasm_extern_vec_t exports = WASM_EMPTY_VEC;
+                wasm_instance_exports(instance, &exports);
+                assert(exports.size == 2);
+                assert(wasm_extern_kind(exports.data[0]) == WASM_EXTERN_MEMORY);
+                wasm_func_t* read = wasm_extern_as_func(exports.data[1]);
+                assert(read);
+                wasm_func_t* copied = wasm_func_copy(read);
+                assert(copied);
+                wasm_val_vec_t arguments = WASM_EMPTY_VEC;
+                wasm_val_t result[1] = { WASM_INIT_VAL };
+                wasm_val_vec_t results = WASM_ARRAY_VEC(result);
+                assert(wasm_func_call(copied, &arguments, &results) == NULL);
+                assert(result[0].of.i32 == 42);
+
+                wasi_env_delete(wasi_env);
+                result[0].of.i32 = 0;
+                assert(wasm_func_call(read, &arguments, &results) == NULL);
+                assert(result[0].of.i32 == 42);
+                result[0].of.i32 = 0;
+                assert(wasm_func_call(copied, &arguments, &results) == NULL);
+                assert(result[0].of.i32 == 42);
+
+                wasm_func_delete(copied);
+                wasm_extern_vec_delete(&exports);
+                wasm_instance_delete(instance);
+                wasm_module_delete(module);
+                wasm_byte_vec_delete(&wasm);
+                wasm_byte_vec_delete(&wat);
+                wasm_store_delete(store);
+                wasm_engine_delete(engine);
+                return 0;
+            }
+        })
+        .success();
+    }
+
+    #[allow(
+        unexpected_cfgs,
+        reason = "tools like cargo-llvm-coverage pass --cfg coverage"
+    )]
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    #[test]
     fn test_wasi_environments_are_independent_in_one_store() {
         (assert_c! {
             #include "tests/wasmer.h"
