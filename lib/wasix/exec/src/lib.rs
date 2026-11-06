@@ -919,7 +919,7 @@ where
 {
     let cleanup = cleanup.into();
     abis.configure_store(&mut store)?;
-    let contexts_supported = !abis.requires_owning_thread();
+    // Hook affinity governs the worker; each context import checks its actual Store custody.
     let invocations = instantiation::NativeInvocations::bind_with_cleanup(
         &mut store,
         abis.requires_owning_thread(),
@@ -1103,7 +1103,6 @@ where
         data.threads = threads;
         data.proc.set_module(module);
         data.asyncify = asyncify;
-        data.contexts_supported = contexts_supported;
         let memory = env.as_ref(&store).memory().unwrap().clone();
         if let Some(attachments) = &attachments {
             attachments
