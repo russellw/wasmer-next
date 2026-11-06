@@ -704,12 +704,12 @@ mod tests {
             let finalized = Rc::new(Cell::new(false));
             if mode == 5 {
                 struct DeleteEnvironment {
-                    env: Rc<RefCell<Option<NativeWasi>>>,
+                    env: std::rc::Weak<RefCell<Option<NativeWasi>>>,
                     finalized: Rc<Cell<bool>>,
                 }
                 impl Drop for DeleteEnvironment {
                     fn drop(&mut self) {
-                        let env = self.env.borrow_mut().take();
+                        let env = self.env.upgrade().and_then(|env| env.borrow_mut().take());
                         drop(env);
                         self.finalized.set(true);
                     }
@@ -725,15 +725,23 @@ mod tests {
                 )
                 .unwrap();
                 let finalizer = DeleteEnvironment {
-                    env: wasi.clone(),
+                    env: Rc::downgrade(&wasi),
                     finalized: finalized.clone(),
                 };
+                let (delete, ready) = tokio::sync::oneshot::channel();
+                t.inner
+                    .cleanup_owner()
+                    .unwrap()
+                    .retain(Box::pin(async move {
+                        let _ = ready.await;
+                        // Rc stays on the existing local cleanup owner. The Send loader
+                        // callback only signals when old-image cleanup reaches this point.
+                        drop(finalizer);
+                    }));
                 assert!(
                     local
                         .submit(Box::new(move |_| Box::pin(async move {
-                            // This destructor runs during retain's synchronous old-image
-                            // cleanup, under the valid outer C API owner, before claim.
-                            drop(finalizer);
+                            let _ = delete.send(());
                         })))
                         .is_ok()
                 );
