@@ -47,19 +47,95 @@ pub enum EndpointKind {
     Datagram,
 }
 
-/// A validated local-unicast operation, before provider transport work is accepted.
+/// Borrowed validation context only; a provider bind admission never retains payload bytes.
+pub enum EndpointAutobind<'a> {
+    Connect(SocketAddr),
+    Send(&'a crate::SendMsg<'a>),
+    Listen(u32),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EndpointBindPurpose {
+    Bind,
+    /// Original unbound listen: call listen_tcp(any:0), never manufacture a bound TCP socket.
+    Listen {
+        backlog: u32,
+    },
+}
+
+/// A validated local-unicast operation, before provider transport work is accepted.
+#[derive(Clone)]
 pub struct EndpointQuery {
     pub kind: EndpointKind,
     pub source_id: EndpointSourceId,
     /// The original guest binding; a wildcard remains a wildcard.
     pub bound: Option<SocketAddr>,
+    /// Literal explicit bind request, including port zero; None means never explicitly bound.
+    pub requested_bind: Option<SocketAddr>,
+    /// The retained explicit bound resource, if admission used the optional provider.
+    pub binding: Option<Arc<dyn EndpointBound>>,
     /// The actual source, if already selected, including an allocated nonzero source port.
     pub effective_source: Option<SocketAddr>,
     pub destination: SocketAddr,
     /// A snapshot hint only: a binding exists, not necessarily a ready/eligible recipient.
     pub local_binding: bool,
 }
+
+/// An optional provider bind is admitted before the namespace reserves its actual address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EndpointBindRequest {
+    pub source_id: EndpointSourceId,
+    pub kind: EndpointKind,
+    pub requested: SocketAddr,
+    /// False for implicit UDP any:0 admission or direct unbound TCP listen.
+    /// Unbound TCP connect does not use bind admission.
+    pub explicit: bool,
+    pub purpose: EndpointBindPurpose,
+    pub domain: Domain,
+    pub v6only: bool,
+    pub reuse_addr: bool,
+    pub reuse_port: bool,
+}
+
+/// The same actual bound resource subsequently used for connect, listen, or datagrams.
+/// EAGAIN means Pending; Ready returns a nonzero actual port. Methods and Drop are bounded,
+/// never enter WLK, and queue cancellation/cleanup on the provider driver. Pending jobs
+/// retain weak publication authority so dropping the last lease closes late results.
+pub trait EndpointBound: Pollable + Any {
+    fn local_addr(&self) -> Result<SocketAddr, Errno>;
+}
+
+#[derive(Clone)]
+pub struct EndpointMember {
+    pub source_id: EndpointSourceId,
+    pub requested_bind: Option<SocketAddr>,
+    pub local: SocketAddr,
+    pub binding: Option<Arc<dyn EndpointBound>>,
+}
+
+impl std::fmt::Debug for EndpointMember {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EndpointMember")
+            .field("source_id", &self.source_id)
+            .field("requested_bind", &self.requested_bind)
+            .field("local", &self.local)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for EndpointMember {
+    fn eq(&self, other: &Self) -> bool {
+        self.source_id == other.source_id
+            && self.requested_bind == other.requested_bind
+            && self.local == other.local
+            && match (&self.binding, &other.binding) {
+                (None, None) => true,
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                _ => false,
+            }
+    }
+}
+impl Eq for EndpointMember {}
 
 /// Provider-owned identity of an exact peer/group/session for an accepted operation.
 /// Retaining it must not redirect to a replacement peer after directory changes. A provider
@@ -92,12 +168,39 @@ pub enum EndpointChoice {
 
 /// One UDP source epoch. Source port 0 has already been allocated locally. The bound IP may
 /// still be wildcard; each send separately supplies its actual effective source.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct EndpointSource {
     pub id: EndpointSourceId,
     pub group_id: EndpointGroupId,
     pub bound: SocketAddr,
     pub domain: Domain,
+    pub requested_bind: Option<SocketAddr>,
+    pub binding: Option<Arc<dyn EndpointBound>>,
+}
+
+impl std::fmt::Debug for EndpointQuery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EndpointQuery")
+            .field("source_id", &self.source_id)
+            .field("requested_bind", &self.requested_bind)
+            .field("bound", &self.bound)
+            .field("effective_source", &self.effective_source)
+            .field("destination", &self.destination)
+            .field("local_binding", &self.local_binding)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for EndpointSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EndpointSource")
+            .field("id", &self.id)
+            .field("group_id", &self.group_id)
+            .field("bound", &self.bound)
+            .field("requested_bind", &self.requested_bind)
+            .field("domain", &self.domain)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Complete desired UDP association/error-filter state for one source epoch. Revisions are
@@ -116,7 +219,7 @@ pub struct UdpTxConfig {
 /// Snapshot of one group and its separate registration attempt. The live member filter and
 /// these identities remain authoritative through table-to-socket ingress handoff; a more
 /// specific/different-family/replacement group must not receive this group's arrival.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EndpointGroupSpec {
     pub group_id: EndpointGroupId,
     pub attempt_id: PublicationAttemptId,
@@ -125,6 +228,9 @@ pub struct EndpointGroupSpec {
     pub domain: Domain,
     pub v6only: bool,
     pub revision: u64,
+    /// Membership at this revision. Each explicit bind retains its own requested address
+    /// and bound resource; one scalar request cannot describe a reuse group.
+    pub members: Arc<[EndpointMember]>,
 }
 
 /// State of the external registration, distinct from local bind/listen success.
@@ -195,6 +301,11 @@ pub trait EndpointLease: Pollable {
     /// remains the group's live member lookup. Ignore equal/older revisions. UDP may ignore it.
     fn set_backlog(&self, revision: u64, backlog: u32) {
         let _ = (revision, backlog);
+    }
+
+    /// Unlocked monotonic membership refresh, including the same bound handles as admission.
+    fn update_members(&self, revision: u64, members: Arc<[EndpointMember]>) {
+        let _ = (revision, members);
     }
 }
 
@@ -303,6 +414,20 @@ pub trait EndpointDatagramTx: Send + Sync {
 /// or publication is never replayed on a generation recheck. Returned data-plane objects
 /// instead obey their stricter any-namespace nonreentrancy/Drop contract documented above.
 pub trait EndpointProvider: Send + Sync {
+    /// Also select existing backend uplink unicast routes. Captured once per namespace;
+    /// DNS, veth, and another namespace's routes remain outside this optional capability.
+    fn select_external(&self) -> bool {
+        false
+    }
+    /// None accepts no work or callback custody and preserves ordinary namespace binding.
+    fn bind(
+        &self,
+        request: EndpointBindRequest,
+        wq: WaitQueue,
+    ) -> Result<Option<Arc<dyn EndpointBound>>, Errno> {
+        let _ = (request, wq);
+        Ok(None)
+    }
     fn select(&self, query: &EndpointQuery) -> Result<EndpointChoice, Errno> {
         let _ = query;
         Ok(EndpointChoice::Namespace)
@@ -552,7 +677,7 @@ mod gate_tests {
 }
 
 /// Observable status of one live group's current registration attempt.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EndpointPublicationStatus {
     pub group: EndpointGroupSpec,
     pub state: PublicationState,
@@ -560,7 +685,11 @@ pub struct EndpointPublicationStatus {
 
 pub(crate) mod runtime;
 
+pub(crate) mod bind;
 pub(crate) mod pending;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod bind_tests;

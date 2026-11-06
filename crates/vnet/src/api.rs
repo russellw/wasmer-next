@@ -584,6 +584,13 @@ pub trait Network: Send + Sync {
 /// listener is `IN | RDNORM` while connections are queued, `RDHUP` after the peer shut down,
 /// `ERR` while an error is pending, `PRI` while an urgent byte waits for `MSG_OOB`), and every
 /// state change must wake the queues `poll` registered with the matching events.
+/// One optional bind transaction owned by its waiting syscall. Dropping an uncommitted
+/// transaction retires its provisional source before releasing the provider lease.
+pub trait BindAdmission: Pollable {
+    /// EAGAIN while pending; repeated successful completion reserves the address only once.
+    fn complete(&self) -> Result<(), Errno>;
+}
+
 pub trait Socket: Pollable {
     /// Kernel timer hook for TCP's 200 ms cork ceiling (TCP_RTO_MIN).
     fn set_cork_timer(&self, arm: Box<dyn Fn(bool) + Send + Sync>) {
@@ -603,6 +610,27 @@ pub trait Socket: Pollable {
     /// `EINVAL`; a taken address `EADDRINUSE`; an address not on an interface
     /// `EADDRNOTAVAIL`.
     fn bind(&self, addr: SocketAddr, privileged: bool) -> Result<(), Errno>;
+
+    /// Optional owned asynchronous provider admission. None leaves ordinary bind unchanged.
+    fn bind_admission(
+        &self,
+        addr: SocketAddr,
+        privileged: bool,
+    ) -> Result<Option<Box<dyn BindAdmission>>, Errno> {
+        let _ = (addr, privileged);
+        Ok(None)
+    }
+
+    /// Optional implicit bind before UDP connect/send or direct unbound TCP listen.
+    /// Unbound TCP connect retains its separate provider path.
+    fn autobind_admission(
+        &self,
+        operation: crate::endpoint::EndpointAutobind<'_>,
+        privileged: bool,
+    ) -> Result<Option<Box<dyn BindAdmission>>, Errno> {
+        let _ = (operation, privileged);
+        Ok(None)
+    }
 
     /// `inet_listen`, with `backlog` already clamped to `somaxconn` by the kernel. Binds to an
     /// ephemeral port if unbound. `EOPNOTSUPP` for datagram sockets, `EINVAL` when connected.
@@ -949,6 +977,11 @@ pub enum StreamState {
 /// Urgent data follows `tcp_recvmsg` and `tcp_recv_urg` as [`crate::RecvQueue`] keeps them,
 /// with the guest's `SO_OOBINLINE`, which arrives through `set_option`.
 pub trait BackendStream: Pollable {
+    /// Actual local address of an opted-in endpoint stream. EAGAIN means it is not ready.
+    /// None preserves the ordinary namespace source. Bounded and nonreentrant like read.
+    fn provider_local_addr(&self) -> Option<Result<SocketAddr, Errno>> {
+        None
+    }
     /// Packet-carrying backends retain partial segments with `more`; synthetic
     /// streams may ignore this TCP packetization hint.
     fn write_more(&self, data: &[u8], more: bool, mss: usize) -> Result<usize, Errno> {

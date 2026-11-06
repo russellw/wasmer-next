@@ -376,8 +376,8 @@ impl Kernel {
         file: Arc<OpenFile>,
         raw: &[u8],
     ) -> SysResult<i32> {
-        let sock = match any_socket_file(file)? {
-            AnySock::Inet((_, sock)) => sock,
+        let (file, sock) = match any_socket_file(file)? {
+            AnySock::Inet((file, sock)) => (file, sock),
             AnySock::Unix(_, sock) => return self.unix_bind(caller, &sock, raw).await,
             AnySock::Netlink(_, nl) => {
                 return Ok(nl.bind(
@@ -409,8 +409,47 @@ impl Kernel {
         if socket::family(raw)? == AddressFamily::AF_UNSPEC && !addr.ip().is_unspecified() {
             return Err(Errno::EAFNOSUPPORT.into());
         }
-        sock.socket.bind(addr, privileged)?;
+        if let Some(admission) = sock.socket.bind_admission(addr, privileged)? {
+            let interrupt = self.interrupt(caller);
+            // bind itself does not acquire O_NONBLOCK or socket send-timeout semantics.
+            let mut io = Self::io(caller, &*interrupt, &file);
+            io.flags &= !OpenFlags::O_NONBLOCK;
+            let mut wait = socket::Blocking::new(&*self.host, io, MsgFlags::empty(), None);
+            wait.wait(
+                WaitOn::Object(&*admission),
+                PollMask::WRITABLE | PollMask::ERR,
+                || admission.complete(),
+            )
+            .await?;
+        } else {
+            sock.socket.bind(addr, privileged)?;
+        }
         Ok(0)
+    }
+
+    async fn endpoint_autobind(
+        &self,
+        caller: &Caller<'_>,
+        file: &OpenFile,
+        socket: &dyn wasixv2_vnet::Socket,
+        operation: wasixv2_vnet::endpoint::EndpointAutobind<'_>,
+    ) -> SysResult<()> {
+        let privileged = self
+            .cred(caller)
+            .ns_capable(self.ns(caller).net.user_ns(), Cap::NetBindService);
+        if let Some(admission) = socket.autobind_admission(operation, privileged)? {
+            let interrupt = self.interrupt(caller);
+            let mut io = Self::io(caller, &*interrupt, file);
+            io.flags &= !OpenFlags::O_NONBLOCK;
+            let mut wait = socket::Blocking::new(&*self.host, io, MsgFlags::empty(), None);
+            wait.wait(
+                WaitOn::Object(&*admission),
+                PollMask::WRITABLE | PollMask::ERR,
+                || admission.complete(),
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     /// `__sys_listen`.
@@ -421,10 +460,10 @@ impl Kernel {
         backlog: i32,
     ) -> SysResult<i32> {
         let file = self.caller_file(caller, fd)?;
-        self.listen_file(caller, file, backlog)
+        self.listen_file(caller, file, backlog).await
     }
 
-    pub(crate) fn listen_file(
+    pub(crate) async fn listen_file(
         &self,
         caller: &Caller<'_>,
         file: Arc<OpenFile>,
@@ -432,7 +471,19 @@ impl Kernel {
     ) -> SysResult<i32> {
         let backlog = (backlog as u32).min(SOMAXCONN);
         match any_socket_file(file)? {
-            AnySock::Inet((_, sock)) => sock.socket.listen(backlog)?,
+            AnySock::Inet((file, sock)) => {
+                if sock.socket.kind() != SocketKind::Stream {
+                    return Ok(sock.socket.listen(backlog).map(|()| 0)?);
+                }
+                self.endpoint_autobind(
+                    caller,
+                    &file,
+                    &*sock.socket,
+                    wasixv2_vnet::endpoint::EndpointAutobind::Listen(backlog),
+                )
+                .await?;
+                sock.socket.listen(backlog)?;
+            }
             AnySock::Unix(_, sock) => sock.listen(backlog, self.peer_cred(caller))?,
             AnySock::Vsock(_, v) => v.listen(backlog)?,
             AnySock::Netlink(..) | AnySock::Packet(..) => return Err(Errno::EOPNOTSUPP.into()),
@@ -598,6 +649,13 @@ impl Kernel {
                 socket::decode(socket.domain(), &raw, false)?
             }
         };
+        self.endpoint_autobind(
+            caller,
+            &file,
+            &**socket,
+            wasixv2_vnet::endpoint::EndpointAutobind::Connect(addr),
+        )
+        .await?;
         let interrupt = self.interrupt(caller);
         let mut wait = sock.blocking(Self::io(caller, &*interrupt, &file), SND, wait);
         // `__inet_stream_connect`: a blocking socket waits for a connection under way, its
@@ -742,7 +800,7 @@ impl Kernel {
         let interrupt = self.interrupt(caller);
         let io = Self::io(caller, &*interrupt, sock.file());
         let result = match sock {
-            AnySock::Inet((_, sock)) => {
+            AnySock::Inet((file, sock)) => {
                 // `security_socket_sendmsg`: a UDP send names its port, or autobinds.
                 if let Some(landlock) = self.landlock(caller)
                     && landlock_request(sock, 0, crate::landlock::CONNECT_SEND_UDP).is_some()
@@ -786,6 +844,13 @@ impl Kernel {
                         net_raw,
                         now: self.host.monotonic(),
                     };
+                    self.endpoint_autobind(
+                        caller,
+                        file,
+                        &*sock.socket,
+                        wasixv2_vnet::endpoint::EndpointAutobind::Send(&msg),
+                    )
+                    .await?;
                     match sock.send(&mut wait, msg).await {
                         Ok(k) => {
                             sent += k;

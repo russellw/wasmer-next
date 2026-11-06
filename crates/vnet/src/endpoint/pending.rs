@@ -54,6 +54,11 @@ impl Pollable for PendingStream {
     }
 }
 impl BackendStream for PendingStream {
+    fn provider_local_addr(&self) -> Option<Result<SocketAddr, Errno>> {
+        self.stream()
+            .ok()
+            .and_then(|stream| stream.provider_local_addr())
+    }
     fn state(&self) -> StreamState {
         match self.stream() {
             Ok(s) => s.state(),

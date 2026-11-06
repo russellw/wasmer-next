@@ -24,8 +24,9 @@ use crate::{
     bpf::{Arrival, PACKET_HOST, PACKET_LOOPBACK, PACKET_MULTICAST, SockFilter},
     cmsg::{self, SendCtl},
     endpoint::{
-        AttemptGate, DatagramDelivery, EndpointChoice, EndpointDatagramTx, EndpointKind,
-        EndpointQuery, EndpointSource, EndpointSourceId, EndpointTarget, UdpTxConfig,
+        AttemptGate, DatagramDelivery, EndpointBindPurpose, EndpointBindRequest, EndpointBound,
+        EndpointChoice, EndpointDatagramTx, EndpointKind, EndpointQuery, EndpointSource,
+        EndpointSourceId, EndpointTarget, UdpTxConfig,
         runtime::{Namespace, SocketEndpoint},
     },
     icmp::{Back, IPPROTO_UDP, IPV4_HDR, IPV6_HDR, Quoted, UDP_HDR, udp_datagram},
@@ -59,6 +60,7 @@ struct Datagram {
 }
 
 /// udp_sock::pending and the first send's cork metadata (udp_sendmsg/udpv6_sendmsg).
+#[derive(Clone)]
 struct Pending {
     policy_dst: SocketAddr,
     data: Vec<u8>,
@@ -67,6 +69,14 @@ struct Pending {
     scope: u32,
     ctl: SendCtl,
     now: std::time::Duration,
+}
+
+struct PreparedFlow<'a> {
+    local: SocketAddr,
+    dst: SocketAddr,
+    scope: u32,
+    ctl: SendCtl,
+    data: Cow<'a, [u8]>,
 }
 
 #[derive(Clone)]
@@ -94,6 +104,10 @@ struct Inner {
     cork: bool,
     pending: Option<Pending>,
     local: Option<SocketAddr>,
+    requested_bind: Option<SocketAddr>,
+    bind_pending: Option<EndpointSourceId>,
+    bind_admission: Weak<crate::endpoint::bind::Admission>,
+    endpoint_bound: Option<Arc<dyn EndpointBound>>,
     /// `inet_rcv_saddr` of a bind that took no port (`IP_BIND_ADDRESS_NO_PORT`): the address
     /// the port taken later by `connect` or a send goes with.
     saddr: Option<IpAddr>,
@@ -165,6 +179,10 @@ impl UdpSocket {
                 cork: false,
                 pending: None,
                 local: None,
+                requested_bind: None,
+                bind_pending: None,
+                bind_admission: Weak::new(),
+                endpoint_bound: None,
                 saddr: None,
                 addr_locked: false,
                 port_locked: false,
@@ -187,6 +205,146 @@ impl UdpSocket {
             }),
             auto_publication: Mutex::new(None),
         })
+    }
+
+    fn provider_bind(
+        &self,
+        requested: SocketAddr,
+        privileged: bool,
+        explicit: bool,
+    ) -> NetResult<Option<Box<dyn crate::BindAdmission>>> {
+        let Some(namespace) = self.net.endpoints() else {
+            return Ok(None);
+        };
+        let original_bind = if explicit {
+            Some(requested)
+        } else {
+            self.lock().requested_bind
+        };
+        let requested = original_bind.unwrap_or(requested);
+        if explicit {
+            self.net.admit(requested, crate::PolicyDirection::Inbound)?;
+        }
+        let (request, admission) = {
+            let mut g = self.lock();
+            if !explicit {
+                if g.local.is_some() {
+                    return Ok(None);
+                }
+                if let Some(admission) = g.bind_admission.upgrade() {
+                    return Ok(Some(admission.subscribe()));
+                }
+            }
+            if !explicit && g.requested_bind != original_bind {
+                return Err(Errno::EAGAIN);
+            }
+            let requested = original_bind.unwrap_or(requested);
+            let request_explicit = original_bind.is_some();
+            let addr = canonical(requested);
+            let freebind = g.opts.flag(0, wasixv2_abi::IpOption::IP_FREEBIND.0);
+            self.net.check_bind(addr, privileged, freebind)?;
+            if matches!(requested, SocketAddr::V6(v6) if v6.ip().to_ipv4_mapped().is_some())
+                && g.opts.v6only
+            {
+                return Err(Errno::EINVAL);
+            }
+            if g.bind_pending.is_some() || g.local.is_some() || (explicit && g.saddr.is_some()) {
+                return Err(Errno::EINVAL);
+            }
+            self.endpoint.renew(&namespace);
+            let source_id = self.endpoint.source();
+            let request = EndpointBindRequest {
+                source_id,
+                kind: EndpointKind::Datagram,
+                requested,
+                explicit: request_explicit,
+                purpose: EndpointBindPurpose::Bind,
+                domain: self.domain(),
+                v6only: g.opts.v6only,
+                reuse_addr: g.opts.reuseaddr,
+                reuse_port: g.opts.reuseport,
+            };
+            let commit = self.me.clone();
+            let cancel = self.me.clone();
+            let active = self.me.clone();
+            let admission = crate::endpoint::bind::Admission::new(
+                self.wq.clone(),
+                move |actual, bound| {
+                    let socket = commit.upgrade().ok_or(Errno::ECANCELED)?;
+                    let actual = crate::endpoint::bind::validate(request, actual)?;
+                    socket.net.check_bind(
+                        actual,
+                        privileged,
+                        freebind || requested.ip().is_unspecified(),
+                    )?;
+                    let mut g = socket.lock();
+                    if g.bind_pending != Some(source_id) || socket.endpoint.source() != source_id {
+                        return Err(Errno::ECANCELED);
+                    }
+                    socket.net.udp_bind(
+                        socket.id,
+                        socket.spec(&g.opts, actual.ip()),
+                        actual.port(),
+                        socket.me.clone(),
+                    )?;
+                    g.local = Some(actual);
+                    g.requested_bind = request.explicit.then_some(requested);
+                    g.saddr = None;
+                    g.port_locked = request.explicit && requested.port() != 0;
+                    g.addr_locked |=
+                        request.explicit && !canonical(requested).ip().is_unspecified();
+                    g.bind_pending = None;
+                    g.bind_admission = Weak::new();
+                    g.endpoint_bound = Some(bound);
+                    socket.claim_publication(&mut g, None);
+                    socket.endpoint_join(&g, actual);
+                    let group = socket.endpoint.group();
+                    let namespace = socket.net.endpoints();
+                    drop(g);
+                    if let (Some(namespace), Some(group)) = (namespace, group) {
+                        namespace.refresh(&group);
+                    }
+                    Ok(())
+                },
+                move || {
+                    if let Some(socket) = cancel.upgrade() {
+                        socket.cancel_bind(source_id);
+                    }
+                },
+                move || {
+                    active.upgrade().is_some_and(|socket| {
+                        let g = socket.inner.lock().unwrap();
+                        g.bind_pending == Some(source_id) && socket.endpoint.source() == source_id
+                    })
+                },
+            );
+            g.bind_pending = Some(source_id);
+            g.bind_admission = Arc::downgrade(&admission);
+            (request, admission)
+        };
+        // The synchronous factory must not block; the lease represents all pending work.
+        let result = namespace.provider.bind(request, self.wq.clone());
+        admission.install(result.clone());
+        match result {
+            Ok(Some(_)) => Ok(Some(admission.subscribe())),
+            other => {
+                self.cancel_bind(request.source_id);
+                other.map(|_| None)
+            }
+        }
+    }
+
+    fn cancel_bind(&self, source: EndpointSourceId) {
+        let mut g = self.lock();
+        if g.bind_pending == Some(source) {
+            g.bind_pending = None;
+            g.bind_admission = Weak::new();
+            if let Some(ns) = self.net.endpoints() {
+                self.endpoint.renew(&ns);
+            }
+            drop(g);
+            self.wq.wake(PollMask::empty());
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -212,6 +370,9 @@ impl UdpSocket {
     }
 
     fn autobind(&self, g: &mut Inner) -> NetResult<SocketAddr> {
+        if g.bind_pending.is_some() {
+            return Err(Errno::EALREADY);
+        }
         if let Some(local) = g.local {
             self.endpoint_join(g, local);
             return Ok(local);
@@ -234,6 +395,8 @@ impl UdpSocket {
                 local,
                 self.domain(),
                 g.opts.v6only,
+                g.requested_bind,
+                g.endpoint_bound.clone(),
             );
         }
     }
@@ -322,6 +485,8 @@ impl UdpSocket {
                 }
                 let local = g.local.ok_or(Errno::EINVAL)?;
                 let group_id = self.endpoint.group_id().ok_or(Errno::EINVAL)?;
+                let requested_bind = g.requested_bind;
+                let binding = g.endpoint_bound.clone();
                 g.endpoint_opening = true;
                 drop(g);
                 let result = ns.provider.datagram(
@@ -330,6 +495,8 @@ impl UdpSocket {
                         group_id,
                         bound: local,
                         domain: self.domain(),
+                        requested_bind,
+                        binding,
                     },
                     initial,
                     self.wq.clone(),
@@ -891,13 +1058,64 @@ impl UdpSocket {
     /// `inet_sendmsg` and `udp_sendmsg`/`udpv6_sendmsg`, failing in their order: autobind,
     /// the size and flags, the destination, the control messages, the route, the payload
     /// limit, then (`sock_alloc_send_pskb`) a pending error and a shut down sender.
-    fn send_locked<'a>(
+    fn send_policy<'a>(
         &'a self,
-        mut g: MutexGuard<'a, Inner>,
-        msg: SendMsg<'_>,
+        msg: &SendMsg<'_>,
+    ) -> NetResult<(
+        MutexGuard<'a, Inner>,
+        Option<SocketAddr>,
+        crate::net::Admission,
+    )> {
+        let mut g = self.lock();
+        let mut admission = crate::net::Admission::Allowed;
+        if self.net.config.policy.is_some() {
+            loop {
+                let dst = policy_destination(&g, msg);
+                drop(g);
+                if let Some(dst) = dst {
+                    admission = self.net.admit(dst, crate::PolicyDirection::Outbound)?;
+                }
+                g = self.lock();
+                if policy_destination(&g, msg) == dst {
+                    break;
+                }
+            }
+        }
+        let dst = policy_destination(&g, msg);
+        Ok((g, dst, admission))
+    }
+
+    fn connect_path(
+        &self,
+        g: &Inner,
+        addr: SocketAddr,
+        admission: crate::net::Admission,
+    ) -> NetResult<Path> {
+        let dst = canonical(addr);
+        let path = match dst.ip().is_multicast() {
+            // `ip4_datagram_connect` routes a group by `IP_MULTICAST_IF`.
+            true => {
+                let route = self.mc_route(g, dst, scope_of(addr), None)?;
+                Path::Nowhere {
+                    src: route.src,
+                    unresolved: false,
+                }
+            }
+            false => self.net.path(dst, g.local.map(|l| l.ip()).or(g.saddr))?,
+        };
+        if admission == crate::net::Admission::DnsOnly && !matches!(path, Path::Dns { .. }) {
+            return Err(Errno::EPERM);
+        }
+        Ok(path)
+    }
+
+    fn send_dns_source(
+        &self,
+        g: &Inner,
+        msg: &SendMsg<'_>,
         policy_dst: Option<SocketAddr>,
         admission: crate::net::Admission,
-    ) -> NetResult<usize> {
+    ) -> NetResult<Option<IpAddr>> {
         let dns_source = if admission == crate::net::Admission::DnsOnly {
             let dst = canonical(policy_dst.ok_or(Errno::EDESTADDRREQ)?);
             let ctl = match &g.pending {
@@ -916,8 +1134,10 @@ impl UdpSocket {
         } else {
             None
         };
-        // `inet_send_prepare`: an unbound socket is bound first, `EAGAIN` if that fails.
-        let local = self.autobind(&mut g).map_err(|_| Errno::EAGAIN)?;
+        Ok(dns_source)
+    }
+
+    fn send_head(&self, g: &Inner, msg: &SendMsg<'_>) -> NetResult<()> {
         if msg.data.len() > MAX_SEND {
             return Err(Errno::EMSGSIZE);
         }
@@ -936,9 +1156,17 @@ impl UdpSocket {
                 Errno::EINVAL
             });
         }
-        // Appends skip the new destination and ancillary data, using the first send's
-        // flow (net/ipv4/udp.c udp_sendmsg, do_append_data).
-        let (local, dst, scope, ctl, data) = match g.pending.take() {
+        Ok(())
+    }
+
+    fn prepare_flow<'b>(
+        &self,
+        g: &Inner,
+        msg: &SendMsg<'b>,
+        local: SocketAddr,
+        pending: Option<Pending>,
+    ) -> NetResult<PreparedFlow<'b>> {
+        let (local, dst, scope, ctl, data) = match pending {
             Some(mut pending) => {
                 let max = if pending.dst.is_ipv4() {
                     MAX_V4_PAYLOAD
@@ -982,21 +1210,139 @@ impl UdpSocket {
                 )
             }
         };
-        let msg = SendMsg { data: &data, ..msg };
-        let cork = g.cork || msg.flags.contains(MsgFlags::MSG_MORE);
-        if let IpAddr::V4(v4) = dst.ip()
-            && v4.is_broadcast()
+        Ok(PreparedFlow {
+            local,
+            dst,
+            scope,
+            ctl,
+            data,
+        })
+    }
+
+    fn check_broadcast(&self, g: &Inner, dst: SocketAddr, len: usize) -> NetResult<bool> {
+        if !matches!(dst.ip(), IpAddr::V4(v4) if v4.is_broadcast()) {
+            return Ok(false);
+        }
+        // Broadcast is not carried (TODO); Linux still checks SO_BROADCAST.
+        if !g
+            .opts
+            .flag(SocketLevel::SOL_SOCKET.0, SocketOption::SO_BROADCAST.0)
         {
-            // Broadcast is not carried (TODO); Linux still checks SO_BROADCAST.
-            if !g
-                .opts
-                .flag(SocketLevel::SOL_SOCKET.0, SocketOption::SO_BROADCAST.0)
-            {
-                return Err(Errno::EACCES);
-            }
-            if msg.data.len() > MAX_V4_PAYLOAD {
-                return Err(Errno::EMSGSIZE);
-            }
+            return Err(Errno::EACCES);
+        }
+        if len > MAX_V4_PAYLOAD {
+            return Err(Errno::EMSGSIZE);
+        }
+        Ok(true)
+    }
+
+    fn check_unicast(
+        &self,
+        g: &mut Inner,
+        flow: &PreparedFlow<'_>,
+        dns_source: Option<IpAddr>,
+    ) -> NetResult<UdpRoute> {
+        let PreparedFlow {
+            local,
+            dst,
+            scope,
+            ctl,
+            data,
+        } = flow;
+        let (local, dst, scope) = (*local, *dst, *scope);
+        let route = match dns_source {
+            Some(src) => UdpRoute::Dns {
+                from: SocketAddr::new(src, local.port()),
+            },
+            None => self.net.udp_route(local, dst, &ctl)?,
+        };
+        let max = if dst.is_ipv4() {
+            MAX_V4_PAYLOAD
+        } else {
+            MAX_V6_PAYLOAD
+        };
+        if data.len() > max {
+            return Err(Errno::EMSGSIZE);
+        }
+        if let Some(size) = ctl.gso_size {
+            cmsg::check_segments(data.len(), size)?;
+        } else {
+            let mtu = self.net.mtu_to(dst.ip());
+            let oif = self.flow_oif(g, Some(dst), scope, &ctl);
+            let len = data.len() + UDP_HDR;
+            Self::check_mtu(g, dst.ip(), oif, mtu, len, ctl.dontfrag)?;
+        }
+        if let Some(e) = Self::take_err(g) {
+            return Err(e);
+        }
+        if g.wr_shut {
+            return Err(Errno::EPIPE);
+        }
+        Ok(route)
+    }
+
+    fn check_multicast(
+        &self,
+        g: &mut Inner,
+        dst: SocketAddr,
+        scope: u32,
+        ctl: &SendCtl,
+        len: usize,
+    ) -> NetResult<McRoute> {
+        let route = self.mc_route(g, dst, scope, Some(ctl))?;
+        let max = match dst.is_ipv4() {
+            true => MAX_V4_PAYLOAD,
+            false => MAX_V6_PAYLOAD,
+        };
+        if len > max {
+            return Err(Errno::EMSGSIZE);
+        }
+        if let Some(size) = ctl.gso_size {
+            cmsg::check_segments(len, size)?;
+        } else {
+            let mtu = self.net.link_mtu(route.oif);
+            let oif = self.flow_oif(g, Some(dst), scope, ctl);
+            let len = len + UDP_HDR;
+            Self::check_mtu(g, dst.ip(), oif, mtu, len, ctl.dontfrag)?;
+        }
+        if let Some(e) = Self::take_err(g) {
+            return Err(e);
+        }
+        if g.wr_shut {
+            return Err(Errno::EPIPE);
+        }
+        Ok(route)
+    }
+
+    fn send_locked<'a>(
+        &'a self,
+        mut g: MutexGuard<'a, Inner>,
+        msg: SendMsg<'_>,
+        policy_dst: Option<SocketAddr>,
+        admission: crate::net::Admission,
+    ) -> NetResult<usize> {
+        let dns_source = self.send_dns_source(&g, &msg, policy_dst, admission)?;
+        // `inet_send_prepare`: an unbound socket is bound first, `EAGAIN` if that fails.
+        let local = self.autobind(&mut g).map_err(|_| Errno::EAGAIN)?;
+        self.send_head(&g, &msg)?;
+        // Appends skip the new destination and ancillary data, using the first send's
+        // flow (net/ipv4/udp.c udp_sendmsg, do_append_data).
+        let pending = g.pending.take();
+        let flow = self.prepare_flow(&g, &msg, local, pending)?;
+        let PreparedFlow {
+            local,
+            dst,
+            scope,
+            ctl,
+            ..
+        } = &flow;
+        let (local, dst, scope, ctl) = (*local, *dst, *scope, *ctl);
+        let msg = SendMsg {
+            data: &flow.data,
+            ..msg
+        };
+        let cork = g.cork || msg.flags.contains(MsgFlags::MSG_MORE);
+        if self.check_broadcast(&g, dst, msg.data.len())? {
             if cork {
                 g.pending = Some(Pending {
                     policy_dst: policy_dst.unwrap_or(dst),
@@ -1013,34 +1359,7 @@ impl UdpSocket {
         if dst.ip().is_multicast() {
             return self.send_multicast(g, local, dst, scope, &ctl, msg, policy_dst);
         }
-        let route = match dns_source {
-            Some(src) => UdpRoute::Dns {
-                from: SocketAddr::new(src, local.port()),
-            },
-            None => self.net.udp_route(local, dst, &ctl)?,
-        };
-        let max = if dst.is_ipv4() {
-            MAX_V4_PAYLOAD
-        } else {
-            MAX_V6_PAYLOAD
-        };
-        if msg.data.len() > max {
-            return Err(Errno::EMSGSIZE);
-        }
-        if let Some(size) = ctl.gso_size {
-            cmsg::check_segments(msg.data.len(), size)?;
-        } else {
-            let mtu = self.net.mtu_to(dst.ip());
-            let oif = self.flow_oif(&g, Some(dst), scope, &ctl);
-            let len = msg.data.len() + UDP_HDR;
-            Self::check_mtu(&mut g, dst.ip(), oif, mtu, len, ctl.dontfrag)?;
-        }
-        if let Some(e) = Self::take_err(&mut g) {
-            return Err(e);
-        }
-        if g.wr_shut {
-            return Err(Errno::EPIPE);
-        }
+        let route = self.check_unicast(&mut g, &flow, dns_source)?;
         if cork {
             g.pending = Some(Pending {
                 policy_dst: policy_dst.unwrap_or(dst),
@@ -1059,7 +1378,8 @@ impl UdpSocket {
             let config = self.endpoint_config(&g);
             let local_binding = g.local;
             let connected = g.endpoint_connection.clone();
-            let eligible = matches!(&route,UdpRoute::Local {at,..} if Arc::ptr_eq(at,&self.net));
+            let eligible = matches!(&route,UdpRoute::Local {at,..} if Arc::ptr_eq(at,&self.net))
+                || (ns.external && matches!(&route, UdpRoute::Backend { .. }));
             let effective = match &route {
                 UdpRoute::Local { from, .. } => *from,
                 _ => local,
@@ -1069,6 +1389,8 @@ impl UdpSocket {
                 kind: EndpointKind::Datagram,
                 source_id: source,
                 bound: local_binding,
+                requested_bind: g.requested_bind,
+                binding: g.endpoint_bound.clone(),
                 effective_source: Some(effective),
                 destination: dst,
                 local_binding: ns.hint(EndpointKind::Datagram, dst, effective),
@@ -1310,28 +1632,7 @@ impl UdpSocket {
     ) -> NetResult<usize> {
         let data = msg.data;
         let cork = g.cork || msg.flags.contains(MsgFlags::MSG_MORE);
-        let route = self.mc_route(&g, dst, scope, Some(ctl))?;
-        let max = match dst.is_ipv4() {
-            true => MAX_V4_PAYLOAD,
-            false => MAX_V6_PAYLOAD,
-        };
-        if data.len() > max {
-            return Err(Errno::EMSGSIZE);
-        }
-        if let Some(size) = ctl.gso_size {
-            cmsg::check_segments(data.len(), size)?;
-        } else {
-            let mtu = self.net.link_mtu(route.oif);
-            let oif = self.flow_oif(&g, Some(dst), scope, ctl);
-            let len = data.len() + UDP_HDR;
-            Self::check_mtu(&mut g, dst.ip(), oif, mtu, len, ctl.dontfrag)?;
-        }
-        if let Some(e) = Self::take_err(&mut g) {
-            return Err(e);
-        }
-        if g.wr_shut {
-            return Err(Errno::EPIPE);
-        }
+        let route = self.check_multicast(&mut g, dst, scope, ctl, data.len())?;
         if cork {
             g.pending = Some(Pending {
                 policy_dst: policy_dst.unwrap_or(dst),
@@ -1596,6 +1897,7 @@ impl Socket for UdpSocket {
     }
 
     fn bind(&self, addr: SocketAddr, privileged: bool) -> NetResult<()> {
+        let requested = addr;
         self.net.admit(addr, crate::PolicyDirection::Inbound)?;
         let mapped = matches!(addr, SocketAddr::V6(v6) if v6.ip().to_ipv4_mapped().is_some());
         let addr = canonical(addr);
@@ -1605,11 +1907,12 @@ impl Socket for UdpSocket {
         }
         let freebind = g.opts.flag(0, wasixv2_abi::IpOption::IP_FREEBIND.0);
         self.net.check_bind(addr, privileged, freebind)?;
-        if g.local.is_some() {
+        if g.bind_pending.is_some() || g.local.is_some() {
             return Err(Errno::EINVAL);
         }
         // `__inet_bind`: without a port, the address waits for the port autobind picks.
         if addr.port() == 0 && g.opts.flag(0, IpOption::IP_BIND_ADDRESS_NO_PORT.0) {
+            g.requested_bind = Some(requested);
             g.saddr = Some(addr.ip());
             g.addr_locked |= !addr.ip().is_unspecified();
             return Ok(());
@@ -1622,6 +1925,7 @@ impl Socket for UdpSocket {
         )?;
         let local = SocketAddr::new(addr.ip(), port);
         g.local = Some(local);
+        g.requested_bind = Some(requested);
         g.saddr = None;
         g.addr_locked |= !addr.ip().is_unspecified();
         g.port_locked = addr.port() != 0;
@@ -1635,6 +1939,56 @@ impl Socket for UdpSocket {
         }
         self.auto_publish(local);
         Ok(())
+    }
+
+    fn bind_admission(
+        &self,
+        requested: SocketAddr,
+        privileged: bool,
+    ) -> NetResult<Option<Box<dyn crate::BindAdmission>>> {
+        self.provider_bind(requested, privileged, true)
+    }
+
+    fn autobind_admission(
+        &self,
+        operation: crate::endpoint::EndpointAutobind<'_>,
+        privileged: bool,
+    ) -> NetResult<Option<Box<dyn crate::BindAdmission>>> {
+        if self.net.endpoints().is_none() || self.lock().local.is_some() {
+            return Ok(None);
+        }
+        // Shared preparation validates without accepting bytes or consuming the live cork.
+        match operation {
+            crate::endpoint::EndpointAutobind::Listen(_) => return Ok(None),
+            crate::endpoint::EndpointAutobind::Connect(destination) => {
+                let admission = self
+                    .net
+                    .admit(destination, crate::PolicyDirection::Outbound)?;
+                let g = self.lock();
+                if self.domain() == Domain::Inet6
+                    && canonical(destination).is_ipv4()
+                    && g.opts.v6only
+                {
+                    return Err(Errno::ENETUNREACH);
+                }
+                self.connect_path(&g, destination, admission)?;
+            }
+            crate::endpoint::EndpointAutobind::Send(msg) => {
+                let (mut g, destination, admission) = self.send_policy(msg)?;
+                let dns_source = self.send_dns_source(&g, msg, destination, admission)?;
+                self.send_head(&g, msg)?;
+                let local = SocketAddr::new(g.saddr.unwrap_or(self.any()), 0);
+                let flow = self.prepare_flow(&g, msg, local, g.pending.clone())?;
+                if self.check_broadcast(&g, flow.dst, flow.data.len())? {
+                    // Broadcast's existing path intentionally skips pending socket errors.
+                } else if flow.dst.ip().is_multicast() {
+                    self.check_multicast(&mut g, flow.dst, flow.scope, &flow.ctl, flow.data.len())?;
+                } else {
+                    self.check_unicast(&mut g, &flow, dns_source)?;
+                }
+            }
+        }
+        self.provider_bind(SocketAddr::new(self.any(), 0), privileged, false)
     }
 
     fn listen(&self, _backlog: u32) -> NetResult<()> {
@@ -1651,27 +2005,16 @@ impl Socket for UdpSocket {
         let admission = self.net.admit(addr, crate::PolicyDirection::Outbound)?;
         let dst = canonical(addr);
         let mut g = self.lock();
-        let path = match dst.ip().is_multicast() {
-            // `ip4_datagram_connect` routes a group by `IP_MULTICAST_IF`.
-            true => {
-                let route = self.mc_route(&g, dst, scope_of(addr), None)?;
-                Path::Nowhere {
-                    src: route.src,
-                    unresolved: false,
-                }
-            }
-            false => self.net.path(dst, g.local.map(|l| l.ip()).or(g.saddr))?,
-        };
-        if admission == crate::net::Admission::DnsOnly && !matches!(path, Path::Dns { .. }) {
-            return Err(Errno::EPERM);
-        }
+        let path = self.connect_path(&g, addr, admission)?;
         let mut selected = None;
         let namespace = self.net.endpoints();
         let mut next_source = None;
         if let Some(ns) = &namespace {
             let candidate = EndpointSourceId(self.net.next_id());
             next_source = Some(candidate);
-            if matches!(path, Path::Local { net: None, .. }) {
+            if matches!(path, Path::Local { net: None, .. })
+                || (ns.external && matches!(path, Path::Backend { .. }))
+            {
                 let previous = self.endpoint.source();
                 let bound = g.local;
                 let saddr = g.saddr;
@@ -1680,6 +2023,8 @@ impl Socket for UdpSocket {
                     kind: EndpointKind::Datagram,
                     source_id: candidate,
                     bound,
+                    requested_bind: g.requested_bind,
+                    binding: g.endpoint_bound.clone(),
                     effective_source: Some(effective),
                     destination: dst,
                     local_binding: ns.hint(EndpointKind::Datagram, dst, effective),
@@ -1691,8 +2036,7 @@ impl Socket for UdpSocket {
                     return Err(Errno::ECANCELED);
                 }
                 let current = self.net.path(dst, g.local.map(|l| l.ip()).or(g.saddr))?;
-                if current.src() != path.src() || !matches!(current, Path::Local { net: None, .. })
-                {
+                if !current.endpoint_same(&path) {
                     return Err(Errno::EAGAIN);
                 }
                 if let EndpointChoice::Provider(target) = choice {
@@ -1702,7 +2046,7 @@ impl Socket for UdpSocket {
         }
         let src = path.src();
         let local = self.autobind(&mut g)?;
-        if local.ip().is_unspecified() {
+        if local.ip().is_unspecified() && g.endpoint_bound.is_none() {
             self.net.state().udp.rehash(self.id, local.port(), src);
             g.local = Some(SocketAddr::new(src, local.port()));
         }
@@ -1716,6 +2060,7 @@ impl Socket for UdpSocket {
             let bound = g.local.unwrap();
             self.endpoint_join(&g, bound);
         }
+        let provider_selected = selected.is_some();
         let endpoint_connection = if let Some(target) = selected {
             EndpointConnection::Peer(target)
         } else if matches!(path, Path::Backend { .. }) {
@@ -1724,6 +2069,12 @@ impl Socket for UdpSocket {
             EndpointConnection::Local
         };
         match path {
+            Path::Backend { .. } if provider_selected => {
+                g.backend = None;
+                if let Some((_, ep)) = &g.published {
+                    let _ = ep.attach(None);
+                }
+            }
             // The host endpoint filters by the peer and reports its ICMP errors.
             Path::Backend { host_dst, .. } => {
                 self.backend_endpoint(&mut g)?.connect(Some(host_dst))?
@@ -1763,15 +2114,16 @@ impl Socket for UdpSocket {
         if let Some(local) = g.local {
             let mut st = self.net.state();
             st.udp.set_remote(self.id, local.port(), None);
-            if !g.port_locked {
+            if !g.port_locked && g.endpoint_bound.is_none() {
                 st.udp.unbind(self.id, local.port());
                 g.local = None;
+                g.endpoint_bound = None;
                 // An address `bind` chose stays without the port (`inet_reset_saddr` only
                 // for an unlocked one).
                 g.saddr = g.addr_locked.then_some(local.ip());
                 drop(st);
                 released = self.release_publication(&mut g);
-            } else if !g.addr_locked {
+            } else if !g.addr_locked && g.endpoint_bound.is_none() {
                 st.udp.rehash(self.id, local.port(), self.any());
                 g.local = Some(SocketAddr::new(self.any(), local.port()));
             }
@@ -1816,22 +2168,7 @@ impl Socket for UdpSocket {
 
     fn send(&self, msg: SendMsg<'_>) -> NetResult<usize> {
         let len = msg.data.len();
-        let mut g = self.lock();
-        let mut admission = crate::net::Admission::Allowed;
-        if self.net.config.policy.is_some() {
-            loop {
-                let dst = policy_destination(&g, &msg);
-                drop(g);
-                if let Some(dst) = dst {
-                    admission = self.net.admit(dst, crate::PolicyDirection::Outbound)?;
-                }
-                g = self.lock();
-                if policy_destination(&g, &msg) == dst {
-                    break;
-                }
-            }
-        }
-        let dst = policy_destination(&g, &msg);
+        let (g, dst, admission) = self.send_policy(&msg)?;
         self.send_locked(g, msg, dst, admission).map(|_| len)
     }
 

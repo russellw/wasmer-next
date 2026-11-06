@@ -313,6 +313,44 @@ impl<T: Clone> PortTable<T> {
         }
     }
 
+    /// Adopts an already-created provider endpoint without releasing the old reservation
+    /// on conflict. The caller holds the namespace port-table lock throughout.
+    pub(crate) fn replace_bound(
+        &mut self,
+        id: SockId,
+        previous: u16,
+        spec: BindSpec,
+        port: u16,
+        payload: T,
+    ) -> NetResult<()> {
+        let previous_entry = self
+            .buckets
+            .get(&previous)
+            .and_then(|bucket| bucket.iter().find(|entry| entry.id == id));
+        let connect_bound = previous_entry.is_some_and(|entry| entry.connect_bound);
+        let remote = previous_entry.and_then(|entry| entry.remote);
+        let conflict = if connect_bound {
+            self.buckets.get(&port).is_some_and(|bucket| {
+                bucket.iter().any(|entry| {
+                    entry.id != id
+                        && addrs_overlap(&spec, &entry.spec)
+                        && (!entry.connect_bound || entry.remote == remote)
+                })
+            })
+        } else {
+            self.port_conflicts(id, &spec, port, true)
+        };
+        if port == 0 || conflict {
+            return Err(Errno::EADDRINUSE);
+        }
+        self.unbind(id, previous);
+        self.insert(id, spec, port, payload);
+        let entry = self.entry_mut(id, port).expect("just inserted");
+        entry.connect_bound = connect_bound;
+        entry.remote = remote;
+        Ok(())
+    }
+
     /// A wildcard-bound socket took a specific source address by connecting
     /// (`inet_bhash2_update_saddr`).
     pub fn rehash(&mut self, id: SockId, port: u16, addr: IpAddr) {

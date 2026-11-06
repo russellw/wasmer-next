@@ -27,6 +27,8 @@ struct Member {
     source: EndpointSourceId,
     socket: SocketRef,
     backlog: u32,
+    requested_bind: Option<SocketAddr>,
+    binding: Option<Arc<dyn EndpointBound>>,
 }
 struct Attempt {
     id: PublicationAttemptId,
@@ -48,7 +50,12 @@ pub(crate) struct Group {
     control: Mutex<Control>,
 }
 impl Group {
-    fn spec(&self, attempt: PublicationAttemptId, revision: u64) -> EndpointGroupSpec {
+    fn spec(
+        &self,
+        attempt: PublicationAttemptId,
+        revision: u64,
+        members: Arc<[EndpointMember]>,
+    ) -> EndpointGroupSpec {
         EndpointGroupSpec {
             group_id: self.id,
             attempt_id: attempt,
@@ -57,7 +64,21 @@ impl Group {
             domain: self.key.domain,
             v6only: self.key.v6only,
             revision,
+            members,
         }
+    }
+    fn member_snapshot(&self, members: &HashMap<u64, Member>) -> Arc<[EndpointMember]> {
+        let mut values: Vec<_> = members
+            .values()
+            .map(|m| EndpointMember {
+                source_id: m.source,
+                requested_bind: m.requested_bind,
+                local: self.key.local,
+                binding: m.binding.clone(),
+            })
+            .collect();
+        values.sort_by_key(|m| m.source_id);
+        values.into()
     }
     fn members(&self) -> Vec<Member> {
         self.members.lock().unwrap().values().cloned().collect()
@@ -136,13 +157,16 @@ impl SocketEndpoint {
 pub(crate) struct Namespace {
     net: Weak<Net>,
     pub(crate) provider: Arc<dyn EndpointProvider>,
+    pub(crate) external: bool,
     groups: Mutex<HashMap<Key, Arc<Group>>>,
 }
 impl Namespace {
     pub(crate) fn new(net: Weak<Net>, provider: Arc<dyn EndpointProvider>) -> Arc<Self> {
+        let external = provider.select_external();
         Arc::new(Self {
             net,
             provider,
+            external,
             groups: Mutex::new(HashMap::new()),
         })
     }
@@ -158,6 +182,8 @@ impl Namespace {
         key: Key,
         socket: SocketRef,
         backlog: u32,
+        requested_bind: Option<SocketAddr>,
+        binding: Option<Arc<dyn EndpointBound>>,
     ) -> Arc<Group> {
         let mut slot = endpoint.group.lock().unwrap();
         if slot.as_ref().is_some_and(|g| g.key != key) {
@@ -199,6 +225,8 @@ impl Namespace {
                     source: endpoint.source(),
                     socket,
                     backlog,
+                    requested_bind,
+                    binding,
                 },
             );
             let mut control = group.control.lock().unwrap();
@@ -216,6 +244,8 @@ impl Namespace {
         domain: Domain,
         v6only: bool,
         backlog: u32,
+        requested_bind: Option<SocketAddr>,
+        binding: Option<Arc<dyn EndpointBound>>,
     ) -> Arc<Group> {
         self.join(
             endpoint,
@@ -227,6 +257,8 @@ impl Namespace {
             },
             SocketRef::Tcp(socket),
             backlog,
+            requested_bind,
+            binding,
         )
     }
     pub(crate) fn join_udp(
@@ -236,6 +268,8 @@ impl Namespace {
         local: SocketAddr,
         domain: Domain,
         v6only: bool,
+        requested_bind: Option<SocketAddr>,
+        binding: Option<Arc<dyn EndpointBound>>,
     ) -> Arc<Group> {
         self.join(
             endpoint,
@@ -247,6 +281,8 @@ impl Namespace {
             },
             SocketRef::Udp(socket),
             0,
+            requested_bind,
+            binding,
         )
     }
     fn leave(&self, group: &Arc<Group>, id: u64) {
@@ -281,7 +317,7 @@ impl Namespace {
                 u64,
             ),
         }
-        let (backlog, work) = {
+        let (backlog, members_snapshot, work) = {
             // Membership and hint revision are one snapshot. A concurrent update cannot
             // consume dirty with a stale backlog stamped with its newer revision.
             let members = group.members.lock().unwrap();
@@ -316,10 +352,11 @@ impl Namespace {
                 });
                 Work::Publish(id, gate, reporter, revision)
             };
-            (backlog, work)
+            (backlog, group.member_snapshot(&members), work)
         };
         let (id, gate, reporter, revision) = match work {
             Work::Hint(lease, revision) => {
+                lease.update_members(revision, members_snapshot);
                 lease.set_backlog(revision, backlog);
                 return;
             }
@@ -333,15 +370,16 @@ impl Namespace {
         });
         let result = match group.key.kind {
             EndpointKind::Stream => self.provider.publish_tcp(
-                group.spec(id, revision),
+                group.spec(id, revision, members_snapshot.clone()),
                 backlog,
                 ingress,
                 reporter.clone(),
             ),
-            EndpointKind::Datagram => {
-                self.provider
-                    .publish_udp(group.spec(id, revision), ingress, reporter.clone())
-            }
+            EndpointKind::Datagram => self.provider.publish_udp(
+                group.spec(id, revision, members_snapshot.clone()),
+                ingress,
+                reporter.clone(),
+            ),
         };
         let mut discard = None;
         {
@@ -400,10 +438,14 @@ impl Namespace {
             .into_iter()
             .filter_map(|g| {
                 let snapshot = {
+                    let members = g.members.lock().unwrap();
                     let c = g.control.lock().unwrap();
-                    c.attempt
-                        .as_ref()
-                        .map(|a| (g.spec(a.id, c.revision), a.reporter.clone()))
+                    c.attempt.as_ref().map(|a| {
+                        (
+                            g.spec(a.id, c.revision, g.member_snapshot(&members)),
+                            a.reporter.clone(),
+                        )
+                    })
                 };
                 snapshot.map(|(group, reporter)| EndpointPublicationStatus {
                     group,

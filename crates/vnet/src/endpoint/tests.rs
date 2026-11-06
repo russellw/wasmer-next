@@ -625,7 +625,7 @@ impl Provider {
         };
         self.broker.records.lock().unwrap().push(Registration {
             target,
-            spec: group,
+            spec: group.clone(),
             sink,
             status: status.clone(),
         });
@@ -659,7 +659,7 @@ impl Provider {
 impl EndpointProvider for Provider {
     fn select(&self, query: &EndpointQuery) -> Result<EndpointChoice, Errno> {
         Self::hook(&self.select_hook);
-        self.queries.lock().unwrap().push(*query);
+        self.queries.lock().unwrap().push(query.clone());
         if self.refuse.load(Ordering::SeqCst) {
             return Err(Errno::EACCES);
         }

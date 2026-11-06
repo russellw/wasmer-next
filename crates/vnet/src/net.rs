@@ -265,6 +265,22 @@ pub(crate) enum Path {
 }
 
 impl Path {
+    pub(crate) fn endpoint_same(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Local { src: a, net: None }, Self::Local { src: b, net: None }) => a == b,
+            (
+                Self::Backend {
+                    src: a,
+                    host_dst: x,
+                },
+                Self::Backend {
+                    src: b,
+                    host_dst: y,
+                },
+            ) => a == b && x == y,
+            _ => false,
+        }
+    }
     pub(crate) fn src(&self) -> IpAddr {
         match self {
             Path::Local { src, .. }
