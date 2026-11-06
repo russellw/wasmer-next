@@ -82,7 +82,8 @@ impl NativeLoader {
         // engines and their in-memory cache belong to this run, sharing only
         // immutable persistent artifact bytes with other runs.
         #[cfg(feature = "napi-v8")]
-        let owner = CompilationOwner::new(&client.compiled_cache, client.services.handle(), context);
+        let owner =
+            CompilationOwner::new(&client.compiled_cache, client.services.handle(), context);
         Arc::new(Self {
             modules: Mutex::default(),
             owner,

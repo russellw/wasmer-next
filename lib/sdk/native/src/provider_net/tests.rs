@@ -14,8 +14,8 @@ use tokio::sync::Notify;
 use virtual_net::tcp_pair::TcpSocketHalf;
 use virtual_net::{
     DynVirtualNetworking, InterestHandler, NetworkError, Result as NetResult, SocketStatus,
-    VirtualConnectedSocket, VirtualConnectionlessSocket, VirtualIoSource,
-    VirtualNetworking, VirtualSocket, VirtualTcpListener, VirtualTcpSocket, VirtualUdpSocket,
+    VirtualConnectedSocket, VirtualConnectionlessSocket, VirtualIoSource, VirtualNetworking,
+    VirtualSocket, VirtualTcpListener, VirtualTcpSocket, VirtualUdpSocket,
 };
 use wasixv2_abi::Errno;
 use wasixv2_vnet::{

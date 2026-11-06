@@ -28,7 +28,9 @@ async fn exercise_directory() {
         .unwrap();
 
     assert_eq!(
-        file.write_at(6, Bytes::from_static(b"/after")).await.unwrap(),
+        file.write_at(6, Bytes::from_static(b"/after"))
+            .await
+            .unwrap(),
         6
     );
     assert_eq!(file.read_at(0, 32).await.unwrap().as_ref(), b"before/after");
@@ -118,7 +120,10 @@ async fn retained_append_handles_survive_concurrent_rename_and_report_actual_off
     const APPENDS_PER_HANDLE: usize = 24;
 
     let directory = Directory::new();
-    directory.write_text("before/log.txt", "seed").await.unwrap();
+    directory
+        .write_text("before/log.txt", "seed")
+        .await
+        .unwrap();
     directory.create_dir(&path("after")).await.unwrap();
 
     let old_path = path("before/log.txt");
