@@ -2680,16 +2680,40 @@ mod tests {
                 wasm_engine_t* engine = wasm_engine_new();
                 wasm_store_t* store = wasm_store_new(engine);
                 const char* entries[] = {
-                    "(func (export \"wasi_thread_start\") (param i32 i32) i32.const 200 i32.const 37 i32.store)",
+                    "(func (export \"wasi_thread_start\") (param i32 i32) "
+                    " i32.const 212 i32.atomic.load if "
+                    "  i32.const 204 i32.const 1 i32.atomic.store "
+                    "  i32.const 204 i32.const 1 memory.atomic.notify drop "
+                    "  block $done loop $wait "
+                    "   i32.const 208 i32.atomic.load br_if $done "
+                    "   i32.const 208 i32.const 0 i64.const -1 memory.atomic.wait32 drop "
+                    "   br $wait end end end "
+                    " i32.const 200 i32.const 37 i32.store)",
                     "",
                     "(func (export \"wasi_thread_start\") (param i64))",
                     "(func (export \"wasi_thread_start\") (param i32 i32))"
                 };
+                const char* gates =
+                    "(func (export \"hold_begin\") (result i32) "
+                    " i32.const 200 i32.const 0 i32.atomic.store "
+                    " i32.const 204 i32.const 0 i32.atomic.store "
+                    " i32.const 208 i32.const 0 i32.atomic.store "
+                    " i32.const 212 i32.const 1 i32.atomic.store i32.const 0)"
+                    "(func (export \"await_started\") (result i32) "
+                    " block $done loop $wait "
+                    "  i32.const 204 i32.atomic.load br_if $done "
+                    "  i32.const 204 i32.const 0 i64.const -1 memory.atomic.wait32 drop "
+                    "  br $wait end end i32.const 0)"
+                    "(func (export \"release\") (result i32) "
+                    " i32.const 208 i32.const 1 i32.atomic.store "
+                    " i32.const 208 i32.const 1 memory.atomic.notify drop "
+                    " i32.const 212 i32.const 0 i32.atomic.store i32.const 0)";
                 for (size_t profile = 0; profile < 4; ++profile) {
                     char source[4096];
                     int length = snprintf(source, sizeof(source),
                         "(module (import \"env\" \"memory\" (memory 1 1 %s))\n"
                         "(import \"wasix_32v1\" \"thread_spawn_v2\" (func $spawn (param i32 i32) (result i32)))\n"
+                        "(import \"wasi\" \"thread-spawn\" (func $wasi_spawn (param i32) (result i32)))\n"
                         "(import \"wasix_32v1\" \"thread_join\" (func $join (param i32) (result i32)))\n"
                         "(import \"wasix_32v1\" \"proc_id\" (func $pid (param i32) (result i32)))\n"
                         "(export \"memory\" (memory 0))\n"
@@ -2697,8 +2721,9 @@ mod tests {
                         "(func (export \"join\") (param i32) (result i32) local.get 0 call $join)\n"
                         "(func (export \"pid\") (result i32) i32.const 108 call $pid drop i32.const 108 i32.load)\n"
                         "(func (export \"answer\") (result i32) i32.const 19)\n"
-                        "(func (export \"_initialize\") unreachable)\n%s)",
-                        profile == 3 ? "" : "shared", entries[profile]);
+                        "(func (export \"_initialize\") unreachable)\n"
+                        "(func (export \"wasi_spawn\") (result i32) i32.const 36 call $wasi_spawn)\n%s%s)",
+                        profile == 3 ? "" : "shared", entries[profile], profile == 0 ? gates : "");
                     assert(length > 0 && (size_t)length < sizeof(source));
                     wasm_module_t* a = module(store, source);
                     wasi_config_t* config = wasi_config_new("host-thread");
@@ -2712,7 +2737,7 @@ mod tests {
                     // must still succeed for every shared/private/entry profile.
                     assert(instance && wasi_env_initialize_instance(env, store, instance));
                     wasm_instance_exports(instance, &exports);
-                    assert(exports.size == (profile == 1 ? 6 : 7));
+                    assert(exports.size == (profile == 0 ? 11 : profile == 1 ? 7 : 8));
                     wasm_memory_t* memory = wasm_extern_as_memory(exports.data[0]);
                     assert(memory && wasm_memory_data_size(memory) >= 256);
                     uint8_t* bytes = wasm_memory_data(memory);
@@ -2720,6 +2745,7 @@ mod tests {
                     wasm_func_t* join = wasm_extern_as_func(exports.data[2]);
                     wasm_func_t* pid = wasm_extern_as_func(exports.data[3]);
                     wasm_func_t* answer = wasm_extern_as_func(exports.data[4]);
+                    wasm_func_t* wasi_spawn = wasm_extern_as_func(exports.data[6]);
                     int32_t original_pid = invoke(pid, 0, 0);
                     assert(original_pid > 0 && invoke(answer, 0, 0) == 19);
                     if (profile == 0) {
@@ -2735,7 +2761,23 @@ mod tests {
                         wasm_extern_vec_t b_imports;
                         wasm_extern_vec_new(&b_imports, 1, &shared);
                         wasm_instance_t* instance_b = wasm_instance_new(store, b, &b_imports, NULL);
-                        assert(instance_b && wasi_env_initialize_instance(env, store, instance_b));
+                        assert(instance_b);
+                        wasm_func_t* hold = wasm_extern_as_func(exports.data[8]);
+                        wasm_func_t* started = wasm_extern_as_func(exports.data[9]);
+                        wasm_func_t* release = wasm_extern_as_func(exports.data[10]);
+                        assert(invoke(hold, 0, 0) == 0);
+                        write32(bytes + 104, 12345);
+                        assert(invoke(spawn, 0, 0) == 0);
+                        uint32_t held_tid = read32(bytes + 104);
+                        assert(held_tid > 0 && held_tid != 12345);
+                        assert(invoke(started, 0, 0) == 0);
+                        assert(read32(bytes + 200) == 0);
+                        // A is physically executing and held before its final
+                        // store. Selecting B affects future thread images only.
+                        assert(wasi_env_initialize_instance(env, store, instance_b));
+                        assert(invoke(release, 0, 0) == 0);
+                        assert(invoke(join, 1, (int32_t)held_tid) == 0);
+                        assert(read32(bytes + 200) == 37);
                         // Invoke A's old functions while B is explicitly selected:
                         // its thread image must use B, with the same process/mm.
                         spawn_join(spawn, join, bytes, 73);
@@ -2748,7 +2790,9 @@ mod tests {
                         wasm_module_delete(b);
                     } else {
                         write32(bytes + 104, 12345);
-                        assert(invoke(spawn, 0, 0) == 76);
+                        int32_t expected = profile == 3 ? 78 : 76;
+                        assert(invoke(spawn, 0, 0) == expected);
+                        assert(invoke(wasi_spawn, 0, 0) == -expected);
                         assert(read32(bytes + 104) == 12345);
                         assert(invoke(pid, 0, 0) == original_pid);
                         assert(invoke(answer, 0, 0) == 19);

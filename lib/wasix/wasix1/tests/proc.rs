@@ -1617,12 +1617,23 @@ async fn unavailable_selected_thread_entries_fail_before_kernel_thread_creation(
             Dispatch.call(caller, call, next)
         }
     }
-    for (shared, entry) in [
-        (true, ""),
-        (true, "(func (export \"wasi_thread_start\") (param i64))"),
+    for (shared, entry, expected) in [
+        (true, "", 76),
+        (
+            true,
+            "(func (export \"wasi_thread_start\") (param i64))",
+            76,
+        ),
+        (false, "", 76),
+        (
+            false,
+            "(func (export \"wasi_thread_start\") (param i64))",
+            76,
+        ),
         (
             false,
             "(func (export \"wasi_thread_start\") (param i32 i32))",
+            78,
         ),
     ] {
         let source = format!(
@@ -1634,11 +1645,11 @@ async fn unavailable_selected_thread_entries_fail_before_kernel_thread_creation(
             {entry}
             (func (export "_start")
                 i32.const 104 i32.const 12345 i32.store
-                (if (i32.ne (call $spawn (i32.const 36) (i32.const 104)) (i32.const 76))
+                (if (i32.ne (call $spawn (i32.const 36) (i32.const 104)) (i32.const {expected}))
                     (then (call $exit (i32.const 1))))
                 (if (i32.ne (i32.load (i32.const 104)) (i32.const 12345))
                     (then (call $exit (i32.const 2))))
-                (if (i32.ne (call $wasi_spawn (i32.const 36)) (i32.const -76))
+                (if (i32.ne (call $wasi_spawn (i32.const 36)) (i32.const -{expected}))
                     (then (call $exit (i32.const 3))))
                 (call $exit (i32.const 0))))"#,
             memory = if shared { "shared" } else { "" }
