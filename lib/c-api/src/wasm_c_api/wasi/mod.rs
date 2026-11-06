@@ -1852,6 +1852,7 @@ mod tests {
                 uint32_t listing_error = read_u32(data, 4700);
                 uint32_t listing_size = read_u32(data, 4704);
                 assert(listing_error == 0);
+                assert(listing_size <= 2048);
                 fprintf(stderr, "root-listing bytes=%u\n", listing_size);
                 size_t cursor = 20000;
                 size_t end = 20000 + listing_size;
@@ -1859,6 +1860,7 @@ mod tests {
                 char listed_names[2][256] = {{0}};
                 size_t entries = 0;
                 while (cursor < end) {
+                    assert(end - cursor >= 24);
                     uint32_t name_len = read_u32(data, cursor + 16);
                     assert(cursor + 24 + name_len <= end);
                     char name[256];
@@ -1918,9 +1920,15 @@ mod tests {
                 assert_preopen_name(data, 5, 0, "named");
                 assert_preopen_name(data, 6, 8, "");
 
+                assert(read_u32(data, 4800) == 0);
+                assert(read_u32(data, 4832) == 0);
+                assert(read_u32(data, 4864) == 0);
                 uint64_t virtual_root = read_u64(data, 4808);
                 uint64_t root_grant = read_u64(data, 4840);
                 uint64_t named_grant = read_u64(data, 4872);
+                assert(virtual_root != root_grant);
+                assert(virtual_root != named_grant);
+                assert(root_grant != named_grant);
                 if (map_root_alias) {
                     assert_open_record(data, 0, 0, virtual_root);
                     assert_open_record(data, 1, 0, virtual_root);
@@ -2061,8 +2069,8 @@ mod tests {
                     "  i32.const 4 i32.const 4080 call $record_pre\n"
                     "  i32.const 5 i32.const 4160 call $record_pre\n"
                     "  i32.const 6 i32.const 4240 call $record_pre\n"
-                    "  i32.const 3 i32.const 20000 i32.const 2048 i64.const 0 i32.const 4704 call $readdir\n"
-                    "  i32.const 4700 i32.store\n"
+                    "  i32.const 4700\n"
+                    "  i32.const 3 i32.const 20000 i32.const 2048 i64.const 0 i32.const 4704 call $readdir i32.store\n"
                     "  i32.const 3 i32.const 0 i32.const 800 i32.const 1 i32.const 2 i32.const 10000 call $record_open\n"
                     "  i32.const 3 i32.const 0 i32.const 804 i32.const 2 i32.const 2 i32.const 10032 call $record_open\n"
                     "  i32.const 3 i32.const 0 i32.const 808 i32.const 3 i32.const 2 i32.const 10064 call $record_open\n"
