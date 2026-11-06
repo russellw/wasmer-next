@@ -1191,6 +1191,10 @@ fn prepared_host_namespace_survives_exec_with_live_names_rights_and_new_argument
         );
         let wasi = process.wasix1().unwrap();
         let mut store = Store::default();
+        let owner = wasmer::sys::NativeCleanupOwner::new();
+        let mut generation = wasmer::sys::NativeInvocationScope::bind_with_cleanup(
+            &mut store, Some(owner),
+        ).unwrap();
         let environment = HostEnvironment::new(
             &mut store.as_store_mut(),
             process.syscalls(),
@@ -1257,9 +1261,18 @@ fn prepared_host_namespace_survives_exec_with_live_names_rights_and_new_argument
             })
             .await;
         drop(environment);
+        generation.close_and_wait_for_cleanup().await;
+        drop(asynchronous.write_lock().await);
+        drop(generation);
         let store = asynchronous
             .into_store()
             .expect("preparation retains no async Store");
+        // Native generations permanently tag their original Store. This runner
+        // fixture transfers prepared process policy to a fresh image Store,
+        // exactly as exec images do; it does not emulate the public C API driver.
+        let engine = store.engine().clone();
+        drop(store);
+        let store = Store::new(engine);
         let module = Module::new(&store, wat::parse_str(parent).unwrap()).unwrap();
         let result = run_with_abis(
             store,
