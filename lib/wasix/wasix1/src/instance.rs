@@ -109,6 +109,17 @@ impl HostProcessState {
             .set_startup_input_with_preopen_rights(input, rights)
     }
 
+    /// Selects already installed preopens with their exact bootstrap bindings.
+    pub fn set_startup_input_with_descriptors(
+        &self,
+        input: crate::StartupInput,
+        descriptors: crate::StartupDescriptors,
+    ) -> Result<(), wasixv2_abi::Errno> {
+        self.0
+            .state
+            .set_startup_input_with_descriptors(input, descriptors)
+    }
+
     /// The process's import binding before the engine has produced an instance.
     pub fn unattached<S: Send + Sync + 'static>(&self) -> Arc<dyn AbiInstance<S>> {
         Arc::new(Wasix1Instance::from_exports(

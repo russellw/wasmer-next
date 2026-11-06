@@ -5,7 +5,7 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
 };
 
-use wasixv2_syscalls::{Fd, TaskId};
+use wasixv2_syscalls::{DescriptorAttachment, DescriptorSet, Fd, TaskId};
 
 use crate::calls;
 
@@ -44,12 +44,39 @@ impl PreopenRights {
         base: crate::abi::fs::Rights::ALL.0,
         inheriting: crate::abi::fs::Rights::ALL.0,
     };
+
+    /// Metadata for a preopen installed by a trusted namespace bootstrap.
+    pub fn attachment(self) -> Result<DescriptorAttachment, wasixv2_abi::Errno> {
+        if !self.is_valid() {
+            return Err(wasixv2_abi::Errno::EINVAL);
+        }
+        Ok(DescriptorAttachment::new(crate::rights::Record {
+            base: crate::abi::fs::Rights(self.base),
+            inheriting: crate::abi::fs::Rights(self.inheriting),
+            preopen: true,
+            socket: false,
+        }))
+    }
+
+    fn is_valid(self) -> bool {
+        (self.base | self.inheriting) & !crate::abi::fs::Rights::ALL.0 == 0
+    }
+}
+
+/// Already installed preopens and their captured provider identities. These
+/// descriptors remain process-owned, including on concurrent startup loads.
+#[derive(Clone)]
+pub struct StartupDescriptors {
+    pub descriptors: Vec<Fd>,
+    pub binding: DescriptorSet,
+    pub virtual_root: Option<Fd>,
 }
 
 #[derive(Clone)]
 pub(crate) struct ConfiguredStartup {
     pub(crate) input: Arc<StartupInput>,
     pub(crate) rights: Option<Arc<[PreopenRights]>>,
+    pub(crate) ready: Option<Arc<StartupDescriptors>>,
 }
 
 #[derive(Default, Clone)]
@@ -62,7 +89,7 @@ impl ProcState {
     /// Configures a host environment once, before its first startup load begins.
     /// This controls only v1 startup buffers and preopens, not kernel procfs data.
     pub fn set_startup_input(&self, input: StartupInput) -> Result<(), wasixv2_abi::Errno> {
-        self.configure_startup_input(input, None)
+        self.configure_startup_input(input, None, None)
     }
 
     /// Configures input and one rights pair per preopen in a single transaction.
@@ -72,13 +99,23 @@ impl ProcState {
         input: StartupInput,
         rights: Vec<PreopenRights>,
     ) -> Result<(), wasixv2_abi::Errno> {
-        self.configure_startup_input(input, Some(rights))
+        self.configure_startup_input(input, Some(rights), None)
+    }
+
+    /// Announces existing captured descriptors without reopening path strings.
+    pub fn set_startup_input_with_descriptors(
+        &self,
+        input: StartupInput,
+        descriptors: StartupDescriptors,
+    ) -> Result<(), wasixv2_abi::Errno> {
+        self.configure_startup_input(input, None, Some(descriptors))
     }
 
     fn configure_startup_input(
         &self,
         input: StartupInput,
         rights: Option<Vec<PreopenRights>>,
+        ready: Option<StartupDescriptors>,
     ) -> Result<(), wasixv2_abi::Errno> {
         let mut policy = self.startup_input.lock().unwrap();
         if policy.sealed || policy.configured.is_some() {
@@ -95,8 +132,33 @@ impl ProcState {
                 .any(|(path, name)| path.contains(&0) || name.contains(&0))
             || rights.as_ref().is_some_and(|rights| {
                 rights.len() != input.preopens.len()
-                    || rights.iter().any(|rights| {
-                        (rights.base | rights.inheriting) & !crate::abi::fs::Rights::ALL.0 != 0
+                    || rights.iter().any(|rights| !rights.is_valid())
+            })
+            || ready.as_ref().is_some_and(|ready| {
+                let mut unique = std::collections::HashSet::new();
+                ready.descriptors.len() != input.preopens.len()
+                    || ready
+                        .virtual_root
+                        .is_some_and(|root| !ready.descriptors.contains(&root))
+                    || ready.descriptors.iter().any(|&fd| {
+                        !unique.insert(fd)
+                            || !ready.binding.get(fd).is_some_and(|entry| {
+                                entry.present
+                                    && entry
+                                        .attachment
+                                        .as_ref()
+                                        .and_then(|attachment| {
+                                            attachment.downcast_ref::<crate::rights::Record>()
+                                        })
+                                        .is_some_and(|record| {
+                                            record.preopen
+                                                && PreopenRights {
+                                                    base: record.base.0,
+                                                    inheriting: record.inheriting.0,
+                                                }
+                                                .is_valid()
+                                        })
+                            })
                     })
             })
         {
@@ -105,6 +167,7 @@ impl ProcState {
         policy.configured = Some(ConfiguredStartup {
             input: Arc::new(input),
             rights: rights.map(Arc::from),
+            ready: ready.map(Arc::new),
         });
         Ok(())
     }
@@ -141,6 +204,13 @@ pub struct Startup {
     pub args: Vec<Vec<u8>>,
     pub env: Vec<Vec<u8>>,
     pub preopens: Vec<Preopen>,
+    pub(crate) root: Option<RootPresentation>,
+}
+
+#[derive(Debug)]
+pub(crate) struct RootPresentation {
+    pub(crate) root: FileId,
+    pub(crate) entries: Vec<(Vec<u8>, u64)>,
 }
 
 /// A directory v1 announces through `fd_prestat_get`.
@@ -258,6 +328,91 @@ impl Procs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_ready_startup_keeps_order_bindings_and_presentation_in_one_forked_policy() {
+        let root = PreopenRights::ALL.attachment().unwrap();
+        let directory = PreopenRights {
+            base: 1,
+            inheriting: 2,
+        }
+        .attachment()
+        .unwrap();
+        // This unit only checks policy custody; provider identity is exercised by
+        // the trusted namespace's guest tests, not this synthetic payload.
+        let binding = DescriptorSet::new(
+            (),
+            vec![
+                wasixv2_syscalls::Descriptor {
+                    fd: Fd(3),
+                    present: true,
+                    attachment: Some(root.clone()),
+                },
+                wasixv2_syscalls::Descriptor {
+                    fd: Fd(4),
+                    present: true,
+                    attachment: Some(directory),
+                },
+            ],
+        );
+        let state = ProcState::default();
+        state
+            .set_startup_input_with_descriptors(
+                StartupInput {
+                    preopens: vec![
+                        (b"unused-root".to_vec(), b"/".to_vec()),
+                        (b"unused-path".to_vec(), b"opaque//alias".to_vec()),
+                    ],
+                    ..StartupInput::default()
+                },
+                StartupDescriptors {
+                    descriptors: vec![Fd(3), Fd(4)],
+                    binding,
+                    virtual_root: Some(Fd(3)),
+                },
+            )
+            .unwrap();
+        let child = state.fork();
+        let configured = state.seal_startup_input().unwrap();
+        let inherited = child.seal_startup_input().unwrap();
+        assert!(Arc::ptr_eq(
+            configured.ready.as_ref().unwrap(),
+            inherited.ready.as_ref().unwrap()
+        ));
+        let ready = inherited.ready.unwrap();
+        assert_eq!(ready.descriptors, [Fd(3), Fd(4)]);
+        assert_eq!(inherited.input.preopens[1].1, b"opaque//alias");
+        assert!(
+            ready
+                .binding
+                .get(Fd(3))
+                .unwrap()
+                .attachment
+                .as_ref()
+                .unwrap()
+                .ptr_eq(&root)
+        );
+    }
+
+    #[test]
+    fn host_ready_startup_rejects_uncaptured_descriptors_without_consuming_configuration() {
+        let state = ProcState::default();
+        let input = StartupInput {
+            preopens: vec![(vec![], b"/".to_vec())],
+            ..StartupInput::default()
+        };
+        let result = state.set_startup_input_with_descriptors(
+            input,
+            StartupDescriptors {
+                descriptors: vec![Fd(3)],
+                binding: DescriptorSet::new((), vec![]),
+                virtual_root: Some(Fd(3)),
+            },
+        );
+        assert_eq!(result, Err(wasixv2_abi::Errno::EINVAL));
+        state.set_startup_input(StartupInput::default()).unwrap();
+        assert!(state.seal_startup_input().unwrap().ready.is_none());
+    }
 
     #[test]
     fn host_startup_input_rights_keep_their_index_and_fork_configuration() {

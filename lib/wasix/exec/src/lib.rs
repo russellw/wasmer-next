@@ -1728,6 +1728,10 @@ pub async fn complete<S: Syscalls + Control + 'static, T>(
     let errno = match (ret, handled) {
         (Ok(value), _) => return Outcome::Return(Ok(value)),
         (Err(SysErr::Errno(errno)), _) => errno,
+        // Linux/v2 has no WASI capability errno. The v1 adapter projects typed
+        // namespace verdicts before this shared completion boundary.
+        (Err(SysErr::NamespaceBoundary), _) => Errno::ENOENT,
+        (Err(SysErr::NamespaceMutation), _) => Errno::EACCES,
         (Err(SysErr::GuestUnwind), _) => unreachable!("checked before guest work"),
         (Err(SysErr::RestartBlock), None | Some(true)) => {
             // Linux's arch/x86/kernel/signal.c:arch_do_signal_or_restart re-enters the

@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use wasixv2_abi::{AtFd, FcntlCmd, Fd, OpenFlags};
+use wasixv2_abi::{AtFd, AtFlags, FcntlCmd, Fd, OpenFlags, Statx, StatxMask};
 use wasixv2_syscalls::{
     Caller, Control, DescriptorInstallations, DescriptorSet, SysResult, Syscalls,
 };
@@ -21,7 +21,9 @@ use crate::{
         Errno,
         fs::{Preopentype, Prestat},
     },
-    process::{Preopen, PreopenRights, ProcState, Startup},
+    process::{
+        FileId, Preopen, PreopenRights, ProcState, RootPresentation, Startup, StartupDescriptors,
+    },
     shim::{self, Env, Frame},
 };
 
@@ -47,6 +49,46 @@ pub(crate) async fn load<S: Syscalls + Control + 'static>(
             Default::default()
         }),
     };
+    if let Some(configured) = &input
+        && let Some(ready) = &configured.ready
+    {
+        let preopens: Vec<_> = ready
+            .descriptors
+            .iter()
+            .zip(&configured.input.preopens)
+            .map(|(&fd, (_, name))| Preopen {
+                fd,
+                name: name.clone(),
+            })
+            .collect();
+        let root = match ready.virtual_root {
+            Some(root_fd) => {
+                let root = ready_file_id(frame, ready, root_fd).await?;
+                let mut entries = Vec::new();
+                for preopen in &preopens {
+                    if preopen.fd != root_fd {
+                        let id = ready_file_id(frame, ready, preopen.fd).await?;
+                        entries.push((preopen.name.clone(), id.ino));
+                    }
+                }
+                entries.sort_by(|a, b| a.0.cmp(&b.0));
+                Some(RootPresentation { root, entries })
+            }
+            None => None,
+        };
+        let startup = Arc::new(Startup {
+            args,
+            env,
+            preopens,
+            root,
+        });
+        if proc.startup.set(startup.clone()).is_ok() {
+            return Ok(startup);
+        }
+        // These are the same already installed descriptors, not descriptors
+        // opened by this load. A losing thread must never close them.
+        return Ok(proc.startup.get().expect("set by the winner").clone());
+    }
     let paths: Vec<(&[u8], &[u8])> = match &input {
         Some(configured) => configured
             .input
@@ -67,6 +109,7 @@ pub(crate) async fn load<S: Syscalls + Control + 'static>(
         args,
         env,
         preopens: opened.iter().map(|(preopen, _)| preopen.clone()).collect(),
+        root: None,
     });
     if proc.startup.set(startup.clone()).is_ok() {
         return Ok(startup);
@@ -74,6 +117,32 @@ pub(crate) async fn load<S: Syscalls + Control + 'static>(
     // Another thread of the process won the race; its preopens are the ones the guest sees.
     close_preopens(frame, &opened).await;
     Ok(proc.startup.get().expect("set by the winner").clone())
+}
+
+async fn ready_file_id<S: Syscalls + Control + 'static>(
+    frame: &Frame<'_, S>,
+    ready: &StartupDescriptors,
+    fd: Fd,
+) -> SysResult<FileId> {
+    let path = frame.mem.alloc_cstr(b"")?;
+    let out = frame.mem.alloc_mut::<Statx>()?;
+    let caller = Caller::new(frame.task, &frame.mem).with_descriptors(&ready.binding);
+    frame
+        .syscalls
+        .statx(
+            &caller,
+            fd,
+            path,
+            AtFlags::AT_EMPTY_PATH,
+            StatxMask::STATX_BASIC_STATS,
+            out,
+        )
+        .await?;
+    let stat = frame.mem.take(out);
+    Ok(FileId {
+        dev: (stat.stx_dev_major, stat.stx_dev_minor),
+        ino: stat.stx_ino,
+    })
 }
 
 type Strings = Vec<Vec<u8>>;

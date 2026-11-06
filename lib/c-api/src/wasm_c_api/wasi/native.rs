@@ -7,11 +7,12 @@ use std::{
     sync::{Arc, Condvar, Mutex},
 };
 use wasixv2::{
-    ByteSink, EmbeddingProcess, LocalFuture, Machine, MachineSyscalls, ProcessConfig, Stdio,
+    ByteSink, DirectoryBootstrap, EmbeddingProcess, LocalFuture, Machine, MachineSyscalls,
+    NamespaceBootstrap, ProcessConfig, Stdio,
 };
 use wasixv2_exec::HostEnvironment;
 use wasixv2_wasix1::{
-    PreopenRights, StartupInput,
+    PreopenRights, StartupDescriptors, StartupInput,
     imports::{self, Module as Namespace},
 };
 use wasmer_api::{AsStoreAsync, AsStoreMut, Imports, Instance, Module, StoreMut};
@@ -114,40 +115,75 @@ impl NativeWasi {
             .collect();
         let (process, environment) = store.run_host(async {
             let machine = Arc::new(Machine::new());
-            let mut input_preopens = Vec::new();
-            for (index, (name, host)) in preopens.into_iter().enumerate() {
-                // Announced aliases are opaque legacy names, not normalized mount
-                // paths. Separate capabilities must never stack on the same mount.
-                let path = format!("/.wasmer-c-api/preopens/{index}");
-                machine
-                    .mount_host_dir(&path, std::path::Path::new(&host), false)
-                    .await?;
-                input_preopens.push((path.into_bytes(), name.into_bytes()));
-            }
-            let process = machine
-                .start_embedding(ProcessConfig {
-                    args,
-                    env: kernel_env,
-                    stdio,
-                })
-                .await?;
-            let wasi = process
-                .wasix1()
-                .ok_or_else(|| anyhow::anyhow!("process owner is closed"))?;
             // Legacy read/write/create directory rights cover the original
             // preview1 bits; later socket/WASIX rights are not inherited.
             let mapped_rights = PreopenRights {
                 base: (1 << 29) - 1,
                 inheriting: (1 << 29) - 1,
             };
-            let rights = vec![mapped_rights; input_preopens.len()];
-            wasi.set_startup_input_with_preopen_rights(
+            let root_fallback = preopens.iter().position(|(name, _)| name == "/");
+            let mut directories = Vec::new();
+            let mut input_preopens = vec![(b"/".to_vec(), b"/".to_vec())];
+            for (name, host) in preopens {
+                let lookup_name = (!name.is_empty()
+                    && name != "."
+                    && name != ".."
+                    && !name.contains('/')
+                    && name.len() <= wasixv2::NAME_MAX)
+                    .then(|| name.as_bytes().to_vec());
+                directories.push(DirectoryBootstrap {
+                    source: machine
+                        .capture_host_directory(std::path::Path::new(&host), false)
+                        .await?,
+                    lookup_name,
+                    attachment: Some(
+                        mapped_rights
+                            .attachment()
+                            .map_err(|error| anyhow::anyhow!("{error:?}"))?,
+                    ),
+                });
+                // Ready descriptors carry authority; these path strings are never reopened.
+                input_preopens.push((Vec::new(), name.into_bytes()));
+            }
+            let (process, boot) = machine
+                .start_embedding_with_namespace(
+                    ProcessConfig {
+                        args,
+                        env: kernel_env,
+                        stdio,
+                    },
+                    NamespaceBootstrap {
+                        directories,
+                        root_attachment: Some(
+                            PreopenRights::ALL
+                                .attachment()
+                                .map_err(|error| anyhow::anyhow!("{error:?}"))?,
+                        ),
+                        root_fallback,
+                    },
+                )
+                .await?;
+            let wasi = process
+                .wasix1()
+                .ok_or_else(|| anyhow::anyhow!("process owner is closed"))?;
+            let root_fd = *boot
+                .descriptors
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("namespace root descriptor is missing"))?;
+            if boot.task != process.task() {
+                anyhow::bail!("namespace bootstrap belongs to another process");
+            }
+            wasi.set_startup_input_with_descriptors(
                 StartupInput {
                     args: startup_args,
                     env: startup_env,
                     preopens: input_preopens,
                 },
-                rights,
+                StartupDescriptors {
+                    descriptors: boot.descriptors,
+                    binding: boot.binding,
+                    virtual_root: Some(root_fd),
+                },
             )
             .map_err(|e| anyhow::anyhow!("{e:?}"))?;
             let environment = store.with_mut(|store| {
