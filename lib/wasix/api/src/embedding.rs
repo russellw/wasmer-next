@@ -140,17 +140,20 @@ mod tests {
         first.close();
         first.close();
         assert_eq!(
-            machine.syscalls.inner.kill(first_task, Signal(0)),
+            machine.syscalls.inner.kill(first_task, Signal::SIGCONT),
             Err(Errno::ESRCH)
         );
-        assert_eq!(machine.syscalls.inner.kill(second_task, Signal(0)), Ok(()));
+        assert_eq!(
+            machine.syscalls.inner.kill(second_task, Signal::SIGCONT),
+            Ok(())
+        );
         assert_eq!(*machine.running.lock().unwrap(), vec![second_task]);
         #[cfg(feature = "wasix1")]
         assert!(first.wasix1().is_none());
 
         drop(second);
         assert_eq!(
-            machine.syscalls.inner.kill(second_task, Signal(0)),
+            machine.syscalls.inner.kill(second_task, Signal::SIGCONT),
             Err(Errno::ESRCH)
         );
         assert!(machine.running.lock().unwrap().is_empty());
