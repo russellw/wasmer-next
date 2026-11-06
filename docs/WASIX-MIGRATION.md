@@ -40,8 +40,10 @@ wasixv2-vnet            wasixv2-vnet-host       wasixv2-vnet-switch
 wasixv2-vnet-web        wasixv2-wait            wasixv2-wasix1
 ```
 
-`lib/wasix/codegen` is the unchanged ABI/code-generator submodule. Its
-`wasixv2-codegen` package is retained too. `wasixv2-wasix1` is the active
+`lib/wasix/codegen` now owns the canonical annotated WIT and generator as tracked
+source, preserving the original MIT license and upstream provenance. The
+`wasixv2-codegen` package is retained. See its `PROVENANCE.md` for the source
+revisions and the engine-context emitter delta. `wasixv2-wasix1` is the active
 WASIX v1/WASI guest adapter on the new kernel; it is not the old runtime
 and must not be removed as part of legacy retirement.
 
@@ -76,8 +78,8 @@ removal, including their CLI commands, options, feature and old-format support;
 this exception does not authorize unrelated removals.
 
 The Cargo workspace still names the old runtime explicitly and includes
-the new crates with `lib/wasix/*`. Existing code-generator gitlink identity
-and pinned revision are unchanged; only its path changes. Generated source
+the new crates with `lib/wasix/*`. The generator is tracked source rather than an external gitlink so required
+engine changes are obtainable from the same private repository. Generated source
 headers now name the new WIT location. A WIT-derived comment in the generated
 syscall file still names the historical `lib/wasixv2/DESIGN.md` path because
 the upstream ABI source and pinned revision were not changed.

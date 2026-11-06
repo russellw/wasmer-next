@@ -1,0 +1,283 @@
+/// Wasm-specific primitives with no Linux syscall equivalent.
+///
+/// Keep this small: anything Linux can express stays in `syscalls`. Hosts return `-ENOSYS` for
+/// extensions they do not implement yet.
+/// @module(wasixv2)
+interface ext {
+  use types.{buf, call-dynamic-flags, const-buf, const-stack-snapshot-ptr, cstr, dl-flags, dl-handle, dl-handle-ptr, reflection-result-ptr, s32-ptr, stack-snapshot-ptr, u32-ptr, u64-ptr, ulong, uptr, uptr-ptr, slong, usize};
+
+  // ==== Process startup ====
+
+  /// Size in bytes of the startup block that `startup-get` writes.
+  startup-size: func() -> u32;
+
+  /// Writes the Linux-style initial process block into `buf`, which holds `len` bytes and must be
+  /// 16-byte aligned. Returns 0, or `-EINVAL` when `len` is less than `startup-size()`.
+  ///
+  /// The layout matches what the kernel puts on the initial stack, with every pointer being a
+  /// guest address inside `buf` and every word `ulong`-sized:
+  ///
+  /// - `argc`
+  /// - `argv[0]` .. `argv[argc - 1]`, then NULL
+  /// - `envp[0]` .. `envp[n - 1]`, then NULL
+  /// - auxv `(type, value)` pairs (see `auxv-type`), terminated by `(AT_NULL, 0)`
+  /// - string data and other auxv payloads (`AT_RANDOM`'s 16 bytes, `AT_EXECFN`, ...)
+  ///
+  /// Hosts provide at least `AT_PAGESZ`, `AT_RANDOM`, `AT_UID`, `AT_EUID`, `AT_GID`, `AT_EGID`,
+  /// `AT_SECURE` and `AT_CLKTCK`. ELF-related entries (`AT_PHDR`, `AT_ENTRY`, ...) are absent.
+  /// @slice(buf, len)
+  startup-get: func(buf: buf, len: usize) -> s32;
+
+  // ==== Threads ====
+
+  /// Starts a task that shares the caller's memory on an instance of its own: `clone` with
+  /// `CLONE_VM` and without `CLONE_VFORK`, which cannot return twice in wasm.
+  ///
+  /// The kernel validates `flags` and creates the task as `clone(flags, newsp, parent-tid, tls,
+  /// child-tid)` does on Linux, so `CLONE_PARENT_SETTID`, `CLONE_CHILD_SETTID`,
+  /// `CLONE_CHILD_CLEARTID` and the sharing flags mean the same. `flags` must contain `CLONE_VM`.
+  /// With `CLONE_THREAD`, which needs `CLONE_FS`, `CLONE_FILES` and `CLONE_SIGHAND` too, the task
+  /// is a thread of the caller's thread group. Without it, the task is the first of a new process
+  /// that shares the caller's memory: a child of the caller's process (of its parent with
+  /// `CLONE_PARENT`) that reports its end with the signal in the low byte of `flags`
+  /// (`CSIGNAL`), and shares with the caller what the other flags say (`CLONE_SIGHAND`: the
+  /// signal handlers). `CLONE_VFORK` and the forms `clone` refuses are `-EINVAL`; vfork and fork
+  /// go through `clone`. `CLONE_SETTLS` records `tls` as the thread pointer the new task starts
+  /// with; without it, it starts with the caller's.
+  ///
+  /// The host then instantiates the module again on the same shared memory and calls its export
+  /// `wasixv2_thread_start(tid: s32, start-arg: uptr)` as the new task, with its id as it sees
+  /// it. That entry point runs before any guest state is set up: it must point
+  /// `__stack_pointer` at the new task's stack and set up TLS before it touches either, all from
+  /// what `start-arg` points to, which the guest defines. The task ends when it calls `exit` or
+  /// `exit_group`, or replaces its image with `execve`; the entry point must not return. A task
+  /// that returns from it or traps ends its thread group, as a fault does. Returns the new
+  /// task's id (a new process's pid) as the caller sees it, or `-errno`.
+  thread-spawn: func(%flags: ulong, start-arg: uptr, parent-tid: s32-ptr, tls: uptr, child-tid: s32-ptr) -> slong;
+
+  // ==== Signals ====
+
+  /// Registers libc's signal trampoline for the thread group, as an index into the module's
+  /// indirect function table, with the signature `fn(signo: s32, info: siginfo-ptr, uctx: void-ptr)`.
+  /// Threads and `fork` children inherit it; `execve` clears it. Until it is registered, signals
+  /// take their default action even when a handler is installed.
+  ///
+  /// To deliver a signal, the host writes a `ucontext_t` (816 bytes, 16-aligned) and above it the
+  /// `siginfo_t` (128 bytes), points `__stack_pointer` below the frame, and calls the trampoline
+  /// on top of the interrupted wasm call stack, which stays intact. For an `SA_ONSTACK` handler the
+  /// frame goes at the top of the alternate stack set with `sigaltstack`. Otherwise it goes below
+  /// the module's `__stack_pointer` minus 128 bytes, LLVM's red zone: a function that calls
+  /// nothing may keep up to 128 bytes of locals below `__stack_pointer` without moving it, as on
+  /// x86-64.
+  ///
+  /// The `ucontext_t` has libc's riscv32-shaped layout: `uc_stack` at 8 holds the alternate stack
+  /// settings, `uc_sigmask` at 20 the mask to restore, and `uc_mcontext` at 160 starts with 32
+  /// `ulong` slots. Slot 0 holds the handler (`sa_handler`, a table index), 1 `sa_flags`, and 2
+  /// and 3 the interrupted `__stack_pointer` and `__tls_base`.
+  ///
+  /// Slot 4 is restart: 1 when the signal interrupted a syscall that runs again once the handler
+  /// returns (`SA_RESTART`), else 0. A handler may set it to 0, and the call then fails with
+  /// `EINTR` instead, as a Linux handler moves the saved program counter off the syscall
+  /// instruction. Setting it to 1 has no effect.
+  ///
+  /// Slot 5 is how many parameters the handler takes, 0 to 3; its type is `(s32 × n) -> ()`. The
+  /// trampoline passes the first n of `signo`, `info` and `uctx`, whatever `SA_SIGINFO` says,
+  /// since a native handler ignores the arguments it does not declare. Delivering to a handler of
+  /// any other type fails as a fault.
+  ///
+  /// Slots 6 to 15 are reserved and zero. Slots 16 to 31 are the guest's: the host writes them as
+  /// zero and never reads them, and libc keeps per-frame state there.
+  ///
+  /// The trampoline calls the handler and returns. That return is `rt_sigreturn`: the host then
+  /// sets the signal mask from `uc_sigmask` and the two globals from slots 2 and 3, and reads
+  /// slot 4. A `siglongjmp` out of the handler unwinds through the host frames as a wasm
+  /// exception, and leaves the mask to `siglongjmp`.
+  ///
+  /// Handlers are table indices, and `SIG_DFL`, `SIG_IGN` and `SIG_HOLD` are 0, 1 and 2, so
+  /// modules are linked with `--table-base=3`: no function lives at those indices.
+  /// Returns 0 or `-errno`.
+  signal-callback-register: func(callback: u32) -> slong;
+
+  // ==== Function tables ====
+  //
+  // Calls and functions whose signatures are only known at run time, which wasm cannot express
+  // from the guest: what libffi needs. The C interface is wasix-libc's `wasix/call_dynamic.h`,
+  // `wasix/reflection.h` and `wasix/closure.h`. Functions are indices into the indirect function
+  // table; argument and result buffers hold values back to back, 4 bytes for i32 and f32, 8 for
+  // i64 and f64, and 16 for v128.
+
+  /// Calls the function at table index `function` with the arguments in `values`, writing its
+  /// results to `results`. Traps, exceptions and `longjmp`s from the callee pass through.
+  ///
+  /// With `CALL_DYNAMIC_STRICT`, both buffers must match the function's signature exactly, or the
+  /// call fails with `-EINVAL`. Without it, the call follows native calling conventions as far as
+  /// wasm allows: extra arguments are dropped, missing ones are zero, and missing results are
+  /// written as zero. The types of the arguments both sides have must still match, or the call
+  /// fails with `-EINVAL`. Returns 0 or `-errno`.
+  /// @slice(values, values-len)
+  /// @slice(results, results-len)
+  call-dynamic: func(
+    function: u32,
+    values: const-buf,
+    values-len: usize,
+    results: buf,
+    results-len: usize,
+    %flags: call-dynamic-flags,
+  ) -> slong;
+
+  /// Writes the signature of the function at table index `function`: its argument types to
+  /// `argument-types` and its result types to `result-types`, one `wasm-value-type` byte each, and
+  /// the counts to `result`. Returns 0; `-EINVAL` if `function` is not a function or has a type no
+  /// `wasm-value-type` describes; `-EOVERFLOW` if a buffer is too small, in which case only
+  /// `result` is written.
+  /// @slice(argument-types, argument-types-len)
+  /// @slice(result-types, result-types-len)
+  reflect-signature: func(
+    function: u32,
+    argument-types: buf,
+    argument-types-len: usize,
+    result-types: buf,
+    result-types-len: usize,
+    %result: reflection-result-ptr,
+  ) -> slong;
+
+  /// Reserves a table slot for a closure and writes its index to `closure`. Calling it before
+  /// `closure-prepare` traps. Returns 0 or `-errno`.
+  ///
+  /// Each function type has a pool of host-generated stub functions, compiled and instantiated
+  /// once per batch of stubs rather than per closure. Each stub reads its backing function and
+  /// environment from an array in linear memory that the host owns.
+  closure-allocate: func(closure: u32-ptr) -> slong;
+
+  /// Makes `closure` callable with the given signature: calling it packs its arguments into a
+  /// buffer and calls `backing(values: uptr, results: uptr, env: uptr)`, a table index, which
+  /// writes the results. `argument-types` and `result-types` are `wasm-value-type` bytes. The
+  /// host takes a free stub of that type, writes `backing` and `env` to its entry and places it
+  /// in the slot in every thread. A closure may be prepared again with another signature.
+  /// Returns 0 or `-errno`.
+  /// @slice(argument-types, argument-types-len)
+  /// @slice(result-types, result-types-len)
+  closure-prepare: func(
+    backing: u32,
+    closure: u32,
+    argument-types: const-buf,
+    argument-types-len: usize,
+    result-types: const-buf,
+    result-types-len: usize,
+    env: uptr,
+  ) -> slong;
+
+  /// Frees `closure`'s slot and returns its stub to its pool. Calling it afterwards traps.
+  /// Returns 0, or `-EINVAL` if `closure` is not an allocated closure.
+  closure-free: func(closure: u32) -> slong;
+
+  // ==== Checkpointing ====
+
+  /// Checkpoints the process: the host saves the guest's memory and its kernel state, and the
+  /// wasm call stack from the asyncify-instrumented functions that led to this call. Returns 0
+  /// when the checkpoint is taken, and 1 when the process is resumed from it, which is when it
+  /// must reseed randomness and reconnect what it needs. Returns `-ENOSYS` if the embedder has
+  /// not enabled checkpoints, and `-EINVAL` if a function on the call path is not instrumented,
+  /// so the stack cannot be captured. The C interface is `wasix_proc_checkpoint()`.
+  checkpoint: func() -> slong;
+
+  /// `setjmp` for the asyncify build configuration, where wasm exceptions are not available:
+  /// records the current call stack in `snapshot`. Returns 0, and later 1 when `stack-restore`
+  /// resumes it, with the value it was given written to `val`. Only for asyncify modules;
+  /// others get `-ENOSYS`. Returns 0, 1 or `-errno`.
+  stack-save: func(snapshot: stack-snapshot-ptr, val: s32-ptr) -> slong;
+
+  /// `longjmp` for the asyncify build configuration: resumes the `stack-save` that filled
+  /// `snapshot`, which returns 1 there with `val` written. Only for asyncify modules.
+  /// @noreturn
+  stack-restore: func(snapshot: const-stack-snapshot-ptr, val: s32);
+
+  // ==== Coroutines ====
+
+  /// Creates a suspended coroutine context and writes its id to `id`. Its first
+  /// resumption calls the function at table index `entry` (`fn()`) on a fresh wasm call stack; the
+  /// guest provides the shadow stack. Carried over from wasixv1 (wasix-libc's `wasix/context.h`):
+  /// greenlet uses it directly, and libc builds `makecontext` and `swapcontext` on top of it.
+  /// Returns 0 or `-errno`.
+  context-create: func(entry: u32, id: u64-ptr) -> slong;
+
+  /// Suspends the current context and resumes context `id`, from where it last
+  /// suspended or from its entry point. Returns 0 once another context switches back to this one,
+  /// or `-errno`.
+  context-switch: func(id: u64) -> slong;
+
+  /// Destroys a suspended or finished context and releases its resources. Destroying
+  /// the current or the main context fails. Returns 0 or `-errno`.
+  context-destroy: func(id: u64) -> slong;
+
+  // ==== Dynamic linking ====
+  //
+  // The host instantiates and links side modules; libc2 decides policy and runs constructors.
+  // See "Dynamic linking" in wasmer's lib/wasixv2/DESIGN.md. Side modules must export
+  // `__wasm_init_tls`, `__tls_size` and `__tls_align`. During a link the host calls only
+  // functions wasm-ld synthesizes, never user code.
+
+  /// `dlopen`: loads `file` and the modules it needs into every instance of the
+  /// process, unless they are loaded already, links them, and writes the handle of `file`'s
+  /// module to `handle`.
+  ///
+  /// `file` NULL is the main program. A `file` containing `/` is opened as is, relative to the
+  /// working directory; otherwise each directory of `search-path` is tried in order.
+  ///
+  /// `search-path` is a colon-separated list, or NULL for none: libc passes `LD_LIBRARY_PATH` as
+  /// read at startup, then the default directories. A needed module is searched in the needing
+  /// module's runtime path, then in `search-path`. Every candidate is opened as `openat` would,
+  /// with the process's credentials and working directory.
+  ///
+  /// `flags` are `RTLD_*`, with musl's meaning. Symbols are bound at load time either way. With
+  /// `RTLD_LAZY`, a function or GOT reference to a missing symbol does not fail the load: it is
+  /// resolved when a later `RTLD_GLOBAL` load defines the symbol, and calling a function that
+  /// never appears kills the process. With `RTLD_NOW`, a missing symbol fails the load.
+  /// `caller-addr` is an address in the calling module's data, such as its `__dso_handle`, or 0
+  /// for the main module. It selects the module whose runtime path applies.
+  ///
+  /// Constructors are not run: newly loaded modules are queued, in initialization order, for
+  /// `dl-next-init`. On failure, writes a NUL-terminated message for `dlerror` into `err`.
+  /// Returns 0 or `-errno`.
+  /// @slice(err, err-len)
+  dl-open: func(
+    file: cstr,
+    %flags: dl-flags,
+    search-path: cstr,
+    caller-addr: uptr,
+    handle: dl-handle-ptr,
+    err: buf,
+    err-len: usize,
+  ) -> slong;
+
+  /// `dlsym`: looks up `symbol` and writes its address to `addr`: a linear memory
+  /// address for data, or a function-table index for a function, which is placed in the table of
+  /// every instance if it is not there yet.
+  ///
+  /// `handle` is a module, searched with its dependencies; `RTLD_DEFAULT`, the global scope; or
+  /// `RTLD_NEXT`, the global scope after the caller's module. `caller-addr` is as for
+  /// `dl-open`. Symbol precedence and weak symbols follow ELF rules. On failure, writes a
+  /// NUL-terminated message for `dlerror` into `err`. Returns 0 or `-errno`.
+  /// @slice(err, err-len)
+  dl-sym: func(
+    handle: dl-handle,
+    symbol: cstr,
+    caller-addr: uptr,
+    addr: uptr-ptr,
+    err: buf,
+    err-len: usize,
+  ) -> slong;
+
+  /// `dlclose`: drops a reference to `handle`. Code is never unloaded. Returns 0, or
+  /// `-EINVAL` if `handle` is not a loaded module.
+  dl-close: func(handle: dl-handle) -> slong;
+
+  /// Takes the next queued module whose constructors have not run, in initialization
+  /// order, and writes the function-table index of its `__wasm_call_ctors` to `ctors`, or 0 if it
+  /// has none. Returns 1 when it took a module, 0 when the queue is empty, or `-errno`.
+  ///
+  /// libc calls this until the queue is empty after every successful `dl-open`, and before
+  /// `main` for the libraries loaded at startup, then calls each `ctors` function. No host lock is
+  /// held then, so constructors may call `dlopen`; libc serializes loading with its own lock.
+  dl-next-init: func(ctors: uptr-ptr) -> slong;
+}

@@ -28,14 +28,16 @@ for the legacy crates that still need replacements before removal.
 
 ## Submodules
 
-Five submodules: `tests/wast/spec`, `lib/napi/quickjs/deps/quickjs`, `wasmer-test-files`,
-`tests/wasixv2` ([wasixv2-tests](https://github.com/wasix-org/wasixv2-tests), the
-wasixv2 test suite, run with `make test-wasixv2`), and `lib/wasix/codegen`.
-The last is
-[wasixv2-abi](https://github.com/wasix-org/wasixv2-abi): the wasixv2 guest ABI in
-WIT and the `wasixv2-codegen` generator, shared with libc2. ABI changes land
-there first; `lib/wasix/exec/tests/generated.rs` checks that the generated
-wasixv2 crates match the pinned commit.
+Four submodules: `tests/wast/spec`, `lib/napi/quickjs/deps/quickjs`,
+`wasmer-test-files`, and `tests/wasixv2`
+([wasixv2-tests](https://github.com/wasix-org/wasixv2-tests), the wasixv2 test
+suite, run with `make test-wasixv2`).
+
+`lib/wasix/codegen` owns the canonical annotated WIT and `wasixv2-codegen`
+generator as tracked source, with its upstream license and provenance. The
+standalone context/function C wrappers live beside it in `compat-libc`.
+`lib/wasix/exec/tests/generated.rs` checks the Wasmer and locked WLK outputs
+against this source.
 
 For initialization and working with the different crates + submodules, see [BUILD.md](./BUILD.md)
 
