@@ -382,7 +382,7 @@ impl ProcessControl {
         #[cfg(feature = "napi-v8")]
         if self.observer.observed_result().is_none() {
             if let Some(napi) = self.napi.lock().unwrap().as_ref() {
-                napi.terminate_all();
+                napi.runtime_control().terminate_all();
             }
         }
         if let Some(stdin) = &self.stdin {
