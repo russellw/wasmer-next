@@ -758,6 +758,9 @@ pub(crate) async fn fd_renumber<S: Syscalls + Control + 'static>(
 ) -> Result<i32, RuntimeError> {
     shim::errno(&env, async |frame| {
         let set = frame.bind_descriptors(&[Fd(from), Fd(to)])?;
+        if !set.get(Fd(from)).is_some_and(|entry| entry.present) {
+            return shim::fail(Errno::BADF);
+        }
         if from != to
             && set
                 .get(Fd(to))

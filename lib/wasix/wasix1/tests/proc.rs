@@ -1050,6 +1050,8 @@ fn prepared_host_namespace_survives_exec_with_live_names_rights_and_new_argument
         (call $check (i32.const 6) (call $renumber (i32.const 0) (i32.const 22)) (i32.const 0))
         (call $check (i32.const 7) (call $setflags (i32.const 22) (i32.const 1)) (i32.const 0))
         (call $check (i32.const 8) (call $renumber (i32.const 4) (i32.const 0)) (i32.const 0))
+        ;; dup2 validates the source before rejecting a protected target.
+        (call $check (i32.const 14) (call $renumber (i32.const -1) (i32.const 0)) (i32.const 8))
         ;; A directory at fd0 is still protected, unlike a stdio object at fd22.
         (call $check (i32.const 9) (call $renumber (i32.const 1) (i32.const 0)) (i32.const 58))
         ;; Ordinary descriptors retain the kernel's real CLOEXEC behavior.
