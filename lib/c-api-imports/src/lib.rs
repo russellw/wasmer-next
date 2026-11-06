@@ -8,8 +8,6 @@ use wasmer_api::{
     TypedFunction, Value, WasmPtr, namespace,
 };
 
-#[cfg(feature = "wasix")]
-mod wasix;
 #[cfg(feature = "wasixv2")]
 mod wasixv2;
 
@@ -2462,20 +2460,6 @@ mod tests {
     };
     use wat::parse_str;
 
-    #[cfg(feature = "wasi")]
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    };
-    #[cfg(feature = "wasi")]
-    use wasmer_types::ModuleHash;
-    #[cfg(feature = "wasi")]
-    use wasmer_wasix::{
-        PluggableRuntime, WasiError,
-        runners::wasi::{RuntimeOrEngine, WasiRunner},
-        runtime::task_manager::tokio::TokioTaskManager,
-    };
-
     #[cfg(any(feature = "wasi", feature = "wasixv2"))]
     pub(super) const WASIX_GUEST: &str = r#"(module
                 (import "wasi_snapshot_preview1" "proc_exit" (func $proc_exit (param i32)))
@@ -2582,53 +2566,6 @@ mod tests {
         assert!(!WasmCAPIVersion::V0.is_compatible_with(WasmCAPIVersion::Unknown));
         assert!(!WasmCAPIVersion::Unknown.is_compatible_with(WasmCAPIVersion::V0));
         assert!(!WasmCAPIVersion::Unknown.is_compatible_with(WasmCAPIVersion::Unknown));
-    }
-
-    #[cfg(feature = "wasi")]
-    #[test]
-    fn wasm_c_api_imports_run_from_wasix_guest() {
-        let wasm = parse_str(WASIX_GUEST).expect("guest wat parses");
-        let store = Store::default();
-        let module = Module::new(&store, &wasm).expect("guest module compiles");
-
-        let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime starts");
-        let _guard = tokio_runtime.enter();
-        let mut runtime = PluggableRuntime::new(Arc::new(TokioTaskManager::new(
-            tokio_runtime.handle().clone(),
-        )));
-        runtime.set_engine(store.engine().clone());
-
-        let resolve_calls = Arc::new(AtomicUsize::new(0));
-        let resolve_engine = store.engine().clone();
-        let hooks = WasmCapiRuntimeHooks::new().with_resolve_module_sync({
-            let resolve_calls = resolve_calls.clone();
-            move |bytes| {
-                resolve_calls.fetch_add(1, Ordering::SeqCst);
-                Ok(Module::new(&resolve_engine, bytes)?)
-            }
-        });
-        runtime.with_instantiation_hook(hooks);
-
-        let result = WasiRunner::new().run_wasm(
-            RuntimeOrEngine::Runtime(Arc::new(runtime)),
-            "wasm-c-api-smoke",
-            module,
-            ModuleHash::new(&wasm),
-        );
-
-        match result {
-            Ok(()) => {}
-            Err(err) => {
-                if let Some(WasiError::Exit(code)) = err.downcast_ref::<WasiError>() {
-                    panic!("guest exited with status {code}");
-                }
-                panic!("guest failed: {err:?}");
-            }
-        }
-        assert_eq!(resolve_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

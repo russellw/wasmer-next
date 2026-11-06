@@ -7776,8 +7776,6 @@ dependencies = [
  "wasixv2",
  "wasixv2-exec",
  "wasmer",
- "wasmer-types",
- "wasmer-wasix",
  "wat",
 ]
 
