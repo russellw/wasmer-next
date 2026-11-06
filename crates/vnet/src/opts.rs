@@ -593,6 +593,24 @@ impl SockOpts {
         self.mc.set(net, self.ty, bound_dev, level, name, value)
     }
 
+    pub(crate) fn prepare_selected_mcast(
+        &self,
+        net: &Net,
+        level: i32,
+        name: i32,
+        value: &[u8],
+    ) -> NetResult<crate::mcast::PreparedMcast> {
+        self.check_level(level)?;
+        self.mc.prepare_selected(
+            net,
+            self.ty,
+            net.device_index(&self.bind_device),
+            level,
+            name,
+            value,
+        )
+    }
+
     /// `setsockopt` for the options every inet socket shares. `bound` is whether the socket
     /// holds a port (some options are fixed after bind).
     pub fn set(&mut self, level: i32, name: i32, value: &[u8], bound: bool) -> NetResult<Changed> {
@@ -827,10 +845,12 @@ impl SockOpts {
                 (Some(_), SocketKind::SeqPacket) => crate::sctp::IPPROTO_SCTP,
             },
             (SOL_SOCKET, n) if n == So::SO_DOMAIN.0 => self.family.map_or(1, Domain::raw),
-            (SOL_IP, n) if n == IpOption::IP_TTL.0 => match self.int(level, name) {
-                0 | -1 => 64,
-                v => v,
-            },
+            (SOL_IP, n) if n == IpOption::IP_TTL.0 => {
+                match self.ints.get(&(level, name)).copied().unwrap_or(-1) {
+                    0 | -1 => 64,
+                    v => v,
+                }
+            }
             (SOL_IPV6, n) if n == Ipv6Option::IPV6_UNICAST_HOPS.0 => {
                 match self.ints.get(&(level, name)) {
                     None | Some(-1) => 64,
@@ -896,6 +916,36 @@ mod tests {
         o.set(SOL_SOCKET, So::SO_SNDBUF.0, &(-1i32).to_le_bytes(), false)
             .unwrap();
         assert_eq!(get(&o, SOL_SOCKET, So::SO_SNDBUF.0), 2 * 212_992);
+    }
+
+    #[test]
+    fn ipv4_ttl_getter_preserves_set_reset_and_range_validation() {
+        let mut o = SockOpts::new(SocketKind::Datagram, Domain::Inet);
+        let name = IpOption::IP_TTL.0;
+        assert_eq!(get(&o, SOL_IP, name), 64);
+        assert_eq!(
+            o.set(SOL_IP, name, &37i32.to_le_bytes(), false),
+            Ok(Changed::Nothing)
+        );
+        assert_eq!(get(&o, SOL_IP, name), 37);
+        assert_eq!(o.unicast_ttl(Domain::Inet), 37);
+
+        for invalid in [i32::MIN, -2, 0, 256, i32::MAX] {
+            assert_eq!(
+                o.set(SOL_IP, name, &invalid.to_le_bytes(), false),
+                Err(Errno::EINVAL)
+            );
+            assert_eq!(get(&o, SOL_IP, name), 37);
+        }
+        for value in [1i32, 255, -1] {
+            assert_eq!(
+                o.set(SOL_IP, name, &value.to_le_bytes(), false),
+                Ok(Changed::Nothing)
+            );
+            let expected = if value == -1 { 64 } else { value };
+            assert_eq!(get(&o, SOL_IP, name), expected);
+            assert_eq!(i32::from(o.unicast_ttl(Domain::Inet)), expected);
+        }
     }
 
     #[test]

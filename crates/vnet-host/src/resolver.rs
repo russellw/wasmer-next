@@ -25,7 +25,7 @@ use std::{
     hash::{BuildHasher, Hasher},
     io::{Read, Write},
     mem,
-    net::{IpAddr, SocketAddr, TcpStream, UdpSocket},
+    net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket},
     path::PathBuf,
     sync::{Arc, Condvar, Mutex},
     thread,
@@ -88,6 +88,11 @@ enum Key {
 
 enum Job {
     Lookup(Key),
+    Host {
+        name: String,
+        port: Option<u16>,
+        done: LookupDone,
+    },
     Forward(Vec<u8>, LookupDone),
 }
 
@@ -166,11 +171,27 @@ impl Resolver {
         self.wake_worker(st);
     }
 
+    /// Direct native host lookup preserves spelling and host search semantics. It uses the
+    /// existing worker bound, without the absolute-name cache used by guest wire DNS.
+    pub(crate) fn lookup_host(
+        &self,
+        host: &str,
+        port: Option<u16>,
+        _dns_server: Option<IpAddr>,
+        done: LookupDone,
+    ) {
+        self.enqueue(Job::Host {
+            name: host.to_owned(),
+            port,
+            done,
+        });
+    }
+
     fn enqueue(&self, job: Job) {
         let mut st = self.0.st.lock().unwrap();
-        if st.waiting.len() + st.queue.len() >= MAX_PENDING {
+        if st.stop || st.waiting.len() + st.queue.len() >= MAX_PENDING {
             drop(st);
-            if let Job::Forward(_, done) = job {
+            if let Job::Forward(_, done) | Job::Host { done, .. } = job {
                 done(Err(LookupError::Failed));
             }
             return;
@@ -208,8 +229,24 @@ impl Resolver {
 
 impl Drop for Resolver {
     fn drop(&mut self) {
-        self.0.st.lock().unwrap().stop = true;
+        let failed = {
+            let mut state = self.0.st.lock().unwrap();
+            state.stop = true;
+            let mut failed = Vec::new();
+            let mut kept = VecDeque::new();
+            for job in state.queue.drain(..) {
+                match job {
+                    Job::Host { done, .. } => failed.push(done),
+                    other => kept.push_back(other),
+                }
+            }
+            state.queue = kept;
+            failed
+        };
         self.0.work.notify_all();
+        for done in failed {
+            done(Err(LookupError::Provider(wasixv2_abi::Errno::ENETDOWN)));
+        }
     }
 }
 
@@ -217,7 +254,7 @@ impl Drop for Resolver {
 fn fail_all(st: &mut State) -> Vec<LookupDone> {
     let mut out: Vec<LookupDone> = st.waiting.drain().flat_map(|(_, w)| w).collect();
     for job in st.queue.drain(..) {
-        if let Job::Forward(_, done) = job {
+        if let Job::Forward(_, done) | Job::Host { done, .. } = job {
             out.push(done);
         }
     }
@@ -249,6 +286,27 @@ fn work(shared: &Shared) {
         };
         match job {
             Job::Forward(query, done) => done(forward(&shared.config, &query)),
+            Job::Host { name, port, done } => {
+                let host = if name.contains(':') {
+                    name.clone()
+                } else {
+                    format!("{name}:{}", port.unwrap_or(0))
+                };
+                let result = host
+                    .to_socket_addrs()
+                    .map(|addresses| {
+                        let addrs = addresses.map(|address| address.ip()).collect();
+                        Found {
+                            answer: Answer::Addrs {
+                                canonical: name,
+                                addrs,
+                            },
+                            ttl: 0,
+                        }
+                    })
+                    .map_err(|error| LookupError::Provider(crate::errno_from_io(&error)));
+                done(result);
+            }
             Job::Lookup(key) => {
                 let found = match &key {
                     Key::Name(name) => lookup_name(&shared.config, name),

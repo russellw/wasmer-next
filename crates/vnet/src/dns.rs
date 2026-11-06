@@ -361,6 +361,11 @@ fn labels_of(name: &str) -> Option<Vec<Vec<u8>>> {
     ok.then_some(labels)
 }
 
+/// Policy spelling for a host name, using exactly the wire DNS label/name admission.
+pub(crate) fn policy_name(name: &str) -> Option<String> {
+    question_name(&labels_of(name)?)
+}
+
 /// Where a record's owner name is: a compression pointer to an earlier name.
 type NameAt = u16;
 /// The question's name, right after the header.
@@ -507,7 +512,9 @@ fn respond(
         Err(LookupError::NotFound { .. }) => {
             return Builder::new(q, NXDOMAIN).finish(q, transport, 0);
         }
-        Err(LookupError::Failed) => return Builder::new(q, SERVFAIL).finish(q, transport, 0),
+        Err(LookupError::Failed | LookupError::Provider(_)) => {
+            return Builder::new(q, SERVFAIL).finish(q, transport, 0);
+        }
     };
     let mut b = Builder::new(q, NOERROR);
     match (want, found) {

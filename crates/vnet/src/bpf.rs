@@ -105,6 +105,7 @@ const AD_VLAN_TPID: i32 = 60;
 
 /// `PACKET_HOST`, `PACKET_MULTICAST`, `PACKET_LOOPBACK` (`skb->pkt_type`).
 pub const PACKET_HOST: u8 = 0;
+pub const PACKET_BROADCAST: u8 = 1;
 pub const PACKET_MULTICAST: u8 = 2;
 pub const PACKET_LOOPBACK: u8 = 5;
 /// `ETH_P_IP`, `ETH_P_IPV6`.

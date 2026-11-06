@@ -8,7 +8,7 @@ use std::{
 
 use futures::FutureExt as _;
 use wasixv2_abi::{AddressFamily, MsgFlags, SocketFlags, SocketLevel, SocketOption, UserMsghdr};
-use wasixv2_syscalls::{read_value, write_value};
+use wasixv2_syscalls::{Control as _, read_value, write_value};
 use wasixv2_vnet::{
     Accepted, Control, Domain, Network, RecvMsg, SendMsg, Shutdown, Socket, SocketKind,
 };
@@ -2268,3 +2268,176 @@ fn provider_ioctl_checks_unprivileged_socket_opener_after_sender_gains_privilege
     );
     assert_eq!(network.lookups.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
+
+#[derive(Default)]
+struct HostLookupNet(
+    Mutex<
+        Vec<(
+            String,
+            wasixv2_vnet::LookupContext,
+            wasixv2_vnet::LookupDone,
+        )>,
+    >,
+);
+impl Network for HostLookupNet {
+    fn supports_contextual_lookup(&self) -> bool {
+        true
+    }
+    fn lookup_contextual(
+        &self,
+        lookup: wasixv2_vnet::Lookup,
+        context: wasixv2_vnet::LookupContext,
+        done: wasixv2_vnet::LookupDone,
+    ) {
+        let wasixv2_vnet::Lookup::Name(name) = lookup else {
+            panic!("host lookup is a name");
+        };
+        self.0.lock().unwrap().push((name, context, done));
+    }
+    fn socket(&self, _: Domain, _: SocketKind, _: i32, _: u32) -> Result<Arc<dyn Socket>, Errno> {
+        panic!("host lookup must not fall back to wire sockets")
+    }
+}
+#[test]
+fn host_lookup_captures_namespace_before_poll_and_returns_exact_provider_errors() {
+    use std::task::{Context, Poll};
+    use wasixv2_abi::CloneFlags;
+    use wasixv2_vnet::{LookupContext, LookupError};
+    let network = Arc::new(HostLookupNet::default());
+    let other = Arc::new(HostLookupNet::default());
+    let (kernel, task, memory) = super::cred::machine_with(|kernel| {
+        let other = other.clone();
+        kernel
+            .with_credentials(Credentials::new(0, 0))
+            .with_network(network.clone())
+            .with_network_factory(move || other.clone())
+    });
+    let caller = Caller::new(task, &memory);
+    let mut lookup = kernel
+        .lookup_host(&caller, "MiXeD.Invalid.", Some(443))
+        .unwrap();
+    assert!(
+        network.0.lock().unwrap().is_empty(),
+        "construction only captures namespace metadata"
+    );
+    assert_eq!(
+        block_on(kernel.unshare(&caller, CloneFlags::CLONE_NEWNET.0 as u32)),
+        Ok(0)
+    );
+    let mut fresh = kernel.lookup_host(&caller, "fresh.invalid", None).unwrap();
+    let mut cx = Context::from_waker(std::task::Waker::noop());
+    assert!(lookup.as_mut().poll(&mut cx).is_pending());
+    assert!(fresh.as_mut().poll(&mut cx).is_pending());
+    let (fresh_name, _, fresh_done) = other.0.lock().unwrap().remove(0);
+    assert_eq!(fresh_name, "fresh.invalid");
+    fresh_done(Ok(wasixv2_vnet::Found {
+        answer: wasixv2_vnet::Answer::Addrs {
+            canonical: fresh_name,
+            addrs: vec!["192.0.2.20".parse().unwrap()],
+        },
+        ttl: 0,
+    }));
+    assert_eq!(
+        fresh.as_mut().poll(&mut cx),
+        Poll::Ready(Ok(vec!["192.0.2.20".parse().unwrap()]))
+    );
+    let (name, context, done) = network.0.lock().unwrap().remove(0);
+    assert_eq!(name, "MiXeD.Invalid.");
+    assert_eq!(context, LookupContext { port: Some(443) });
+    done(Err(LookupError::Provider(Errno::EOPNOTSUPP)));
+    assert_eq!(
+        lookup.as_mut().poll(&mut cx),
+        Poll::Ready(Err(SysErr::Errno(Errno::EOPNOTSUPP)))
+    );
+}
+#[test]
+fn provider_controls_alone_do_not_select_host_dns() {
+    let network = Arc::new(ControlledNet::default());
+    let (kernel, task, memory) =
+        super::cred::machine_with(|kernel| kernel.with_network(network.clone()));
+    let caller = Caller::new(task, &memory);
+    assert!(kernel.lookup_host(&caller, "wire.invalid", None).is_none());
+    assert_eq!(
+        network.lookups.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "host capability is not provider-control probing"
+    );
+}
+
+#[test]
+fn interrupted_host_lookup_retires_waiter_before_late_owned_callback() {
+    use std::task::{Context, Poll};
+    let network = Arc::new(HostLookupNet::default());
+    let (kernel, task, memory) = super::cred::machine_with(|kernel| {
+        let network = network.clone();
+        kernel
+            .with_credentials(Credentials::new(0, 0))
+            .with_network_factory(move || network.clone())
+    });
+    let caller = Caller::new(task, &memory);
+    let newnet = wasixv2_abi::CloneFlags::CLONE_NEWNET.0 as u32;
+    assert_eq!(block_on(kernel.unshare(&caller, newnet)), Ok(0));
+    let realm = Arc::downgrade(&kernel.ns(&caller).net);
+    let mut lookup = kernel.lookup_host(&caller, "late.invalid", None).unwrap();
+    let mut cx = Context::from_waker(std::task::Waker::noop());
+    assert!(lookup.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(block_on(kernel.unshare(&caller, newnet)), Ok(0));
+    kernel.kill(task, wasixv2_abi::Signal::SIGKILL).unwrap();
+    assert_eq!(
+        lookup.as_mut().poll(&mut cx),
+        Poll::Ready(Err(SysErr::Errno(Errno::EINTR)))
+    );
+    drop(lookup);
+    drop(caller);
+    // The late callback cannot access either caller or guest memory.
+    drop(memory);
+    assert!(
+        realm.upgrade().is_some(),
+        "admitted callback pins the original noninitial realm after cancellation"
+    );
+    let (_, _, done) = network.0.lock().unwrap().remove(0);
+    done(Ok(wasixv2_vnet::Found {
+        answer: wasixv2_vnet::Answer::Addrs {
+            canonical: "late.invalid".into(),
+            addrs: vec!["192.0.2.30".parse().unwrap()],
+        },
+        ttl: 0,
+    }));
+    assert!(
+        realm.upgrade().is_none(),
+        "actual callback completion retires its original realm"
+    );
+}
+
+#[test]
+fn unpolled_host_lookup_with_pending_kill_or_stop_restarts_without_admission() {
+    for signal in [wasixv2_abi::Signal::SIGKILL, wasixv2_abi::Signal::SIGSTOP] {
+        let network = Arc::new(HostLookupNet::default());
+        let (kernel, task, memory) =
+            super::cred::machine_with(|kernel| kernel.with_network(network.clone()));
+        let caller = Caller::new(task, &memory);
+        let selected = kernel
+            .lookup_host(&caller, "not-admitted.invalid", None)
+            .unwrap();
+        kernel.kill(task, signal).unwrap();
+        assert_eq!(block_on(selected), Err(SysErr::Restart));
+        assert!(
+            network.0.lock().unwrap().is_empty(),
+            "pending work must run before policy/provider admission"
+        );
+        if signal == wasixv2_abi::Signal::SIGSTOP {
+            assert_eq!(kernel.take_pending(task), Some(GuestAction::Stopped));
+            kernel.kill(task, wasixv2_abi::Signal::SIGCONT).unwrap();
+            assert_eq!(kernel.take_pending(task), None);
+            let mut selected = kernel
+                .lookup_host(&caller, "after-continue.invalid", None)
+                .unwrap();
+            use std::task::Context;
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            assert!(selected.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(network.0.lock().unwrap().len(), 1);
+        }
+    }
+}
+
+mod admission;

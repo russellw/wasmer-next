@@ -28,7 +28,10 @@ mod resolver;
 #[cfg(unix)]
 pub use errno::errno_from_io;
 #[cfg(unix)]
-pub use reactor::{HostBackend, VsockConfig, VsockRoute};
+pub use reactor::{
+    HostBackend, NativeBoundTcp, NativeClose, NativeDatagram, NativeListener, NativeReceiveLease,
+    NativeStream, VsockConfig, VsockRoute,
+};
 #[cfg(unix)]
 pub use resolver::ResolverConfig;
 

@@ -4223,3 +4223,234 @@ fn admission_refuses_transports_without_policy_coverage() {
         Some(Errno::ENODEV)
     );
 }
+
+/// Host-context lookup uses the same backend lifetime as ordinary DNS, but only by opt-in.
+#[derive(Default)]
+struct ContextResolver {
+    resolver: Resolver,
+    contexts: Mutex<Vec<crate::LookupContext>>,
+}
+impl Backend for ContextResolver {
+    fn connect(&self, addr: SocketAddr, queue: WaitQueue) -> Result<Arc<dyn BackendStream>, Errno> {
+        self.resolver.connect(addr, queue)
+    }
+    fn datagram(
+        &self,
+        domain: Domain,
+        queue: WaitQueue,
+    ) -> Result<Arc<dyn BackendDatagram>, Errno> {
+        self.resolver.datagram(domain, queue)
+    }
+    fn publish(
+        &self,
+        addr: SocketAddr,
+        backlog: u32,
+        sink: Arc<dyn InboundSink>,
+    ) -> Result<Box<dyn Publication>, std::io::Error> {
+        self.resolver.publish(addr, backlog, sink)
+    }
+    fn supports_contextual_lookup(&self) -> bool {
+        true
+    }
+    fn lookup_contextual(
+        &self,
+        lookup: crate::Lookup,
+        context: crate::LookupContext,
+        done: crate::LookupDone,
+    ) {
+        self.contexts.lock().unwrap().push(context);
+        self.resolver.lookup(lookup, done);
+    }
+}
+
+struct ContextPolicy {
+    allowed: std::sync::atomic::AtomicBool,
+    net: Mutex<std::sync::Weak<Net>>,
+    feedback: Mutex<Vec<(String, Vec<std::net::IpAddr>)>>,
+}
+impl std::fmt::Debug for ContextPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ContextPolicy")
+    }
+}
+impl crate::NetworkPolicy for ContextPolicy {
+    fn allows_socket(&self, _: SocketAddr, _: crate::PolicyDirection) -> bool {
+        true
+    }
+    fn allows_domain(&self, name: &str) -> bool {
+        // Both callbacks must be outside the network's locks.
+        if let Some(net) = self.net.lock().unwrap().upgrade() {
+            let _ = net.interfaces();
+        }
+        name == "Case.Example" && self.allowed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn resolved_domain(&self, name: &str, addrs: &[std::net::IpAddr]) {
+        if let Some(net) = self.net.lock().unwrap().upgrade() {
+            let _ = net.interfaces();
+        }
+        self.feedback
+            .lock()
+            .unwrap()
+            .push((name.into(), addrs.to_vec()));
+    }
+}
+fn context_net() -> (Arc<Net>, Arc<ContextResolver>, Arc<ContextPolicy>) {
+    let resolver = Arc::new(ContextResolver::default());
+    let policy = Arc::new(ContextPolicy {
+        allowed: std::sync::atomic::AtomicBool::new(true),
+        net: Mutex::default(),
+        feedback: Mutex::default(),
+    });
+    let net = Net::new(
+        NetConfig {
+            policy: Some(policy.clone()),
+            ..NetConfig::host_default()
+        },
+        Some(resolver.clone()),
+    );
+    *policy.net.lock().unwrap() = Arc::downgrade(&net);
+    (net, resolver, policy)
+}
+type ContextResult = Arc<Mutex<Option<Result<crate::Found, crate::LookupError>>>>;
+fn context_lookup(net: &dyn Network, name: &str, port: Option<u16>) -> ContextResult {
+    let result = Arc::new(Mutex::new(None));
+    let output = result.clone();
+    net.lookup_contextual(
+        crate::Lookup::Name(name.into()),
+        crate::LookupContext { port },
+        Box::new(move |value| {
+            *output.lock().unwrap() = Some(value);
+        }),
+    );
+    result
+}
+#[test]
+fn contextual_lookup_is_default_off_and_preserves_name_port_and_domain_policy() {
+    let (ordinary, _) = with_resolver(NetConfig::default());
+    assert!(!ordinary.supports_contextual_lookup());
+    assert!(!net().supports_contextual_lookup());
+    let (net, resolver, policy) = context_net();
+    assert!(net.supports_contextual_lookup());
+    let result = context_lookup(&*net, "Case.Example.", Some(443));
+    assert!(result.lock().unwrap().is_none());
+    assert_eq!(
+        resolver.resolver.questions(),
+        vec![crate::Lookup::Name("Case.Example.".into())]
+    );
+    assert_eq!(
+        *resolver.contexts.lock().unwrap(),
+        vec![crate::LookupContext { port: Some(443) }]
+    );
+    let answer = addrs("other.canonical", &["192.0.2.9"], 0);
+    resolver.resolver.answer(answer.clone());
+    assert_eq!(*result.lock().unwrap(), Some(answer));
+    assert_eq!(
+        *policy.feedback.lock().unwrap(),
+        vec![("Case.Example".into(), vec!["192.0.2.9".parse().unwrap()])]
+    );
+    for bad in ["denied.example", "Case..Example", "Case\\Example", ""] {
+        let result = context_lookup(&*net, bad, None);
+        assert!(matches!(
+            *result.lock().unwrap(),
+            Some(Err(crate::LookupError::Provider(
+                Errno::EPERM | Errno::EINVAL
+            )))
+        ));
+    }
+    assert!(
+        resolver.resolver.questions().is_empty(),
+        "rejected names never reach the provider"
+    );
+}
+#[test]
+fn contextual_pending_policy_and_activity_changes_reject_before_feedback_or_data() {
+    use crate::{LookupError, provider::Snapshot};
+    use std::sync::atomic::Ordering;
+    let (net, resolver, policy) = context_net();
+    let denied = context_lookup(&*net, "Case.Example", None);
+    policy.allowed.store(false, Ordering::SeqCst);
+    resolver
+        .resolver
+        .answer(addrs("Case.Example", &["192.0.2.1"], 0));
+    assert_eq!(
+        *denied.lock().unwrap(),
+        Some(Err(LookupError::Provider(Errno::EPERM)))
+    );
+    policy.allowed.store(true, Ordering::SeqCst);
+    for unavailable in [false, true] {
+        let stale = context_lookup(&*net, "Case.Example", None);
+        net.publish_provider(
+            &Snapshot {
+                active: Some(!unavailable),
+                ..Snapshot::default()
+            },
+            None,
+        )
+        .unwrap();
+        // Restoring the same boolean cannot revive an old activity identity (ABA).
+        net.publish_provider(
+            &Snapshot {
+                active: Some(true),
+                ..Snapshot::default()
+            },
+            None,
+        )
+        .unwrap();
+        resolver
+            .resolver
+            .answer(addrs("Case.Example", &["192.0.2.2"], 0));
+        assert_eq!(
+            *stale.lock().unwrap(),
+            Some(Err(LookupError::Provider(Errno::ENETDOWN)))
+        );
+    }
+    assert!(policy.feedback.lock().unwrap().is_empty());
+    let exact = context_lookup(&*net, "Case.Example", Some(0));
+    resolver
+        .resolver
+        .answer(Err(LookupError::Provider(Errno::EACCES)));
+    assert_eq!(
+        *exact.lock().unwrap(),
+        Some(Err(LookupError::Provider(Errno::EACCES)))
+    );
+    net.publish_provider(
+        &Snapshot {
+            active: Some(false),
+            ..Snapshot::default()
+        },
+        None,
+    )
+    .unwrap();
+    let down = context_lookup(&*net, "Case.Example", None);
+    assert_eq!(
+        *down.lock().unwrap(),
+        Some(Err(LookupError::Provider(Errno::ENETDOWN)))
+    );
+    assert!(resolver.resolver.questions().is_empty());
+}
+
+#[test]
+fn contextual_names_keep_custom_spelling_without_policy_and_require_spelling_only_for_policy() {
+    let resolver = Arc::new(ContextResolver::default());
+    let net = Net::new(NetConfig::default(), Some(resolver.clone()));
+    for name in ["bücher.Example.", "", &"x".repeat(300)] {
+        let result = context_lookup(&*net, name, Some(443));
+        assert_eq!(
+            resolver.resolver.questions(),
+            vec![crate::Lookup::Name(name.into())]
+        );
+        resolver
+            .resolver
+            .answer(addrs("provider.original", &["192.0.2.7"], 0));
+        assert!(matches!(*result.lock().unwrap(), Some(Ok(_))));
+    }
+    let (net, resolver, _) = context_net();
+    for name in ["bücher.Example.", "", &"x".repeat(300)] {
+        let result = context_lookup(&*net, name, Some(443));
+        assert_eq!(
+            *result.lock().unwrap(),
+            Some(Err(crate::LookupError::Provider(Errno::EPERM)))
+        );
+    }
+    assert!(resolver.resolver.questions().is_empty());
+}

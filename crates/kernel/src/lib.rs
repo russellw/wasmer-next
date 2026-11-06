@@ -872,6 +872,21 @@ impl Kernel {
 }
 
 impl Syscalls for Kernel {
+    fn lookup_host<'a>(
+        &'a self,
+        caller: &'a Caller<'_>,
+        name: &'a str,
+        port: Option<u16>,
+    ) -> Option<wasixv2_syscalls::LocalFuture<'a, SysResult<Vec<std::net::IpAddr>>>> {
+        // Capture metadata only: no policy/backend callback runs until this future is polled.
+        let net = self.ns(caller).net.clone();
+        let network = net.network.as_ref()?.clone();
+        if !network.supports_contextual_lookup() {
+            return None;
+        }
+        Some(Box::pin(self.host_lookup(caller, net, network, name, port)))
+    }
+
     fn context_create<'a>(
         &'a self,
         caller: &'a Caller<'_>,

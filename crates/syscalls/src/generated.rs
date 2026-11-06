@@ -46,6 +46,19 @@ use crate::{
 // The futures are deliberately not `Send`: wasmer's async host calls are not.
 #[allow(unused_variables)]
 pub trait Syscalls {
+    /// Optional host-only name lookup. `None` preserves the guest's ordinary DNS path.
+    /// This is not a guest syscall and must be explicitly admitted by each layer.
+    /// Construction may capture pure immutable namespace/capability metadata only;
+    /// provider admission, policy callbacks and lookup work begin when the future is polled.
+    fn lookup_host<'a>(
+        &'a self,
+        caller: &'a Caller<'_>,
+        name: &'a str,
+        port: Option<u16>,
+    ) -> Option<crate::LocalFuture<'a, SysResult<Vec<std::net::IpAddr>>>> {
+        None
+    }
+
     /// Size in bytes of the startup block that `startup-get` writes.
     ///
     /// Wasm import `wasixv2.startup_size`.
@@ -13410,6 +13423,19 @@ pub fn dispatch<'a, S: Syscalls + ?Sized>(
 /// A layer is written for the syscalls `S` it runs in front of: a generic one (a tracer) for
 /// every `S`, one that needs more of what it wraps (the kernel's syscall entry) for that type.
 pub trait Layer<S: Syscalls> {
+    /// Optional host lookup, disabled even when `next` supports it unless this layer opts in.
+    /// Construction is metadata-only; provider/policy work must remain in the returned future.
+    fn lookup_host<'a>(
+        &'a self,
+        caller: &'a Caller<'_>,
+        name: &'a str,
+        port: Option<u16>,
+        next: &'a S,
+    ) -> Option<crate::LocalFuture<'a, SysResult<Vec<std::net::IpAddr>>>> {
+        let _ = (caller, name, port, next);
+        None
+    }
+
     fn call<'a>(
         &'a self,
         caller: &'a Caller<'_>,
@@ -13435,6 +13461,15 @@ fn mismatch(call: &str) -> ! {
 }
 
 impl<L: Layer<S>, S: Syscalls> Syscalls for Layered<L, S> {
+    fn lookup_host<'a>(
+        &'a self,
+        caller: &'a Caller<'_>,
+        name: &'a str,
+        port: Option<u16>,
+    ) -> Option<crate::LocalFuture<'a, SysResult<Vec<std::net::IpAddr>>>> {
+        self.layer.lookup_host(caller, name, port, &self.inner)
+    }
+
     fn startup_size<'a>(&'a self, caller: &'a Caller<'_>) -> MaybeFuture<'a, SysResult<u32>> {
         let call = Syscall::StartupSize;
         self.layer

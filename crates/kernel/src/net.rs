@@ -376,8 +376,8 @@ impl Kernel {
         file: Arc<OpenFile>,
         raw: &[u8],
     ) -> SysResult<i32> {
-        let sock = match any_socket_file(file)? {
-            AnySock::Inet((_, sock)) => sock,
+        let (file, sock) = match any_socket_file(file)? {
+            AnySock::Inet((file, sock)) => (file, sock),
             AnySock::Unix(_, sock) => return self.unix_bind(caller, &sock, raw).await,
             AnySock::Netlink(_, nl) => {
                 return Ok(nl.bind(
@@ -409,8 +409,47 @@ impl Kernel {
         if socket::family(raw)? == AddressFamily::AF_UNSPEC && !addr.ip().is_unspecified() {
             return Err(Errno::EAFNOSUPPORT.into());
         }
-        sock.socket.bind(addr, privileged)?;
+        if let Some(admission) = sock.socket.bind_admission(addr, privileged)? {
+            let interrupt = self.interrupt(caller);
+            // bind itself does not acquire O_NONBLOCK or socket send-timeout semantics.
+            let mut io = Self::io(caller, &*interrupt, &file);
+            io.flags &= !OpenFlags::O_NONBLOCK;
+            let mut wait = socket::Blocking::new(&*self.host, io, MsgFlags::empty(), None);
+            wait.wait(
+                WaitOn::Object(&*admission),
+                PollMask::WRITABLE | PollMask::ERR,
+                || admission.complete_result().ok_or(Errno::EAGAIN),
+            )
+            .await??;
+        } else {
+            sock.socket.bind(addr, privileged)?;
+        }
         Ok(0)
+    }
+
+    async fn endpoint_autobind(
+        &self,
+        caller: &Caller<'_>,
+        file: &OpenFile,
+        socket: &dyn wasixv2_vnet::Socket,
+        operation: wasixv2_vnet::endpoint::EndpointAutobind<'_>,
+    ) -> SysResult<()> {
+        let privileged = self
+            .cred(caller)
+            .ns_capable(self.ns(caller).net.user_ns(), Cap::NetBindService);
+        if let Some(admission) = socket.autobind_admission(operation, privileged)? {
+            let interrupt = self.interrupt(caller);
+            let mut io = Self::io(caller, &*interrupt, file);
+            io.flags &= !OpenFlags::O_NONBLOCK;
+            let mut wait = socket::Blocking::new(&*self.host, io, MsgFlags::empty(), None);
+            wait.wait(
+                WaitOn::Object(&*admission),
+                PollMask::WRITABLE | PollMask::ERR,
+                || admission.complete_result().ok_or(Errno::EAGAIN),
+            )
+            .await??;
+        }
+        Ok(())
     }
 
     /// `__sys_listen`.
@@ -421,10 +460,10 @@ impl Kernel {
         backlog: i32,
     ) -> SysResult<i32> {
         let file = self.caller_file(caller, fd)?;
-        self.listen_file(caller, file, backlog)
+        self.listen_file(caller, file, backlog).await
     }
 
-    pub(crate) fn listen_file(
+    pub(crate) async fn listen_file(
         &self,
         caller: &Caller<'_>,
         file: Arc<OpenFile>,
@@ -432,7 +471,19 @@ impl Kernel {
     ) -> SysResult<i32> {
         let backlog = (backlog as u32).min(SOMAXCONN);
         match any_socket_file(file)? {
-            AnySock::Inet((_, sock)) => sock.socket.listen(backlog)?,
+            AnySock::Inet((file, sock)) => {
+                if sock.socket.kind() != SocketKind::Stream {
+                    return Ok(sock.socket.listen(backlog).map(|()| 0)?);
+                }
+                self.endpoint_autobind(
+                    caller,
+                    &file,
+                    &*sock.socket,
+                    wasixv2_vnet::endpoint::EndpointAutobind::Listen(backlog),
+                )
+                .await?;
+                sock.socket.listen(backlog)?;
+            }
             AnySock::Unix(_, sock) => sock.listen(backlog, self.peer_cred(caller))?,
             AnySock::Vsock(_, v) => v.listen(backlog)?,
             AnySock::Netlink(..) | AnySock::Packet(..) => return Err(Errno::EOPNOTSUPP.into()),
@@ -598,6 +649,13 @@ impl Kernel {
                 socket::decode(socket.domain(), &raw, false)?
             }
         };
+        self.endpoint_autobind(
+            caller,
+            &file,
+            &**socket,
+            wasixv2_vnet::endpoint::EndpointAutobind::Connect(addr),
+        )
+        .await?;
         let interrupt = self.interrupt(caller);
         let mut wait = sock.blocking(Self::io(caller, &*interrupt, &file), SND, wait);
         // `__inet_stream_connect`: a blocking socket waits for a connection under way, its
@@ -742,7 +800,7 @@ impl Kernel {
         let interrupt = self.interrupt(caller);
         let io = Self::io(caller, &*interrupt, sock.file());
         let result = match sock {
-            AnySock::Inet((_, sock)) => {
+            AnySock::Inet((file, sock)) => {
                 // `security_socket_sendmsg`: a UDP send names its port, or autobinds.
                 if let Some(landlock) = self.landlock(caller)
                     && landlock_request(sock, 0, crate::landlock::CONNECT_SEND_UDP).is_some()
@@ -786,6 +844,13 @@ impl Kernel {
                         net_raw,
                         now: self.host.monotonic(),
                     };
+                    self.endpoint_autobind(
+                        caller,
+                        file,
+                        &*sock.socket,
+                        wasixv2_vnet::endpoint::EndpointAutobind::Send(&msg),
+                    )
+                    .await?;
                     match sock.send(&mut wait, msg).await {
                         Ok(k) => {
                             sent += k;
@@ -2776,6 +2841,66 @@ fn landlock_autobind(landlock: &crate::landlock::Domain, sock: &SocketFile) -> R
     match bound {
         0 => landlock.check_net(0, crate::landlock::BIND_UDP),
         _ => Ok(()),
+    }
+}
+
+// Host-only resolver admission. This never borrows guest memory into a backend callback.
+impl Kernel {
+    pub(crate) async fn host_lookup(
+        &self,
+        caller: &Caller<'_>,
+        net: Arc<NetNs>,
+        network: Arc<dyn wasixv2_vnet::Network>,
+        name: &str,
+        port: Option<u16>,
+    ) -> SysResult<Vec<std::net::IpAddr>> {
+        use std::sync::Mutex;
+        use wasixv2_vnet::{Answer, Found, Lookup, LookupContext, LookupError};
+        use wasixv2_wait::{Interrupt, WaitQueue, wait_event};
+        let interrupt = self.interrupt(caller);
+        // No operation has been admitted yet: let canonical return-to-guest handling
+        // deliver STOP/KILL/task work and decide whether it may restart this import.
+        if interrupt.pending() {
+            return Err(SysErr::Restart);
+        }
+        struct Wait {
+            result: Mutex<Option<Result<Found, LookupError>>>,
+            queue: WaitQueue,
+        }
+        let wait = Arc::new(Wait {
+            result: Mutex::new(None),
+            queue: WaitQueue::new(),
+        });
+        let completed = wait.clone();
+        network.lookup_contextual(
+            Lookup::Name(name.to_owned()),
+            LookupContext { port },
+            Box::new(move |result| {
+                // An admitted operation owns its initiating realm until actual completion,
+                // even if the subscriber was interrupted or changed namespaces meanwhile.
+                let _namespace = net;
+                *completed.result.lock().unwrap() = Some(result);
+                completed.queue.wake(PollMask::IN);
+            }),
+        );
+        // Interruption retires only this waiter. An admitted provider owns its result until
+        // callback completion, just like provider_ioctl; no Restart may replay the lookup.
+        let result = wait_event(
+            &wait.queue,
+            || wait.result.lock().unwrap().take(),
+            &*interrupt,
+        )
+        .await
+        .map_err(|_| Errno::EINTR)?;
+        match result {
+            Ok(Found {
+                answer: Answer::Addrs { addrs, .. },
+                ..
+            }) => Ok(addrs),
+            Ok(_) | Err(LookupError::Failed) => Err(Errno::EIO.into()),
+            Err(LookupError::NotFound { .. }) => Err(Errno::ENOENT.into()),
+            Err(LookupError::Provider(error)) => Err(error.into()),
+        }
     }
 }
 

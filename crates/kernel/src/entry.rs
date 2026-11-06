@@ -96,6 +96,45 @@ const NR_CLONE: u32 = 220;
 pub struct SyscallEntry<L = Dispatch>(pub L);
 
 impl<L: Layer<Kernel>> Layer<Kernel> for SyscallEntry<L> {
+    fn lookup_host<'a>(
+        &'a self,
+        caller: &'a Caller<'_>,
+        name: &'a str,
+        port: Option<u16>,
+        next: &'a Kernel,
+    ) -> Option<wasixv2_syscalls::LocalFuture<'a, SysResult<Vec<std::net::IpAddr>>>> {
+        // An ordinary guest DNS path must pass through each observable/filtered syscall.
+        let constrained = move || next.seccomp_active(caller.task()) || next.tracees.used();
+        if constrained() {
+            return None;
+        }
+        let mut future = self.0.lookup_host(caller, name, port, next)?;
+        Some(Box::pin(async move {
+            let status = next.task_ref(caller.task(), |task| task.signals.status.clone());
+            status
+                .during(
+                    wasixv2_wait::TaskState::Uninterruptible,
+                    wasixv2_syscalls::as_task(
+                        caller.task(),
+                        poll_fn(move |cx| {
+                            // Recheck on every poll and after completion. Never replay a selected
+                            // provider operation if tracing/filtering was installed while it waited.
+                            if constrained() {
+                                return std::task::Poll::Ready(Err(Errno::EPERM.into()));
+                            }
+                            let result = future.as_mut().poll(cx);
+                            if constrained() {
+                                std::task::Poll::Ready(Err(Errno::EPERM.into()))
+                            } else {
+                                result
+                            }
+                        }),
+                    ),
+                )
+                .await
+        }))
+    }
+
     fn call<'a>(
         &'a self,
         caller: &'a Caller<'_>,
@@ -153,6 +192,16 @@ impl<L: Layer<Kernel>> Layer<Kernel> for SyscallEntry<L> {
 pub struct Dispatch;
 
 impl<S: Syscalls> Layer<S> for Dispatch {
+    fn lookup_host<'a>(
+        &'a self,
+        caller: &'a Caller<'_>,
+        name: &'a str,
+        port: Option<u16>,
+        next: &'a S,
+    ) -> Option<wasixv2_syscalls::LocalFuture<'a, SysResult<Vec<std::net::IpAddr>>>> {
+        next.lookup_host(caller, name, port)
+    }
+
     fn call<'a>(
         &'a self,
         caller: &'a Caller<'_>,

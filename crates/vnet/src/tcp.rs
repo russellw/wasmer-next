@@ -3,7 +3,7 @@
 
 use std::{
     collections::VecDeque,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::{
         Arc, Mutex, MutexGuard, Weak,
         atomic::{AtomicU8, AtomicU64, Ordering},
@@ -17,6 +17,11 @@ use crate::{
     Accepted, BackendStream, Domain, NetResult, PortEntry, Publication, RecvMsg, Room, SendMsg,
     Shutdown, Socket, SocketKind, StreamState,
     addr::{canonical, connect_target, present, unbound},
+    endpoint::{
+        AttemptGate, EndpointBindPurpose, EndpointBindRequest, EndpointBound, EndpointChoice,
+        EndpointKind, EndpointMember, EndpointQuery, EndpointSourceId, EndpointTarget,
+        pending::PendingStream, runtime::SocketEndpoint,
+    },
     net::{Net, Path},
     opts::{self, Changed, SockOpts},
     ports::{BindSpec, SockId},
@@ -36,6 +41,15 @@ enum Phase {
     Pending,
     Established,
     Failed,
+}
+
+/// External provider routing owns its source without inventing a namespace route/interface.
+enum ConnectRoute {
+    Namespace(Path),
+    Provider {
+        target: EndpointTarget,
+        source: IpAddr,
+    },
 }
 
 impl Transport {
@@ -198,6 +212,10 @@ struct Inner {
     /// Canonical bound address, once bound.
     local: Option<SocketAddr>,
     policy_bind: Option<SocketAddr>,
+    bind_pending: Option<EndpointSourceId>,
+    bind_admission: Weak<crate::endpoint::bind::Admission>,
+    endpoint_bound: Option<Arc<dyn EndpointBound>>,
+    endpoint_selected: bool,
     /// `SOCK_BINDPORT_LOCK`: the port was chosen by `bind`, so it survives a disconnect.
     port_locked: bool,
     /// `SOCK_BINDADDR_LOCK`: the address was chosen by `bind`, so a disconnect keeps it.
@@ -221,6 +239,7 @@ struct Inner {
 pub struct TcpSocket {
     net: Arc<Net>,
     id: SockId,
+    endpoint: SocketEndpoint,
     domain: AtomicU8,
     /// `sk_uid`, for `SO_REUSEPORT`.
     uid: u32,
@@ -305,6 +324,7 @@ impl TcpSocket {
         Arc::new_cyclic(|me| Self {
             net,
             id,
+            endpoint: SocketEndpoint::new(id),
             domain: AtomicU8::new(domain as u8),
             uid,
             ino: AtomicU64::new(0),
@@ -317,6 +337,10 @@ impl TcpSocket {
                 cork_armed: false,
                 local,
                 policy_bind: None,
+                bind_pending: None,
+                bind_admission: Weak::new(),
+                endpoint_bound: None,
+                endpoint_selected: false,
                 port_locked: false,
                 addr_locked: false,
                 put_back: None,
@@ -328,6 +352,207 @@ impl TcpSocket {
                 wr_shut: false,
             }),
         })
+    }
+
+    fn provider_bind(
+        &self,
+        requested: SocketAddr,
+        privileged: bool,
+        explicit: bool,
+        purpose: EndpointBindPurpose,
+    ) -> NetResult<Option<Box<dyn crate::BindAdmission>>> {
+        let Some(namespace) = self.net.endpoints() else {
+            return Ok(None);
+        };
+        let external = namespace.external;
+        let original_bind = if explicit {
+            Some(requested)
+        } else {
+            self.lock().policy_bind
+        };
+        let requested = original_bind.unwrap_or(requested);
+        if explicit || matches!(purpose, EndpointBindPurpose::Listen { .. }) {
+            self.net.admit(requested, crate::PolicyDirection::Inbound)?;
+        }
+        let (request, admission, freebind) = {
+            let mut g = self.lock();
+            if !explicit {
+                if g.local.is_some() {
+                    return Ok(None);
+                }
+                if let Some(admission) = g.bind_admission.upgrade() {
+                    return Ok(Some(admission.subscribe()));
+                }
+            }
+            if !explicit && g.policy_bind != original_bind {
+                return Err(Errno::EAGAIN);
+            }
+            let requested = original_bind.unwrap_or(requested);
+            let request_explicit = original_bind.is_some();
+            let addr = canonical(requested);
+            let freebind = g.opts.flag(0, wasixv2_abi::IpOption::IP_FREEBIND.0);
+            if !external {
+                self.net.check_bind(addr, privileged, freebind)?;
+            }
+            // External capability alone does not select an address authority. Its pure
+            // choice below precedes the selected security check and any provider work.
+            if matches!(requested, SocketAddr::V6(v6) if v6.ip().to_ipv4_mapped().is_some())
+                && g.opts.v6only
+            {
+                return Err(Errno::EINVAL);
+            }
+            if g.bind_pending.is_some()
+                || g.local.is_some()
+                || !matches!(g.state, State::Closed)
+                || (explicit && g.saddr.is_some())
+            {
+                return Err(Errno::EINVAL);
+            }
+            self.endpoint.renew(&namespace);
+            let source_id = self.endpoint.source();
+            let request = EndpointBindRequest {
+                source_id,
+                kind: EndpointKind::Stream,
+                requested,
+                explicit: request_explicit,
+                purpose: if request_explicit {
+                    EndpointBindPurpose::Bind
+                } else {
+                    purpose
+                },
+                domain: self.domain(),
+                v6only: g.opts.v6only,
+                reuse_addr: g.opts.reuseaddr,
+                reuse_port: g.opts.reuseport,
+            };
+            let commit = self.me.clone();
+            let cancel = self.me.clone();
+            let active = self.me.clone();
+            let admission = crate::endpoint::bind::Admission::new(
+                self.wq.clone(),
+                move |actual, bound| {
+                    let socket = commit.upgrade().ok_or(Errno::ECANCELED)?;
+                    let actual = crate::endpoint::bind::validate(request, actual)?;
+                    socket.net.check_bind(
+                        actual,
+                        privileged,
+                        freebind || external || requested.ip().is_unspecified(),
+                    )?;
+                    let mut g = socket.lock();
+                    if g.bind_pending != Some(source_id)
+                        || socket.endpoint.source() != source_id
+                        || (
+                            socket.domain(),
+                            g.opts.v6only,
+                            g.opts.reuseaddr,
+                            g.opts.reuseport,
+                        ) != (
+                            request.domain,
+                            request.v6only,
+                            request.reuse_addr,
+                            request.reuse_port,
+                        )
+                    {
+                        return Err(Errno::ECANCELED);
+                    }
+                    socket.net.tcp_bind(
+                        socket.id,
+                        socket.spec(&g.opts, actual.ip()),
+                        actual.port(),
+                        socket.me.clone(),
+                    )?;
+                    g.local = Some(actual);
+                    g.policy_bind = request.explicit.then_some(requested);
+                    g.saddr = None;
+                    g.port_locked = request.explicit && requested.port() != 0;
+                    g.addr_locked |=
+                        request.explicit && !canonical(requested).ip().is_unspecified();
+                    g.bind_pending = None;
+                    g.bind_admission = Weak::new();
+                    g.endpoint_bound = Some(bound);
+
+                    Ok(())
+                },
+                move || {
+                    if let Some(socket) = cancel.upgrade() {
+                        socket.cancel_bind(source_id);
+                    }
+                },
+                move || {
+                    active.upgrade().is_some_and(|socket| {
+                        let g = socket.inner.lock().unwrap();
+                        g.bind_pending == Some(source_id) && socket.endpoint.source() == source_id
+                    })
+                },
+            );
+            g.bind_pending = Some(source_id);
+            g.bind_admission = Arc::downgrade(&admission);
+            (request, admission, freebind)
+        };
+        // The synchronous factory must not block; the lease represents all pending work.
+        let result = (|| {
+            if external && !namespace.provider.select_bind(&request)? {
+                // Pure namespace selection accepts no physical work. The ordinary bind
+                // path below repeats all namespace address/route validation.
+                return Ok(None);
+            }
+            if explicit || matches!(request.purpose, EndpointBindPurpose::Listen { .. }) {
+                self.net.admit(requested, crate::PolicyDirection::Inbound)?;
+            }
+            {
+                let g = self.lock();
+                if g.bind_pending != Some(request.source_id)
+                    || self.endpoint.source() != request.source_id
+                    || g.local.is_some()
+                    || !matches!(g.state, State::Closed)
+                    || (explicit && g.saddr.is_some())
+                {
+                    return Err(Errno::ECANCELED);
+                }
+                if matches!(requested, SocketAddr::V6(v6) if v6.ip().to_ipv4_mapped().is_some())
+                    && g.opts.v6only
+                {
+                    return Err(Errno::EINVAL);
+                }
+                let current_freebind = g.opts.flag(0, wasixv2_abi::IpOption::IP_FREEBIND.0);
+                self.net.check_bind(
+                    canonical(requested),
+                    privileged,
+                    current_freebind || external,
+                )?;
+                if self.domain() != request.domain
+                    || g.opts.v6only != request.v6only
+                    || g.opts.reuseaddr != request.reuse_addr
+                    || g.opts.reuseport != request.reuse_port
+                    || current_freebind != freebind
+                {
+                    return Err(Errno::ECANCELED);
+                }
+            }
+            // No socket/namespace guard crosses the accepted foreign factory call.
+            namespace.provider.bind(request, self.wq.clone())
+        })();
+        admission.install(result.clone());
+        match result {
+            Ok(Some(_)) => Ok(Some(admission.subscribe())),
+            other => {
+                self.cancel_bind(request.source_id);
+                other.map(|_| None)
+            }
+        }
+    }
+
+    fn cancel_bind(&self, source: EndpointSourceId) {
+        let mut g = self.lock();
+        if g.bind_pending == Some(source) {
+            g.bind_pending = None;
+            g.bind_admission = Weak::new();
+            if let Some(ns) = self.net.endpoints() {
+                self.endpoint.renew(&ns);
+            }
+            drop(g);
+            self.wq.wake(PollMask::empty());
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -360,21 +585,76 @@ impl TcpSocket {
         let State::Connecting(t, peer) = &g.state else {
             return;
         };
-        match t.phase() {
-            Phase::Pending => {}
-            Phase::Established => {
-                g.state = State::Connected(t.clone(), *peer);
+        let t = t.clone();
+        let peer = *peer;
+        let actual = if g.endpoint_selected {
+            match &t {
+                Transport::Remote(stream) => stream.provider_local_addr(),
+                _ => None,
             }
-            Phase::Failed => {
-                // `tcp_done`: state CLOSE, both directions shut, autobound port released.
-                g.err = t.take_error().or(Some(Errno::ECONNREFUSED));
-                g.failed = true;
-                g.rd_shut = true;
-                g.wr_shut = true;
-                g.state = State::Closed;
-                self.put_port(g);
+        } else {
+            None
+        };
+        let mut failure = None;
+        if let Some(actual) = actual {
+            match actual {
+                Err(Errno::EAGAIN) => return,
+                Err(error) => failure = Some(error),
+                Ok(actual) => {
+                    let actual = canonical(actual);
+                    let previous = g.local.expect("connecting source reserved");
+                    let requested = g.policy_bind.map(canonical);
+                    if actual.port() == 0
+                        || actual.is_ipv4() != peer.is_ipv4()
+                        || requested.is_some_and(|request| {
+                            !request.ip().is_unspecified() && request.ip() != actual.ip()
+                        })
+                        || (g.endpoint_bound.is_some() && previous.port() != actual.port())
+                    {
+                        failure = Some(Errno::EPROTO);
+                    } else if actual != previous {
+                        let result = self.net.state().tcp.replace_bound(
+                            self.id,
+                            previous.port(),
+                            self.spec(&g.opts, actual.ip()),
+                            actual.port(),
+                            self.me.clone(),
+                        );
+                        match result {
+                            Ok(()) => {
+                                g.local = Some(actual);
+                                self.net
+                                    .state()
+                                    .tcp
+                                    .set_remote(self.id, actual.port(), Some(peer));
+                            }
+                            Err(error) => failure = Some(error),
+                        }
+                    }
+                }
             }
         }
+        if failure.is_none() {
+            match t.phase() {
+                Phase::Pending => return,
+                Phase::Established => {
+                    g.state = State::Connected(t, peer);
+                    return;
+                }
+                Phase::Failed => failure = t.take_error().or(Some(Errno::ECONNREFUSED)),
+            }
+        }
+        // No alternate address or replay after provider acceptance or an adoption conflict.
+        if let Transport::Remote(stream) = &t {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+        g.err = failure;
+        g.failed = true;
+        g.rd_shut = true;
+        g.wr_shut = true;
+        g.state = State::Closed;
+        g.endpoint_selected = false;
+        self.put_port(g);
     }
 
     /// `inet_put_port` unless the user bound the port.
@@ -384,10 +664,14 @@ impl TcpSocket {
         {
             self.net.state().tcp.unbind(self.id, local.port());
             g.put_back = Some(local);
+            g.endpoint_bound = None;
         }
     }
 
     fn autobind(&self, g: &mut Inner) -> NetResult<()> {
+        if g.bind_pending.is_some() {
+            return Err(Errno::EALREADY);
+        }
         if g.local.is_none() {
             let ip = g.saddr.unwrap_or(self.domain_any());
             let port = self
@@ -443,6 +727,9 @@ impl TcpSocket {
     fn stop_listening(&self, g: &mut Inner) {
         if !matches!(g.state, State::Listening(_)) {
             return;
+        }
+        if let Some(namespace) = self.net.endpoints() {
+            self.endpoint.renew(&namespace);
         }
         let State::Listening(l) = std::mem::replace(&mut g.state, State::Closed) else {
             unreachable!("checked above");
@@ -501,6 +788,9 @@ impl TcpSocket {
     fn release_inner(&self, abort: bool) {
         let mut g = self.inner.lock().unwrap();
         self.stop_listening(&mut g);
+        if let Some(namespace) = self.net.endpoints() {
+            self.endpoint.renew(&namespace);
+        }
         let abort = abort || g.opts.linger == Some(0);
         let old = std::mem::replace(&mut g.state, State::Closed);
         if let Some(local) = g.local.take() {
@@ -572,6 +862,31 @@ impl TcpSocket {
 
     /// A connection accepted by the backend for a published port; `wq` is the queue the stream
     /// wakes.
+    pub(crate) fn endpoint_room(
+        &self,
+        source: EndpointSourceId,
+        _peer: SocketAddr,
+        _destination: SocketAddr,
+        table: Option<&mut PollTable<'_>>,
+    ) -> Room {
+        if self.endpoint.source() != source {
+            return Room::Gone;
+        }
+        self.poll_room(table)
+    }
+
+    pub(crate) fn incoming_endpoint(
+        &self,
+        source: EndpointSourceId,
+        gate: &AttemptGate,
+        stream: Arc<dyn BackendStream>,
+        wq: WaitQueue,
+        local: SocketAddr,
+        peer: SocketAddr,
+    ) -> Offer {
+        self.incoming_scoped(Some((source, gate)), stream, wq, local, peer)
+    }
+
     pub(crate) fn incoming_remote(
         &self,
         stream: Arc<dyn BackendStream>,
@@ -579,6 +894,20 @@ impl TcpSocket {
         local: SocketAddr,
         peer: SocketAddr,
     ) -> Offer {
+        self.incoming_scoped(None, stream, wq, local, peer)
+    }
+
+    fn incoming_scoped(
+        &self,
+        scope: Option<(EndpointSourceId, &AttemptGate)>,
+        stream: Arc<dyn BackendStream>,
+        wq: WaitQueue,
+        local: SocketAddr,
+        peer: SocketAddr,
+    ) -> Offer {
+        if scope.is_some_and(|(source, _)| self.endpoint.source() != source) {
+            return Offer::Declined(stream);
+        }
         let Some(l) = self.listener.lock().unwrap().clone() else {
             return Offer::Declined(stream);
         };
@@ -588,21 +917,37 @@ impl TcpSocket {
                 return Offer::Declined(stream);
             }
         }
-        // `inet_csk_clone_lock` copies the listener's options into the new sock.
         let child = self.new_child(local, peer, wq, |_, opts| {
             replay_options(&*stream, opts);
             Transport::Remote(stream)
         });
         let mut li = l.inner.lock().unwrap();
-        if li.closed || li.full() {
+        if li.closed
+            || li.full()
+            || scope.is_some_and(|(source, _)| self.endpoint.source() != source)
+        {
             drop(li);
             child.release_inner(true);
             return Offer::Dropped;
         }
-        li.ready.push_back((child, peer));
+        let queued = match scope {
+            Some((source, gate)) => self
+                .endpoint
+                .commit(source, || gate.commit(|| li.ready.push_back((child, peer))))
+                .flatten()
+                .is_some(),
+            None => {
+                li.ready.push_back((child, peer));
+                true
+            }
+        };
         drop(li);
-        l.wq.wake(PollMask::IN | PollMask::RDNORM);
-        Offer::Queued
+        if queued {
+            l.wq.wake(PollMask::IN | PollMask::RDNORM);
+            Offer::Queued
+        } else {
+            Offer::Dropped
+        }
     }
 
     /// Connects to a listener of `target`, this namespace or the one across a veth.
@@ -695,9 +1040,17 @@ impl Pollable for TcpSocket {
                 }
             }
             State::Connecting(t, _) | State::Connected(t, _) => {
+                let waiting_local = g.endpoint_selected
+                    && matches!(&g.state, State::Connecting(..))
+                    && matches!(t, Transport::Remote(stream) if stream.provider_local_addr() == Some(Err(Errno::EAGAIN)));
                 let t = t.clone();
                 drop(g);
-                t.poll()
+                let events = t.poll();
+                if waiting_local {
+                    events & !(PollMask::OUT | PollMask::WRNORM)
+                } else {
+                    events
+                }
             }
             State::Closed => {
                 let mut m = PollMask::HUP | PollMask::OUT | PollMask::WRNORM;
@@ -758,7 +1111,7 @@ impl Socket for TcpSocket {
         }
         let freebind = g.opts.flag(0, wasixv2_abi::IpOption::IP_FREEBIND.0);
         self.net.check_bind(addr, privileged, freebind)?;
-        if g.local.is_some() || !matches!(g.state, State::Closed) {
+        if g.bind_pending.is_some() || g.local.is_some() || !matches!(g.state, State::Closed) {
             return Err(Errno::EINVAL);
         }
         // `__inet_bind`: without a port, the address waits for the port `connect` picks.
@@ -785,6 +1138,30 @@ impl Socket for TcpSocket {
         Ok(())
     }
 
+    fn bind_admission(
+        &self,
+        requested: SocketAddr,
+        privileged: bool,
+    ) -> NetResult<Option<Box<dyn crate::BindAdmission>>> {
+        self.provider_bind(requested, privileged, true, EndpointBindPurpose::Bind)
+    }
+
+    fn autobind_admission(
+        &self,
+        operation: crate::endpoint::EndpointAutobind<'_>,
+        privileged: bool,
+    ) -> NetResult<Option<Box<dyn crate::BindAdmission>>> {
+        match operation {
+            crate::endpoint::EndpointAutobind::Listen(backlog) => self.provider_bind(
+                unbound(self.domain()),
+                privileged,
+                false,
+                EndpointBindPurpose::Listen { backlog },
+            ),
+            _ => Ok(None),
+        }
+    }
+
     fn listen(&self, backlog: u32) -> NetResult<()> {
         let mut g = loop {
             let requested = self.lock().policy_bind;
@@ -797,6 +1174,9 @@ impl Socket for TcpSocket {
                 break g;
             }
         };
+        if g.bind_pending.is_some() {
+            return Err(Errno::EALREADY);
+        }
         match &g.state {
             State::Listening(l) => {
                 l.inner.lock().unwrap().backlog = backlog;
@@ -805,6 +1185,26 @@ impl Socket for TcpSocket {
                 }
                 // A larger queue may have room for connections held back.
                 l.room.wake(PollMask::empty());
+                let group = self.net.endpoints().map(|ns| {
+                    let group = ns.join_tcp(
+                        &self.endpoint,
+                        self.me.clone(),
+                        EndpointMember {
+                            source_id: self.endpoint.source(),
+                            local: g.local.unwrap(),
+                            requested_bind: g.policy_bind,
+                            binding: g.endpoint_bound.clone(),
+                        },
+                        self.domain(),
+                        g.opts.v6only,
+                        backlog,
+                    );
+                    (ns, group)
+                });
+                drop(g);
+                if let Some((ns, group)) = group {
+                    ns.refresh(&group);
+                }
                 return Ok(());
             }
             State::Connecting(..) | State::Connected(..) => return Err(Errno::EINVAL),
@@ -828,8 +1228,30 @@ impl Socket for TcpSocket {
         g.state = State::Listening(l.clone());
         g.rd_shut = false;
         g.wr_shut = false;
+        let group = self.net.endpoints().map(|ns| {
+            let group = ns.join_tcp(
+                &self.endpoint,
+                self.me.clone(),
+                EndpointMember {
+                    source_id: self.endpoint.source(),
+                    local,
+                    requested_bind: g.policy_bind,
+                    binding: g.endpoint_bound.clone(),
+                },
+                self.domain(),
+                g.opts.v6only,
+                backlog,
+            );
+            (ns, group)
+        });
+        let provider_bound = g.endpoint_bound.is_some();
         drop(g);
-        self.auto_publish(&l, local, backlog);
+        if let Some((ns, group)) = group {
+            ns.refresh(&group);
+        }
+        if !provider_bound {
+            self.auto_publish(&l, local, backlog);
+        }
         Ok(())
     }
 
@@ -852,10 +1274,20 @@ impl Socket for TcpSocket {
     }
 
     fn connect(&self, addr: SocketAddr) -> NetResult<()> {
-        let admission = self.net.admit(addr, crate::PolicyDirection::Outbound)?;
+        let mut admission = self.net.admit(addr, crate::PolicyDirection::Outbound)?;
         let mapped = matches!(addr, SocketAddr::V6(v6) if v6.ip().to_ipv4_mapped().is_some());
         let dst = connect_target(canonical(addr));
+        // Canonical table keys omit IPv6 scope/flow, but the physical provider needs the
+        // literal sockaddr. Wildcard connect retains its existing loopback translation.
+        let provider_dst = if canonical(addr).ip().is_unspecified() {
+            dst
+        } else {
+            addr
+        };
         let mut g = self.lock();
+        if g.bind_pending.is_some() {
+            return Err(Errno::EALREADY);
+        }
         match &g.state {
             State::Listening(_) | State::Connected(..) => return Err(Errno::EISCONN),
             State::Connecting(..) => return Err(Errno::EALREADY),
@@ -869,15 +1301,133 @@ impl Socket for TcpSocket {
         if mapped && g.opts.v6only {
             return Err(Errno::ENETUNREACH);
         }
-        let path = self.net.path(dst, g.local.map(|l| l.ip()).or(g.saddr))?;
-        if admission == crate::net::Admission::DnsOnly && !matches!(path, Path::Dns { .. }) {
+        // An opt-in external provider may own an address/route absent from this namespace.
+        // Keep the ordinary route error intact until pure selection chooses its owner.
+        let mut path = self.net.path(dst, g.local.map(|l| l.ip()).or(g.saddr));
+        if admission == crate::net::Admission::DnsOnly && !matches!(&path, Ok(Path::Dns { .. })) {
+            return Err(Errno::EPERM);
+        }
+        let mut provider_route = None;
+        if let Some(namespace) = self.net.endpoints() {
+            if !namespace.external
+                && let Err(error) = &path
+            {
+                return Err(*error);
+            }
+            // Every new association attempt has an identity even after an immediate refusal.
+            self.endpoint.renew(&namespace);
+            loop {
+                let external_candidate =
+                    namespace.external && self.net.external_route_candidate(dst)?;
+                let eligible = match &path {
+                    Ok(Path::Local { net: None, .. }) => true,
+                    Ok(Path::Backend { .. }) => namespace.external,
+                    Err(Errno::ENETUNREACH | Errno::EADDRNOTAVAIL) => external_candidate,
+                    // Explicit route denial, DNS and private/veth paths keep their authority.
+                    _ => false,
+                };
+                if !eligible {
+                    break;
+                }
+                let source = self.endpoint.source();
+                let bound = g.local;
+                let saddr = g.saddr;
+                let v6only = g.opts.v6only;
+                let requested_bind = g.policy_bind;
+                let binding = g.endpoint_bound.clone();
+                let provider_source =
+                    bound.map(|local| local.ip()).or(saddr).unwrap_or_else(|| {
+                        if dst.is_ipv4() {
+                            std::net::Ipv4Addr::UNSPECIFIED.into()
+                        } else {
+                            std::net::Ipv6Addr::UNSPECIFIED.into()
+                        }
+                    });
+                let provider_source = if namespace.external {
+                    provider_source
+                } else {
+                    path.as_ref().unwrap().src()
+                };
+                let effective =
+                    SocketAddr::new(provider_source, bound.map_or(0, |local| local.port()));
+                let query = EndpointQuery {
+                    kind: EndpointKind::Stream,
+                    source_id: source,
+                    bound,
+                    requested_bind,
+                    binding: binding.clone(),
+                    effective_source: Some(effective),
+                    destination: dst,
+                    local_binding: namespace.hint(EndpointKind::Stream, dst, effective),
+                };
+                drop(g);
+                let choice = namespace.provider.select(&query)?;
+                // Selection admits no transport work. Recheck policy before the factory.
+                admission = self.net.admit(addr, crate::PolicyDirection::Outbound)?;
+                g = self.lock();
+                if g.bind_pending.is_some() {
+                    return Err(Errno::EALREADY);
+                }
+                if !matches!(g.state, State::Closed) {
+                    return Err(if matches!(g.state, State::Connecting(..)) {
+                        Errno::EALREADY
+                    } else {
+                        Errno::EISCONN
+                    });
+                }
+                let next = self.net.path(dst, g.local.map(|l| l.ip()).or(g.saddr));
+                let same_path = match (&path, &next) {
+                    (Ok(old), Ok(new)) => old.endpoint_same(new),
+                    (Err(old), Err(new)) => old == new,
+                    _ => false,
+                };
+                let same_binding = match (&binding, &g.endpoint_bound) {
+                    (None, None) => true,
+                    (Some(old), Some(new)) => Arc::ptr_eq(old, new),
+                    _ => false,
+                };
+                if source != self.endpoint.source()
+                    || bound != g.local
+                    || saddr != g.saddr
+                    || v6only != g.opts.v6only
+                    || requested_bind != g.policy_bind
+                    || !same_binding
+                    || !same_path
+                    || (namespace.external
+                        && external_candidate != self.net.external_route_candidate(dst)?)
+                {
+                    path = next;
+                    continue;
+                }
+                if let EndpointChoice::Provider(target) = choice {
+                    if admission == crate::net::Admission::DnsOnly {
+                        return Err(Errno::EPERM);
+                    }
+                    provider_route = Some(ConnectRoute::Provider {
+                        target,
+                        source: provider_source,
+                    });
+                }
+                break;
+            }
+        }
+        let route = match provider_route {
+            Some(route) => route,
+            None => ConnectRoute::Namespace(path?),
+        };
+        if admission == crate::net::Admission::DnsOnly
+            && !matches!(&route, ConnectRoute::Namespace(Path::Dns { .. }))
+        {
             return Err(Errno::EPERM);
         }
         // Nothing answers out there: Linux's connect fails once neighbour resolution gives up.
-        if let Path::Nowhere { .. } = path {
+        if matches!(&route, ConnectRoute::Namespace(Path::Nowhere { .. })) {
             return Err(Errno::EHOSTUNREACH);
         }
-        let src = path.src();
+        let src = match &route {
+            ConnectRoute::Namespace(path) => path.src(),
+            ConnectRoute::Provider { source, .. } => *source,
+        };
         match g.local {
             None => {
                 let port = self.net.tcp_bind_connect(
@@ -897,6 +1447,55 @@ impl Socket for TcpSocket {
         g.rd_shut = false;
         g.wr_shut = false;
         g.err = None;
+        g.endpoint_selected = matches!(&route, ConnectRoute::Provider { .. });
+        let path = match route {
+            ConnectRoute::Namespace(path) => path,
+            ConnectRoute::Provider { target, .. } => {
+                let namespace = self.net.endpoints().unwrap();
+                let source = self.endpoint.source();
+                let local = g.local.unwrap();
+                let pending = PendingStream::new(dst, self.wq.clone());
+                let reserved: Arc<dyn BackendStream> = pending.clone();
+                g.state = State::Connecting(Transport::Remote(reserved.clone()), dst);
+                drop(g);
+                let result = namespace.provider.connect(
+                    target,
+                    source,
+                    local,
+                    provider_dst,
+                    self.wq.clone(),
+                );
+                let failure = result.as_ref().err().copied();
+                let mut g = self.lock();
+                let current = self.endpoint.source() == source
+                    && matches!(&g.state,State::Connecting(Transport::Remote(stream),_) if Arc::ptr_eq(stream,&reserved));
+                if current {
+                    match result {
+                        Ok(stream) => {
+                            if canonical(stream.peer_addr()) != dst {
+                                pending.complete(Err(Errno::EPROTO));
+                            } else {
+                                replay_options(&*stream, &g.opts);
+                                pending.complete(Ok(stream));
+                            }
+                        }
+                        Err(e) => pending.complete(Err(e)),
+                    }
+                    self.refresh(&mut g);
+                    if let Some(error) = failure {
+                        g.failed = false;
+                        g.err = None;
+                        return Err(error);
+                    }
+                } else {
+                    drop(g);
+                    drop(result);
+                    pending.complete(Err(Errno::ECANCELED));
+                    return Err(Errno::ECANCELED);
+                }
+                return Err(Errno::EINPROGRESS);
+            }
+        };
         match path {
             Path::Local { net, .. } => {
                 let target = net.unwrap_or_else(|| self.net.clone());
@@ -930,6 +1529,9 @@ impl Socket for TcpSocket {
         // an autobound port (`tcp_set_state` calls `inet_put_port`) and the source address.
         let mut g = self.lock();
         self.stop_listening(&mut g);
+        if let Some(namespace) = self.net.endpoints() {
+            self.endpoint.renew(&namespace);
+        }
         self.abort_connection(&mut g);
         g.rd_shut = false;
         g.wr_shut = false;
@@ -952,6 +1554,9 @@ impl Socket for TcpSocket {
             }
             // `inet_shutdown` in `SYN_SENT` disconnects (`tcp_disconnect`).
             State::Connecting(..) => {
+                if let Some(namespace) = self.net.endpoints() {
+                    self.endpoint.renew(&namespace);
+                }
                 self.abort_connection(&mut g);
                 self.reset_saddr(&mut g);
                 self.put_port(&mut g);

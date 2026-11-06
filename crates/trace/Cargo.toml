@@ -16,3 +16,4 @@ tracing.workspace = true
 
 [dev-dependencies]
 futures.workspace = true
+tracing = { workspace = true, features = ["std"] }

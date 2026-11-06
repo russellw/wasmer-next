@@ -1517,7 +1517,7 @@ impl Kernel {
                     return Err(Errno::EINVAL);
                 }
                 let file = self.req_file(caller, ctx, req)?;
-                self.listen_file(caller, file, s.len as i32)
+                self.listen_file(caller, file, s.len as i32).await
             }
             _ => return Err(Errno::EOPNOTSUPP),
         };

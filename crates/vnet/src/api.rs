@@ -352,6 +352,18 @@ pub enum NewLinkKind {
 
 /// A network namespace: what the kernel's `socket` and the network pseudo files use.
 pub trait Network: Send + Sync {
+    /// Immutable opt-in for host-only contextual name lookup. No I/O or admission here.
+    fn supports_contextual_lookup(&self) -> bool {
+        false
+    }
+
+    /// Resolves a host name through the explicitly selected namespace backend.
+    /// Once selected, errors are authoritative; callers must not replay through wire DNS.
+    fn lookup_contextual(&self, lookup: Lookup, context: LookupContext, done: LookupDone) {
+        let _ = (lookup, context);
+        done(Err(LookupError::Failed));
+    }
+
     /// Controls of the configured transport in this exact namespace; absent by default.
     fn provider(&self) -> Option<Arc<dyn crate::provider::Provider>> {
         None
@@ -572,6 +584,22 @@ pub trait Network: Send + Sync {
 /// listener is `IN | RDNORM` while connections are queued, `RDHUP` after the peer shut down,
 /// `ERR` while an error is pending, `PRI` while an urgent byte waits for `MSG_OOB`), and every
 /// state change must wake the queues `poll` registered with the matching events.
+/// One optional bind transaction owned by its waiting syscall. Dropping an uncommitted
+/// transaction retires its provisional source before releasing the provider lease.
+pub trait BindAdmission: Pollable {
+    /// EAGAIN while pending; repeated successful completion reserves the address only once.
+    fn complete(&self) -> Result<(), Errno>;
+
+    /// Distinguishes pending readiness from a completed operation returning EAGAIN.
+    /// Existing admissions keep the original EAGAIN-is-pending convention by default.
+    fn complete_result(&self) -> Option<Result<(), Errno>> {
+        match self.complete() {
+            Err(Errno::EAGAIN) => None,
+            result => Some(result),
+        }
+    }
+}
+
 pub trait Socket: Pollable {
     /// Kernel timer hook for TCP's 200 ms cork ceiling (TCP_RTO_MIN).
     fn set_cork_timer(&self, arm: Box<dyn Fn(bool) + Send + Sync>) {
@@ -591,6 +619,27 @@ pub trait Socket: Pollable {
     /// `EINVAL`; a taken address `EADDRINUSE`; an address not on an interface
     /// `EADDRNOTAVAIL`.
     fn bind(&self, addr: SocketAddr, privileged: bool) -> Result<(), Errno>;
+
+    /// Optional owned asynchronous provider admission. None leaves ordinary bind unchanged.
+    fn bind_admission(
+        &self,
+        addr: SocketAddr,
+        privileged: bool,
+    ) -> Result<Option<Box<dyn BindAdmission>>, Errno> {
+        let _ = (addr, privileged);
+        Ok(None)
+    }
+
+    /// Optional implicit bind before UDP connect/send or direct unbound TCP listen.
+    /// Unbound TCP connect retains its separate provider path.
+    fn autobind_admission(
+        &self,
+        operation: crate::endpoint::EndpointAutobind<'_>,
+        privileged: bool,
+    ) -> Result<Option<Box<dyn BindAdmission>>, Errno> {
+        let _ = (operation, privileged);
+        Ok(None)
+    }
 
     /// `inet_listen`, with `backlog` already clamped to `somaxconn` by the kernel. Binds to an
     /// ephemeral port if unbound. `EOPNOTSUPP` for datagram sockets, `EINVAL` when connected.
@@ -740,6 +789,26 @@ pub trait NetworkPolicy: std::fmt::Debug + Send + Sync {
 /// Implementations do their I/O off the guest's thread. A backend object wakes the guest
 /// socket's original wait queue, including when the object was created after registration.
 pub trait Backend: Send + Sync {
+    /// Immutable, side-effect-free opt-in for contextual host lookup; ordinary DNS is unchanged.
+    fn supports_contextual_lookup(&self) -> bool {
+        false
+    }
+
+    /// Optional host lookup, preserving the original name and caller's service-port hint.
+    fn lookup_contextual(&self, lookup: Lookup, context: LookupContext, done: LookupDone) {
+        let _ = (lookup, context);
+        done(Err(LookupError::Failed));
+    }
+
+    /// Optional endpoint control/factory for one newly constructed namespace. Called once
+    /// per Net, without Net/socket locks; default None preserves ordinary Linux routing.
+    /// A shared backend must return separately scoped handles rather than assume shared Net
+    /// state. Returned transports queue peer delivery/cleanup and never synchronously enter
+    /// ANY WLK Net, socket or endpoint ingress from data-plane methods or Drop.
+    fn endpoint_namespace(&self) -> Option<Arc<dyn crate::endpoint::EndpointProvider>> {
+        None
+    }
+
     /// Optional controls for this same transport, never a different network session.
     fn provider(&self) -> Option<Arc<dyn crate::provider::Provider>> {
         None
@@ -856,6 +925,12 @@ pub enum Lookup {
     Forward(Vec<u8>),
 }
 
+/// Context supplied only by an explicitly admitted host-side lookup.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LookupContext {
+    pub port: Option<u16>,
+}
+
 /// What a [`Lookup`] found, and for how many seconds that holds (the TTL of the records made
 /// of it).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -886,6 +961,8 @@ pub enum LookupError {
     NotFound { ttl: u32 },
     /// The host could not tell (`SERVFAIL`).
     Failed,
+    /// Exact error from an explicitly selected contextual provider.
+    Provider(Errno),
 }
 
 /// Receives the result of a [`Backend::lookup`].
@@ -909,6 +986,11 @@ pub enum StreamState {
 /// Urgent data follows `tcp_recvmsg` and `tcp_recv_urg` as [`crate::RecvQueue`] keeps them,
 /// with the guest's `SO_OOBINLINE`, which arrives through `set_option`.
 pub trait BackendStream: Pollable {
+    /// Actual local address of an opted-in endpoint stream. EAGAIN means it is not ready.
+    /// None preserves the ordinary namespace source. Bounded and nonreentrant like read.
+    fn provider_local_addr(&self) -> Option<Result<SocketAddr, Errno>> {
+        None
+    }
     /// Packet-carrying backends retain partial segments with `more`; synthetic
     /// streams may ignore this TCP packetization hint.
     fn write_more(&self, data: &[u8], more: bool, mss: usize) -> Result<usize, Errno> {

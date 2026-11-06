@@ -212,6 +212,7 @@ pub(crate) struct NetState {
     pub udp: PortTable<Weak<UdpSocket>>,
     pub udp_pubs: Vec<UdpPublication>,
     pub ifaces: Interfaces,
+    pub provider_activity: Arc<()>,
     pub provider_active: bool,
     pub provider_activity_known: bool,
     pub provider_reconciliation: Option<Errno>,
@@ -264,6 +265,22 @@ pub(crate) enum Path {
 }
 
 impl Path {
+    pub(crate) fn endpoint_same(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Local { src: a, net: None }, Self::Local { src: b, net: None }) => a == b,
+            (
+                Self::Backend {
+                    src: a,
+                    host_dst: x,
+                },
+                Self::Backend {
+                    src: b,
+                    host_dst: y,
+                },
+            ) => a == b && x == y,
+            _ => false,
+        }
+    }
     pub(crate) fn src(&self) -> IpAddr {
         match self {
             Path::Local { src, .. }
@@ -331,6 +348,8 @@ impl IpPath {
 pub struct Net {
     state: Mutex<NetState>,
     pub(crate) backend: Option<Arc<dyn Backend>>,
+    endpoint_namespace: Option<Arc<dyn crate::endpoint::EndpointProvider>>,
+    endpoint_runtime: Option<Arc<crate::endpoint::runtime::Namespace>>,
     pub(crate) config: NetConfig,
     next_id: AtomicU64,
     me: Weak<Net>,
@@ -368,6 +387,7 @@ impl Net {
                 }
             }
         }
+        let endpoint_namespace = backend.as_ref().and_then(|b| b.endpoint_namespace());
         let seed = config.seed;
         Arc::new_cyclic(|me| Self {
             state: Mutex::new(NetState {
@@ -375,6 +395,7 @@ impl Net {
                 udp: PortTable::new(Proto::Udp),
                 udp_pubs: Vec::new(),
                 ifaces,
+                provider_activity: Arc::new(()),
                 provider_active: true,
                 provider_activity_known: true,
                 provider_reconciliation: None,
@@ -384,10 +405,39 @@ impl Net {
                 sctp: SctpPorts::default(),
             }),
             backend,
+            endpoint_runtime: endpoint_namespace.as_ref().map(|provider| {
+                crate::endpoint::runtime::Namespace::new(me.clone(), provider.clone())
+            }),
+            endpoint_namespace,
             config,
             next_id: AtomicU64::new(1),
             me: me.clone(),
         })
+    }
+
+    /// The optional namespace-scoped endpoint capability captured at construction. Capturing
+    /// or retrieving it alone does not select routes, publish sockets or establish peering.
+    pub fn endpoint_namespace(&self) -> Option<Arc<dyn crate::endpoint::EndpointProvider>> {
+        self.endpoint_namespace.clone()
+    }
+
+    pub(crate) fn endpoints(&self) -> Option<Arc<crate::endpoint::runtime::Namespace>> {
+        self.endpoint_runtime.clone()
+    }
+
+    /// Snapshot registration status without changing local bind/listen success.
+    pub fn endpoint_publications(&self) -> Vec<crate::endpoint::EndpointPublicationStatus> {
+        self.endpoint_runtime
+            .as_ref()
+            .map_or_else(Vec::new, |ns| ns.statuses())
+    }
+
+    /// Explicit unlocked control entry. Retry failed registrations and refresh dirty hints;
+    /// accepted connect/send work is never replayed. Do not call with WLK locks held.
+    pub fn retry_endpoint_publications(&self) {
+        if let Some(namespace) = &self.endpoint_runtime {
+            namespace.retry_all();
+        }
     }
 
     /// Publishes one complete provider readback atomically, before its waiter is woken.
@@ -398,6 +448,7 @@ impl Net {
     ) -> NetResult<()> {
         let lock = rtnl();
         let mut st = self.configure(&lock);
+        st.provider_activity = Arc::new(());
         if let Some(active) = snapshot.active {
             st.provider_active = active;
             st.provider_activity_known = true;
@@ -425,6 +476,14 @@ impl Net {
     /// The policy inherited by network namespaces the machine creates.
     pub fn policy(&self) -> Option<Arc<dyn crate::NetworkPolicy>> {
         self.config.policy.clone()
+    }
+
+    fn lookup_activity_matches(&self, activity: &Arc<()>) -> bool {
+        let state = self.state();
+        Arc::ptr_eq(activity, &state.provider_activity)
+            && state.provider_reconciliation.is_none()
+            && state.provider_active
+            && state.provider_activity_known
     }
 
     pub(crate) fn admit(
@@ -682,6 +741,10 @@ impl Net {
             net: self.me.clone(),
             guest: canonical(guest),
         })
+    }
+
+    pub(crate) fn external_route_candidate(&self, dst: SocketAddr) -> NetResult<bool> {
+        self.state().ifaces.external_route_candidate(dst.ip())
     }
 
     /// Where traffic to `dst` (canonical) goes, given the socket's bound address.
@@ -1118,6 +1181,14 @@ impl Drop for UdpPublished {
 
 /// Where one UDP datagram goes (see [`Net::udp_route`]).
 pub(crate) enum UdpRoute {
+    /// Candidate owned by an already-admitted external resource. It carries literal
+    /// physical hints, never a fabricated namespace route or effective interface.
+    External { from: SocketAddr, interface: u32 },
+    /// Canonically validated multicast, offered only to an opted-in external endpoint.
+    Multicast { from: SocketAddr, interface: u32 },
+    /// Permission/size-validated limited broadcast, offered only to that same capability.
+    Broadcast,
+
     /// Inside the namespace, from `from`, to the socket bound for it if any.
     Local {
         from: SocketAddr,
@@ -1139,6 +1210,91 @@ pub(crate) enum UdpRoute {
 }
 
 impl Network for Net {
+    fn supports_contextual_lookup(&self) -> bool {
+        self.backend
+            .as_ref()
+            .is_some_and(|backend| backend.supports_contextual_lookup())
+    }
+
+    fn lookup_contextual(
+        &self,
+        lookup: crate::Lookup,
+        context: crate::LookupContext,
+        done: crate::LookupDone,
+    ) {
+        use crate::{Answer, Lookup, LookupError};
+        let Some(backend) = self
+            .backend
+            .as_ref()
+            .filter(|backend| backend.supports_contextual_lookup())
+        else {
+            return done(Err(LookupError::Provider(Errno::EOPNOTSUPP)));
+        };
+        let policy = self.policy();
+        let name = policy.as_ref().and_then(|_| match &lookup {
+            Lookup::Name(name) => crate::dns::policy_name(name),
+            _ => None,
+        });
+        // Only an installed policy needs the DNS wire spelling. Custom host providers
+        // retain their original UTF-8 input, including names the wire format cannot spell.
+        let activity = {
+            let state = self.state();
+            if state.provider_reconciliation.is_some()
+                || !state.provider_active
+                || !state.provider_activity_known
+            {
+                drop(state);
+                return done(Err(LookupError::Provider(Errno::ENETDOWN)));
+            }
+            state.provider_activity.clone()
+        };
+        if policy.as_ref().is_some_and(|policy| {
+            name.as_deref()
+                .is_none_or(|name| !policy.allows_domain(name))
+        }) {
+            return done(Err(LookupError::Provider(Errno::EPERM)));
+        }
+        if !self.lookup_activity_matches(&activity) {
+            return done(Err(LookupError::Provider(Errno::ENETDOWN)));
+        }
+        let net = self.arc();
+        backend.lookup_contextual(
+            lookup,
+            context,
+            Box::new(move |result| {
+                if !net.lookup_activity_matches(&activity) {
+                    return done(Err(LookupError::Provider(Errno::ENETDOWN)));
+                }
+                // Mutable domain policy is checked again before releasing a pending result.
+                // Backend/policy/user callbacks never run with the network state locked.
+                if policy.as_ref().is_some_and(|policy| {
+                    name.as_deref()
+                        .is_none_or(|name| !policy.allows_domain(name))
+                }) {
+                    return done(Err(LookupError::Provider(Errno::EPERM)));
+                }
+                if !net.lookup_activity_matches(&activity) {
+                    return done(Err(LookupError::Provider(Errno::ENETDOWN)));
+                }
+                if let (
+                    Some(policy),
+                    Some(name),
+                    Ok(crate::Found {
+                        answer: Answer::Addrs { addrs, .. },
+                        ..
+                    }),
+                ) = (&policy, &name, &result)
+                {
+                    policy.resolved_domain(name, addrs);
+                }
+                if !net.lookup_activity_matches(&activity) {
+                    return done(Err(LookupError::Provider(Errno::ENETDOWN)));
+                }
+                done(result);
+            }),
+        );
+    }
+
     fn provider(&self) -> Option<Arc<dyn crate::provider::Provider>> {
         let provider = self.backend.as_ref()?.provider()?;
         Some(Arc::new(crate::provider::NamespaceProvider {
