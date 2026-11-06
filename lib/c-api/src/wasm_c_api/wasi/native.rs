@@ -992,7 +992,7 @@ mod tests {
             trap.is_some(),
             "Detached completion remains a trap, never fabricated i64 results"
         );
-        assert_eq!(results.as_slice()[0].kind, wasm_valkind_enum::WASM_I64 as _);
+        assert_eq!(results.as_slice()[0].kind, wasm_valkind_enum::WASM_I64 as u8);
         assert_eq!(unsafe { results.as_slice()[0].of.int64_t }, 0x123456789);
         assert_eq!(
             observed.get(),
