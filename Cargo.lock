@@ -7766,6 +7766,7 @@ dependencies = [
  "typetag",
  "wasixv2",
  "wasixv2-exec",
+ "wasixv2-vfs",
  "wasixv2-wasix1",
  "wasmer",
  "wasmer-c-api-imports",

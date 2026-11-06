@@ -546,6 +546,468 @@ mod tests {
             })
             .unwrap();
     }
+    /// Actual public constructor/call path, rather than the synthetic takeover
+    /// control: a nonleader execs while the leader's old instance runs its vfork
+    /// child. The successor is observed sleeping before public env deletion.
+    #[cfg(unix)]
+    #[test]
+    fn public_nonleader_detached_exec_cancels_pending_successor_on_environment_delete() {
+        use super::super::{
+            WasiBackend, wasi_config_capture_stdout, wasi_config_mapdir, wasi_config_new,
+            wasi_env_delete, wasi_env_initialize_instance, wasi_env_new, wasi_get_imports,
+        };
+        use crate::wasm_c_api::{
+            externals::{
+                wasm_extern_t, wasm_extern_vec_t, wasm_func_call, wasm_func_copy,
+                wasm_func_new_with_env, wasm_func_t,
+            },
+            instance::{wasm_instance_new, wasm_instance_t},
+            module::{wasm_module_new, wasm_module_t},
+            store::wasm_store_t,
+            trap::wasm_trap_t,
+            types::{wasm_byte_vec_t, wasm_functype_t, wasm_valkind_enum},
+            value::{wasm_val_inner, wasm_val_t, wasm_val_vec_t},
+        };
+        use std::{
+            ffi::CString,
+            sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+            time::{Duration, Instant},
+        };
+        use wasmer_api::{FunctionType, Value};
+
+        fn immediate<F: Future>(future: F) -> Option<F::Output> {
+            match std::pin::pin!(future)
+                .as_mut()
+                .poll(&mut Context::from_waker(std::task::Waker::noop()))
+            {
+                Poll::Ready(value) => Some(value),
+                Poll::Pending => None,
+            }
+        }
+        fn status(syscalls: &MachineSyscalls, leader: u32) -> Option<String> {
+            let vfs = syscalls.inner.vfs();
+            let root = vfs.root();
+            let cred = wasixv2_vfs::Cred::root();
+            let cx = wasixv2_vfs::Ctx {
+                cred: &cred,
+                root: &root,
+                umask: 0,
+                task: 0,
+                leases: None,
+            };
+            let how = wasixv2_vfs::OpenHow {
+                flags: Default::default(),
+                mode: 0,
+                lookup: wasixv2_vfs::LookupFlags::follow(),
+            };
+            let file =
+                immediate(vfs.open(&cx, &root, format!("/proc/{leader}/stat").as_bytes(), &how))?
+                    .ok()?;
+            let mut bytes = [0; 4096];
+            // Procfs snapshots are canonical immediate reads, always from offset ZERO.
+            let count = immediate(file.read_at(&mut bytes, 0))?.ok()?;
+            String::from_utf8(bytes[..count].to_vec()).ok()
+        }
+        fn module(store: &mut wasm_store_t, source: &str) -> Box<wasm_module_t> {
+            let bytes: wasm_byte_vec_t = wat::parse_str(source).unwrap().into();
+            unsafe { wasm_module_new(Some(store), Some(&bytes)) }.unwrap()
+        }
+        fn function(store: &wasm_store_t, instance: &wasm_instance_t, name: &str) -> wasm_func_t {
+            wasm_func_t {
+                extern_: wasm_extern_t::new(
+                    store.inner.clone(),
+                    instance
+                        .inner
+                        .exports
+                        .get_function(name)
+                        .unwrap()
+                        .clone()
+                        .into(),
+                ),
+            }
+        }
+        struct Probe(Box<dyn Fn() -> i32>);
+        unsafe extern "C" fn probe(
+            data: *mut std::ffi::c_void,
+            _: &wasm_val_vec_t,
+            result: &mut wasm_val_vec_t,
+        ) -> Option<Box<wasm_trap_t>> {
+            let probe = unsafe { &*data.cast::<Probe>() };
+            let value = (probe.0)();
+            result.as_uninit_slice()[0].write(wasm_val_t {
+                kind: wasm_valkind_enum::WASM_I32 as _,
+                of: wasm_val_inner { int32_t: value },
+            });
+            None
+        }
+        unsafe extern "C" fn finalize_probe(data: *mut std::ffi::c_void) {
+            drop(unsafe { Box::from_raw(data.cast::<Probe>()) });
+        }
+        struct Directory(std::path::PathBuf);
+        impl Drop for Directory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let directory = Directory(std::env::temp_dir().join(format!(
+            "wasmer-public-detached-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        )));
+        std::fs::create_dir(&directory.0).unwrap();
+        let child = wat::parse_str(
+            r#"(module
+            (import "wasix_32v1" "fd_write" (func $write (param i32 i32 i32 i32) (result i32)))
+            (import "wasix_32v1" "thread_sleep" (func $sleep (param i64) (result i32)))
+            (import "wasix_32v1" "proc_exit2" (func $exit (param i32)))
+            (memory (export "memory") 1) (data (i32.const 100) "READY")
+            (func (export "_start")
+                i32.const 0 i32.const 100 i32.store i32.const 4 i32.const 5 i32.store
+                i32.const 1 i32.const 0 i32.const 1 i32.const 8 call $write
+                if unreachable end
+                i64.const 30000000000 call $sleep drop
+                i32.const 77 call $exit unreachable))"#,
+        )
+        .unwrap();
+        let child_path = directory.0.join("child.wasm");
+        std::fs::write(&child_path, child).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&child_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let engine = wasm_engine_new();
+        let mut store = unsafe { wasm_store_new(Some(&engine)) }.unwrap();
+        let name = CString::new("old-leader").unwrap();
+        let mut config = unsafe { wasi_config_new(name.as_ptr()) }.unwrap();
+        let alias = CString::new("prog").unwrap();
+        let host = CString::new(directory.0.to_str().unwrap()).unwrap();
+        assert!(unsafe { wasi_config_mapdir(&mut config, alias.as_ptr(), host.as_ptr()) });
+        wasi_config_capture_stdout(&mut config);
+        let environment = unsafe { wasi_env_new(Some(&mut store), config) }.unwrap();
+        let environment = Rc::new(RefCell::new(Some(environment)));
+        let (syscalls, leader, capture, local, cleanup) = {
+            let environment = environment.borrow();
+            let WasiBackend::Native(native) = &environment.as_ref().unwrap().inner else {
+                panic!("native backend required");
+            };
+            let process = native.endpoint.process.borrow();
+            let process = process.as_ref().unwrap();
+            (
+                process.syscalls(),
+                process.task().0,
+                native.stdout.clone().unwrap(),
+                wasixv2_exec::local_cleanup_runner(
+                    &store.inner.async_store().unwrap(),
+                    native.environment().loader_cleanup().clone(),
+                )
+                .unwrap(),
+                native.environment().loader_cleanup().clone(),
+            )
+        };
+        let observed = Rc::new(Cell::new(0));
+        let detached = Rc::new(Cell::new(0));
+        let finalized = Rc::new(Cell::new(0));
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let (delete, deletion) = tokio::sync::oneshot::channel();
+        let delete = RefCell::new(Some(delete));
+        let weak = Rc::downgrade(&environment);
+        let checked_detached = detached.clone();
+        let deleted = finalized.clone();
+        store
+            .inner
+            .cleanup_owner()
+            .unwrap()
+            .retain(Box::pin(async move {
+                deletion.await.unwrap();
+                let environment = weak.upgrade().unwrap().borrow_mut().take().unwrap();
+                let WasiBackend::Native(native) = &environment.inner else {
+                    panic!("native backend required");
+                };
+                if native
+                    .endpoint
+                    .handoff
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(HostCallHandoff::is_detached)
+                {
+                    checked_detached.set(checked_detached.get() + 1);
+                }
+                // Exercise the actual exported destructor, on its original owner.
+                wasi_env_delete(Some(environment));
+                deleted.set(deleted.get() + 1);
+            }));
+        let checked = observed.clone();
+        let observer_syscalls = syscalls.clone();
+        let observer_capture = capture.clone();
+        let completion = cleaned.clone();
+        let deadline = Cell::new(None);
+        let data = Box::into_raw(Box::new(Probe(Box::new(move || {
+            let limit = deadline.get().unwrap_or_else(|| {
+                let limit = Instant::now() + Duration::from_secs(5);
+                deadline.set(Some(limit));
+                limit
+            });
+            if Instant::now() >= limit {
+                return 2;
+            }
+            let ready = observer_capture
+                .queue
+                .lock()
+                .unwrap()
+                .0
+                .iter()
+                .any(|(bytes, _)| bytes == b"READY");
+            let sleeping = status(&observer_syscalls, leader).is_some_and(|line| {
+                let Some((head, tail)) = line.rsplit_once(')') else {
+                    return false;
+                };
+                head == format!("{leader} (child.wasm")
+                    && tail.split_whitespace().next() == Some("S")
+            });
+            if !(ready && sleeping) {
+                return 0;
+            }
+            checked.set(checked.get() + 1);
+            // Queue deletion only AFTER the exact successor is already Pending.
+            // The existing old-image loader runner signals during retirement,
+            // after the public dispatcher has published its Detached endpoint.
+            let delete = delete.borrow_mut().take().unwrap();
+            let complete = completion.clone();
+            assert!(
+                local
+                    .submit(Box::new(move |_| {
+                        let _ = delete.send(());
+                        Box::pin(async move {
+                            let (send, receive) = tokio::sync::oneshot::channel();
+                            tokio::task::spawn_local(async move {
+                                tokio::task::yield_now().await;
+                                tokio::time::sleep(Duration::from_millis(1)).await;
+                                complete.store(true, Ordering::SeqCst);
+                                let _ = send.send(());
+                            });
+                            let _ = receive.await;
+                        })
+                    }))
+                    .is_ok()
+            );
+            1
+        }))));
+        let ty = wasm_functype_t::new(FunctionType::new([], [wasmer_api::Type::I32]));
+        let callback = unsafe {
+            wasm_func_new_with_env(
+                Some(&mut store),
+                Some(&ty),
+                Some(probe),
+                data.cast(),
+                Some(finalize_probe),
+            )
+        }
+        .unwrap();
+        let parent_source = r#"(module
+            (import "env" "memory" (memory 1 1 shared))
+            (import "wasix_32v1" "thread_spawn_v2" (func $spawn (param i32 i32) (result i32)))
+            (import "wasix_32v1" "proc_fork_env" (func $vfork (param i32) (result i32)))
+            (import "wasix_32v1" "thread_sleep" (func $sleep (param i64) (result i32)))
+            (import "wasix_32v1" "proc_exit2" (func $exit (param i32)))
+            (import "test" "probe" (func $probe (result i32)))
+            (export "memory" (memory 0))
+            (global (export "resumed") (mut i32) (i32.const 0))
+            (func (export "run") (result i64) (local $state i32)
+                i32.const 36 i32.const 104 call $spawn if unreachable end
+                i32.const 100 call $vfork if unreachable end
+                i32.const 204 i32.const 1 i32.atomic.store
+                i32.const 204 i32.const 1 memory.atomic.notify drop
+                block $ready loop $wait
+                    call $probe local.tee $state i32.const 1 i32.eq br_if $ready
+                    local.get $state i32.const 2 i32.eq if unreachable end
+                    i64.const 1000000 call $sleep drop br $wait end end
+                i32.const 0 call $exit
+                i32.const 1 global.set 0 i64.const -1))"#;
+        let parent = module(&mut store, parent_source);
+        // Public ordered getter supplies the actual WASI/memory prefix. The
+        // public host callback is appended last, rather than invented as a WASI import.
+        let provider = module(
+            &mut store,
+            &parent_source.replace(
+                "(import \"test\" \"probe\" (func $probe (result i32)))",
+                "(func $probe (result i32) i32.const 0)",
+            ),
+        );
+        let mut imports: wasm_extern_vec_t = Vec::<Option<Box<wasm_extern_t>>>::new().into();
+        assert!(unsafe {
+            wasi_get_imports(
+                Some(&store),
+                environment.borrow_mut().as_deref_mut(),
+                Some(&provider),
+                &mut imports,
+            )
+        });
+        let shared = imports.as_slice()[0].as_ref().unwrap().as_ref().clone();
+        let mut values = imports.take();
+        values.push(Some(Box::new(callback.extern_.clone())));
+        imports.set_buffer(values);
+        let mut parent_instance =
+            unsafe { wasm_instance_new(Some(&mut store), Some(&parent), Some(&imports), None) }
+                .unwrap();
+        assert!(unsafe {
+            wasi_env_initialize_instance(
+                environment.borrow_mut().as_deref_mut().unwrap(),
+                &mut store,
+                &mut parent_instance,
+            )
+        });
+        let worker = module(
+            &mut store,
+            r#"(module
+            (import "env" "memory" (memory 1 1 shared))
+            (import "wasix_32v1" "proc_exec3" (func $exec (param i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+            (export "memory" (memory 0))
+            (data (i32.const 1000) "/prog/child.wasm") (data (i32.const 1040) "child\0a")
+            (func (export "wasi_thread_start") (param i32 i32)
+                block $go loop $wait
+                    i32.const 204 i32.atomic.load br_if $go
+                    i32.const 204 i32.const 0 i64.const 5000000000 memory.atomic.wait32
+                    i32.const 2 i32.eq if unreachable end br $wait end end
+                i32.const 1000 i32.const 16 i32.const 1040 i32.const 6
+                i32.const 0 i32.const 0 i32.const 0 i32.const 0 i32.const 0 call $exec drop
+                i32.const 200 i32.const 99 i32.atomic.store unreachable))"#,
+        );
+        let mut worker_imports: wasm_extern_vec_t = Vec::<Option<Box<wasm_extern_t>>>::new().into();
+        assert!(unsafe {
+            wasi_get_imports(
+                Some(&store),
+                environment.borrow_mut().as_deref_mut(),
+                Some(&worker),
+                &mut worker_imports,
+            )
+        });
+        let mut values = worker_imports.take();
+        values[0] = Some(Box::new(shared));
+        worker_imports.set_buffer(values);
+        let mut worker_instance = unsafe {
+            wasm_instance_new(Some(&mut store), Some(&worker), Some(&worker_imports), None)
+        }
+        .unwrap();
+        assert!(unsafe {
+            wasi_env_initialize_instance(
+                environment.borrow_mut().as_deref_mut().unwrap(),
+                &mut store,
+                &mut worker_instance,
+            )
+        });
+        // A second public WASI environment already exists on this same Store;
+        // retiring M must not close its process, selection, or import handles.
+        let sibling_module = module(
+            &mut store,
+            r#"(module
+            (import "wasix_32v1" "proc_id" (func $pid (param i32) (result i32)))
+            (memory (export "memory") 1)
+            (func (export "pid") (result i32)
+                i32.const 0 call $pid if unreachable end i32.const 0 i32.load))"#,
+        );
+        let name = CString::new("unrelated-sibling").unwrap();
+        let config = unsafe { wasi_config_new(name.as_ptr()) }.unwrap();
+        let mut sibling_env = unsafe { wasi_env_new(Some(&mut store), config) }.unwrap();
+        let mut sibling_imports: wasm_extern_vec_t =
+            Vec::<Option<Box<wasm_extern_t>>>::new().into();
+        assert!(unsafe {
+            wasi_get_imports(
+                Some(&store),
+                Some(&mut sibling_env),
+                Some(&sibling_module),
+                &mut sibling_imports,
+            )
+        });
+        let mut sibling_instance = unsafe {
+            wasm_instance_new(
+                Some(&mut store),
+                Some(&sibling_module),
+                Some(&sibling_imports),
+                None,
+            )
+        }
+        .unwrap();
+        assert!(unsafe {
+            wasi_env_initialize_instance(&mut sibling_env, &mut store, &mut sibling_instance)
+        });
+        let mut sibling = wasm_func_copy(&function(&store, &sibling_instance, "pid"));
+        let empty: wasm_val_vec_t = Vec::<wasm_val_t>::new().into();
+        let mut sibling_result: wasm_val_vec_t =
+            vec![wasm_val_t::from_value(&Value::I32(-1), &store.inner).unwrap()].into();
+        assert!(
+            unsafe { wasm_func_call(Some(&mut sibling), Some(&empty), &mut sibling_result) }
+                .is_none()
+        );
+        let sibling_pid = unsafe { sibling_result.as_slice()[0].of.int32_t };
+        assert!(sibling_pid > 0);
+        // Explicit selection T controls spawning; the old M function/probe stays
+        // callable. T and its replacement have no test-only host imports.
+        let mut run = wasm_func_copy(&function(&store, &parent_instance, "run"));
+        let args: wasm_val_vec_t = Vec::<wasm_val_t>::new().into();
+        let mut results: wasm_val_vec_t =
+            vec![wasm_val_t::from_value(&Value::I64(0x123456789), &store.inner).unwrap()].into();
+        let trap = unsafe { wasm_func_call(Some(&mut run), Some(&args), &mut results) };
+        assert!(
+            trap.is_some(),
+            "Detached completion remains a trap, never fabricated i64 results"
+        );
+        assert_eq!(results.as_slice()[0].kind, wasm_valkind_enum::WASM_I64 as _);
+        assert_eq!(unsafe { results.as_slice()[0].of.int64_t }, 0x123456789);
+        assert_eq!(
+            observed.get(),
+            1,
+            "the exact successor was READY and sleeping"
+        );
+        assert_eq!(
+            detached.get(),
+            1,
+            "public deletion followed actual Detached publication"
+        );
+        assert_eq!(finalized.get(), 1);
+        assert!(environment.borrow().is_none());
+        assert!(cleaned.load(Ordering::SeqCst));
+        assert!(!cleanup.is_open());
+        assert_eq!(
+            store
+                .inner
+                .with_mut(|s| parent_instance
+                    .inner
+                    .exports
+                    .get_global("resumed")
+                    .unwrap()
+                    .get(s))
+                .unwrap()
+                .i32(),
+            Some(0)
+        );
+        assert!(
+            status(&syscalls, leader).is_none(),
+            "the canceled successor task is released"
+        );
+        let state = capture.queue.lock().unwrap();
+        assert!(
+            state.1,
+            "the configured writer closes after actual terminal cleanup"
+        );
+        assert_eq!(
+            state
+                .0
+                .iter()
+                .flat_map(|(bytes, offset)| bytes[*offset..].iter().copied())
+                .collect::<Vec<_>>(),
+            b"READY"
+        );
+        drop(state);
+        assert!(
+            unsafe { wasm_func_call(Some(&mut sibling), Some(&empty), &mut sibling_result) }
+                .is_none()
+        );
+        assert_eq!(
+            unsafe { sibling_result.as_slice()[0].of.int32_t },
+            sibling_pid
+        );
+        wasi_env_delete(Some(sibling_env));
+    }
+
     #[cfg(unix)]
     #[test]
     fn foreign_swallowed_exec_forwards_once_and_ownerless_calls_retire_after_real_cleanup() {
