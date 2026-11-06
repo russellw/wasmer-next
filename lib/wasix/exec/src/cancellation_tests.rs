@@ -1516,11 +1516,81 @@ fn detached_factory_failures_publish_only_after_single_release_and_lease_retirem
         handoff: std::sync::Weak<process::Handoff>,
         released: Arc<std::sync::atomic::AtomicBool>,
     }
-    impl LoaderControl for ControlProbe {}
-    impl Syscalls for ControlProbe {}
+    impl LoaderControl for ControlProbe {
+        fn loader_reserve_host<'a>(
+            &'a self,
+            caller: &'a Caller<'_>,
+            bytes: u32,
+            alignment: u32,
+        ) -> LocalFuture<'a, SysResult<Box<dyn HostMemoryLease>>> {
+            self.inner.loader_reserve_host(caller, bytes, alignment)
+        }
+    }
+    impl Syscalls for ControlProbe {
+        fn exit_group<'a>(
+            &'a self,
+            caller: &'a Caller<'_>,
+            status: i32,
+        ) -> MaybeFuture<'a, SysResult<()>> {
+            self.inner.exit_group(caller, status)
+        }
+        fn exit<'a>(
+            &'a self,
+            caller: &'a Caller<'_>,
+            status: i32,
+        ) -> MaybeFuture<'a, SysResult<()>> {
+            self.inner.exit(caller, status)
+        }
+    }
+    impl CpuTime for ControlProbe {}
+    impl PidView for ControlProbe {
+        fn tgid(&self, task: TaskId) -> TaskId {
+            self.inner.tgid(task)
+        }
+    }
+    impl ExitMm for ControlProbe {
+        fn exit_mm<'a>(&'a self, caller: &'a Caller<'a>) -> LocalFuture<'a, ()> {
+            self.inner.exit_mm(caller)
+        }
+    }
+    impl GroupStop for ControlProbe {
+        fn stop_wait(&self, task: TaskId) -> LocalFuture<'_, ()> {
+            self.inner.stop_wait(task)
+        }
+    }
+    impl VforkWait for ControlProbe {
+        fn vfork_wait(&self, task: TaskId) -> LocalFuture<'_, ()> {
+            self.inner.vfork_wait(task)
+        }
+    }
+    impl AtomicWait for ControlProbe {
+        fn atomic_wait<'a>(
+            &'a self,
+            caller: &'a Caller<'a>,
+            addr: u32,
+            expected: AtomicWord,
+            timeout: Option<Duration>,
+        ) -> LocalFuture<'a, SysResult<i32>> {
+            self.inner.atomic_wait(caller, addr, expected, timeout)
+        }
+        fn atomic_notify(&self, task: TaskId, addr: u32, count: u32) -> u32 {
+            self.inner.atomic_notify(task, addr, count)
+        }
+    }
+    impl SharedMappings for ControlProbe {
+        fn shared_mappings(&self, task: TaskId) -> Vec<SharedMapping> {
+            self.inner.shared_mappings(task)
+        }
+    }
     impl Control for ControlProbe {
         fn take_pending(&self, task: TaskId) -> Option<GuestAction> {
             self.inner.take_pending(task)
+        }
+        fn take_image(&self, task: TaskId) -> Option<Image> {
+            self.inner.take_image(task)
+        }
+        fn group_wait(&self, task: TaskId) -> LocalFuture<'_, ()> {
+            self.inner.group_wait(task)
         }
         fn fault(&self, task: TaskId, signal: i32) -> bool {
             let handoff = self.handoff.upgrade().unwrap();
