@@ -21,6 +21,7 @@ members = [
   "crates/record",
   "crates/policy",
   "crates/checkpoint",
+  "crates/native",
 ]
 exclude = ["third-party/shared-buffer"]
 resolver = "2"

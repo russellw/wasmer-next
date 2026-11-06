@@ -1422,6 +1422,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "wlk-native"
+version = "0.0.0"
+dependencies = [
+ "libc",
+ "tokio",
+ "wasixv2-abi",
+ "wasixv2-host",
+ "wasixv2-kernel",
+ "wasixv2-syscalls",
+ "wasixv2-vfs",
+ "wasixv2-vfs-host",
+ "wasixv2-vnet",
+ "wasixv2-vnet-host",
+]
+
+[[package]]
 name = "writeable"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
