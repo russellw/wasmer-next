@@ -48,6 +48,13 @@ signal tests pass. The combined CLI/Swift Cargo check passes at `6a1602ee31b`.
 Strict lint still reports existing resolver/CLI findings outside these changes.
 These completed ports do not close the remaining C API and SDK migrations.
 
+Linux native NAPI/custom bindings and the v2 NAPI CLI are integrated from
+`a2336f0f3d7`: private/shared refill and GC (including switched-first contexts),
+protected leases, cancellation, JSPI, callback safety, startup/late DSO, threads,
+vfork/exec and CLI mounts passed the final-pin focused gates. Owning-thread
+affinity no longer blanket-disables contexts. Mandatory macOS, standalone export
+lock, retained full-suite evidence and browser validation remain open.
+
 ### Current unfinished source handoffs
 
 These private branches preserve ongoing work. Their component results do not
