@@ -77,9 +77,53 @@ impl FileWriteGuard<'_> {
         self.file.modified(n);
         Ok((at + n as u64, n))
     }
+    /// Append using an opt-in provider's honest unknown-offset outcome. The
+    /// supplied cursor belongs to the existing locked open-file description.
+    pub async fn append_for_cursor_as(
+        &self,
+        data: &[u8],
+        cursor: u64,
+        cred: &crate::Cred,
+    ) -> FsResult<(u64, usize)> {
+        let inode = self.file.path.dentry.inode();
+        let data = inode.sealed_write(data, None).await?;
+        let outcome = self
+            .file
+            .handle()?
+            .append_at_cursor_as(data, cursor, cred)
+            .await?;
+        let (start, count) = match outcome {
+            crate::AppendOutcome::Positioned { start, count } => (start, count),
+            crate::AppendOutcome::OffsetUnknown { count } => (cursor, count),
+        };
+        if count > data.len() {
+            return Err(Errno::EIO);
+        }
+        self.file.modified(count);
+        let end = start.checked_add(count as u64).ok_or(Errno::EOVERFLOW)?;
+        Ok((end, count))
+    }
 }
 
 impl File {
+    /// The driver's open-time compatibility position, never a second cursor.
+    pub fn initial_position(&self, append: bool) -> u64 {
+        self.handle()
+            .map_or(0, |handle| handle.initial_position(append))
+    }
+
+    pub async fn append_for_cursor_as(
+        &self,
+        data: &[u8],
+        cursor: u64,
+        cred: &crate::Cred,
+    ) -> FsResult<(u64, usize)> {
+        self.write_guard()
+            .await?
+            .append_for_cursor_as(data, cursor, cred)
+            .await
+    }
+
     pub fn limits_file_size(&self) -> bool {
         self.file_type() == FileType::Regular && self.path.dentry.sb().fs.limits_file_size()
     }

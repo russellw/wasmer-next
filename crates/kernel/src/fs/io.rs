@@ -249,9 +249,13 @@ impl<'a> Target<'a> {
             }
         };
         if self.append {
+            let cursor = match self.at {
+                At::Position => self.file.pos(),
+                At::Offset(offset) => offset.checked_add(done as u64).ok_or(Errno::EOVERFLOW)?,
+            };
             let (end, n) = match guard {
-                Some(guard) => guard.append_as(data, &self.cred).await?,
-                None => inner.append_as(data, &self.cred).await?,
+                Some(guard) => guard.append_for_cursor_as(data, cursor, &self.cred).await?,
+                None => inner.append_for_cursor_as(data, cursor, &self.cred).await?,
             };
             if matches!(self.at, At::Position) {
                 self.file.set_pos(end);

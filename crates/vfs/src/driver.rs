@@ -358,11 +358,25 @@ pub trait Node: Send + Sync + Any {
     }
 }
 
+/// Append completion for providers that can report an atomic position, and for
+/// explicitly opted-in compatibility providers whose cursor is maintained by the caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppendOutcome {
+    Positioned { start: u64, count: usize },
+    OffsetUnknown { count: usize },
+}
+
 /// An object opened for data access (Linux's `file_operations`).
 ///
 /// Data methods are called on regular files only and `readdir` on directories only.
 #[async_trait(?Send)]
 pub trait Handle: Send + Sync {
+    /// Initial open-file position. Ordinary drivers retain Linux's zero position.
+    /// Compatibility drivers may use their open-time length for an append open.
+    fn initial_position(&self, _append: bool) -> u64 {
+        0
+    }
+
     /// Some filesystems query userspace before the synchronous readiness sample.
     async fn prepare_poll(&self, _events: u32) {}
 
@@ -425,6 +439,19 @@ pub trait Handle: Send + Sync {
 
     async fn append_as(&self, data: &[u8], _cred: &Cred) -> FsResult<(u64, usize)> {
         self.append(data).await
+    }
+
+    /// Cursor-aware compatibility append. The default preserves the strict atomic
+    /// append contract. OffsetUnknown must only be returned by an opted-in driver;
+    /// it advances the caller's existing cursor without claiming an atomic offset.
+    async fn append_at_cursor_as(
+        &self,
+        data: &[u8],
+        _cursor: u64,
+        cred: &Cred,
+    ) -> FsResult<AppendOutcome> {
+        let (start, count) = self.append_as(data, cred).await?;
+        Ok(AppendOutcome::Positioned { start, count })
     }
 
     async fn allocate_as(

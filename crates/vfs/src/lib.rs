@@ -36,7 +36,7 @@ pub use cred::{
     generic_permission, generic_permission_acl, initial_user_ns, same_user_ns,
 };
 pub use dentry::Dentry;
-pub use driver::{Filesystem, Handle, Link, MAX_DIR_COOKIE, Node, SharedContents};
+pub use driver::{AppendOutcome, Filesystem, Handle, Link, MAX_DIR_COOKIE, Node, SharedContents};
 pub use export::{HandleKind, MAX_HANDLE_SZ};
 pub use file::{DIR_POS_EOD, File, FileWriteGuard};
 pub use fileattr::{

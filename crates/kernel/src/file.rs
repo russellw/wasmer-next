@@ -276,10 +276,14 @@ impl Drop for StreamFlock {
 
 impl OpenFile {
     pub(crate) fn new(backing: Backing, flags: OpenFlags) -> Self {
+        let initial = match &backing {
+            Backing::Inode(file) => file.initial_position(flags.contains(OpenFlags::O_APPEND)),
+            Backing::Stream(..) => 0,
+        };
         Self {
             backing,
             flags: AtomicU32::new((flags & !OPEN_ONLY_FLAGS).0),
-            pos: Mutex::new(0),
+            pos: Mutex::new(initial),
             pos_lock: futures_util::lock::Mutex::new(()),
             epoll_links: Mutex::default(),
             stream_flock: OnceLock::new(),
@@ -524,7 +528,8 @@ impl OpenFile {
         };
         let _pos = self.lock_pos().await;
         if self.flags().contains(OpenFlags::O_APPEND) {
-            let (end, n) = file.append_as(data, cred).await?;
+            let cursor = *self.pos.lock_or_recover();
+            let (end, n) = file.append_for_cursor_as(data, cursor, cred).await?;
             *self.pos.lock_or_recover() = end;
             return Ok(n);
         }

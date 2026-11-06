@@ -241,6 +241,8 @@ pub trait DirSink {
 /// How an object is opened for data access.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct OpenOptions {
+    /// Preserve O_APPEND when opening a provider-owned file.
+    pub append: bool,
     pub read: bool,
     pub write: bool,
     /// Do not update the access time on reads (`O_NOATIME`).

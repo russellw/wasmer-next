@@ -582,6 +582,7 @@ impl Vfs {
         let options = OpenOptions {
             read: true,
             write: true,
+            append: false,
             noatime: false,
             sync: false,
             truncate: false,
@@ -1664,6 +1665,7 @@ async fn lock_rename(old_dir: &Path, new_dir: &Path) -> (DirLock, Option<DirLock
 fn open_options(flags: OpenFlags, at: &Path, task: u32) -> OpenOptions {
     let access = flags & OpenFlags::O_ACCMODE;
     OpenOptions {
+        append: flags.contains(OpenFlags::O_APPEND),
         read: access != OpenFlags::O_WRONLY,
         write: access != OpenFlags::O_RDONLY,
         noatime: flags.contains(OpenFlags::O_NOATIME) || at.mnt.flags().noatime,

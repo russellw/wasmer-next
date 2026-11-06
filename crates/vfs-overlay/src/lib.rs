@@ -1596,6 +1596,22 @@ impl FileHandle {
 
 #[async_trait(?Send)]
 impl Handle for FileHandle {
+    fn initial_position(&self, append: bool) -> u64 {
+        self.real.lock().unwrap().1.initial_position(append)
+    }
+
+    async fn append_at_cursor_as(
+        &self,
+        data: &[u8],
+        cursor: u64,
+        cred: &wasixv2_vfs::Cred,
+    ) -> FsResult<wasixv2_vfs::AppendOutcome> {
+        self.current()
+            .await?
+            .append_at_cursor_as(data, cursor, cred)
+            .await
+    }
+
     async fn read_at(&self, buf: &mut [u8], offset: u64) -> FsResult<usize> {
         self.current().await?.read_at(buf, offset).await
     }
