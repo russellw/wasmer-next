@@ -1581,6 +1581,9 @@ fn detached_factory_failures_publish_only_after_single_release_and_lease_retirem
         fn shared_mappings(&self, task: TaskId) -> Vec<SharedMapping> {
             self.inner.shared_mappings(task)
         }
+        fn wipe_on_fork(&self, task: TaskId) -> Vec<Range<u64>> {
+            self.inner.wipe_on_fork(task)
+        }
     }
     impl Control for ControlProbe {
         fn take_pending(&self, task: TaskId) -> Option<GuestAction> {
