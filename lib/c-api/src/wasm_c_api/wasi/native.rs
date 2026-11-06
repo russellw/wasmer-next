@@ -740,9 +740,12 @@ mod tests {
                     }));
                 assert!(
                     local
-                        .submit(Box::new(move |_| Box::pin(async move {
+                        .submit(Box::new(move |_| {
+                            // The factory runs during synchronous predecessor flush,
+                            // before enqueue can claim or admit the replacement.
                             let _ = delete.send(());
-                        })))
+                            Box::pin(async {})
+                        }))
                         .is_ok()
                 );
             }
