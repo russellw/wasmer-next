@@ -63,9 +63,8 @@ impl wasm_extern_t {
 // }
 
 impl wasm_extern_t {
-    pub(crate) unsafe fn ty(&self) -> ExternType {
-        let store_ref = unsafe { self.store.store() };
-        self.inner.ty(&store_ref)
+    pub(crate) fn ty(&self) -> Result<ExternType, wasmer_api::RuntimeError> {
+        self.store.with_mut(|store| self.inner.ty(store))
     }
 }
 

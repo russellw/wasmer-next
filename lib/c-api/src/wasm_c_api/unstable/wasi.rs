@@ -160,10 +160,10 @@ unsafe fn wasi_get_unordered_imports_inner(
     let store = &mut wasi_env.store;
     let module = module?;
 
-    let import_object = {
-        let mut store_mut = unsafe { store.store_mut() };
-        c_try!(wasi_env.inner.import_object(&mut store_mut, &module.inner))
-    };
+    let import_object =
+        c_try!(c_try!(store.with_mut(|store| {
+            wasi_env.inner.import_object(store, &module.inner)
+        })));
 
     imports.set_buffer(
         import_object

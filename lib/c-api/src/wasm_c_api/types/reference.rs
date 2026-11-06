@@ -83,8 +83,11 @@ fn with_foreign<R>(ref_: &wasm_ref_t, f: impl FnOnce(&Foreign) -> R) -> Option<R
     match &ref_.inner {
         Value::ExternRef(Some(e)) => {
             let store = ref_.store.upgrade()?;
-            let store_ref = unsafe { store.store() };
-            e.downcast::<Foreign>(&store_ref).map(f)
+            store
+                .with_mut(|store| e.downcast::<Foreign>(store).map(f))
+                .map_err(crate::error::update_last_error)
+                .ok()
+                .flatten()
         }
         _ => None,
     }
@@ -170,10 +173,11 @@ pub unsafe extern "C" fn wasm_foreign_new(
     store: Option<&mut wasm_store_t>,
 ) -> Option<Box<wasm_foreign_t>> {
     let store = store?;
-    let extern_ref = {
-        let mut store_mut = unsafe { store.inner.store_mut() };
-        ExternRef::new(&mut store_mut, Foreign::new())
-    };
+    let extern_ref = c_try!(
+        store
+            .inner
+            .with_mut(|store| ExternRef::new(store, Foreign::new()))
+    );
     Some(Box::new(wasm_ref_t {
         inner: Value::ExternRef(Some(extern_ref)),
         store: store.inner.downgrade(),

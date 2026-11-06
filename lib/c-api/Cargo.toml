@@ -67,7 +67,7 @@ middlewares = ["compiler", "wasmer-middlewares", "wasmer-api/wasmparser"]
 engine = ["compiler"]
 
 # Enable the `sys` backend.
-sys = ["wasmer-api/sys", "wasmer-compiler", "wasmer-c-api-imports/sys"]
+sys = ["wasmer-api/sys", "wasmer-api/experimental-async", "wasmer-compiler", "wasmer-c-api-imports/sys"]
 
 # Enable the `singlepass` compiler.
 singlepass = [

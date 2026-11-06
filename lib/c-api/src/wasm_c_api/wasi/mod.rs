@@ -187,7 +187,6 @@ pub unsafe extern "C" fn wasi_env_new(
     mut config: Box<wasi_config_t>,
 ) -> Option<Box<wasi_env_t>> {
     let store = &mut store?.inner;
-    let mut store_mut = unsafe { store.store_mut() };
 
     let runtime = config.runtime.take();
 
@@ -201,7 +200,7 @@ pub unsafe extern "C" fn wasi_env_new(
     let handle = runtime.handle().clone();
     let _guard = handle.enter();
     let mut rt = PluggableRuntime::new(Arc::new(TokioTaskManager::new(runtime)));
-    rt.set_engine(store_mut.engine().clone());
+    rt.set_engine(c_try!(store.with_mut(|store| store.engine().clone())));
 
     if !config.inherit_stdout {
         config.builder.set_stdout(Box::new(Pipe::channel().0));
@@ -213,12 +212,9 @@ pub unsafe extern "C" fn wasi_env_new(
 
     // TODO: impl capturer for stdin
 
-    let env = c_try!(
-        config
-            .builder
-            .runtime(Arc::new(rt))
-            .finalize(&mut store_mut)
-    );
+    let env = c_try!(c_try!(store.with_mut(|store| {
+        config.builder.runtime(Arc::new(rt)).finalize(store)
+    })));
 
     Some(Box::new(wasi_env_t {
         inner: env,
@@ -230,8 +226,8 @@ pub unsafe extern "C" fn wasi_env_new(
 #[unsafe(no_mangle)]
 pub extern "C" fn wasi_env_delete(state: Option<Box<wasi_env_t>>) {
     if let Some(mut env) = state {
-        let mut store = unsafe { env.store.store_mut() };
-        env.inner.on_exit(&mut store, None);
+        let store = env.store.clone();
+        c_try!(store.with_mut(|store| env.inner.on_exit(store, None)); otherwise ());
     }
 }
 
@@ -252,12 +248,8 @@ pub unsafe extern "C" fn wasi_env_read_stdout(
     buffer_len: usize,
 ) -> isize {
     let inner_buffer = unsafe { slice::from_raw_parts_mut(buffer as *mut _, buffer_len) };
-    let store = unsafe { env.store.store() };
 
-    let stdout = {
-        let data = env.inner.data(&store);
-        data.stdout()
-    };
+    let stdout = c_try!(env.store.with_mut(|store| env.inner.data(store).stdout()); otherwise -1);
 
     if let Ok(mut stdout) = stdout {
         if let Some(stdout) = stdout.as_mut() {
@@ -279,11 +271,7 @@ pub unsafe extern "C" fn wasi_env_read_stderr(
     buffer_len: usize,
 ) -> isize {
     let inner_buffer = unsafe { slice::from_raw_parts_mut(buffer as *mut _, buffer_len) };
-    let store = unsafe { env.store.store() };
-    let stderr = {
-        let data = env.inner.data(&store);
-        data.stderr()
-    };
+    let stderr = c_try!(env.store.with_mut(|store| env.inner.data(store).stderr()); otherwise -1);
     if let Ok(mut stderr) = stderr {
         if let Some(stderr) = stderr.as_mut() {
             read_inner(stderr, inner_buffer)
@@ -401,10 +389,10 @@ unsafe fn wasi_get_imports_inner(
     let store = &mut wasi_env.store;
     let module = module?;
 
-    let mut import_object = {
-        let mut store_mut = unsafe { store.store_mut() };
-        c_try!(wasi_env.inner.import_object(&mut store_mut, &module.inner))
-    };
+    let mut import_object =
+        c_try!(c_try!(store.with_mut(|store| {
+            wasi_env.inner.import_object(store, &module.inner)
+        })));
 
     let shared_memory = module.inner.imports().memories().next().map(|a| *a.ty());
 
@@ -413,19 +401,9 @@ unsafe fn wasi_get_imports_inner(
         None => wasmer_wasix::runtime::SpawnType::CreateMemory,
     };
 
-    let tasks = {
-        let store_ref = unsafe { store.store() };
-        wasi_env
-            .inner
-            .data(&store_ref)
-            .runtime
-            .task_manager()
-            .clone()
-    };
-    let memory = {
-        let mut store_mut = unsafe { store.store_mut() };
-        tasks.build_memory(&mut store_mut, spawn_type).unwrap()
-    };
+    let tasks =
+        c_try!(store.with_mut(|store| wasi_env.inner.data(store).runtime.task_manager().clone()));
+    let memory = c_try!(store.with_mut(|store| tasks.build_memory(store, spawn_type))).unwrap();
 
     if let Some(memory) = memory {
         import_object.define("env", "memory", memory);
@@ -470,11 +448,7 @@ pub unsafe extern "C" fn wasi_env_initialize_instance(
     store: &mut wasm_store_t,
     instance: &mut wasm_instance_t,
 ) -> bool {
-    let mut store_mut = unsafe { store.inner.store_mut() };
-    wasi_env
-        .inner
-        .initialize(&mut store_mut, instance.inner.clone())
-        .unwrap();
+    c_try!(store.inner.with_mut(|store| wasi_env.inner.initialize(store, instance.inner.clone()).unwrap()); otherwise false);
     true
 }
 
