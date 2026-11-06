@@ -1033,3 +1033,153 @@ fn cancellation_waits_for_an_actual_live_sibling_before_releasing_the_leader() {
         assert_eq!(events.iter().filter(|event| event.0 == phase).count(), 1);
     }
 }
+
+#[derive(Clone, Copy)]
+enum CommittedStarter {
+    Normal,
+    Reject,
+    Panic,
+    Discard,
+    Busy,
+}
+struct CommittedHost {
+    proof: Arc<Proof>,
+    mode: CommittedStarter,
+}
+impl Host for CommittedHost {
+    fn realtime(&self) -> Duration {
+        Duration::ZERO
+    }
+    fn monotonic(&self) -> Duration {
+        Duration::ZERO
+    }
+    fn sleep(&self, _: Duration) -> LocalFuture<'_, ()> {
+        Box::pin(async {})
+    }
+    fn random(&self, _: &mut [u8]) {}
+    fn executor(&self) -> &dyn Executor {
+        self
+    }
+    fn report(&self, _: &str) {}
+}
+impl Executor for CommittedHost {
+    fn spawn_local(&self, future: LocalFuture<'static, ()>) {
+        ProofHost(self.proof.clone()).spawn_local(future);
+    }
+    fn spawn_blocking(&self, work: Box<dyn FnOnce() + Send>) -> LocalFuture<'static, ()> {
+        Box::pin(async move { work() })
+    }
+    fn spawn_thread(&self, start: ThreadStart) -> std::io::Result<()> {
+        match self.mode {
+            CommittedStarter::Busy => {
+                ProofHost(self.proof.clone()).spawn_thread(Box::new(move || {
+                    let busy = thread::OwningThread::acquire().unwrap();
+                    let run = start();
+                    Box::pin(async move {
+                        run.await;
+                        drop(busy);
+                    })
+                }))
+            }
+            CommittedStarter::Normal => ProofHost(self.proof.clone()).spawn_thread(start),
+            CommittedStarter::Reject => Err(std::io::ErrorKind::Unsupported.into()),
+            CommittedStarter::Panic => panic!("committed starter panic sentinel"),
+            CommittedStarter::Discard => {
+                drop(start);
+                Ok(())
+            }
+        }
+    }
+}
+
+#[test]
+fn committed_cancellation_and_starter_failures_retain_predecessor_and_exact_terminal_custody() {
+    if !subprocess(
+        "cancellation::tests::committed_cancellation_and_starter_failures_retain_predecessor_and_exact_terminal_custody",
+    ) {
+        return;
+    }
+    struct Lease(Arc<std::sync::atomic::AtomicUsize>);
+    impl crate::ExecProcessLease for Lease {}
+    impl Drop for Lease {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for mode in [
+        CommittedStarter::Normal,
+        CommittedStarter::Reject,
+        CommittedStarter::Panic,
+        CommittedStarter::Discard,
+        CommittedStarter::Busy,
+    ] {
+        let (proof, observed) = lifecycle_proof(false);
+        let host = Arc::new(CommittedHost {
+            proof: proof.clone(),
+            mode,
+        });
+        let control = Arc::new(PendingControl(proof.clone()));
+        let engine = Store::default().engine().clone();
+        let retired = Arc::new(AtomicUsize::new(0));
+        let image = process::ExecImage::new(
+            Image::copied(vec![]),
+            Some(Box::new(Lease(retired.clone()))),
+        );
+        let terminal = PreinstalledTerminalCustody::new(TaskId(1), image);
+        let completion = Arc::new(process::Handoff::default());
+        let mut abis = Abis::wasixv2();
+        abis.push_instantiation_hook(Arc::new(LifecycleHook {
+            proof: proof.clone(),
+            image: vec![],
+        }));
+        let abis = Arc::new(abis);
+        let (barrier_tx, barrier_rx) = oneshot::channel::<()>();
+        let starter = start_committed_entry(
+            engine.clone(),
+            control.clone(),
+            host.clone(),
+            abis.clone(),
+            Box::pin(async move {
+                let _ = barrier_rx.await;
+            }),
+            terminal.clone(),
+            completion.clone(),
+        );
+        // Drop even an entirely unpolled waiter. Cancellation must not drop the
+        // predecessor receiver or the only replacement image/lease.
+        drop(starter);
+        assert_eq!(retired.load(Ordering::SeqCst), 0);
+        let mut events = Vec::new();
+        if matches!(mode, CommittedStarter::Normal | CommittedStarter::Busy) {
+            until(&observed, &mut events, "worker-start");
+        }
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event.0, "fault" | "release"))
+        );
+        assert!(
+            observed.try_recv().is_err(),
+            "no terminal action before predecessor settlement"
+        );
+        let _ = barrier_tx.send(());
+        let spawner = process::spawner(engine, control, host, abis);
+        // This is the preinstalled old-thread owner, entered only once its real
+        // predecessor keepalive has released the barrier above.
+        futures::executor::block_on(spawner.retire_committed(terminal, completion));
+        if matches!(mode, CommittedStarter::Normal | CommittedStarter::Busy) {
+            until(&observed, &mut events, "worker-done");
+        } else {
+            while let Ok(event) = observed.try_recv() {
+                events.push(event);
+            }
+        }
+        assert_eq!(events.iter().filter(|event| event.0 == "fault").count(), 1);
+        assert_eq!(
+            events.iter().filter(|event| event.0 == "release").count(),
+            1
+        );
+        assert_eq!(retired.load(Ordering::SeqCst), 1);
+    }
+}

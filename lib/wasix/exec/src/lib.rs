@@ -25,7 +25,19 @@ mod memory_image;
 #[cfg(all(target_os = "linux", feature = "sys"))]
 mod pagemap;
 mod preempt;
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+pub use cancellation::OwnedEntryWaiter;
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+use cancellation::PreinstalledTerminalCustody;
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+pub use embedding::HostCallHandoff;
 pub use embedding::HostEnvironment;
+
+/// A committed image transition uses a typed abort, including when a C API
+/// instance start propagates it through an instantiation trampoline.
+pub fn is_call_handoff(error: &RuntimeError) -> bool {
+    process::pending_marker(error).is_some()
+}
 
 mod preparation;
 mod process;
@@ -645,13 +657,12 @@ async fn ended<S: Syscalls + Control + Send + Sync + 'static>(
         Ok(Exited(status)) => return Ended::Exited(status),
         Err(err) => err,
     };
-    let err = match err.downcast::<process::ExecNew>() {
-        Ok(process::ExecNew(image)) => return Ended::Exec(image),
-        Err(err) => err,
-    };
-    if err.downcast_ref::<process::Detached>().is_some() {
-        let handoff = cx.with(|env, _| env.proc.handoff.clone()).await;
-        return Ended::Detached(handoff);
+    if let Some(handoff) = process::pending_marker(&err) {
+        match handoff.claim() {
+            Ok(process::PendingOutcome::Exec { image, .. }) => return Ended::Exec(image),
+            Ok(process::PendingOutcome::Detached) => return Ended::Detached(handoff.clone()),
+            Err(error) => tracing::warn!(%error, "cannot claim committed image outcome"),
+        }
     }
     let (syscalls, task, handoff) = cx
         .with(|env, _| (env.syscalls.clone(), env.task, env.proc.handoff.clone()))
@@ -1629,14 +1640,12 @@ pub async fn complete<S: Syscalls + Control + 'static, T>(
                     let image = syscalls
                         .take_image(process)
                         .unwrap_or_else(|| Image::copied(Vec::new()));
+                    let Some(parent) = vfork_parent else {
+                        return Outcome::Unwind(process::commit_exec(env, process, image).await);
+                    };
                     let image = match process::exec_image(env, process, image).await {
                         Ok(image) => image,
                         Err(error) => return Outcome::Unwind(error),
-                    };
-                    let Some(parent) = vfork_parent else {
-                        return Outcome::Unwind(RuntimeError::user(Box::new(process::ExecNew(
-                            image,
-                        ))));
                     };
                     process::spawn_image(env, process, image).await;
                     match vfork_resume(env, parent, task).await {
@@ -1793,7 +1802,7 @@ async fn vfork_resume<S: Control + 'static>(
     child: TaskId,
 ) -> Option<VforkResume> {
     if parent.resumes == Resume::Gone {
-        let detached = RuntimeError::user(Box::new(process::Detached));
+        let detached = process::commit_detached(env).await;
         return Some(VforkResume::Unwind(detached));
     }
     process::switch(env, parent.task).await;

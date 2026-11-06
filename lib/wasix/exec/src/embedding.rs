@@ -85,6 +85,28 @@ impl<S: Syscalls + Control + Send + Sync + 'static> HostEnvironment<S> {
             .retain_process(data.syscalls.tgid(data.task), &**abi)
     }
 
+    /// Nonconsuming identity check; function provenance never changes selected memory.
+    #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+    pub fn call_handoff(
+        &self,
+        store: &mut StoreMut<'_>,
+        error: &wasmer::RuntimeError,
+    ) -> Option<HostCallHandoff> {
+        if store.objects_mut().id() != self.store_id {
+            return None;
+        }
+        let marker = process::pending_marker(error)?;
+        let data = self.env.as_ref(store);
+        if !Arc::ptr_eq(marker, &data.proc.handoff) || !marker.is_pending() {
+            return None;
+        }
+        Some(HostCallHandoff {
+            handoff: marker.clone(),
+            spawner: data.proc.spawner.clone(),
+            state: Arc::new(std::sync::Mutex::new(HostCallState::Unclaimed)),
+        })
+    }
+
     /// The same loader scope used by this environment and its future images.
     pub fn loader_cleanup(&self) -> &Arc<LoaderCleanup> {
         &self.cleanup
@@ -110,6 +132,11 @@ impl<S: Syscalls + Control + Send + Sync + 'static> HostEnvironment<S> {
         abi: Arc<dyn AbiInstance<S>>,
     ) -> Result<(), ExecError> {
         let memory = self.instance_memory(store, instance)?;
+        if self.env.as_ref(store).proc.handoff.is_committed() {
+            return Err(ExecError::StoreMode(wasmer::RuntimeError::new(
+                "WASI image has already committed an exec handoff",
+            )));
+        }
         let asyncify = asyncify::Asyncify::new(instance, store)?;
         let stack_pointer = crate::stack_pointer(instance);
         let main_stack = memory::main_stack(instance, store);
@@ -207,4 +234,143 @@ pub(crate) fn environment<S: Syscalls + Control + Send + Sync + 'static>(
     env.as_mut(store).cleanup = Some(cleanup);
     abis.install_hooks(store, &env);
     env
+}
+
+/// An exact one-shot, engine-free committed image handoff. The caller installs
+/// retirement custody before claiming or admitting its replacement worker.
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+#[derive(Clone)]
+pub struct HostCallHandoff {
+    handoff: Arc<process::Handoff>,
+    spawner: Arc<dyn process::Spawn>,
+    state: Arc<std::sync::Mutex<HostCallState>>,
+}
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+enum HostCallState {
+    Unclaimed,
+    Exec(crate::PreinstalledTerminalCustody),
+    Detached,
+    Retired,
+}
+
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+impl HostCallHandoff {
+    /// Claim only after an old-thread retirement owner has retained this token.
+    pub fn claim(&self) -> Result<(), wasmer::RuntimeError> {
+        let outcome = self.handoff.claim()?;
+        let next = match outcome {
+            process::PendingOutcome::Exec { task, image } => {
+                HostCallState::Exec(crate::PreinstalledTerminalCustody::new(task, image))
+            }
+            process::PendingOutcome::Detached => HostCallState::Detached,
+        };
+        let old = std::mem::replace(
+            &mut *self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            next,
+        );
+        drop(old);
+        Ok(())
+    }
+
+    pub fn cancel(&self) {
+        let terminal = {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match &*state {
+                HostCallState::Exec(terminal) => Some(terminal.clone()),
+                _ => None,
+            }
+        };
+        if let Some(terminal) = terminal {
+            terminal.cancel();
+        }
+    }
+
+    /// The predecessor resolves only after physical roots, original Store guards,
+    /// and the old loader/LocalSet retirement keepalive have actually settled.
+    pub fn start(
+        &self,
+        predecessor: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+    ) -> Result<crate::OwnedEntryWaiter, ExecError> {
+        let terminal = {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match &*state {
+                HostCallState::Exec(terminal) => Some(terminal.clone()),
+                _ => None,
+            }
+        }
+        .ok_or_else(|| {
+            ExecError::StoreMode(wasmer::RuntimeError::new("no claimed exec handoff"))
+        })?;
+        self.spawner
+            .start_committed(terminal, predecessor, self.handoff.clone())
+    }
+
+    pub fn is_detached(&self) -> bool {
+        matches!(
+            *self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            HostCallState::Detached
+        )
+    }
+
+    pub async fn wait_detached(&self) -> Result<i32, ExecError> {
+        self.handoff.wait().await
+    }
+
+    /// Called by the retained old-thread owner only after its physical/loader
+    /// drain. Accepted workers keep terminal authority; all other paths fault
+    /// and release exactly once here, including starters that never ran.
+    pub async fn retire(&self) {
+        let unclaimed = matches!(
+            *self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            HostCallState::Unclaimed
+        );
+        if unclaimed {
+            if self.claim().is_err() {
+                return;
+            }
+            self.cancel();
+        }
+        if unclaimed && self.is_detached() {
+            // The existing takeover owns release. Retirement only waits for it.
+            let _ = self.handoff.wait().await;
+        }
+        let terminal = {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match &*state {
+                HostCallState::Exec(terminal) => Some(terminal.clone()),
+                _ => None,
+            }
+        };
+        if let Some(terminal) = terminal {
+            self.spawner
+                .retire_committed(terminal, self.handoff.clone())
+                .await;
+        }
+        let old = std::mem::replace(
+            &mut *self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            HostCallState::Retired,
+        );
+        drop(old);
+    }
 }

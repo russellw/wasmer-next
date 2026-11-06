@@ -137,7 +137,7 @@ impl Cancellation {
     }
     #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
     async fn terminal_owner(&self) -> Option<Arc<process::Handoff>> {
-        poll_fn(|cx| {
+        let result = poll_fn(|cx| {
             let next = cx.waker().clone();
             let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
             if state.phase == Phase::Transferring {
@@ -152,7 +152,20 @@ impl Cancellation {
             state.phase = Phase::Terminal;
             Poll::Ready(None)
         })
-        .await
+        .await;
+        if result.is_none() {
+            // This observer runs after the worker's physical/loader cleanup.
+            // A cloned diagnostic marker must not retain an unclaimed image.
+            let image = self
+                .0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .image
+                .clone();
+            let pending = image.and_then(|image| image.retire_pending());
+            drop(pending);
+        }
+        result
     }
     #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
     fn request(&self) {
@@ -219,6 +232,437 @@ impl Drop for WaitGuard {
             cancellation.request();
         }
     }
+}
+
+/// Preinstalled, engine-free disposition for a committed external call.
+/// Its old-thread retirement owner remains responsible until a worker accepts.
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+#[derive(Clone)]
+pub(crate) struct PreinstalledTerminalCustody(Arc<Mutex<TerminalState>>);
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TerminalPhase {
+    Starting,
+    Fallback,
+    WorkerAccepted,
+    Terminal,
+}
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+struct TerminalState {
+    task: TaskId,
+    entry: Option<process::ExecImage>,
+    phase: TerminalPhase,
+    canceled: bool,
+    cancellation: Option<Cancellation>,
+    finished: bool,
+    phase_waiter: Option<Waker>,
+    completion_waiters: std::collections::BTreeMap<usize, Waker>,
+    next_waiter: usize,
+}
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+impl PreinstalledTerminalCustody {
+    pub(crate) fn new(task: TaskId, entry: process::ExecImage) -> Self {
+        Self(Arc::new(Mutex::new(TerminalState {
+            task,
+            entry: Some(entry),
+            phase: TerminalPhase::Starting,
+            canceled: false,
+            cancellation: None,
+            finished: false,
+            phase_waiter: None,
+            completion_waiters: Default::default(),
+            next_waiter: 0,
+        })))
+    }
+    pub fn cancel(&self) {
+        let (cancellation, wake, observers) = {
+            let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            state.canceled = true;
+            if state.phase == TerminalPhase::Starting {
+                state.phase = TerminalPhase::Fallback;
+            }
+            (
+                state.cancellation.clone(),
+                state.phase_waiter.take(),
+                if state.phase == TerminalPhase::Fallback {
+                    std::mem::take(&mut state.completion_waiters)
+                } else {
+                    Default::default()
+                },
+            )
+        };
+        if let Some(cancellation) = cancellation {
+            cancellation.request();
+        }
+        if let Some(wake) = wake {
+            wake.wake();
+        }
+        for (_, wake) in observers {
+            wake.wake();
+        }
+    }
+    pub(crate) fn retirement_ready(&self) -> TerminalWait {
+        TerminalWait {
+            terminal: self.clone(),
+            key: None,
+        }
+    }
+    pub(crate) fn task(&self) -> TaskId {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).task
+    }
+    fn bind(&self, cancellation: Cancellation) -> bool {
+        let canceled = {
+            let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            if state.phase != TerminalPhase::Starting || state.cancellation.is_some() {
+                return false;
+            }
+            state.cancellation = Some(cancellation.clone());
+            state.canceled
+        };
+        if canceled {
+            cancellation.request();
+        }
+        true
+    }
+    fn decide(&self, accepted: bool) -> bool {
+        let (result, wake, observers) = {
+            let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            let result = accepted && state.phase == TerminalPhase::Starting;
+            if state.phase == TerminalPhase::Starting {
+                state.phase = if result {
+                    TerminalPhase::WorkerAccepted
+                } else {
+                    TerminalPhase::Fallback
+                };
+            }
+            (
+                result,
+                state.phase_waiter.take(),
+                if state.phase == TerminalPhase::Fallback {
+                    std::mem::take(&mut state.completion_waiters)
+                } else {
+                    Default::default()
+                },
+            )
+        };
+        if let Some(wake) = wake {
+            wake.wake();
+        }
+        for (_, wake) in observers {
+            wake.wake();
+        }
+        result
+    }
+    async fn accepted(&self) -> bool {
+        poll_fn(|cx| {
+            let next = cx.waker().clone();
+            let old = {
+                let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+                if state.phase != TerminalPhase::Starting {
+                    let accepted = state.phase == TerminalPhase::WorkerAccepted;
+                    drop(state);
+                    drop(next);
+                    return Poll::Ready(accepted);
+                }
+                state.phase_waiter.replace(next)
+            };
+            drop(old);
+            Poll::Pending
+        })
+        .await
+    }
+    fn worker_entry(&self) -> Option<process::ExecImage> {
+        let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.phase != TerminalPhase::WorkerAccepted {
+            return None;
+        }
+        state.entry.take()
+    }
+    /// Called only by the preinstalled old-thread owner after actual predecessor drain.
+    pub(crate) fn claim_fallback(&self) -> Option<process::ExecImage> {
+        let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.phase != TerminalPhase::Fallback {
+            return None;
+        }
+        state.phase = TerminalPhase::Terminal;
+        state.entry.take()
+    }
+    pub(crate) fn mark_finished(&self) {
+        let wake = {
+            let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            state.phase = TerminalPhase::Terminal;
+            state.finished = true;
+            std::mem::take(&mut state.completion_waiters)
+        };
+        for (_, wake) in wake {
+            wake.wake();
+        }
+    }
+}
+
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+pub(crate) struct TerminalWait {
+    terminal: PreinstalledTerminalCustody,
+    key: Option<usize>,
+}
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+impl Future for TerminalWait {
+    type Output = ();
+    fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let mut next = Some(cx.waker().clone());
+        let (ready, key, old) = {
+            let mut state = self
+                .terminal
+                .0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if state.finished || state.phase == TerminalPhase::Fallback {
+                (
+                    true,
+                    self.key,
+                    self.key
+                        .and_then(|key| state.completion_waiters.remove(&key)),
+                )
+            } else {
+                let key = self.key.unwrap_or_else(|| {
+                    let key = state.next_waiter;
+                    state.next_waiter = key.checked_add(1).expect("terminal waiter id exhausted");
+                    key
+                });
+                (
+                    false,
+                    Some(key),
+                    state
+                        .completion_waiters
+                        .insert(key, next.take().expect("owned terminal waker")),
+                )
+            }
+        };
+        self.key = if ready { None } else { key };
+        drop(old);
+        drop(next);
+        if ready {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+}
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+impl Drop for TerminalWait {
+    fn drop(&mut self) {
+        let old = self.key.take().and_then(|key| {
+            self.terminal
+                .0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .completion_waiters
+                .remove(&key)
+        });
+        drop(old);
+    }
+}
+
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+struct StartAdmission(Option<PreinstalledTerminalCustody>);
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+impl Drop for StartAdmission {
+    fn drop(&mut self) {
+        if let Some(terminal) = self.0.take() {
+            // A starter may accept and then discard the unentered ThreadStart.
+            // No worker owns the entry yet; the installed predecessor owns fallback.
+            terminal.cancel();
+            let wake = {
+                let mut state = terminal.0.lock().unwrap_or_else(PoisonError::into_inner);
+                if state.entry.is_some() && state.phase == TerminalPhase::WorkerAccepted {
+                    state.phase = TerminalPhase::Fallback;
+                    std::mem::take(&mut state.completion_waiters)
+                } else {
+                    Default::default()
+                }
+            };
+            for (_, wake) in wake {
+                wake.wake();
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+pub struct OwnedEntryWaiter {
+    waiting: WaitGuard,
+    completion: std::pin::Pin<Box<dyn Future<Output = Result<i32, ExecError>>>>,
+}
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+impl Future for OwnedEntryWaiter {
+    type Output = Result<i32, ExecError>;
+    fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let result = self.completion.as_mut().poll(cx);
+        if result.is_ready() {
+            self.waiting.0 = None;
+        }
+        result
+    }
+}
+
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+fn panic_error(panic: Box<dyn std::any::Any + Send>) -> ExecError {
+    let message = panic
+        .downcast_ref::<&str>()
+        .map(|value| (*value).to_owned())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "a panic without a message".to_owned());
+    ExecError::Panic(message)
+}
+
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+async fn committed_worker<S>(
+    profile: Result<Option<thread::OwningThread>, ExecError>,
+    engine: Engine,
+    entry: process::ExecImage,
+    syscalls: Arc<S>,
+    task: TaskId,
+    host: Arc<dyn Host>,
+    abis: Arc<Abis<S>>,
+    cancellation: Cancellation,
+) -> Result<i32, ExecError>
+where
+    S: Syscalls + Control + Send + Sync + 'static,
+{
+    let profile = match profile.and_then(|profile| {
+        if let Some(profile) = &profile {
+            profile.authorize()?;
+        }
+        Ok(profile)
+    }) {
+        Ok(profile) => profile,
+        Err(error) => {
+            process::fault(&*syscalls, task, wasixv2_abi::Signal::SIGSEGV.0);
+            process::finish_task(&*syscalls, task).await;
+            return Err(error);
+        }
+    };
+    let cleanup = RunCleanup::new(
+        wasixv2_host::LoaderCleanup::new(host.clone()),
+        engine.is_sys(),
+    )
+    .with_cancellation(cancellation.clone());
+    let call = async {
+        let run = async {
+            cancellation
+                .run(process::run_new_image(
+                    engine,
+                    entry,
+                    syscalls.clone(),
+                    task,
+                    host,
+                    abis,
+                    cleanup.clone(),
+                ))
+                .await
+                .unwrap_or(Err(ExecError::Dropped))
+        };
+        let result = match profile {
+            Some(profile) => profile.run(&cleanup, run).await,
+            None => cleanup.run(run).await,
+        };
+        if cancellation.selected() {
+            if let Some(handoff) = cancellation.terminal_owner().await {
+                return handoff.wait().await;
+            }
+            process::fault(&*syscalls, task, wasixv2_abi::Signal::SIGSEGV.0);
+            process::finish_task(&*syscalls, task).await;
+        }
+        result
+    };
+    match crate::catch_panic(call).await {
+        Ok(result) => result,
+        Err(panic) => {
+            let error = panic_error(panic);
+            process::fault(&*syscalls, task, wasixv2_abi::Signal::SIGSEGV.0);
+            process::finish_task(&*syscalls, task).await;
+            Err(error)
+        }
+    }
+}
+
+/// Synchronous admission: a supplied terminal already belongs to old-thread
+/// retirement custody. No ThreadStart closure owns its only pending image/lease.
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+pub(crate) fn start_committed_entry<S>(
+    engine: Engine,
+    syscalls: Arc<S>,
+    host: Arc<dyn Host>,
+    abis: Arc<Abis<S>>,
+    predecessor: std::pin::Pin<Box<dyn Future<Output = ()> + Send>>,
+    terminal: PreinstalledTerminalCustody,
+    completion: Arc<process::Handoff>,
+) -> Result<OwnedEntryWaiter, ExecError>
+where
+    S: Syscalls + Control + Send + Sync + 'static,
+{
+    let task = terminal.task();
+    let cancellation = Cancellation::new(task);
+    let waiting = WaitGuard(Some(cancellation.clone()));
+    if !terminal.bind(cancellation.clone()) {
+        return Err(ExecError::Dropped);
+    }
+    let done = process::Takeover(completion.clone());
+    let worker_host = host.clone();
+    let worker_terminal = terminal.clone();
+    let mut admission = StartAdmission(Some(terminal.clone()));
+    let required = abis.requires_owning_thread();
+    let start = Box::new(move || {
+        let profile = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            thread::OwningThread::required(required)
+        }))
+        .unwrap_or_else(|panic| Err(panic_error(panic)));
+        Box::pin(async move {
+            let accepted = worker_terminal.accepted().await;
+            // This is deliberately outside cancellation::execution. Cancel records
+            // intent, but the predecessor owns the old physical drain and sender.
+            predecessor.await;
+            if !accepted {
+                return;
+            }
+            drop(admission.0.take());
+            let result = match worker_terminal.worker_entry() {
+                Some(entry) => {
+                    committed_worker(
+                        profile,
+                        engine,
+                        entry,
+                        syscalls,
+                        task,
+                        worker_host,
+                        abis,
+                        cancellation,
+                    )
+                    .await
+                }
+                None => Err(ExecError::Dropped),
+            };
+            worker_terminal.mark_finished();
+            done.report(result);
+        }) as wasixv2_host::LocalFuture<'static, ()>
+    });
+    let started = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        host.executor().spawn_thread(start)
+    })) {
+        Ok(result) => result.map_err(ExecError::OwningThreadSpawn),
+        Err(panic) => Err(panic_error(panic)),
+    };
+    if let Err(error) = started {
+        terminal.decide(false);
+        return Err(error);
+    }
+    if !terminal.decide(true) {
+        return Err(ExecError::Dropped);
+    }
+    Ok(OwnedEntryWaiter {
+        waiting,
+        completion: Box::pin(async move { completion.wait().await }),
+    })
 }
 
 #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
