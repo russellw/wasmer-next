@@ -2686,7 +2686,7 @@ mod tests {
                     "  i32.const 204 i32.const 1 memory.atomic.notify drop "
                     "  block $done loop $wait "
                     "   i32.const 208 i32.atomic.load br_if $done "
-                    "   i32.const 208 i32.const 0 i64.const -1 memory.atomic.wait32 drop "
+                    "   i32.const 208 i32.const 0 i64.const 5000000000 memory.atomic.wait32 i32.const 2 i32.eq if unreachable end "
                     "   br $wait end end end "
                     " i32.const 200 i32.const 37 i32.store)",
                     "",
@@ -2702,7 +2702,7 @@ mod tests {
                     "(func (export \"await_started\") (result i32) "
                     " block $done loop $wait "
                     "  i32.const 204 i32.atomic.load br_if $done "
-                    "  i32.const 204 i32.const 0 i64.const -1 memory.atomic.wait32 drop "
+                    "  i32.const 204 i32.const 0 i64.const 5000000000 memory.atomic.wait32 i32.const 2 i32.eq if unreachable end "
                     "  br $wait end end i32.const 0)"
                     "(func (export \"release\") (result i32) "
                     " i32.const 208 i32.const 1 i32.atomic.store "
