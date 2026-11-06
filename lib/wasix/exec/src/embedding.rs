@@ -5,7 +5,7 @@ use wasixv2_host::{Host, LoaderCleanup};
 use wasixv2_syscalls::{Control, Syscalls, TaskId};
 use wasmer::{AsStoreMut, FunctionEnv, Instance, Memory, StoreMut};
 
-use crate::{AbiInstance, Abis, ExecEnv, ExecError, asyncify, memory, process};
+use crate::{Abi, AbiInstance, Abis, ExecEnv, ExecError, asyncify, memory, process, thread};
 
 /// Host handles for one externally owned process. This owns no Store or kernel
 /// process registration; its caller retains both and settles calls before retirement.
@@ -14,6 +14,7 @@ pub struct HostEnvironment<S: 'static> {
     store_id: wasmer_types::StoreId,
     initialized: Arc<std::sync::atomic::AtomicBool>,
     cleanup: Arc<LoaderCleanup>,
+    abis: Arc<Abis<S>>,
 }
 
 impl<S: 'static> Clone for HostEnvironment<S> {
@@ -23,6 +24,7 @@ impl<S: 'static> Clone for HostEnvironment<S> {
             store_id: self.store_id,
             initialized: self.initialized.clone(),
             cleanup: self.cleanup.clone(),
+            abis: self.abis.clone(),
         }
     }
 }
@@ -41,7 +43,7 @@ impl<S: Syscalls + Control + Send + Sync + 'static> HostEnvironment<S> {
             syscalls,
             task,
             host,
-            abis,
+            abis.clone(),
             cleanup.clone(),
             Arc::default(),
         );
@@ -50,6 +52,7 @@ impl<S: Syscalls + Control + Send + Sync + 'static> HostEnvironment<S> {
             store_id: store.objects_mut().id(),
             initialized: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cleanup,
+            abis,
         }
     }
 
@@ -133,22 +136,96 @@ impl<S: Syscalls + Control + Send + Sync + 'static> HostEnvironment<S> {
         instance: &Instance,
         abi: Arc<dyn AbiInstance<S>>,
     ) -> Result<(), ExecError> {
+        self.initialize_image(store, instance, abi, None)
+    }
+
+    /// Selects an externally instantiated image and its canonical shared-memory
+    /// thread factory, without starting or replacing the process. The factory is
+    /// explicit so an otherwise accepted module with no ABI imports stays valid.
+    pub fn initialize_with_thread_abi(
+        &self,
+        store: &mut StoreMut<'_>,
+        instance: &Instance,
+        binding: Arc<dyn AbiInstance<S>>,
+        image_abi: Arc<dyn Abi<S>>,
+    ) -> Result<(), ExecError> {
+        self.initialize_image(store, instance, binding, Some(image_abi))
+    }
+
+    fn initialize_image(
+        &self,
+        store: &mut StoreMut<'_>,
+        instance: &Instance,
+        abi: Arc<dyn AbiInstance<S>>,
+        image_abi: Option<Arc<dyn Abi<S>>>,
+    ) -> Result<(), ExecError> {
         let memory = self.instance_memory(store, instance)?;
         if self.env.as_ref(store).proc.handoff.is_committed() {
             return Err(ExecError::StoreMode(wasmer::RuntimeError::new(
                 "WASI image has already committed an exec handoff",
             )));
         }
+        let image_abi = image_abi.map(|abi| abi.for_image(instance.module()).unwrap_or(abi));
+        // Stage fallible instance metadata before publishing any selected handles.
         let asyncify = asyncify::Asyncify::new(instance, store)?;
         let stack_pointer = crate::stack_pointer(instance);
         let main_stack = memory::main_stack(instance, store);
-        let data = self.env.as_mut(store);
-        data.memory = Some(memory);
-        data.main_stack = main_stack;
-        data.stack_pointer = stack_pointer;
-        data.abi = Some(abi);
-        data.proc.set_module(instance.module());
-        data.asyncify = asyncify;
+        let shared = memory.as_shared(store);
+        let (syscalls, task, host, handoff, low_guard, read_only, base, layout) = {
+            let data = self.env.as_ref(store);
+            (
+                data.syscalls.clone(),
+                data.task,
+                data.host.clone(),
+                data.proc.handoff.clone(),
+                data.low_guard,
+                data.read_only.clone(),
+                data.base.clone(),
+                data.layout.clone(),
+            )
+        };
+        let foreign = memory::ForeignMemory::capture(
+            &memory,
+            store,
+            shared.clone(),
+            low_guard,
+            read_only.clone(),
+            syscalls.page_access(task),
+            base.clone(),
+        );
+        let threads = shared.zip(image_abi).map(|(shared, image_abi)| {
+            thread::Image::new(
+                store.engine().clone(),
+                instance.module(),
+                shared,
+                (low_guard, read_only, base),
+                main_stack.clone(),
+                layout,
+                syscalls.clone(),
+                host,
+                image_abi,
+                self.abis.clone(),
+                handoff,
+            ) as Arc<dyn thread::Start>
+        });
+        // Kernel first-attachment semantics remain unchanged; remote reselection
+        // requires the separately reviewed stable host-selection capability.
+        if let Some(foreign) = foreign {
+            syscalls.attach_memory(task, Arc::new(foreign));
+        }
+        let old = {
+            let data = self.env.as_mut(store);
+            data.main_stack = main_stack;
+            data.stack_pointer = stack_pointer;
+            data.proc.set_module(instance.module());
+            (
+                data.memory.replace(memory),
+                data.abi.replace(abi),
+                std::mem::replace(&mut data.threads, threads),
+                std::mem::replace(&mut data.asyncify, asyncify),
+            )
+        };
+        drop(old);
         self.initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(())

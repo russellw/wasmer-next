@@ -1084,6 +1084,36 @@ pub(crate) struct ForeignMemory {
 }
 
 impl ForeignMemory {
+    /// Capture the same checked native/shared backing for runners and externally
+    /// owned host images. This never creates shared memory from private memory.
+    pub(crate) fn capture(
+        memory: &Memory,
+        store: &impl AsStoreRef,
+        shared: Option<wasmer::SharedMemory>,
+        low_guard: u32,
+        read_only: Arc<ReadOnly>,
+        page_access: Option<Arc<PageAccess>>,
+        base: Option<Arc<Base>>,
+    ) -> Option<Self> {
+        #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+        let backing = memory
+            .host_memory_access(store)
+            .ok()
+            .map(ForeignBacking::Access)
+            .or_else(|| shared.map(ForeignBacking::Shared))?;
+        #[cfg(not(all(feature = "sys", not(target_arch = "wasm32"))))]
+        let backing = {
+            let _ = (memory, store);
+            shared?
+        };
+        let foreign = Self::new(backing, low_guard, read_only, page_access);
+        #[cfg(all(target_os = "linux", feature = "sys"))]
+        let foreign = foreign.with_base(base);
+        #[cfg(not(all(target_os = "linux", feature = "sys")))]
+        let _ = base;
+        Some(foreign)
+    }
+
     pub(crate) fn new(
         memory: impl Into<ForeignBacking>,
         low_guard: u32,

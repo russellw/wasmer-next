@@ -381,6 +381,14 @@ impl Wasix1Instance {
         );
     }
 
+    /// Host attachment accepts reactors and incomplete modules. A spawn must
+    /// check the selected instance's actual entry before creating a kernel task.
+    pub(crate) fn thread_entry_available(&self, store: &impl wasmer::AsStoreRef) -> bool {
+        self.exports
+            .get_typed_function::<(i32, i32), ()>(store, THREAD_ENTRY)
+            .is_ok()
+    }
+
     pub(crate) fn procs(&self) -> &Arc<Procs> {
         &self.procs
     }

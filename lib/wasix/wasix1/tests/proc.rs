@@ -1595,3 +1595,82 @@ fn asyncify_calls_without_asyncify() {
     "#;
     assert_eq!(status(wat), 0);
 }
+
+/// Host selection accepts incomplete/private modules, but no unsupported spawn
+/// may reach kernel clone or fault a newly created child and its parent group.
+#[tokio::test]
+async fn unavailable_selected_thread_entries_fail_before_kernel_thread_creation() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use wasixv2_kernel::{Dispatch, HostClock, Kernel, SyscallEntry};
+    use wasixv2_syscalls::{Caller, Layer, Layered, MaybeFuture, SysResult, Syscall, SyscallRet};
+    struct Count(Arc<AtomicUsize>);
+    impl Layer<Kernel> for Count {
+        fn call<'a>(
+            &'a self,
+            caller: &'a Caller<'_>,
+            call: Syscall,
+            next: &'a Kernel,
+        ) -> MaybeFuture<'a, SysResult<SyscallRet>> {
+            if matches!(&call, Syscall::ThreadSpawn { .. }) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            Dispatch.call(caller, call, next)
+        }
+    }
+    for (shared, entry) in [
+        (true, ""),
+        (true, "(func (export \"wasi_thread_start\") (param i64))"),
+        (
+            false,
+            "(func (export \"wasi_thread_start\") (param i32 i32))",
+        ),
+    ] {
+        let source = format!(
+            r#"(module
+            (import "env" "memory" (memory 1 1 {memory}))
+            (import "wasix_32v1" "thread_spawn_v2" (func $spawn (param i32 i32) (result i32)))
+            (import "wasi" "thread-spawn" (func $wasi_spawn (param i32) (result i32)))
+            (import "wasix_32v1" "proc_exit2" (func $exit (param i32)))
+            {entry}
+            (func (export "_start")
+                i32.const 104 i32.const 12345 i32.store
+                (if (i32.ne (call $spawn (i32.const 36) (i32.const 104)) (i32.const 76))
+                    (then (call $exit (i32.const 1))))
+                (if (i32.ne (i32.load (i32.const 104)) (i32.const 12345))
+                    (then (call $exit (i32.const 2))))
+                (if (i32.ne (call $wasi_spawn (i32.const 36)) (i32.const -76))
+                    (then (call $exit (i32.const 3))))
+                (call $exit (i32.const 0))))"#,
+            memory = if shared { "shared" } else { "" }
+        );
+        let host: Arc<dyn wasixv2::Host> = Arc::new(wasixv2::TokioHost::default());
+        let root = Arc::new(wasixv2_vfs_mem::MemFs::new(
+            Arc::new(HostClock(host.clone())),
+            0o777,
+            1,
+            1,
+        ));
+        let mut abis = wasixv2_exec::Abis::new();
+        abis.push(Arc::new(wasixv2_wasix1::Wasix1::new()));
+        let abis = Arc::new(abis);
+        let kernel = Kernel::new(host.clone(), root).with_binfmt(abis.clone());
+        let task = kernel
+            .spawn(ProcessConfig {
+                args: vec!["preflight".into()],
+                env: vec![],
+                stdio: Stdio::from_fns(|_| {}, |_| {}),
+            })
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let syscalls = Arc::new(Layered::new(SyscallEntry(Count(calls.clone())), kernel));
+        let store = wasmer::Store::default();
+        let module = wasixv2_exec::load(store.engine(), &wat::parse_str(source).unwrap()).unwrap();
+        let result = wasixv2_exec::run_with_abis(store, &module, syscalls, task, host, abis).await;
+        assert_eq!(result.unwrap(), 0);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "preflight precedes kernel thread creation"
+        );
+    }
+}

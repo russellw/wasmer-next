@@ -225,7 +225,7 @@ pub(crate) struct Image<S> {
 impl<S> Image<S> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        store: &Store,
+        engine: Engine,
         module: &Module,
         memory: SharedMemory,
         (low_guard, read_only, base): (u32, Arc<ReadOnly>, Option<Arc<Base>>),
@@ -238,7 +238,7 @@ impl<S> Image<S> {
         handoff: Arc<process::Handoff>,
     ) -> Arc<Self> {
         Arc::new(Self {
-            engine: store.engine().clone(),
+            engine,
             module: module.clone(),
             memory,
             low_guard,

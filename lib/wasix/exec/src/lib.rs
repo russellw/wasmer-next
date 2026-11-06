@@ -1066,32 +1066,23 @@ where
             .retain_process(task, &*bound)
             .map_err(ExecError::CustomBinding)?;
         let shared = memory.as_shared(&store);
-        #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
-        let foreign = memory
-            .host_memory_access(&store)
-            .ok()
-            .map(memory::ForeignBacking::Access)
-            .or_else(|| shared.clone().map(memory::ForeignBacking::Shared));
-        #[cfg(not(all(feature = "sys", not(target_arch = "wasm32"))))]
-        let foreign = shared.clone();
-        if let Some(foreign) = foreign {
-            // Browser C1 posts registration here before attachment; foreign requests
-            // may complete through the independent JS copy worker without a readiness ack.
-            let foreign = memory::ForeignMemory::new(
-                foreign,
-                low_guard,
-                read_only.clone(),
-                syscalls.page_access(task),
-            );
-            #[cfg(all(target_os = "linux", feature = "sys"))]
-            let foreign = foreign.with_base(base.clone());
+        if let Some(foreign) = memory::ForeignMemory::capture(
+            &memory,
+            &store,
+            shared.clone(),
+            low_guard,
+            read_only.clone(),
+            syscalls.page_access(task),
+            base.clone(),
+        ) {
+            // Preserve the kernel's original mm attachment identity and lifetime.
             syscalls.attach_memory(task, Arc::new(foreign));
         }
         // ---- thr ----
         let threads = shared.map(|shared| {
             let protected = (low_guard, read_only.clone(), base.clone());
             let image = thread::Image::new(
-                &store,
+                store.engine().clone(),
                 module,
                 shared,
                 protected,

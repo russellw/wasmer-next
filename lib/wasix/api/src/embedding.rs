@@ -101,6 +101,15 @@ impl EmbeddingProcess {
         self.wasix1.as_ref()
     }
 
+    /// The exact Wasix1 factory already registered in this Machine. Host-selected
+    /// modules need not have ABI imports, so import-based selection is insufficient.
+    #[cfg(feature = "wasix1")]
+    pub fn wasix1_abi(&self) -> Option<Arc<wasixv2_wasix1::Wasix1>> {
+        self.wasix1
+            .as_ref()
+            .map(|_| self.machine.wasix1.abi.clone())
+    }
+
     /// Disarms registration after an external executor has settled terminal cleanup.
     /// This does not fault or release the task again. The executor must settle all
     /// guest invocations and own the task's release before calling this method.

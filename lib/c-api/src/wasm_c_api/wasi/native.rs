@@ -308,15 +308,25 @@ impl NativeWasi {
             anyhow::bail!("WASI environment is retired or its image was replaced");
         }
         self.endpoint.env.validate_instance(store, instance)?;
-        let binding = {
+        let (wasi, image_abi) = {
             let process = self.endpoint.process.borrow();
-            let wasi = process
+            let process = process
                 .as_ref()
-                .and_then(EmbeddingProcess::wasix1)
                 .ok_or_else(|| anyhow::anyhow!("WASI environment is closed"))?;
-            wasi.attach(instance, store)
+            (
+                process
+                    .wasix1()
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("WASI environment is closed"))?,
+                process
+                    .wasix1_abi()
+                    .ok_or_else(|| anyhow::anyhow!("WASI environment is closed"))?,
+            )
         };
-        self.endpoint.env.initialize(store, instance, binding)?;
+        let binding = wasi.attach(instance, store);
+        self.endpoint
+            .env
+            .initialize_with_thread_abi(store, instance, binding, image_abi)?;
         Ok(())
     }
 

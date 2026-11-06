@@ -2614,4 +2614,156 @@ mod tests {
         }).success();
         eprintln!("{}", String::from_utf8_lossy(&output.get_output().stderr));
     }
+
+    #[allow(
+        unexpected_cfgs,
+        reason = "tools like cargo-llvm-coverage pass --cfg coverage"
+    )]
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    #[test]
+    fn test_wasi_public_host_attachment_spawns_threads_without_process_entry_and_preflights_selected_exports()
+     {
+        (assert_c! {
+            #include "tests/wasmer.h"
+            #include <stdint.h>
+            #include <stdio.h>
+            #include <string.h>
+
+            static uint32_t read32(const uint8_t* p) {
+                return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+                    ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+            }
+            static void write32(uint8_t* p, uint32_t value) {
+                for (size_t i = 0; i < 4; ++i) p[i] = (uint8_t)(value >> (i * 8));
+            }
+            static int32_t invoke(wasm_func_t* function, size_t argc, int32_t value) {
+                wasm_val_t input[] = { WASM_I32_VAL(value) };
+                wasm_val_vec_t args, results;
+                wasm_val_vec_new(&args, argc, input);
+                wasm_val_vec_new_uninitialized(&results, 1);
+                results.data[0] = (wasm_val_t)WASM_I32_VAL(-999);
+                wasm_trap_t* trap = wasm_func_call(function, &args, &results);
+                if (trap) {
+                    wasm_message_t message;
+                    wasm_trap_message(trap, &message);
+                    fprintf(stderr, "thread fixture trap: %.*s\n", (int)message.size, message.data);
+                }
+                assert(!trap && results.data[0].kind == WASM_I32);
+                int32_t result = results.data[0].of.i32;
+                wasm_val_vec_delete(&results);
+                wasm_val_vec_delete(&args);
+                return result;
+            }
+            static wasm_module_t* module(wasm_store_t* store, const char* source) {
+                wasm_byte_vec_t wat, wasm;
+                wasmer_byte_vec_new_from_string(&wat, source);
+                wat2wasm(&wat, &wasm);
+                assert(wasm.size);
+                wasm_module_t* result = wasm_module_new(store, &wasm);
+                assert(result);
+                wasm_byte_vec_delete(&wasm);
+                wasm_byte_vec_delete(&wat);
+                return result;
+            }
+            static void spawn_join(
+                wasm_func_t* spawn, wasm_func_t* join, uint8_t* memory, uint32_t expected
+            ) {
+                write32(memory + 104, 12345);
+                write32(memory + 200, 0);
+                assert(invoke(spawn, 0, 0) == 0);
+                uint32_t tid = read32(memory + 104);
+                assert(tid > 0 && tid != 12345);
+                assert(invoke(join, 1, (int32_t)tid) == 0);
+                assert(read32(memory + 200) == expected);
+            }
+            int main() {
+                wasm_engine_t* engine = wasm_engine_new();
+                wasm_store_t* store = wasm_store_new(engine);
+                const char* entries[] = {
+                    "(func (export \"wasi_thread_start\") (param i32 i32) i32.const 200 i32.const 37 i32.store)",
+                    "",
+                    "(func (export \"wasi_thread_start\") (param i64))",
+                    "(func (export \"wasi_thread_start\") (param i32 i32))"
+                };
+                for (size_t profile = 0; profile < 4; ++profile) {
+                    char source[4096];
+                    int length = snprintf(source, sizeof(source),
+                        "(module (import \"env\" \"memory\" (memory 1 1 %s))\n"
+                        "(import \"wasix_32v1\" \"thread_spawn_v2\" (func $spawn (param i32 i32) (result i32)))\n"
+                        "(import \"wasix_32v1\" \"thread_join\" (func $join (param i32) (result i32)))\n"
+                        "(import \"wasix_32v1\" \"proc_id\" (func $pid (param i32) (result i32)))\n"
+                        "(export \"memory\" (memory 0))\n"
+                        "(func (export \"spawn\") (result i32) i32.const 36 i32.const 104 call $spawn)\n"
+                        "(func (export \"join\") (param i32) (result i32) local.get 0 call $join)\n"
+                        "(func (export \"pid\") (result i32) i32.const 108 call $pid drop i32.const 108 i32.load)\n"
+                        "(func (export \"answer\") (result i32) i32.const 19)\n"
+                        "(func (export \"_initialize\") unreachable)\n%s)",
+                        profile == 3 ? "" : "shared", entries[profile]);
+                    assert(length > 0 && (size_t)length < sizeof(source));
+                    wasm_module_t* a = module(store, source);
+                    wasi_config_t* config = wasi_config_new("host-thread");
+                    assert(config);
+                    wasi_env_t* env = wasi_env_new(store, config);
+                    assert(env);
+                    wasm_extern_vec_t imports = WASM_EMPTY_VEC, exports = WASM_EMPTY_VEC;
+                    assert(wasi_get_imports(store, env, a, &imports));
+                    wasm_instance_t* instance = wasm_instance_new(store, a, &imports, NULL);
+                    // No _start exists, and _initialize traps if called. Selection
+                    // must still succeed for every shared/private/entry profile.
+                    assert(instance && wasi_env_initialize_instance(env, store, instance));
+                    wasm_instance_exports(instance, &exports);
+                    assert(exports.size == (profile == 1 ? 6 : 7));
+                    wasm_memory_t* memory = wasm_extern_as_memory(exports.data[0]);
+                    assert(memory && wasm_memory_data_size(memory) >= 256);
+                    uint8_t* bytes = wasm_memory_data(memory);
+                    wasm_func_t* spawn = wasm_extern_as_func(exports.data[1]);
+                    wasm_func_t* join = wasm_extern_as_func(exports.data[2]);
+                    wasm_func_t* pid = wasm_extern_as_func(exports.data[3]);
+                    wasm_func_t* answer = wasm_extern_as_func(exports.data[4]);
+                    int32_t original_pid = invoke(pid, 0, 0);
+                    assert(original_pid > 0 && invoke(answer, 0, 0) == 19);
+                    if (profile == 0) {
+                        spawn_join(spawn, join, bytes, 37);
+                        // Pure B has only an imported shared memory and its actual
+                        // thread entry. It must not be rejected by ABI import matching.
+                        wasm_module_t* b = module(store,
+                            "(module (import \"env\" \"memory\" (memory 1 1 shared))\n"
+                            "(export \"memory\" (memory 0))\n"
+                            "(func (export \"wasi_thread_start\") (param i32 i32)\n"
+                            " i32.const 200 i32.const 73 i32.store))");
+                        wasm_extern_t* shared = wasm_extern_copy(imports.data[0]);
+                        wasm_extern_vec_t b_imports;
+                        wasm_extern_vec_new(&b_imports, 1, &shared);
+                        wasm_instance_t* instance_b = wasm_instance_new(store, b, &b_imports, NULL);
+                        assert(instance_b && wasi_env_initialize_instance(env, store, instance_b));
+                        // Invoke A's old functions while B is explicitly selected:
+                        // its thread image must use B, with the same process/mm.
+                        spawn_join(spawn, join, bytes, 73);
+                        assert(invoke(pid, 0, 0) == original_pid);
+                        assert(wasi_env_initialize_instance(env, store, instance));
+                        spawn_join(spawn, join, bytes, 37);
+                        assert(invoke(pid, 0, 0) == original_pid);
+                        wasm_instance_delete(instance_b);
+                        wasm_extern_vec_delete(&b_imports);
+                        wasm_module_delete(b);
+                    } else {
+                        write32(bytes + 104, 12345);
+                        assert(invoke(spawn, 0, 0) == 76);
+                        assert(read32(bytes + 104) == 12345);
+                        assert(invoke(pid, 0, 0) == original_pid);
+                        assert(invoke(answer, 0, 0) == 19);
+                    }
+                    wasi_env_delete(env);
+                    assert(invoke(answer, 0, 0) == 19);
+                    wasm_extern_vec_delete(&exports);
+                    wasm_instance_delete(instance);
+                    wasm_extern_vec_delete(&imports);
+                    wasm_module_delete(a);
+                }
+                wasm_store_delete(store);
+                wasm_engine_delete(engine);
+                return 0;
+            }
+        }).success();
+    }
 }
