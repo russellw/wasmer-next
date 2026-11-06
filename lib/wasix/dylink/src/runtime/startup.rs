@@ -69,19 +69,25 @@ impl Drop for Pending {
             return;
         }
         let owner = self.owner.clone();
-        self.cleanup.spawn(Box::pin(async move {
-            for lease in leases {
-                lease.release().await;
-            }
-            drop(closing);
-            drop(owner);
-        }));
+        let job: wasixv2_host::LocalLoaderCleanupJob = Box::new(move |_| {
+            Box::pin(async move {
+                for lease in leases {
+                    lease.release().await;
+                }
+                drop(closing);
+                drop(owner);
+            })
+        });
+        if let Err(job) = self.cleanup.submit_local(job) {
+            self.cleanup.spawn(job(None));
+        }
     }
 }
 
 struct Prepared<S: 'static> {
     root: Arc<Root>,
     base: Arc<dyn Abi<S>>,
+    prepared_base: Option<Box<dyn PreparedImage<S>>>,
     imports: Imports,
     forwarders: Vec<BoundModule>,
     tls: Vec<u32>,
@@ -100,7 +106,7 @@ impl<S: Syscalls + Control + Send + Sync + 'static> PreparedImage<S> for Prepare
     fn bind(
         mut self: Box<Self>,
         instance: &Instance,
-        store: &mut Store,
+        store: &mut StoreMut<'_>,
         task: TaskId,
         role: Role,
     ) -> std::result::Result<Arc<dyn AbiInstance<S>>, ExecError> {
@@ -108,7 +114,7 @@ impl<S: Syscalls + Control + Send + Sync + 'static> PreparedImage<S> for Prepare
             root: self.root.clone(),
             base: self.base.clone(),
         };
-        let bound = image.bind_store(instance, store, task, role)?;
+        let bound = image.bind_store(instance, store, task, role, self.prepared_base.take())?;
         {
             let mut local = lock(&bound.local);
             local.forwarders.append(&mut self.forwarders);
@@ -126,17 +132,48 @@ impl<S: Syscalls + Control + Send + Sync + 'static> PreparedImage<S> for Prepare
 }
 
 impl<S: Syscalls + Control + Send + Sync + 'static> Image<S> {
-    pub(super) async fn prepare_startup(&self, cx: &Preparation<'_, S>) -> PreparedResult<S> {
+    pub(super) async fn prepare_image(&self, cx: &Preparation<'_, S>) -> PreparedResult<S> {
+        let base = self.base.prepare(cx).await?;
+        let mut imports = cx.with_store(|data, _| data.abi_imports().clone()).await;
+        if let Some(base) = &base {
+            imports.extend(base.imports());
+        }
+        let startup = self.prepare_startup(cx, &imports).await?;
+        if base.is_none() && startup.is_none() {
+            return Ok(None);
+        }
+        let mut prepared = startup.unwrap_or_else(|| Prepared {
+            root: self.root.clone(),
+            base: self.base.clone(),
+            prepared_base: None,
+            imports: Imports::new(),
+            forwarders: Vec::new(),
+            tls: vec![0],
+            bound: None,
+        });
+        if let Some(base) = &base {
+            let mut overlay = base.imports().clone();
+            overlay.extend(&prepared.imports);
+            prepared.imports = overlay;
+        }
+        prepared.prepared_base = base;
+        Ok(Some(Box::new(prepared)))
+    }
+
+    async fn prepare_startup(
+        &self,
+        cx: &Preparation<'_, S>,
+        base: &Imports,
+    ) -> std::result::Result<Option<Prepared<S>>, ExecError> {
         if let Some(error) = self.root.error.get() {
             return Err(load_error(error));
         }
-        let (syscalls, task, cleanup, base) = cx
+        let (syscalls, task, cleanup) = cx
             .with_store(|data, _| {
                 (
                     data.syscalls().clone(),
                     data.task(),
                     data.loader_cleanup().cloned(),
-                    data.abi_imports().clone(),
                 )
             })
             .await;
@@ -271,14 +308,13 @@ impl<S: Syscalls + Control + Send + Sync + 'static> Image<S> {
             .map_err(load_error)?;
         let graph = Arc::new(graph);
         let (imports, forwarders) = cx
-            .with_store(|_, store| {
-                main_imports(&self.root.forward_code, store, &base, &graph, &tls)
-            })
+            .with_store(|_, store| main_imports(&self.root.forward_code, store, base, &graph, &tls))
             .await
             .map_err(load_error)?;
-        Ok(Some(Box::new(Prepared::<S> {
+        Ok(Some(Prepared::<S> {
             root: self.root.clone(),
             base: self.base.clone(),
+            prepared_base: None,
             imports,
             forwarders,
             tls,
@@ -288,7 +324,7 @@ impl<S: Syscalls + Control + Send + Sync + 'static> Image<S> {
                 env: cx.environment().clone(),
                 process,
             }),
-        })))
+        }))
     }
 }
 
@@ -612,6 +648,10 @@ impl<S: Syscalls + Control + Send + Sync + 'static> StoreImage<S> {
                     local.stage.as_mut().unwrap().apply(store, &table)?;
                     let mut stage = local.stage.take().unwrap();
                     local.leases.append(&mut stage.leases);
+                    local.closure_pools.append(&mut stage.closure_pools);
+                    if let Some(slots) = stage.closure_slots.take() {
+                        local.closure_slots = slots;
+                    }
                     local.forwarders.append(&mut stage.forwarders);
                     for module in stage.modules.into_values() {
                         local.instances.push(module.publish()?);
@@ -671,6 +711,10 @@ impl<S: Syscalls + Control + Send + Sync + 'static> StoreImage<S> {
             .ok_or_else(|| failure("missing startup admission"))?;
         let transaction = syscalls.loader_activate(task, closing).map_err(failure)?;
         let mut coordinator = load::Coordinator {
+            local_cleanup: wasixv2_exec::local_cleanup_runner(
+                &store,
+                bound.pending.cleanup.clone(),
+            ),
             transaction: Some(transaction),
             cleanup: None,
             root: self.root.clone(),
@@ -918,6 +962,7 @@ mod tests {
         let library =
             || Library::new(crate::tests::bytes("(module)", [0; 4], &[], &[], &[]), None).unwrap();
         let mut graph = Graph {
+            closures: Default::default(),
             host_imports: None,
             libraries: vec![library(), library(), library(), library()],
             global: vec![0, 1, 2, 3],

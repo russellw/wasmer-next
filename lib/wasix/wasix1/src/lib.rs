@@ -42,11 +42,11 @@ pub mod shim;
 
 use std::sync::{Arc, RwLock};
 
-pub use instance::{SIGNAL_CALLBACK, THREAD_ENTRY};
+pub use instance::{HostProcessState, SIGNAL_CALLBACK, THREAD_ENTRY};
 pub use process::{CommandDefaults, Commands, FileId};
 use wasixv2_exec::{Abi, AbiInstance, ExecEnv, ExecError, Role};
 use wasixv2_syscalls::{Control, Syscalls, TaskId};
-use wasmer::{FunctionEnv, Imports, Instance, Module, Store};
+use wasmer::{FunctionEnv, Imports, Instance, Module, StoreMut};
 
 use crate::{imports::Module as V1Module, instance::Wasix1Instance, process::Procs};
 
@@ -101,6 +101,18 @@ impl Wasix1 {
         self
     }
 
+    /// Owns compat state for an existing kernel process without starting a new
+    /// process image. Its attachments share startup data and HTTP client handles.
+    pub fn host_process(&self, task: TaskId) -> HostProcessState {
+        HostProcessState::new(
+            self.procs.clone(),
+            self.commands.clone(),
+            self.http.clone(),
+            self.limits,
+            task,
+        )
+    }
+
     /// Enables the historical v1 HTTP extension with an explicit embedder capability.
     /// Browser providers must complete their I/O on an independent event-loop worker.
     pub fn with_http_provider(mut self, provider: Arc<dyn http::HttpProvider>) -> Self {
@@ -142,7 +154,7 @@ where
 
     fn imports(
         &self,
-        store: &mut Store,
+        store: &mut StoreMut<'_>,
         env: &FunctionEnv<ExecEnv<S>>,
         module: &Module,
     ) -> Imports {
@@ -152,7 +164,7 @@ where
     fn bind(
         &self,
         instance: &Instance,
-        _store: &mut Store,
+        _store: &mut StoreMut<'_>,
         task: TaskId,
         role: Role,
     ) -> Result<Arc<dyn AbiInstance<S>>, ExecError> {

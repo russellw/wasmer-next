@@ -1,0 +1,72 @@
+{
+  "source_commit": "427c4cbfc5b805b109f0fba93ad26573cf6c3774",
+  "license": "MIT, Copyright (c) 2019-present Wasmer, Inc. and its affiliates.",
+  "files": [
+    {
+      "original": "lib/virtual-net/src/lib.rs",
+      "fixture": "classic-reference/src/lib.rs",
+      "sha256_original": "0837ee5b2940a8b564095e026ce84d16ee657b262f5ba48b16d2e06487a9ec01",
+      "sha256_fixture": "f520d1308a4cef862c72e830e98b6681218bc4b8695156bdc9e66ad6907c27bf"
+    },
+    {
+      "original": "lib/virtual-net/src/meta.rs",
+      "fixture": "classic-reference/src/meta.rs",
+      "sha256_original": "6b20b2c3d49064d5c5ef50c9dd0d7d9e187eac8c5c6ebac4f4bf4c1022be9e37",
+      "sha256_fixture": "6b20b2c3d49064d5c5ef50c9dd0d7d9e187eac8c5c6ebac4f4bf4c1022be9e37"
+    },
+    {
+      "original": "lib/virtual-net/src/server.rs",
+      "fixture": "classic-reference/src/server.rs",
+      "sha256_original": "0ab5ee7f465f8520dd2f735d1c8106a54b841b17b4a02844f1aae7653fa49909",
+      "sha256_fixture": "0ab5ee7f465f8520dd2f735d1c8106a54b841b17b4a02844f1aae7653fa49909"
+    },
+    {
+      "original": "lib/virtual-net/src/host.rs",
+      "fixture": "classic-reference/src/host.rs",
+      "sha256_original": "6db96ed14c0b6d9b3f9bcd46f1e322309e1279919afb150529f11476a7acb659",
+      "sha256_fixture": "8fb4ab0e0ba2b92367f9486262f05320434abfca318864a760d78e7994a34ede"
+    },
+    {
+      "original": "lib/virtual-net/src/rx_tx.rs",
+      "fixture": "classic-reference/src/rx_tx.rs",
+      "sha256_original": "2f08918409f20845531240d1f38b2cc7e23ee737511cee56e778a67bd1c40479",
+      "sha256_fixture": "2f08918409f20845531240d1f38b2cc7e23ee737511cee56e778a67bd1c40479"
+    },
+    {
+      "original": "lib/virtual-io/src/guard.rs",
+      "fixture": "classic-io-reference/src/guard.rs",
+      "sha256_original": "c3b0ec1cde9c2317d8f56a88140dc29e7343d430b1ecd31190fb022f78121f05",
+      "sha256_fixture": "c3b0ec1cde9c2317d8f56a88140dc29e7343d430b1ecd31190fb022f78121f05"
+    },
+    {
+      "original": "lib/virtual-io/src/lib.rs",
+      "fixture": "classic-io-reference/src/lib.rs",
+      "sha256_original": "93d89d0753cc366b0dc82278e33507f280ceeb4165972a506483f8aa87b3e189",
+      "sha256_fixture": "93d89d0753cc366b0dc82278e33507f280ceeb4165972a506483f8aa87b3e189"
+    },
+    {
+      "original": "lib/virtual-io/src/interest.rs",
+      "fixture": "classic-io-reference/src/interest.rs",
+      "sha256_original": "65c93ba7f49d58cac31b357d3963b92cc952f4488cafa8a8bb4cc7ed6cd85a50",
+      "sha256_fixture": "65c93ba7f49d58cac31b357d3963b92cc952f4488cafa8a8bb4cc7ed6cd85a50"
+    },
+    {
+      "original": "lib/virtual-io/src/waker.rs",
+      "fixture": "classic-io-reference/src/waker.rs",
+      "sha256_original": "8b298cca93a96803777d4a2d4e27d561231a31119773d5b6d217d0d84c9d05de",
+      "sha256_fixture": "8b298cca93a96803777d4a2d4e27d561231a31119773d5b6d217d0d84c9d05de"
+    },
+    {
+      "original": "lib/virtual-io/src/selector.rs",
+      "fixture": "classic-io-reference/src/selector.rs",
+      "sha256_original": "d0abad6b928887709b8b5fa7dd69be985cf9eecbafd88692c5b3c97109de36ed",
+      "sha256_fixture": "d0abad6b928887709b8b5fa7dd69be985cf9eecbafd88692c5b3c97109de36ed"
+    },
+    {
+      "original": "lib/virtual-io/src/arc.rs",
+      "fixture": "classic-io-reference/src/arc.rs",
+      "sha256_original": "7f44170492458a5e981e51c62fe80d28e3b5a7141a6c248d0377d34127ad7175",
+      "sha256_fixture": "7f44170492458a5e981e51c62fe80d28e3b5a7141a6c248d0377d34127ad7175"
+    }
+  ]
+}

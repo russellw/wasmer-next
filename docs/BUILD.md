@@ -234,3 +234,14 @@ For coordinated source edits, use explicit local `[patch."https://github.com/was
 overrides for every affected core package; remove those overrides before committing
 and regenerate the lockfile against the pushed WLK source. Never mix two source
 identities for the same kernel types.
+
+## Native executor shutdown
+
+An executor may reject or discard an unpublished process factory, or discard its
+never-polled worker future. Once a worker enters an image whose cancellation
+authority it owns, the executor must continue driving it through cancellation,
+physical invocation cleanup and the final thread-group wait. Dropping a caller's
+waiter requests cancellation; it does not authorize discarding that owning worker.
+After an exec handoff transfers authority, the old worker can be discarded without
+faulting or releasing the replacement image. Cleanup does not make progress after
+the host discards every executor job and every owner-thread driver.

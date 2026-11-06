@@ -6,7 +6,7 @@
 use std::{cell::RefCell, ops::Range, sync::Arc};
 
 use wasixv2_syscalls::{Control, Errno, LoaderClosing, MemoryLayout, Syscalls, UserMemory};
-use wasmer::{FunctionEnv, Memory, Module, RuntimeError, Store};
+use wasmer::{FunctionEnv, Memory, Module, RuntimeError, Store, StoreAsync};
 
 use crate::{
     Abi, Binding, ExecEnv, ExecError, LoadError, PreparedImage, Role,
@@ -19,6 +19,7 @@ use crate::{
 /// this borrow or an async store handle beyond the preparation call.
 pub struct Preparation<'a, S: 'static> {
     cx: Outside<'a, S>,
+    local_cleanup: Option<wasixv2_host::LocalCleanupRunner>,
     module: &'a Module,
     role: Role,
     imported: Option<&'a Memory>,
@@ -34,6 +35,10 @@ pub(crate) struct Bootstrap {
 }
 
 impl<S: Syscalls + Control + Send + Sync + 'static> Preparation<'_, S> {
+    pub fn local_cleanup(&self) -> Option<wasixv2_host::LocalCleanupRunner> {
+        self.local_cleanup.clone()
+    }
+
     pub fn module(&self) -> &Module {
         self.module
     }
@@ -234,15 +239,21 @@ where
         None => None,
     };
     let binding_cell = RefCell::new(binding.take());
-    let preparation = Preparation {
-        cx: Outside { env, store: &store },
+    let local_cleanup = scope
+        .as_ref()
+        .and_then(|scope| crate::local_cleanup_runner(&store, scope.clone()));
+    let (prepared, bootstrap) = match prepare_on_async_store(
+        &store,
+        env,
         module,
         role,
+        abi,
         imported,
-        binding: &binding_cell,
-        bootstrap: RefCell::new(None),
-    };
-    let prepared = match abi.prepare(&preparation).await {
+        &binding_cell,
+        local_cleanup.as_ref(),
+    )
+    .await
+    {
         Ok(prepared) => prepared,
         Err(error) => {
             if let Some(attachments) = &mut attachments {
@@ -251,13 +262,6 @@ where
             return Err(error);
         }
     };
-    let bootstrap = preparation.bootstrap.into_inner();
-    if bootstrap.is_some() && prepared.is_none() {
-        if let Some(attachments) = &mut attachments {
-            attachments.settle().await;
-        }
-        return Err(ExecError::Load(LoadError::Format(Errno::EINVAL)));
-    }
     *binding = binding_cell.into_inner();
     let invocations = attachments
         .as_mut()
@@ -281,6 +285,40 @@ where
         }
     };
     Ok((store, prepared, bootstrap, invocations))
+}
+
+/// Prepares an image on the caller's existing async Store. The caller retains
+/// admission and attachment custody across this future and any error settlement.
+#[allow(clippy::too_many_arguments)] // Store, ABI and caller-owned admission/cleanup custody.
+#[allow(clippy::type_complexity)] // The optional ABI state and bootstrap are one preparation result.
+pub(crate) async fn prepare_on_async_store<S>(
+    store: &StoreAsync,
+    env: &FunctionEnv<ExecEnv<S>>,
+    module: &Module,
+    role: Role,
+    abi: &dyn Abi<S>,
+    imported: Option<&Memory>,
+    binding: &RefCell<Option<Binding>>,
+    local_cleanup: Option<&wasixv2_host::LocalCleanupRunner>,
+) -> Result<(Option<Box<dyn PreparedImage<S>>>, Option<Bootstrap>), ExecError>
+where
+    S: Syscalls + Control + Send + Sync + 'static,
+{
+    let preparation = Preparation {
+        local_cleanup: local_cleanup.cloned(),
+        cx: Outside { env, store },
+        module,
+        role,
+        imported,
+        binding,
+        bootstrap: RefCell::new(None),
+    };
+    let prepared = abi.prepare(&preparation).await?;
+    let bootstrap = preparation.bootstrap.into_inner();
+    if bootstrap.is_some() && prepared.is_none() {
+        return Err(ExecError::Load(LoadError::Format(Errno::EINVAL)));
+    }
+    Ok((prepared, bootstrap))
 }
 
 pub(crate) fn verify_memory(
@@ -315,7 +353,7 @@ pub(crate) mod tests {
         task::{Context, Waker},
     };
     use wasixv2_syscalls::{LocalFuture, SignalFrame, TaskId};
-    use wasmer::{AsyncFunctionEnvMut, Function, Imports, Instance, RuntimeError};
+    use wasmer::{AsyncFunctionEnvMut, Function, Imports, Instance, RuntimeError, StoreMut};
 
     #[derive(Clone, Copy, PartialEq, Eq)]
     pub(crate) enum Mode {
@@ -404,7 +442,7 @@ pub(crate) mod tests {
         }
         fn imports(
             &self,
-            store: &mut Store,
+            store: &mut StoreMut<'_>,
             env: &FunctionEnv<ExecEnv<Recorder>>,
             module: &Module,
         ) -> Imports {
@@ -508,7 +546,7 @@ pub(crate) mod tests {
         fn bind(
             &self,
             instance: &Instance,
-            store: &mut Store,
+            store: &mut StoreMut<'_>,
             task: TaskId,
             role: Role,
         ) -> Result<Arc<dyn AbiInstance<Recorder>>, ExecError> {
@@ -526,7 +564,7 @@ pub(crate) mod tests {
             &self,
             _: &Instance,
             _: &Memory,
-            _: &mut Store,
+            _: &mut StoreMut<'_>,
             _: bool,
         ) -> Option<MemoryLayout> {
             let mut layout = layout();
@@ -535,7 +573,7 @@ pub(crate) mod tests {
             }
             Some(layout)
         }
-        fn main_stack(&self, _: &Instance, _: &mut Store) -> Range<u32> {
+        fn main_stack(&self, _: &Instance, _: &mut StoreMut<'_>) -> Range<u32> {
             0..131072
         }
     }
@@ -559,7 +597,7 @@ pub(crate) mod tests {
         }
         fn imports(
             &self,
-            store: &mut Store,
+            store: &mut StoreMut<'_>,
             env: &FunctionEnv<ExecEnv<Recorder>>,
             module: &Module,
         ) -> Imports {
@@ -568,7 +606,7 @@ pub(crate) mod tests {
         fn bind(
             &self,
             instance: &Instance,
-            store: &mut Store,
+            store: &mut StoreMut<'_>,
             task: TaskId,
             role: Role,
         ) -> Result<Arc<dyn AbiInstance<Recorder>>, ExecError> {
@@ -623,7 +661,7 @@ pub(crate) mod tests {
         fn bind(
             mut self: Box<Self>,
             instance: &Instance,
-            store: &mut Store,
+            store: &mut StoreMut<'_>,
             task: TaskId,
             role: Role,
         ) -> Result<Arc<dyn AbiInstance<Recorder>>, ExecError> {

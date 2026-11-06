@@ -1,25 +1,20 @@
 use std::{collections::HashMap, ffi::OsString, path::PathBuf, sync::Arc};
 
+use super::runtime::RunContext;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use indexmap::IndexMap;
 use itertools::Itertools;
 use url::Url;
 use wasmer::Engine;
-#[cfg(feature = "journal")]
-use wasmer_wasix::journal::SnapshotTrigger;
-use wasmer_wasix::{
-    PluggableRuntime, Runtime,
-    http::HttpClient,
-    runners::{MAPPED_CURRENT_DIR_DEFAULT_PATH, MappedDirectory},
-    runtime::{
-        module_cache::{FileSystemCache, ModuleCache},
-        package_loader::BuiltinPackageLoader,
-        resolver::{
-            BackendSource, FileSystemSource, InMemorySource, LocalRegistrySource, MultiSource,
-            WebSource,
-        },
-        task_manager::tokio::{RuntimeOrHandle, TokioTaskManager},
+use wasmer_cache::module_cache::{FileSystemCache, ModuleCache, SharedCache};
+use wasmer_config::filesystem::{MAPPED_CURRENT_DIR_DEFAULT_PATH, MappedDirectory};
+use wasmer_package::{
+    http::{HttpClient, reqwest::ReqwestHttpClient},
+    loader::PackageDownloader,
+    resolver::{
+        BackendSource, FileSystemSource, InMemorySource, LocalRegistrySource, MultiSource,
+        WebSource,
     },
 };
 
@@ -191,80 +186,6 @@ pub struct Wasi {
     #[clap(long = "enable-cpu-backoff")]
     pub enable_cpu_backoff: Option<u64>,
 
-    /// Specifies one or more journal files that Wasmer will use to restore
-    /// the state of the WASM process as it executes.
-    ///
-    /// The state of the WASM process and its sandbox will be reapplied using
-    /// the journals in the order that you specify here.
-    #[cfg(feature = "journal")]
-    #[clap(long = "journal")]
-    pub read_only_journals: Vec<PathBuf>,
-
-    /// Specifies one or more journal files that Wasmer will use to restore
-    /// and save the state of the WASM process as it executes.
-    ///
-    /// The state of the WASM process and its sandbox will be reapplied using
-    /// the journals in the order that you specify here.
-    ///
-    /// The last journal file specified will be created if it does not exist
-    /// and opened for read and write. New journal events will be written to this
-    /// file
-    #[cfg(feature = "journal")]
-    #[clap(long = "journal-writable")]
-    pub writable_journals: Vec<PathBuf>,
-
-    /// Flag that indicates if the journal will be automatically compacted
-    /// as it fills up and when the process exits
-    #[cfg(feature = "journal")]
-    #[clap(long = "enable-compaction")]
-    pub enable_compaction: bool,
-
-    /// Tells the compactor not to compact when the journal log file is closed
-    #[cfg(feature = "journal")]
-    #[clap(long = "without-compact-on-drop")]
-    pub without_compact_on_drop: bool,
-
-    /// Tells the compactor to compact when it grows by a certain factor of
-    /// its original size. (i.e. '0.2' would be it compacts after the journal
-    /// has grown by 20 percent)
-    ///
-    /// Default is to compact on growth that exceeds 15%
-    #[cfg(feature = "journal")]
-    #[clap(long = "with-compact-on-growth", default_value = "0.15")]
-    pub with_compact_on_growth: f32,
-
-    /// Indicates what events will cause a snapshot to be taken
-    /// and written to the journal file.
-    ///
-    /// If not specified, the default is to snapshot when the process idles, when
-    /// the process exits or periodically if an interval argument is also supplied,
-    /// as well as when the process requests a snapshot explicitly.
-    ///
-    /// Additionally if the snapshot-on is not specified it will also take a snapshot
-    /// on the first stdin, environ or socket listen - this can be used to accelerate
-    /// the boot up time of WASM processes.
-    #[cfg(feature = "journal")]
-    #[clap(long = "snapshot-on")]
-    pub snapshot_on: Vec<SnapshotTrigger>,
-
-    /// Adds a periodic interval (measured in milli-seconds) that the runtime will automatically
-    /// take snapshots of the running process and write them to the journal. When specifying
-    /// this parameter it implies that `--snapshot-on interval` has also been specified.
-    #[cfg(feature = "journal")]
-    #[clap(long = "snapshot-period")]
-    pub snapshot_interval: Option<u64>,
-
-    /// If specified, the runtime will stop executing the WASM module after the first snapshot
-    /// is taken.
-    #[cfg(feature = "journal")]
-    #[clap(long = "stop-after-snapshot")]
-    pub stop_after_snapshot: bool,
-
-    /// Skip writes to stdout and stderr when replying journal events to bootstrap a module.
-    #[cfg(feature = "journal")]
-    #[clap(long = "skip-journal-stdio")]
-    pub skip_stdio_during_bootstrap: bool,
-
     /// Allow instances to send http requests.
     ///
     /// Access to domains is granted by default.
@@ -361,55 +282,52 @@ impl Wasi {
 
     /// The runtime `wasmer run` resolves, downloads and compiles packages with: the registry
     /// and local sources, the package cache and the compiled-module cache.
-    pub fn prepare_runtime<I>(
+    pub(super) fn prepare_context(
         &self,
         engine: Engine,
         env: &WasmerEnv,
-        rt_or_handle: I,
+        executor: tokio::runtime::Runtime,
         preferred_webc_version: webc::Version,
         compiler_debug_dir_used: bool,
-    ) -> Result<impl Runtime + Send + Sync + use<I>>
-    where
-        I: Into<RuntimeOrHandle>,
-    {
-        let tokio_task_manager = Arc::new(TokioTaskManager::new(rt_or_handle.into()));
-        let mut rt = PluggableRuntime::new(tokio_task_manager.clone());
-
-        let client =
-            wasmer_wasix::http::default_http_client().context("No HTTP client available")?;
-        let client = Arc::new(client);
-
+        progress: indicatif::ProgressBar,
+        quiet_mode: bool,
+    ) -> Result<RunContext> {
+        let client = Arc::new(ReqwestHttpClient::default());
         let package_loader = self
             .prepare_package_loader(env, client.clone())
             .context("Unable to prepare the package loader")?;
-
-        let registry = self.prepare_source(env, client, preferred_webc_version)?;
-
-        if !self.disable_cache && !compiler_debug_dir_used {
-            let cache_dir = env.cache_dir().join("compiled");
-            let module_cache = wasmer_wasix::runtime::module_cache::in_memory()
-                .with_fallback(FileSystemCache::new(cache_dir, tokio_task_manager));
-            rt.set_module_cache(module_cache);
-        }
-
-        rt.set_package_loader(package_loader)
-            .set_source(registry)
-            .set_engine(engine);
-
-        Ok(rt)
+        let source = self.prepare_source(env, client, preferred_webc_version)?;
+        let module_cache: Arc<dyn ModuleCache + Send + Sync> =
+            if !self.disable_cache && !compiler_debug_dir_used {
+                let cache = SharedCache::default().with_fallback(FileSystemCache::new(
+                    env.cache_dir().join("compiled"),
+                    executor.handle().clone(),
+                ));
+                Arc::new(cache)
+            } else {
+                Arc::new(SharedCache::default())
+            };
+        Ok(RunContext::new(
+            executor,
+            engine,
+            source,
+            package_loader,
+            module_cache,
+            progress,
+            quiet_mode,
+        ))
     }
 
     fn prepare_package_loader(
         &self,
         env: &WasmerEnv,
         client: Arc<dyn HttpClient + Send + Sync>,
-    ) -> Result<BuiltinPackageLoader> {
+    ) -> Result<PackageDownloader> {
         let checkout_dir = env.cache_dir().join("checkouts");
         let tokens = tokens_by_authority(env)?;
 
-        let loader = BuiltinPackageLoader::new()
+        let loader = PackageDownloader::new(client)
             .with_cache_dir(checkout_dir)
-            .with_shared_http_client(client)
             .with_tokens(tokens);
 
         Ok(loader)

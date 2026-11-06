@@ -14,14 +14,17 @@
 use std::time::Duration;
 
 use wasixv2_syscalls::{AtomicWord, Caller, Control, Errno, Syscalls, UserMemory};
-use wasmer::{AsyncFunctionEnvMut, Function, FunctionEnv, Imports, RuntimeError, Store};
+use wasmer::{AsyncFunctionEnvMut, Function, FunctionEnv, Imports, RuntimeError, StoreMut};
 use wasmer_types::TrapCode;
 
 use crate::{ExecEnv, GuestMemory, caller_parts, preempt, return_to_guest};
 
 /// Defines the imports that replace the instructions.
-pub(crate) fn define<S>(imports: &mut Imports, store: &mut Store, env: &FunctionEnv<ExecEnv<S>>)
-where
+pub(crate) fn define<S>(
+    imports: &mut Imports,
+    store: &mut StoreMut<'_>,
+    env: &FunctionEnv<ExecEnv<S>>,
+) where
     S: Syscalls + Control + 'static,
 {
     let module = preempt::HOOK_MODULE;
@@ -117,7 +120,8 @@ where
     let addr = effective_address(env, addr, offset, size).await?;
     let (syscalls, task) = caller_parts(env).await;
     let memory = GuestMemory { env };
-    let caller = Caller::new(task, &memory);
+    let caller = Caller::new(task, &memory)
+        .with_process_fork_allowed(crate::process_fork_allowed(env).await);
     // A negative timeout waits forever.
     let timeout = u64::try_from(timeout).ok().map(Duration::from_nanos);
     loop {

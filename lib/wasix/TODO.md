@@ -1,9 +1,76 @@
 # WASIX compatibility TODO
 
-Stopped-work checkpoint: 2026-11-05. Integration branch: `feat/wasixv2`.
-Subagents were stopped at the user's request. **Full supported v1 parity is not complete.**
+Active delivery: 2026-11-05. Integration target: private
+[`wasmerio/wasmer-next`, `main`](https://github.com/wasmerio/wasmer-next/tree/main).
+The previous stopped-work snapshot is preserved below. **Full supported v1 parity is not complete.**
 This tree was renamed from `lib/wasixv2` to `lib/wasix`; crate names remain unchanged.
 The old runtime remains in `lib/wasix-legacy` until its consumers have working replacements.
+
+## Active unification work
+
+All new source is published only to private `wasmerio/wasmer-next` and
+`wasmerio/wlk`. The CLI and embedding consumers must use v2 before legacy
+runtime/support crates are removed. Keep `wasixv2-wasix1`, the v1 guest adapter
+on the v2 kernel. Original fixtures and behavior evidence remain removal gates.
+
+| Stream | Required result |
+| --- | --- |
+| Contexts and closures | Native and JSPI execution, exact values/errors, cancellation and physical-frame cleanup; actual supported v1 consumers. |
+| CLI and legacy consumers | V2 package/acquisition/cache/HTTP/network paths, C API/Swift/examples ports, then legacy crate removal. |
+| NAPI and custom bindings | Trait-based v2 facade, managed refill/leases, callbacks/finalizers and supported lifecycle proofs. |
+| Browser SDK | Current/classic public APIs, packages, streams/mounts/transports, termination and resource retirement. |
+| Providers and coredumps | Optional configured-provider controls and compositional original-source trap coordinates. |
+
+Only WebC v3 containers are required. WebC v1 and v2 container compatibility
+are excluded; remove their compatibility paths and retain clear unsupported-format
+errors. This does not remove WASIX v1 guest compatibility through the v2 runtime.
+
+Journaling, journal commands and compatibility with old journal formats are
+explicitly excluded by the user. Do not port their formats or retain them as a
+parity gate. Remove their CLI hooks and retire old journal dependencies with the
+remaining legacy consumers.
+
+Managers use native Sol 6.1 high implementors/reviewers and Luna max validators.
+Large designs require independent review. Validation runs serially against the
+integrated source tuple; a compile or placeholder is not a completed parity item.
+
+Delivered checkpoints: shared resolver/HTTP/downloader and resolved-command/package
+metadata are integrated; acquisition/progress tests pass (75). Configured-provider controls are
+integrated at runtime `6a216cca2d6` with WLK `2a99684cd671`: 228 component behavior
+tests and strict lint passed, followed by the integrated CLI journal check,
+22 compatibility net tests and 13 original-reference codec/relay tests. Generic
+package-volume mounting also passed 20 component tests. Full CLI/SDK consumer
+migration and the remaining stream requirements above are still open.
+
+Swift now uses the v2 machine and shared package installer; its 11 component
+tests pass. CLI terminal ownership and signal retirement are integrated; both
+signal tests pass. The combined CLI/Swift Cargo check passes at `6a1602ee31b`.
+Strict lint still reports existing resolver/CLI findings outside these changes.
+These completed ports do not close the remaining C API and SDK migrations.
+
+### Current unfinished source handoffs
+
+These private branches preserve ongoing work. Their component results do not
+establish full parity or an integrated release result.
+
+| Work | Private source | Remaining gate |
+| --- | --- | --- |
+| Contexts/closures | Native foundation integrated as `6e9876f90e3`, WLK `fc3b2b99821` | Reviewed native custody, startup/cancellation, owned generator and base preparation are integrated. Composed check, canonical equality (3), preparation (3), contexts (3) and cancellation (6) pass. Nonmain `posix_spawn` and browser work remain separate. |
+| Shared resolved installer | Integrated on `main`; [component source](https://github.com/wasmerio/wasmer-next/tree/wasixv2/parity-cli-resolved-install) | Combined installer tests pass (15); remaining consumer integration is tracked separately. |
+| Download progress | Integrated on `main`; [component source](https://github.com/wasmerio/wasmer-next/tree/wasixv2/parity-cli-package-progress) | Acquisition/progress tests pass (75); SDK subscriber integration remains. |
+| Browser isolation | [SDK `a5be3a955f9`](https://github.com/wasmerio/wasmer-next/tree/parity/sdk-isolation-20261105) | One Chromium/Firefox busy-module and live-directory batch passed on WLK `8bce49d4`; a later repeated teardown probe retained two coordinators. Stable retirement, current public API assembly and Node remain. |
+| Original-source coredumps | [Runtime `18df6357995`](https://github.com/wasmerio/wasmer-next/tree/wasixv2/parity-coredump-next), [CLI `6e082fdaf85`](https://github.com/wasmerio/wasmer-next/tree/wasixv2/parity-cli-coredump-wiring) | Type-level tests pass; compiler/artifact, original guest, observer/cache and CLI integration validation remain. |
+| Cross-sandbox network endpoints | [WLK `4dc0bab536c`](https://github.com/wasmerio/wlk/tree/parity/endpoint-selection-20261105) | Reviewed optional API only; routing and SDK provider integration remain. |
+
+Proposed macOS pathname-observation and configured-CPU contracts are documented in
+[WLK's reviewed design](https://github.com/wasmerio/wlk/blob/main/docs/plans/2026-11-05-v1-parity-contracts/design.md).
+The user approved the macOS observation/capability separation and deferred the
+configured-CPU proposal. Native NAPI/V8 stack integration and its supported macOS
+profile remain mandatory work.
+
+Terminal sizing: ordinary resize and real-zero handling remain required. Exact
+SDK dimensions above 65535 are a nonblocking follow-up: retain public u32 input
+and use one documented low-16-bit Linux projection, without separate size state.
 
 ## Scope and snapshot
 
@@ -141,9 +208,10 @@ They are not part of the checked raw SDK foundation or integration snapshot.
 
 ## Other required behavior and integration
 
-- [ ] Configured-provider bridge/unbridge/DHCP acquisition and route lifetimes.
-  Network access-policy rules are delivered; those do not provide these controls.
-  Use proper optional provider contracts and preserve authorization/error ordering.
+- [x] Configured-provider bridge/unbridge/DHCP acquisition and forwarding of the
+  existing provider route deadlines. Optional provider contracts preserve
+  authorization/error ordering and cancellation custody; unavailable providers
+  remain explicit. This does not claim additional Linux route-expiration semantics.
 - [ ] Correct coredump original-source function indices and instruction offsets
   through dynamic preparation and preemption before delivering trap dumps. Current
   observer/flag tests pass, but frames currently describe transformed code while
@@ -151,6 +219,12 @@ They are not part of the checked raw SDK foundation or integration snapshot.
   do not subtract a fixed import count or disable preemption.
 - [ ] Recheck function/reflection table-mutation/cacheability, original-error,
   signature and custom-layer behavior with completed closures and contexts.
+  Conservative `cacheable=false` on mutable imported tables is an accepted
+  nonblocking result difference: the contract permits refusing caching, while
+  `true` promises future signature stability. Keep the two original reflection
+  fixtures and their failing `true` assertions unchanged and report this gap;
+  do not claim all reflection fixtures pass. Do not add permanent table-write
+  enforcement or restrict accepted modules merely to enable this optimization.
 - [ ] Finish Chromium retirement diagnosis: debugger-free controls established
   sleeping worker OS threads persisting at 5 seconds; Firefox passed. Heap/context
   retention versus caching is unproved. Do not waive it as a known leak or claim
@@ -190,7 +264,14 @@ Additional reference-lifetime test draft:
 ## Intentional deferrals / later design work
 
 - Snapshot/restore: intentionally excluded; unused legacy feature to be redesigned.
+- Journaling and old journal-format compatibility: explicitly excluded. No new
+  format crate or compatibility implementation is required.
 - Windows and nominal WASIX64: deferred by the user; not current parity blockers.
+- SDK `parallelism` configuration: deferred by the user. Guest-advertised parallelism
+  currently follows the kernel default rather than the requested SDK value. Do not
+  block this delivery on per-Machine CPU/affinity/procfs configuration.
+- macOS support targets 13 and newer, explicitly approved by the user. The
+  descriptor-safe host-filesystem port and its validation remain required.
 - RTLD_NEXT: deferred. Full Linux compatibility is not the completion criterion.
 - Full-image dynamic copying fork / multi-module asyncify, TLS-dependent initializer
   snapshots and unsupported dynamic relocation forms require their own consumer-backed

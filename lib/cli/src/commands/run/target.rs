@@ -5,16 +5,13 @@ use std::{
     sync::Arc,
 };
 
+use super::runtime::{ModuleCompiler as _, RunContext, RunPackage};
 use anyhow::{Context as _, Error, bail};
 use indicatif::ProgressBar;
 use wasmer::Module;
+use wasmer_cache::module_cache::HashedModuleData;
 #[cfg(feature = "compiler")]
 use wasmer_compiler::ArtifactBuild;
-use wasmer_wasix::{
-    Runtime,
-    bin_factory::BinaryPackage,
-    runtime::{module_cache::HashedModuleData, task_manager::VirtualTaskManagerExt as _},
-};
 
 /// We've been given the path for a file... What does it contain and how should
 /// that be run?
@@ -66,9 +63,9 @@ impl TargetOnDisk {
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
-pub enum ExecutableTarget {
+pub(super) enum ExecutableTarget {
     WebAssembly { module: Module, path: PathBuf },
-    Package(Box<BinaryPackage>),
+    Package(Box<RunPackage>),
 }
 
 impl ExecutableTarget {
@@ -77,17 +74,12 @@ impl ExecutableTarget {
     #[tracing::instrument(level = "debug", skip_all)]
     pub fn from_dir(
         dir: &Path,
-        runtime: &Arc<dyn Runtime + Send + Sync>,
+        runtime: &Arc<RunContext>,
         pb: &ProgressBar,
     ) -> Result<Self, Error> {
         pb.set_message(format!("Loading \"{}\" into memory", dir.display()));
         pb.set_message("Resolving dependencies");
-        let inner_runtime = runtime.clone();
-        let pkg = runtime.task_manager().spawn_and_block_on({
-            let path = dir.to_path_buf();
-
-            async move { BinaryPackage::from_dir(&path, inner_runtime.as_ref()).await }
-        })??;
+        let pkg = runtime.block_on(runtime.load_dir(dir))?;
 
         Ok(ExecutableTarget::Package(Box::new(pkg)))
     }
@@ -96,7 +88,7 @@ impl ExecutableTarget {
     #[tracing::instrument(level = "debug", skip_all)]
     pub fn from_file(
         path: &Path,
-        runtime: &Arc<dyn Runtime + Send + Sync>,
+        runtime: &Arc<RunContext>,
         pb: &ProgressBar,
     ) -> Result<Self, Error> {
         pb.set_message(format!("Loading from \"{}\"", path.display()));
@@ -108,7 +100,7 @@ impl ExecutableTarget {
 
                 pb.set_message("Compiling to WebAssembly");
                 let module = runtime
-                    .load_hashed_module_sync(module_data, None)
+                    .block_on(runtime.compile(module_data, &runtime.engine))
                     .with_context(|| format!("Unable to compile \"{}\"", path.display()))?;
 
                 Ok(ExecutableTarget::WebAssembly {
@@ -117,7 +109,7 @@ impl ExecutableTarget {
                 })
             }
             TargetOnDisk::Artifact => {
-                let engine = runtime.engine();
+                let engine = runtime.engine.clone();
                 pb.set_message("Deserializing pre-compiled WebAssembly module");
                 let module = unsafe { Module::deserialize_from_file(&engine, path)? };
 
@@ -130,10 +122,7 @@ impl ExecutableTarget {
                 let container = wasmer_package::utils::from_disk(path)?;
                 pb.set_message("Resolving dependencies");
 
-                let inner_runtime = runtime.clone();
-                let pkg = runtime.task_manager().spawn_and_block_on(async move {
-                    BinaryPackage::from_webc(&container, inner_runtime.as_ref()).await
-                })??;
+                let pkg = runtime.block_on(runtime.load_webc(container))?;
                 Ok(ExecutableTarget::Package(Box::new(pkg)))
             }
         }

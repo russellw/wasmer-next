@@ -16,6 +16,7 @@ use virtual_net::{
     host::LocalNetworking,
     meta::{MessageRequest, MessageResponse},
 };
+use wasix1_net_reference as virtual_net;
 use wasixv2_abi::Errno;
 use wasixv2_vnet::{Answer, Backend, Domain, Lookup, Shutdown, StreamState};
 use wasixv2_vnet_web::{
@@ -31,13 +32,13 @@ struct ReferenceRelay {
 }
 impl ReferenceRelay {
     fn new() -> Self {
+        Self::with_provider(Arc::new(LocalNetworking::new()))
+    }
+    fn with_provider(provider: Arc<dyn virtual_net::VirtualNetworking>) -> Self {
         let (tx, requests) = mpsc::channel(8);
         let (responses, rx) = mpsc::channel(8);
-        let (reference, driver) = RemoteNetworkingServer::new_from_mpsc(
-            responses,
-            requests,
-            Arc::new(LocalNetworking::new()),
-        );
+        let (reference, driver) =
+            RemoteNetworkingServer::new_from_mpsc(responses, requests, provider);
         Self {
             tx: Some(tx),
             rx,
@@ -305,4 +306,344 @@ fn stock_relay_ephemeral_tcp_udp_publication_ipv4() {
 #[test]
 fn stock_relay_ephemeral_tcp_udp_publication_ipv6() {
     ephemeral_publications("::1".parse().unwrap());
+}
+
+/// Same original server and wire producer as the socket relay tests, with a configured
+/// provider that makes bridge admission and exact route values observable.
+#[derive(Debug)]
+struct ConfiguredReference {
+    sockets: LocalNetworking,
+    state: Mutex<ConfiguredState>,
+    fail_readback: std::sync::atomic::AtomicBool,
+    changing: std::sync::atomic::AtomicBool,
+    stall_dhcp: std::sync::atomic::AtomicBool,
+    dhcp_entered: std::sync::atomic::AtomicBool,
+    release_dhcp: tokio::sync::Notify,
+}
+#[derive(Debug, Default)]
+struct ConfiguredState {
+    bridged: bool,
+    addresses: Vec<virtual_net::IpCidr>,
+    routes: Vec<virtual_net::IpRoute>,
+    calls: Vec<&'static str>,
+}
+impl ConfiguredReference {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            sockets: LocalNetworking::new(),
+            state: Mutex::new(ConfiguredState {
+                addresses: vec![virtual_net::IpCidr {
+                    ip: "10.0.2.15".parse().unwrap(),
+                    prefix: 24,
+                }],
+                ..ConfiguredState::default()
+            }),
+            fail_readback: std::sync::atomic::AtomicBool::new(false),
+            changing: std::sync::atomic::AtomicBool::new(false),
+            stall_dhcp: std::sync::atomic::AtomicBool::new(false),
+            dhcp_entered: std::sync::atomic::AtomicBool::new(false),
+            release_dhcp: tokio::sync::Notify::new(),
+        })
+    }
+}
+#[async_trait::async_trait]
+impl virtual_net::VirtualNetworking for ConfiguredReference {
+    async fn bridge(
+        &self,
+        network: &str,
+        token: &str,
+        security: virtual_net::StreamSecurity,
+    ) -> virtual_net::Result<()> {
+        assert_eq!(
+            (network, token, security),
+            (
+                "tenant",
+                "credential",
+                virtual_net::StreamSecurity::DoubleEncryption
+            )
+        );
+        assert!(
+            !self
+                .changing
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+        );
+        tokio::task::yield_now().await;
+        let mut state = self.state.lock().unwrap();
+        state.bridged = true;
+        state.calls.push("bridge");
+        self.changing
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+    async fn unbridge(&self) -> virtual_net::Result<()> {
+        let mut state = self.state.lock().unwrap();
+        state.bridged = false;
+        state.calls.push("unbridge");
+        Ok(())
+    }
+    async fn dhcp_acquire(&self) -> virtual_net::Result<Vec<IpAddr>> {
+        if self.stall_dhcp.load(std::sync::atomic::Ordering::SeqCst) {
+            self.dhcp_entered
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.release_dhcp.notified().await;
+        }
+        let mut state = self.state.lock().unwrap();
+        state.calls.push("dhcp");
+        state.addresses = vec![virtual_net::IpCidr {
+            ip: "192.0.2.9".parse().unwrap(),
+            prefix: 24,
+        }];
+        Ok(state.addresses.iter().map(|a| a.ip).collect())
+    }
+    async fn ip_add(&self, ip: IpAddr, prefix: u8) -> virtual_net::Result<()> {
+        self.state
+            .lock()
+            .unwrap()
+            .addresses
+            .push(virtual_net::IpCidr { ip, prefix });
+        Ok(())
+    }
+    async fn ip_remove(&self, ip: IpAddr) -> virtual_net::Result<()> {
+        self.state.lock().unwrap().addresses.retain(|a| a.ip != ip);
+        Ok(())
+    }
+    async fn ip_clear(&self) -> virtual_net::Result<()> {
+        self.state.lock().unwrap().addresses.clear();
+        Ok(())
+    }
+    async fn ip_list(&self) -> virtual_net::Result<Vec<virtual_net::IpCidr>> {
+        assert!(
+            !self.changing.load(std::sync::atomic::Ordering::SeqCst),
+            "readback raced mutation ACK"
+        );
+        if self
+            .fail_readback
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(virtual_net::NetworkError::IOError);
+        }
+        let mut state = self.state.lock().unwrap();
+        state.calls.push("addresses");
+        Ok(state.addresses.clone())
+    }
+    async fn mac(&self) -> virtual_net::Result<[u8; 6]> {
+        Ok([2, 1, 2, 3, 4, 5])
+    }
+    async fn gateway_set(&self, ip: IpAddr) -> virtual_net::Result<()> {
+        self.state
+            .lock()
+            .unwrap()
+            .routes
+            .push(virtual_net::IpRoute {
+                cidr: virtual_net::IpCidr {
+                    ip: if ip.is_ipv4() {
+                        IpAddr::from([0, 0, 0, 0])
+                    } else {
+                        IpAddr::from([0u16; 8])
+                    },
+                    prefix: 0,
+                },
+                via_router: ip,
+                preferred_until: None,
+                expires_at: None,
+            });
+        Ok(())
+    }
+    async fn route_add(
+        &self,
+        cidr: virtual_net::IpCidr,
+        via_router: IpAddr,
+        preferred_until: Option<Duration>,
+        expires_at: Option<Duration>,
+    ) -> virtual_net::Result<()> {
+        self.state
+            .lock()
+            .unwrap()
+            .routes
+            .push(virtual_net::IpRoute {
+                cidr,
+                via_router,
+                preferred_until,
+                expires_at,
+            });
+        Ok(())
+    }
+    async fn route_remove(&self, ip: IpAddr) -> virtual_net::Result<()> {
+        self.state
+            .lock()
+            .unwrap()
+            .routes
+            .retain(|r| r.cidr.ip != ip);
+        Ok(())
+    }
+    async fn route_clear(&self) -> virtual_net::Result<()> {
+        self.state.lock().unwrap().routes.clear();
+        Ok(())
+    }
+    async fn route_list(&self) -> virtual_net::Result<Vec<virtual_net::IpRoute>> {
+        Ok(self.state.lock().unwrap().routes.clone())
+    }
+    async fn connect_tcp(
+        &self,
+        addr: SocketAddr,
+        peer: SocketAddr,
+    ) -> virtual_net::Result<Box<dyn virtual_net::VirtualTcpSocket + Sync>> {
+        if !self.state.lock().unwrap().bridged {
+            return Err(virtual_net::NetworkError::NotConnected);
+        }
+        self.sockets.connect_tcp(addr, peer).await
+    }
+}
+async fn provider_call(
+    net: &Arc<wasixv2_vnet::Net>,
+    driver: &mut Driver,
+    relay: &mut dyn Transport,
+    operation: wasixv2_vnet::provider::Request,
+) -> wasixv2_vnet::provider::Completion {
+    use wasixv2_vnet::Network;
+    let result = Arc::new(Mutex::new(None));
+    let output = result.clone();
+    net.provider().unwrap().start(
+        operation,
+        Box::new(move |done| *output.lock().unwrap() = Some(done)),
+    );
+    drive_until("provider control", driver, relay, || {
+        result.lock().unwrap().is_some()
+    })
+    .await;
+    result.lock().unwrap().take().unwrap()
+}
+#[test]
+fn configured_classic_provider_controls_deadlines_reconciliation_and_same_transport() {
+    use wasixv2_vnet::{
+        Network,
+        provider::{Cidr, Readback, Reply, Request, Route, Security},
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let reference=ConfiguredReference::new();
+        let mut capabilities=Capabilities::classic(true);
+        capabilities.provider=Some(Readback {addresses:true,mac:true,routes:true});
+        let (backend,mut driver)=WebBackend::new(Config::default(),capabilities).unwrap();
+        let net=wasixv2_vnet::Net::new(wasixv2_vnet::NetConfig::host_default(),Some(backend.clone()));
+        let mut relay=Classic::new(ReferenceRelay::with_provider(reference.clone()),capabilities);
+        let bridge=|| Request::Bridge {network:"tenant".into(),token:"credential".into(),security:Security::DoubleEncryption};
+        assert_eq!(provider_call(&net,&mut driver,&mut relay,bridge()).await.result,Ok(Reply::None));
+        assert_eq!(reference.state.lock().unwrap().calls[..2],["bridge","addresses"]);
+        // Accepted control completion remains live even when the guest-facing waiter is gone.
+        let (send,receive)=tokio::sync::oneshot::channel();
+        net.provider().unwrap().start(Request::Dhcp,Box::new(move |done| {let _=send.send(done);}));
+        drop(receive);
+        drive_until("canceled DHCP publishes",&mut driver,&mut relay,|| net.interfaces().iter().flat_map(|i| &i.addresses).any(|a| a.addr=="192.0.2.9".parse::<IpAddr>().unwrap())).await;
+        let route=Route {cidr:Cidr {ip:"0.0.0.0".parse().unwrap(),prefix:0},via_router:"192.0.2.1".parse().unwrap(),preferred_until:Some(0),expires_at:Some(u64::MAX)};
+        assert_eq!(provider_call(&net,&mut driver,&mut relay,Request::AddRoute(route.clone())).await.result,Ok(Reply::None));
+        assert_eq!(provider_call(&net,&mut driver,&mut relay,Request::Routes).await.result,Ok(Reply::Routes(vec![route])));
+        { let state=reference.state.lock().unwrap(); let old=&state.routes[0];
+        assert_eq!(old.preferred_until,Some(Duration::ZERO));assert_eq!(old.expires_at,Some(Duration::from_nanos(u64::MAX))); }
+        // A postcommit getter failure is distinct from provider refusal and disables stale routing.
+        reference.fail_readback.store(true,std::sync::atomic::Ordering::SeqCst);
+        let result=provider_call(&net,&mut driver,&mut relay,Request::AddAddress(Cidr {ip:"192.0.2.10".parse().unwrap(),prefix:24})).await;
+        assert_eq!(result.result,Err(Errno::EIO));assert_eq!(result.reconciliation,Some(Errno::EIO));
+        assert!(net.interfaces().iter().filter(|i| i.name=="eth0").all(|i| i.flags&1==0));
+        assert!(provider_call(&net,&mut driver,&mut relay,Request::Addresses).await.result.is_ok());
+        assert!(net.interfaces().iter().filter(|i| i.name=="eth0").all(|i| i.flags&1!=0));
+        // Execute the real v1 imports through Machine/Kernel and this same original relay.
+        let wasm=wat::parse_str(r#"(module
+          (import "wasix_32v1" "port_bridge" (func $bridge (param i32 i32 i32 i32 i32) (result i32)))
+          (import "wasix_32v1" "port_dhcp_acquire" (func $dhcp (result i32)))
+          (import "wasix_32v1" "port_route_clear" (func $clear (result i32)))
+          (import "wasix_32v1" "port_route_add" (func $add (param i32 i32 i32 i32) (result i32)))
+          (import "wasix_32v1" "port_route_list" (func $routes (param i32 i32) (result i32)))
+          (import "wasix_32v1" "port_addr_list" (func $addresses (param i32 i32) (result i32)))
+          (import "wasi_snapshot_preview1" "proc_exit" (func $exit (param i32)))
+          (memory (export "memory") 1)
+          (data (i32.const 100) "\01\00\00\00\00\00\00")
+          (data (i32.const 200) "\01\00\c0\00\02\01")
+          (data (i32.const 400) "tenantcredential")
+          (func $ok (param $value i32) (param $step i32)
+            (if (local.get $value) (then (call $exit (local.get $step)) unreachable)))
+          (func $assert (param $value i32) (param $step i32)
+            (if (i32.eqz (local.get $value)) (then (call $exit (local.get $step)) unreachable)))
+          (func (export "_start")
+            (call $ok (call $bridge (i32.const 400) (i32.const 6) (i32.const 406) (i32.const 10) (i32.const 3)) (i32.const 1))
+            (call $ok (call $dhcp) (i32.const 2))
+            (call $ok (call $clear) (i32.const 3))
+            (i32.store8 (i32.const 300) (i32.const 1))
+            (i32.store8 (i32.const 320) (i32.const 1))
+            (i64.store (i32.const 328) (i64.const -1))
+            (call $ok (call $add (i32.const 100) (i32.const 200) (i32.const 300) (i32.const 320)) (i32.const 4))
+            (call $assert (i32.eq (call $routes (i32.const 1000) (i32.const 8)) (i32.const 61)) (i32.const 5))
+            (call $assert (i32.eq (i32.load (i32.const 8)) (i32.const 1)) (i32.const 6))
+            (call $ok (call $routes (i32.const 1000) (i32.const 8)) (i32.const 7))
+            (call $assert (i32.eq (i32.load8_u (i32.const 1144)) (i32.const 1)) (i32.const 8))
+            (call $assert (i64.eqz (i64.load (i32.const 1152))) (i32.const 9))
+            (call $assert (i32.eq (i32.load8_u (i32.const 1160)) (i32.const 1)) (i32.const 10))
+            (call $assert (i64.eq (i64.load (i32.const 1168)) (i64.const -1)) (i32.const 11))
+            (call $ok (call $addresses (i32.const 2000) (i32.const 8)) (i32.const 12))
+            (call $assert (i32.eq (i32.load8_u (i32.const 2006)) (i32.const 24)) (i32.const 13))
+            (call $assert (i32.eq (call $bridge (i32.const 400) (i32.const 6) (i32.const 406) (i32.const 10) (i32.const 99)) (i32.const 28)) (i32.const 14))
+            (call $exit (i32.const 0))))"#).unwrap();
+        let machine=wasixv2::Machine::builder().user(wasixv2::Credentials::new(0,0)).network(net.clone()).build();
+        let run=machine.run(&wasm,wasixv2::Stdio::from_fns(|_| {}, |_| {}));
+        let mut run=std::pin::pin!(run);
+        let status=tokio::time::timeout(Duration::from_secs(10),futures_util::future::poll_fn(|cx| {
+            assert!(driver.poll(cx,&mut relay).is_pending());
+            run.as_mut().poll(cx)
+        })).await.unwrap().unwrap();
+        assert_eq!(status,0,"v1 configured-provider guest check {status}");
+        let listener=TcpListener::bind("127.0.0.1:0").unwrap();let address=listener.local_addr().unwrap();
+        let server=std::thread::spawn(move || {let (mut peer,_)=listener.accept().unwrap();peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();let mut byte=[0];peer.read_exact(&mut byte).unwrap();assert_eq!(byte,[b'x']);});
+        let stream=backend.connect(address,WaitQueue::new()).unwrap();
+        drive_until("postbridge socket uses configured transport",&mut driver,&mut relay,|| stream.state()!=StreamState::Connecting).await;
+        assert_eq!(stream.state(),StreamState::Established);assert_eq!(stream.write(b"x"),Ok(1));
+        drive_until("postbridge data",&mut driver,&mut relay,|| stream.output_len()==0).await;
+        server.join().unwrap();
+        assert_eq!(provider_call(&net,&mut driver,&mut relay,Request::Unbridge).await.result,Ok(Reply::None));
+        let stream=backend.connect(address,WaitQueue::new()).unwrap();
+        drive_until("unbridge affects actual socket provider",&mut driver,&mut relay,|| stream.state()!=StreamState::Connecting).await;
+        assert_eq!(stream.state(),StreamState::Closed);assert_eq!(stream.take_error(),Some(Errno::ENOTCONN));
+    });
+}
+
+/// A genuinely blocked v1 import must take SIGKILL without waiting for its provider.
+/// The retained transaction subsequently publishes into the same namespace after task exit.
+#[tokio::test]
+async fn configured_classic_blocked_v1_guest_is_killable_without_replaying_dhcp() {
+    use std::sync::atomic::Ordering;
+    use wasixv2_vnet::{Network, provider::Readback};
+    tokio::task::LocalSet::new().run_until(async {
+        let reference=ConfiguredReference::new();
+        reference.stall_dhcp.store(true,Ordering::SeqCst);
+        let mut capabilities=Capabilities::classic(true);
+        capabilities.provider=Some(Readback {addresses:true,mac:false,routes:false});
+        let (backend,driver)=WebBackend::new(Config::default(),capabilities).unwrap();
+        let net=wasixv2_vnet::Net::new(wasixv2_vnet::NetConfig::host_default(),Some(backend));
+        let relay=Classic::new(ReferenceRelay::with_provider(reference.clone()),capabilities);
+        let io=tokio::task::spawn_local(driver.run(relay));
+        let machine=std::rc::Rc::new(wasixv2::Machine::builder().user(wasixv2::Credentials::new(0,0)).network(net.clone()).build());
+        let wasm=wat::parse_str(r#"(module
+          (import "wasix_32v1" "port_dhcp_acquire" (func $dhcp (result i32)))
+          (import "wasi_snapshot_preview1" "proc_exit" (func $exit (param i32)))
+          (memory (export "memory") 1)
+          (func (export "_start") (call $exit (call $dhcp))))"#).unwrap();
+        let run=tokio::task::spawn_local({let machine=machine.clone();async move {machine.run(&wasm,wasixv2::Stdio::from_fns(|_|{},|_|{})).await}});
+        tokio::time::timeout(Duration::from_secs(10),async {
+            while !reference.dhcp_entered.load(Ordering::SeqCst) {tokio::task::yield_now().await;}
+        }).await.expect("guest reached actual blocked provider");
+        tokio::time::timeout(Duration::from_secs(10),machine.shutdown()).await.expect("SIGKILL ends blocked provider import");
+        assert_eq!(tokio::time::timeout(Duration::from_secs(10),run).await.expect("guest task completes after SIGKILL").unwrap().unwrap(),128+9);
+        assert_eq!(reference.state.lock().unwrap().calls.iter().filter(|c| **c=="dhcp").count(),0);
+        reference.release_dhcp.notify_one();
+        tokio::time::timeout(Duration::from_secs(10),async {
+            while !net.interfaces().iter().flat_map(|i| &i.addresses).any(|a| a.addr=="192.0.2.9".parse::<IpAddr>().unwrap()) {tokio::task::yield_now().await;}
+        }).await.expect("accepted completion publishes after killed guest");
+        assert_eq!(reference.state.lock().unwrap().calls.iter().filter(|c| **c=="dhcp").count(),1,"accepted mutation was never replayed");
+        let wasm=wat::parse_str(r#"(module (import "wasi_snapshot_preview1" "proc_exit" (func $exit (param i32))) (memory (export "memory") 1) (func (export "_start") (call $exit (i32.const 0))))"#).unwrap();
+        assert_eq!(machine.run(&wasm,wasixv2::Stdio::from_fns(|_|{},|_|{})).await.unwrap(),0);
+        io.abort();
+        assert!(io.await.unwrap_err().is_cancelled());
+    }).await;
 }

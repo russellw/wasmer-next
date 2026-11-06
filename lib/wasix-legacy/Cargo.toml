@@ -20,7 +20,8 @@ harness = false
 required-features = ["sys-thread"]
 
 [dependencies]
-wasmer-package = { workspace = true, features = ["execution"] }
+wasmer-package = { workspace = true, features = ["execution", "acquisition"] }
+wasmer-cache = { path = "../cache", version = "=7.5.0", default-features = false, features = ["module-cache"] }
 wasmer-wasix-types = { path = "../wasi-types", version = "0.705.0", features = [
   "enable-serde",
 ] }
@@ -137,18 +138,6 @@ walkdir.workspace = true
 fs_extra.workspace = true
 itertools.workspace = true
 
-[target.'cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))'.dependencies.reqwest]
-workspace = true
-default-features = false
-features = ["rustls", "json", "stream", "socks", "blocking"]
-optional = true
-
-[target.'cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))'.dependencies.reqwest]
-workspace = true
-default-features = false
-features = ["native-tls", "json", "stream", "socks", "blocking"]
-optional = true
-
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
@@ -218,6 +207,7 @@ ctrlc = ["tokio/signal"]
 # the minimal sys implementation
 sys-minimal = ["wasmer/sys", "sys-thread", "tokio/fs"]
 sys = [
+  "wasmer-cache/module-cache-sys",
   "package-authoring",
   "webc/mmap",
   "time",
@@ -242,7 +232,7 @@ package-authoring = ["wasmer-package/authoring"]
 sys-default = ["sys"]
 sys-poll = []
 extra-logging = []
-sys-thread = ["tokio/rt", "tokio/time", "tokio/rt-multi-thread", "rusty_pool"]
+sys-thread = ["tokio/rt", "tokio/time", "tokio/rt-multi-thread", "rusty_pool", "wasmer-package/acquisition-thread", "wasmer-cache/module-cache-filesystem"]
 journal = ["tokio/fs", "wasmer-journal/log-file"]
 
 # Deprecated. Kept it for compatibility
@@ -253,6 +243,7 @@ v8 = ["wasmer/v8"]
 llvm = ["wasmer/llvm"]
 
 js = [
+  "wasmer-package/http-client-js",
   "virtual-fs/js",
   "getrandom/wasm_js",
   "chrono",
@@ -270,6 +261,7 @@ test-js = ["js", "wasmer/wat"]
 host-vnet = ["virtual-net/host-net"]
 host-threads = []
 host-reqwest = ["reqwest"]
+reqwest = ["wasmer-package/http-client"]
 host-fs = ["virtual-fs/host-fs"]
 remote-vnet = ["virtual-net/remote"]
 

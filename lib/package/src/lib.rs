@@ -4,6 +4,15 @@ mod macros;
 
 mod error;
 
+#[cfg(feature = "acquisition")]
+pub mod commands;
+#[cfg(feature = "acquisition")]
+pub mod http;
+#[cfg(feature = "acquisition")]
+pub mod loader;
+#[cfg(feature = "acquisition")]
+pub mod resolver;
+
 #[cfg(feature = "authoring")]
 pub use error::AuthoringError;
 pub use error::WasmerPackageError;

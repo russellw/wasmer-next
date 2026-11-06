@@ -3,12 +3,10 @@ use std::{
     sync::Arc,
 };
 
+use super::runtime::RunContext;
 use anyhow::Error;
 use indicatif::ProgressBar;
 use wasmer_config::package::PackageSource;
-use wasmer_wasix::{
-    Runtime, bin_factory::BinaryPackage, runtime::task_manager::VirtualTaskManagerExt as _,
-};
 
 use super::ExecutableTarget;
 
@@ -48,7 +46,7 @@ impl CliPackageSource {
     #[tracing::instrument(level = "debug", skip_all)]
     pub fn resolve_target(
         &self,
-        rt: &Arc<dyn Runtime + Send + Sync>,
+        rt: &Arc<RunContext>,
         pb: &ProgressBar,
     ) -> Result<ExecutableTarget, Error> {
         match self {
@@ -56,11 +54,7 @@ impl CliPackageSource {
             Self::Dir(d) => ExecutableTarget::from_dir(d, rt, pb),
             Self::Package(pkg) => {
                 pb.set_message("Loading from the registry");
-                let inner_pck = pkg.clone();
-                let inner_rt = rt.clone();
-                let pkg = rt.task_manager().spawn_and_block_on(async move {
-                    BinaryPackage::from_registry(&inner_pck, inner_rt.as_ref()).await
-                })??;
+                let pkg = rt.block_on(rt.load_registry(pkg))?;
                 Ok(ExecutableTarget::Package(Box::new(pkg)))
             }
         }

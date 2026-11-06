@@ -44,6 +44,7 @@ pub struct Frame<'a, S: 'static> {
     pub mem: CompatMemory<'a, S>,
     abi: Arc<dyn AbiInstance<S>>,
     unwind: wasixv2_exec::GuestUnwind,
+    fork_allowed: bool,
     descriptors: RefCell<Option<wasixv2_syscalls::DescriptorSet>>,
     installations: RefCell<Option<wasixv2_syscalls::DescriptorInstallations>>,
 }
@@ -51,7 +52,8 @@ pub struct Frame<'a, S: 'static> {
 impl<'a, S: Syscalls + Control + 'static> Frame<'a, S> {
     /// The caller to pass to every v2 call: this task, with this call's memory.
     pub fn caller(&self) -> Caller<'_> {
-        let mut caller = Caller::new(self.task, &self.mem);
+        let mut caller =
+            Caller::new(self.task, &self.mem).with_process_fork_allowed(self.fork_allowed);
         if let Some(set) = &*self.descriptors.borrow() {
             caller = caller.with_descriptors(set);
         }
@@ -186,12 +188,34 @@ pub enum Done<T> {
 /// Runs `body` as one v1 call (see the module docs).
 pub async fn call<S, T>(
     env: &Env<S>,
-    mut body: impl AsyncFnMut(&Frame<'_, S>) -> V1Result<T>,
+    body: impl AsyncFnMut(&Frame<'_, S>) -> V1Result<T>,
 ) -> Result<Done<T>, RuntimeError>
 where
     S: Syscalls + Control + 'static,
 {
-    let (syscalls, task, abi) = {
+    call_inner(env, body, None).await
+}
+
+pub(crate) async fn call_with_spawn<S, T>(
+    env: &Env<S>,
+    body: impl AsyncFnMut(&Frame<'_, S>) -> V1Result<T>,
+    spawn: &wasixv2_exec::HostSpawn,
+) -> Result<Done<T>, RuntimeError>
+where
+    S: Syscalls + Control + 'static,
+{
+    call_inner(env, body, Some(spawn)).await
+}
+
+async fn call_inner<S, T>(
+    env: &Env<S>,
+    mut body: impl AsyncFnMut(&Frame<'_, S>) -> V1Result<T>,
+    spawn: Option<&wasixv2_exec::HostSpawn>,
+) -> Result<Done<T>, RuntimeError>
+where
+    S: Syscalls + Control + 'static,
+{
+    let (syscalls, task, abi, fork_allowed) = {
         let guard = env.read().await;
         let data = guard.data();
         data.enter();
@@ -199,7 +223,12 @@ where
             .abi()
             .cloned()
             .ok_or_else(|| RuntimeError::new("a v1 import ran before its instance was bound"))?;
-        (data.syscalls().clone(), data.task(), abi)
+        (
+            data.syscalls().clone(),
+            data.task(),
+            abi,
+            data.process_fork_allowed(),
+        )
     };
     let frame = Frame {
         env,
@@ -207,7 +236,8 @@ where
         task,
         mem: CompatMemory::new(GuestMemory::new(env)),
         abi,
-        unwind: wasixv2_exec::GuestUnwind::default(),
+        fork_allowed,
+        unwind: wasixv2_exec::GuestUnwind::new(env).await,
         descriptors: RefCell::new(None),
         installations: RefCell::new(None),
     };
@@ -226,7 +256,13 @@ where
             Err(Error::V1(errno)) => (Ok(None), Some(errno)),
         };
         let ret = frame.unwind().finish(env, ret).await?;
-        return Ok(match complete(env, &*syscalls, task, ret).await {
+        let outcome = match spawn {
+            Some(spawn) => {
+                wasixv2_exec::complete_with_spawn(env, &*syscalls, task, ret, spawn).await
+            }
+            None => complete(env, &*syscalls, task, ret).await,
+        };
+        return Ok(match outcome {
             // A body cannot go on halfway, so a call that saved how to continue
             // (`ERESTART_RESTARTBLOCK`) runs again from the start too.
             Outcome::Rerun | Outcome::Restart => continue,

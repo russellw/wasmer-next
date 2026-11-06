@@ -11,13 +11,12 @@
 //!
 //! Ready?
 
-use std::io::{Read, Write};
-
-use wasmer::{Module, wat2wasm};
-use wasmer_wasix::{
-    Pipe,
-    runners::wasi::{RuntimeOrEngine, WasiRunner},
+use std::{
+    io::{Read, Write, pipe},
+    sync::{Arc, Mutex},
 };
+
+use wasixv2::{BlockingSource, Machine, ProcessConfig, Stdio, load};
 
 const REVERSE_WASI_WAT: &[u8] = br#"
 (module
@@ -93,52 +92,48 @@ const REVERSE_WASI_WAT: &[u8] = br#"
 "#;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let wasm_bytes = wat2wasm(REVERSE_WASI_WAT)?.into_owned();
-
-    // We need at least an engine to be able to compile the module.
+    let wasm_bytes = wasmer::wat2wasm(REVERSE_WASI_WAT)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let _guard = runtime.enter();
+    let machine = Machine::new();
     let engine = wasmer::Engine::default();
 
     println!("Compiling module...");
-    // Let's compile the Wasm module.
-    let module = Module::new(&engine, &wasm_bytes[..])?;
+    let module = load(&engine, &wasm_bytes)?;
 
     let msg = "racecar go zoom";
     println!("Writing \"{msg}\" to the WASI stdin...");
-    let (mut stdin_sender, stdin_reader) = Pipe::channel();
-    let (stdout_sender, mut stdout_reader) = Pipe::channel();
+    let (stdin_reader, mut stdin_writer) = pipe()?;
+    let (mut stdout_reader, stdout_writer) = pipe()?;
+    writeln!(stdin_writer, "{msg}")?;
+    drop(stdin_writer);
+    let captured = Mutex::new(stdout_writer);
+    let mut stdio = Stdio::from_fns(
+        move |bytes| captured.lock().unwrap().write_all(bytes).unwrap(),
+        |bytes| std::io::stderr().write_all(bytes).unwrap(),
+    );
+    // BlockingSource adapts a host reader without blocking the guest executor.
+    stdio.stdin = Arc::new(BlockingSource::new(stdin_reader));
 
-    // To write to the stdin
-    writeln!(stdin_sender, "{msg}")?;
-
-    {
-        // Create a WASI runner. We use a scope to make sure the runner is dropped
-        // as soon as we are done with it; otherwise, it will keep the stdout pipe
-        // open.
-        let mut runner = WasiRunner::new();
-
-        // Configure the WasiRunner with the stdio pipes.
-        runner
-            .with_stdin(Box::new(stdin_reader))
-            .with_stdout(Box::new(stdout_sender));
-
-        // Now, run the module.
-        println!("Running module...");
-        runner.run_wasm(
-            RuntimeOrEngine::Engine(engine),
-            "hello",
-            module,
-            wasmer_types::ModuleHash::new(wasm_bytes),
-        )?;
-    }
-
-    // To read from the stdout
+    println!("Running module...");
+    let status = runtime.block_on(machine.run_module(
+        &engine,
+        &module,
+        ProcessConfig {
+            args: vec!["hello".into()],
+            env: vec![],
+            stdio,
+        },
+    ))?;
+    assert_eq!(status, 0);
+    // Release the guest streams before reading the pipe through end of stream.
+    drop(machine);
     let mut buf = String::new();
     stdout_reader.read_to_string(&mut buf)?;
     println!("Read \"{}\" from the WASI stdout!", buf.trim());
-
-    // Verify the module wrote the correct thing, for the test below
     assert_eq!(buf.trim(), "mooz og racecar");
-
     Ok(())
 }
 

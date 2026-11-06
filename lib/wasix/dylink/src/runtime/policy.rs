@@ -105,9 +105,10 @@ impl LoadPolicy for NativePolicy {
     }
 }
 
-/// Compose a prepared dynamic main with an ordinary imports/bind ABI, such as
-/// Wasix1. The base must not have an independent pre-instantiation loader. Bound
-/// entry, signal, return and teardown behavior stay with the base instance.
+/// Compose a prepared dynamic main with a guest ABI, such as Wasix1. Its host-only
+/// preparation runs before dynamic startup and custom binding hooks. The base must
+/// not have an independent pre-instantiation loader. Bound entry, signal, return
+/// and teardown behavior stay with the base instance.
 pub fn compose<S: Syscalls + Control + Send + Sync + 'static>(
     module: &Module,
     base: Arc<dyn Abi<S>>,

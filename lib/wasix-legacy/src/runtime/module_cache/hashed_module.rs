@@ -1,52 +1,37 @@
+use crate::bin_factory::BinaryPackageCommand;
 use shared_buffer::OwnedBuffer;
 use wasmer_types::ModuleHash;
 
-use crate::bin_factory::BinaryPackageCommand;
+/// Immutable module bytes and their hash, with legacy package-command convenience.
+#[derive(Clone, PartialEq, Eq)]
+pub struct HashedModuleData(wasmer_cache::module_cache::HashedModuleData);
 
-/// A wrapper around Webassembly code and its hash.
-///
-/// Allows passing around WASM code and it's hash without the danger of
-/// using a wrong hash.
-///
-/// Safe by construction: can only be created from a [`BinaryPackageCommand`](crate::bin_factory::BinaryPackageCommand), which
-/// already has the hash embedded, or from bytes that will be hashed in the
-/// constructor.
-///
-/// Can be cloned cheaply.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HashedModuleData {
-    hash: ModuleHash,
-    wasm: OwnedBuffer,
+impl std::fmt::Debug for HashedModuleData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.0, f)
+    }
 }
 
 impl HashedModuleData {
     pub fn new(bytes: impl Into<OwnedBuffer>) -> Self {
-        let wasm = bytes.into();
-        let hash = ModuleHash::new(&wasm);
-        Self { hash, wasm }
+        Self(wasmer_cache::module_cache::HashedModuleData::new(bytes))
     }
 
-    /// Create new [`HashedModuleData`] from the given [`BinaryPackageCommand`](crate::bin_factory::BinaryPackageCommand).
-    ///
-    /// This is very cheap, as the hash is already available in the command.
+    /// Retain the command's signed hash and bytes without hashing them again.
     pub fn from_command(command: &BinaryPackageCommand) -> Self {
-        Self {
-            hash: *command.hash(),
-            wasm: command.atom(),
-        }
+        Self(wasmer_cache::module_cache::HashedModuleData::from_parts(
+            *command.hash(),
+            command.atom(),
+        ))
     }
 
-    /// Get the module hash.
     pub fn hash(&self) -> &ModuleHash {
-        &self.hash
+        self.0.hash()
     }
-
-    /// Get the WASM code.
     pub fn wasm(&self) -> &OwnedBuffer {
-        &self.wasm
+        self.0.wasm()
     }
-
     pub fn into_parts(self) -> (ModuleHash, OwnedBuffer) {
-        (self.hash, self.wasm)
+        self.0.into_parts()
     }
 }

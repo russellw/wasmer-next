@@ -8,6 +8,9 @@ pub mod abi;
 pub mod asyncify;
 mod atomics;
 mod base;
+mod cancellation;
+mod cleanup;
+mod contexts;
 mod cooperative;
 mod cputime;
 mod dynamic;
@@ -23,6 +26,8 @@ mod pagemap;
 mod preempt;
 mod preparation;
 mod process;
+mod spawn_custody;
+pub use spawn_custody::HostSpawn;
 mod signal;
 mod thread;
 mod unwind;
@@ -40,6 +45,8 @@ use std::{
 pub use abi::{
     Abi, AbiInstance, Abis, Entry, EntryReturn, PreparedImage, Role, Sigreturn, VforkResume,
 };
+pub use cleanup::local_cleanup_runner;
+pub use contexts::{context_operations_supported, process_fork_allowed};
 pub use dynamic::GuestDynamicLinker;
 pub use function::{CallBufferPolicy, GuestFunctionOperations, TableMetadata};
 pub use generated::IMPORT_MODULE;
@@ -64,8 +71,8 @@ use wasixv2_syscalls::{
 };
 pub use wasixv2_syscalls::{Image, ImageId};
 use wasmer::{
-    AsyncFunctionEnvMut, CompileError, Engine, Function, FunctionEnv, Global, Imports, Instance,
-    Memory, MemoryError, Module, Pages, RuntimeError, Store, Value,
+    AsStoreMut, AsyncFunctionEnvMut, CompileError, Engine, Function, FunctionEnv, Global, Imports,
+    Instance, Memory, MemoryError, Module, Pages, RuntimeError, Store, StoreMut, Value,
 };
 use wasmer_types::TrapCode;
 
@@ -163,6 +170,8 @@ pub struct ExecEnv<S> {
     fork_payload: Option<asyncify::Tag>,
     /// Process accounting for `task`.
     cpu: cputime::CpuSample,
+    contexts: std::sync::Weak<contexts::Shared>,
+    contexts_supported: bool,
 }
 
 impl<S: Control> ExecEnv<S> {
@@ -196,6 +205,8 @@ impl<S: Control> ExecEnv<S> {
             proc,
             asyncify: None,
             fork_payload: None,
+            contexts: std::sync::Weak::new(),
+            contexts_supported: true,
         }
     }
 
@@ -248,6 +259,12 @@ impl<S> ExecEnv<S> {
     }
 
     /// The task the instance runs as; it changes when vfork switches the instance.
+    pub fn process_fork_allowed(&self) -> bool {
+        self.contexts
+            .upgrade()
+            .is_none_or(|group| group.current() == 0)
+    }
+
     pub fn task(&self) -> TaskId {
         self.task
     }
@@ -400,7 +417,16 @@ where
             .authorize()
             .map_err(|error| reject_profile(&*syscalls, task, error))?;
     }
-    let cleanup = wasixv2_host::LoaderCleanup::new(host.clone());
+    let cleanup = cleanup::RunCleanup::new(wasixv2_host::LoaderCleanup::new(host.clone()), {
+        #[cfg(feature = "sys")]
+        {
+            store.engine().is_sys()
+        }
+        #[cfg(not(feature = "sys"))]
+        {
+            false
+        }
+    });
     let run = process::run(
         store,
         module,
@@ -446,7 +472,7 @@ where
 {
     if abis.requires_owning_thread() {
         #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
-        return run_owned_entry(
+        return cancellation::run_owned_entry(
             engine,
             ThreadEntry::Image(image),
             syscalls,
@@ -483,7 +509,16 @@ where
             .authorize()
             .map_err(|error| reject_profile(&*syscalls, task, error))?;
     }
-    let cleanup = wasixv2_host::LoaderCleanup::new(host.clone());
+    let cleanup = cleanup::RunCleanup::new(wasixv2_host::LoaderCleanup::new(host.clone()), {
+        #[cfg(feature = "sys")]
+        {
+            engine.is_sys()
+        }
+        #[cfg(not(feature = "sys"))]
+        {
+            false
+        }
+    });
     let run = process::run_exec(
         engine,
         image,
@@ -525,7 +560,7 @@ where
 {
     #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
     {
-        run_owned_entry(
+        cancellation::run_owned_entry(
             engine,
             ThreadEntry::Module(module.clone()),
             syscalls,
@@ -556,70 +591,6 @@ fn reject_profile<S: Control>(syscalls: &S, task: TaskId, error: ExecError) -> E
 enum ThreadEntry {
     Module(Module),
     Image(Image),
-}
-
-#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
-async fn run_owned_entry<S>(
-    engine: Engine,
-    entry: ThreadEntry,
-    syscalls: Arc<S>,
-    task: TaskId,
-    host: Arc<dyn Host>,
-    abis: Arc<Abis<S>>,
-) -> Result<i32, ExecError>
-where
-    S: Syscalls + Control + Send + Sync + 'static,
-{
-    let completion = Arc::new(process::Handoff::default());
-    let done = process::Takeover(completion.clone());
-    let worker_syscalls = syscalls.clone();
-    let worker_host = host.clone();
-    host.executor()
-        .spawn_thread(Box::new(move || {
-            // This runs on the selected owner, before any Store or FunctionEnv.
-            let profile = thread::OwningThread::acquire();
-            Box::pin(async move {
-                let result = match profile {
-                    Err(error) => Err(reject_profile(&*worker_syscalls, task, error)),
-                    Ok(profile) => {
-                        let call = async {
-                            match entry {
-                                ThreadEntry::Module(module) => {
-                                    run_with_abis_profiled(
-                                        Store::new(engine),
-                                        &module,
-                                        worker_syscalls.clone(),
-                                        task,
-                                        worker_host,
-                                        abis,
-                                        Some(profile),
-                                    )
-                                    .await
-                                }
-                                ThreadEntry::Image(image) => {
-                                    run_exec_profiled(
-                                        engine,
-                                        image,
-                                        worker_syscalls.clone(),
-                                        task,
-                                        worker_host,
-                                        abis,
-                                        Some(profile),
-                                    )
-                                    .await
-                                }
-                            }
-                        };
-                        catch_panic(call).await.unwrap_or_else(|panic| {
-                            Err(host_panicked(&*worker_syscalls, task, panic))
-                        })
-                    }
-                };
-                done.report(result);
-            })
-        }))
-        .map_err(|error| reject_profile(&*syscalls, task, ExecError::OwningThreadSpawn(error)))?;
-    completion.wait().await
 }
 
 /// How one image's run ended.
@@ -667,6 +638,9 @@ async fn ended<S: Syscalls + Control + Send + Sync + 'static>(
         }
         (Err(err), _) => err,
     };
+    if err.downcast_ref::<contexts::Returned>().is_some() {
+        return exit_on_return(cx, role, 129).await;
+    }
     let err = match err.downcast::<Exited>() {
         Ok(Exited(status)) => return Ended::Exited(status),
         Err(err) => err,
@@ -763,17 +737,22 @@ fn unreachable_trap() -> Result<i32, RuntimeError> {
 /// Reports a host panic and kills the thread group of `task` with SIGSEGV, as a kernel oops
 /// kills the task it hit (`make_task_dead`).
 fn host_panicked<S: Control>(syscalls: &S, task: TaskId, panic: Box<dyn Any + Send>) -> ExecError {
+    let error = panic_error(task, panic);
+    // The kernel's state may be what panicked; a second panic changes nothing.
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        process::fault(syscalls, task, Signal::SIGSEGV.0);
+        syscalls.release(task);
+    }));
+    error
+}
+
+fn panic_error(task: TaskId, panic: Box<dyn Any + Send>) -> ExecError {
     let message = panic
         .downcast_ref::<&str>()
         .map(|s| s.to_string())
         .or_else(|| panic.downcast_ref::<String>().cloned())
         .unwrap_or_else(|| "a panic without a message".to_string());
     tracing::error!(tid = task.0, "the host panicked running a guest: {message}");
-    // The kernel's state may be what panicked; a second panic changes nothing.
-    let _ = catch_unwind(AssertUnwindSafe(|| {
-        process::fault(syscalls, task, Signal::SIGSEGV.0);
-        syscalls.release(task);
-    }));
     ExecError::Panic(message)
 }
 
@@ -799,7 +778,7 @@ async fn run_image<S>(
     task: TaskId,
     host: Arc<dyn Host>,
     abis: Arc<Abis<S>>,
-    cleanup: Arc<wasixv2_host::LoaderCleanup>,
+    cleanup: cleanup::RunCleanup,
 ) -> Result<Ended, ExecError>
 where
     S: Syscalls + Control + Send + Sync + 'static,
@@ -817,7 +796,7 @@ async fn run_forked<S>(
     task: TaskId,
     host: Arc<dyn Host>,
     abis: Arc<Abis<S>>,
-    cleanup: Arc<wasixv2_host::LoaderCleanup>,
+    cleanup: cleanup::RunCleanup,
 ) -> Result<Ended, ExecError>
 where
     S: Syscalls + Control + Send + Sync + 'static,
@@ -932,15 +911,20 @@ async fn instantiate<S>(
     task: TaskId,
     host: Arc<dyn Host>,
     abis: Arc<Abis<S>>,
-    cleanup: Arc<wasixv2_host::LoaderCleanup>,
+    cleanup: impl Into<cleanup::RunCleanup>,
     fork: Option<&asyncify::ForkImage>,
 ) -> Result<Ready<S>, ExecError>
 where
     S: Syscalls + Control + Send + Sync + 'static,
 {
+    let cleanup = cleanup.into();
     abis.configure_store(&mut store)?;
-    let invocations =
-        instantiation::NativeInvocations::bind(&mut store, abis.requires_owning_thread())?;
+    let contexts_supported = !abis.requires_owning_thread();
+    let invocations = instantiation::NativeInvocations::bind_with_cleanup(
+        &mut store,
+        abis.requires_owning_thread(),
+        &cleanup,
+    )?;
     let abi = abis.require(module)?;
     abi.attach_cleanup(&cleanup);
     let mut admission = syscalls
@@ -955,16 +939,17 @@ where
         abis.clone(),
     );
     let handoff = Arc::new(process::Handoff::default());
+    handoff.bind_cancellation(cleanup.cancellation());
     let proc = process::ProcExports::new(spawner, handoff.clone());
     let env = FunctionEnv::new(
         &mut store,
         ExecEnv::new(syscalls.clone(), task, proc, host.clone()),
     );
-    env.as_mut(&mut store).cleanup = Some(cleanup);
-    abis.install_hooks(&mut store, &env);
-    let mut imports = imports(&*abi, &mut store, &env, module);
+    env.as_mut(&mut store).cleanup = Some(cleanup.shared().clone());
+    abis.install_hooks(&mut store.as_store_mut(), &env);
+    let mut imports = imports(&*abi, &mut store.as_store_mut(), &env, module);
     let size = fork.map(|image| image.memory.size());
-    let imported = import_memory(&mut store, module, &mut imports, size)?;
+    let imported = import_memory(&mut store.as_store_mut(), module, &mut imports, size)?;
     // Fork copies retain their existing rewind/bind contract. Native startup is
     // EH/PIC-only; this opt-in phase does not add multi-module asyncify/fork support.
     let (mut store, prepared, bootstrap, invocations) = if fork.is_none() {
@@ -1011,10 +996,15 @@ where
             None => instance.exports.get_memory("memory")?.clone(),
         };
         // Decided from the module's own globals, before a fork child's copy replaces them.
-        let guarded = abi.guardable(&instance, &mut store);
-        let main_stack = abi.main_stack(&instance, &mut store);
+        let guarded = abi.guardable(&instance, &mut store.as_store_mut());
+        let main_stack = abi.main_stack(&instance, &mut store.as_store_mut());
         let mut asyncify = asyncify::Asyncify::new(&instance, &mut store)?;
-        let layout = abi.image_layout(&instance, &memory, &mut store, asyncify.is_some());
+        let layout = abi.image_layout(
+            &instance,
+            &memory,
+            &mut store.as_store_mut(),
+            asyncify.is_some(),
+        );
         if let Some(bootstrap) = &bootstrap
             && (layout.as_ref() != bootstrap.layout.as_ref()
                 || main_stack != bootstrap.stack
@@ -1055,8 +1045,10 @@ where
             return Err(ExecError::Load(LoadError::Format(Errno::EINVAL)));
         }
         let bound = match prepared {
-            Some(prepared) => prepared.bind(&instance, &mut store, task, Role::Process)?,
-            None => abi.bind(&instance, &mut store, task, Role::Process)?,
+            Some(prepared) => {
+                prepared.bind(&instance, &mut store.as_store_mut(), task, Role::Process)?
+            }
+            None => abi.bind(&instance, &mut store.as_store_mut(), task, Role::Process)?,
         };
         let shared = memory.as_shared(&store);
         #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
@@ -1111,6 +1103,7 @@ where
         data.threads = threads;
         data.proc.set_module(module);
         data.asyncify = asyncify;
+        data.contexts_supported = contexts_supported;
         let memory = env.as_ref(&store).memory().unwrap().clone();
         if let Some(attachments) = &attachments {
             attachments
@@ -1288,13 +1281,26 @@ impl<S: Syscalls + Control + Send + Sync + 'static> Ready<S> {
             None
         };
         let result = match prepared {
-            Ok(()) => cooperative::drive(&entry, &*self.abi, self.abi.start(&entry)).await,
+            Ok(()) => {
+                cooperative::drive(
+                    &entry,
+                    &*self.abi,
+                    contexts::drive(&entry, &mut attachments, {
+                        let abi = self.abi.clone();
+                        let env = self.env.clone();
+                        let store = entry.store();
+                        async move { abi.start(&Entry::new(&env, &store)).await }
+                    }),
+                )
+                .await
+            }
             Err(e) => Err(e),
         };
         let on_return = self.abi.on_entry_return();
-        if let Some(attachments) = &mut attachments {
-            attachments.settle().await;
-        }
+        let result = match &mut attachments {
+            Some(attachments) => attachments.finish(result).await,
+            None => result,
+        };
         let ended = ended(entry.cx(), result, on_return, Role::Process).await;
         if let Some(attachments) = &mut attachments {
             attachments.deactivate().await;
@@ -1338,15 +1344,34 @@ impl<S: Syscalls + Control + Send + Sync + 'static> Ready<S> {
             store: &store,
         };
         let result = match asyncify::start_rewind(&cx, buffer).await {
-            Ok(()) => asyncify::call(&cx, Some(entry), &function, &args)
+            Ok(()) => {
+                let root = Entry::new(&self.env, &store);
+                cooperative::drive(
+                    &root,
+                    &*self.abi,
+                    contexts::drive(&root, &mut attachments, {
+                        let env = self.env.clone();
+                        let store = root.store();
+                        async move {
+                            let cx = asyncify::Outside {
+                                env: &env,
+                                store: &store,
+                            };
+                            asyncify::call(&cx, Some(entry), &function, &args)
+                                .await
+                                .map(drop)
+                        }
+                    }),
+                )
                 .await
-                .map(drop),
+            }
             Err(err) => Err(err),
         };
         let on_return = self.abi.on_entry_return();
-        if let Some(attachments) = &mut attachments {
-            attachments.settle().await;
-        }
+        let result = match &mut attachments {
+            Some(attachments) => attachments.finish(result).await,
+            None => result,
+        };
         let ended = ended(&cx, result, on_return, Role::Process).await;
         if let Some(attachments) = &mut attachments {
             attachments.deactivate().await;
@@ -1359,7 +1384,7 @@ impl<S: Syscalls + Control + Send + Sync + 'static> Ready<S> {
 /// the imports its atomic waits and notifies became.
 fn imports<S>(
     abi: &dyn Abi<S>,
-    store: &mut Store,
+    store: &mut StoreMut<'_>,
     env: &FunctionEnv<ExecEnv<S>>,
     module: &Module,
 ) -> Imports
@@ -1404,7 +1429,7 @@ fn jspi_import(future: wasmer::js::JspiFuture) -> js_sys::Promise {
 /// and at least `size` bytes. libc-built guests import a shared memory so threads can share it;
 /// others export `memory`.
 fn import_memory(
-    store: &mut Store,
+    store: &mut StoreMut<'_>,
     module: &Module,
     imports: &mut Imports,
     size: Option<u64>,
@@ -1537,6 +1562,27 @@ pub async fn complete<S: Syscalls + Control + 'static, T>(
     task: TaskId,
     ret: SysResult<T>,
 ) -> Outcome<T> {
+    complete_inner(env, syscalls, task, ret, None).await
+}
+
+/// Completion of a host-only spawn, retaining its child across task switches.
+pub async fn complete_with_spawn<S: Syscalls + Control + 'static, T>(
+    env: &AsyncFunctionEnvMut<ExecEnv<S>>,
+    syscalls: &S,
+    task: TaskId,
+    ret: SysResult<T>,
+    spawn: &HostSpawn,
+) -> Outcome<T> {
+    complete_inner(env, syscalls, task, ret, Some(spawn)).await
+}
+
+async fn complete_inner<S: Syscalls + Control + 'static, T>(
+    env: &AsyncFunctionEnvMut<ExecEnv<S>>,
+    syscalls: &S,
+    task: TaskId,
+    ret: SysResult<T>,
+    spawn: Option<&HostSpawn>,
+) -> Outcome<T> {
     if matches!(ret, Err(SysErr::GuestUnwind)) {
         finish_import(env).await;
         return Outcome::Unwind(RuntimeError::new(
@@ -1607,11 +1653,18 @@ pub async fn complete<S: Syscalls + Control + 'static, T>(
                     task: to,
                     ret: value,
                 } => {
+                    if let Some(spawn) = spawn {
+                        // No await after consuming SwitchTask may precede this capture.
+                        spawn.switched(task, to);
+                    }
                     process::switch(env, to).await;
                     task = to;
                     switched = Some(value);
                 }
                 GuestAction::Exec { vfork_parent } => {
+                    if let (Some(spawn), Some(parent)) = (spawn, vfork_parent) {
+                        spawn.returning(task, parent);
+                    }
                     // The kernel queues the image with the action; without one, the empty image
                     // fails to load and the process dies as past any `execve`'s point of no return.
                     let image = syscalls
@@ -1622,7 +1675,8 @@ pub async fn complete<S: Syscalls + Control + 'static, T>(
                             image,
                         ))));
                     };
-                    process::spawn_image(env, task, image).await;
+                    let publication = spawn.and_then(|spawn| spawn.publication(task));
+                    process::spawn_image(env, task, image, publication).await;
                     match vfork_resume(env, parent, task).await {
                         Some(VforkResume::Unwind(err)) => return Outcome::Unwind(err),
                         Some(VforkResume::ReturnSuccess) => {
@@ -1652,12 +1706,21 @@ pub async fn complete<S: Syscalls + Control + 'static, T>(
                     };
                 }
                 GuestAction::VforkReturn { parent, child } => {
+                    if let Some(spawn) = spawn {
+                        spawn.returning(child, parent);
+                    }
                     // The child ended; nothing runs as it any more, and all its time is charged.
                     // Its memory is the parent's, which stays.
                     env.read().await.data().sample_cpu();
                     let memory = GuestMemory { env };
-                    syscalls.exit_mm(&Caller::new(child, &memory)).await;
+                    match spawn {
+                        Some(spawn) => spawn.exit_mm(child).await,
+                        None => syscalls.exit_mm(&Caller::new(child, &memory)).await,
+                    }
                     syscalls.release(child);
+                    if let Some(spawn) = spawn {
+                        spawn.released(child);
+                    }
                     match vfork_resume(env, parent, child).await {
                         Some(VforkResume::Unwind(err)) => return Outcome::Unwind(err),
                         Some(VforkResume::ReturnSuccess) => {
@@ -1797,7 +1860,8 @@ async fn return_to_guest<S: Syscalls + Control + 'static, R: From<i32>>(
             Outcome::Rerun => None,
             Outcome::Restart => {
                 let memory = GuestMemory { env };
-                let caller = Caller::new(task, &memory);
+                let caller = Caller::new(task, &memory)
+                    .with_process_fork_allowed(process_fork_allowed(env).await);
                 ret = Syscalls::restart_syscall(syscalls, &caller)
                     .await
                     .map(R::from);

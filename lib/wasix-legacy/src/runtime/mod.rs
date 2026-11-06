@@ -3,10 +3,9 @@ pub mod package_loader;
 pub mod resolver;
 pub mod task_manager;
 
-use self::module_cache::CacheError;
 pub use self::task_manager::{SpawnType, VirtualTaskManager};
 use module_cache::HashedModuleData;
-use wasmer_types::{CompilationProgressCallback, ModuleHash};
+use wasmer_types::ModuleHash;
 
 use std::{
     borrow::Cow,
@@ -30,10 +29,7 @@ use crate::{
     http::{DynHttpClient, HttpClient},
     os::TtyBridge,
     runtime::{
-        module_cache::{
-            ModuleCache, ThreadLocalCache,
-            progress::{ModuleLoadProgress, ModuleLoadProgressReporter},
-        },
+        module_cache::{ModuleCache, ThreadLocalCache, progress::ModuleLoadProgressReporter},
         package_loader::{PackageLoader, UnsupportedPackageLoader},
         resolver::{BackendSource, MultiSource, Source},
     },
@@ -573,72 +569,24 @@ pub type DynRuntime = dyn Runtime + Send + Sync;
 ///
 // This function exists to provide a reusable baseline implementation for
 // implementing [`Runtime::load_module`], so custom logic can be added on top.
-#[tracing::instrument(level = "debug", skip_all)]
 pub async fn load_module(
     engine: &Engine,
     module_cache: &(dyn ModuleCache + Send + Sync),
     input: ModuleInput<'_>,
     on_progress: Option<ModuleLoadProgressReporter>,
 ) -> Result<Module, crate::SpawnError> {
-    let wasm_hash = input.hash();
-
-    let result = if let Some(on_progress) = &on_progress {
-        module_cache
-            .load_with_progress(wasm_hash, engine, on_progress.clone())
-            .await
-    } else {
-        module_cache.load(wasm_hash, engine).await
-    };
-
-    match result {
-        Ok(module) => return Ok(module),
-        Err(CacheError::NotFound) => {}
-        Err(other) => {
-            tracing::warn!(
-                %wasm_hash,
-                error=&other as &dyn std::error::Error,
-                "Unable to load the cached module",
-            );
-        }
-    }
-
-    let res = if let Some(progress) = on_progress {
-        #[allow(unused_variables)]
-        let p = CompilationProgressCallback::new(move |p| {
-            progress.notify(ModuleLoadProgress::CompilingModule(p))
-        });
-        #[cfg(feature = "sys")]
-        {
-            if engine.is_sys() {
-                use wasmer::sys::NativeEngineExt;
-                engine.new_module_with_progress(input.wasm(), p)
-            } else {
-                Module::new(&engine, input.wasm())
-            }
-        }
-        #[cfg(not(feature = "sys"))]
-        {
-            Module::new(&engine, input.wasm())
-        }
-    } else {
-        Module::new(&engine, input.wasm())
-    };
-
-    let module = res.map_err(|err| crate::SpawnError::CompileError {
-        module_hash: wasm_hash,
-        error: err,
-    })?;
-
-    // TODO: pass a [`HashedModule`] struct that is safe by construction.
-    if let Err(e) = module_cache.save(wasm_hash, engine, &module).await {
-        tracing::warn!(
-            %wasm_hash,
-            error=&e as &dyn std::error::Error,
-            "Unable to cache the compiled module",
-        );
-    }
-
-    Ok(module)
+    wasmer_cache::module_cache::load_module(
+        engine,
+        module_cache,
+        input.hash(),
+        input.wasm(),
+        on_progress,
+    )
+    .await
+    .map_err(|error| crate::SpawnError::CompileError {
+        module_hash: error.module_hash,
+        error: error.error,
+    })
 }
 
 #[derive(Debug, Default)]

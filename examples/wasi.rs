@@ -14,13 +14,12 @@
 //!
 //! Ready?
 
-use std::{io::Read, sync::Arc};
-
-use wasmer_wasix::{
-    Pipe, PluggableRuntime, Runtime,
-    runners::wasi::{RuntimeOrEngine, WasiRunner},
-    runtime::{module_cache::HashedModuleData, task_manager::tokio::TokioTaskManager},
+use std::{
+    io::Write,
+    sync::{Arc, Mutex},
 };
+
+use wasixv2::{Machine, ProcessConfig, Stdio, load};
 
 const HELLO_WASI_WAT: &[u8] = br#"
 (module
@@ -39,54 +38,39 @@ const HELLO_WASI_WAT: &[u8] = br#"
 "#;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let wasm_bytes = wasmer::wat2wasm(HELLO_WASI_WAT)?.into_owned();
-
-    // We optionally need a tokio runtime and a WASI runtime. This doesn't need to
-    // happen though; see the wasi-pipes example for an alternate approach. Things
-    // such as the file system or networking can be configured on the runtime.
-    let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
+    let wasm_bytes = wasmer::wat2wasm(HELLO_WASI_WAT)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()
-        .unwrap();
-    let _guard = tokio_runtime.enter();
-    let tokio_task_manager = TokioTaskManager::new(tokio_runtime.handle().clone());
-    let runtime = PluggableRuntime::new(Arc::new(tokio_task_manager));
+        .build()?;
+    let _guard = runtime.enter();
+    let machine = Machine::new();
+    let engine = wasmer::Engine::default();
 
     println!("Compiling module...");
-    // Let's compile the Wasm module.
-    let data = HashedModuleData::new(wasm_bytes.clone());
-    let module = runtime.load_hashed_module_sync(data, None)?;
+    let module = load(&engine, &wasm_bytes)?;
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let captured = output.clone();
+    let stdio = Stdio::from_fns(
+        move |bytes| captured.lock().unwrap().extend_from_slice(bytes),
+        |bytes| std::io::stderr().write_all(bytes).unwrap(),
+    );
 
-    // Create a pipe for the module's stdout.
-    let (stdout_tx, mut stdout_rx) = Pipe::channel();
-
-    {
-        // Create a WASI runner. We use a scope to make sure the runner is dropped
-        // as soon as we are done with it; otherwise, it will keep the stdout pipe
-        // open.
-        let mut runner = WasiRunner::new();
-        runner.with_stdout(Box::new(stdout_tx));
-
-        println!("Running module...");
-        // Now, run the module.
-        runner.run_wasm(
-            RuntimeOrEngine::Runtime(Arc::new(runtime)),
-            "hello",
-            module,
-            wasmer_types::ModuleHash::new(wasm_bytes),
-        )?;
-    }
+    println!("Running module...");
+    let status = runtime.block_on(machine.run_module(
+        &engine,
+        &module,
+        ProcessConfig {
+            args: vec!["hello".into()],
+            env: vec![],
+            stdio,
+        },
+    ))?;
+    assert_eq!(status, 0);
 
     println!("Run complete - reading output");
-
-    let mut buf = String::new();
-    stdout_rx.read_to_string(&mut buf).unwrap();
-
+    let buf = String::from_utf8(output.lock().unwrap().clone())?;
     println!("Output: {buf}");
-
-    // Verify the module wrote the correct thing, for the test below
     assert_eq!(buf, "Hello, world!\n");
-
     Ok(())
 }
 

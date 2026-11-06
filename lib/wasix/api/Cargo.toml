@@ -41,6 +41,8 @@ thiserror.workspace = true
 tracing.workspace = true
 wasmparser.workspace = true
 webc.workspace = true
+wasmer-package = { workspace = true, features = ["acquisition"], optional = true }
+wasmer-config = { workspace = true, optional = true }
 futures-util = { workspace = true, optional = true }
 async-trait.workspace = true
 wasm-bindgen = { workspace = true, optional = true }
@@ -56,7 +58,7 @@ tokio = { workspace = true, optional = true, features = ["fs", "io-util", "sync"
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 futures-util.workspace = true
 bincode = { workspace = true, features = ["serde"] }
-virtual-net = { path = "../../virtual-net" }
+wasix1-net-reference = { path = "tests/support/classic-reference" }
 wasixv2-vnet-web = { workspace = true }
 wasixv2-wait = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
@@ -70,6 +72,7 @@ wasm-bindgen-futures.workspace = true
 js-sys.workspace = true
 
 [features]
+resolved-packages = ["dep:wasmer-package", "dep:wasmer-config"]
 default = ["sys", "tokio", "host-network", "wasix1"]
 sys = [
   "wasmer/sys",

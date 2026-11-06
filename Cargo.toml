@@ -24,6 +24,7 @@ wasmer-middlewares = { version = "=7.5.0", path = "lib/middlewares", optional = 
 wasmer-types = { version = "=7.5.0", path = "lib/types" }
 wasmer-wast = { version = "=7.5.0", path = "tests/lib/wast", optional = true }
 wasmer-wasix = { path = "lib/wasix-legacy", optional = true }
+wasixv2 = { path = "lib/wasix/api", default-features = false, features = ["sys", "tokio", "wasix1"], optional = true }
 
 # Third party dependencies
 crossbeam-queue.workspace = true
@@ -72,7 +73,12 @@ members = [
   "tests/lib/wast",
   "tests/wasmer-argus",
 ]
-exclude = ["./lib/cli/tests/packages/axum", "lib/wild"]
+exclude = [
+  "./lib/cli/tests/packages/axum",
+  "lib/wild",
+  "lib/wasix/api/tests/support/classic-reference",
+  "lib/wasix/api/tests/support/classic-io-reference",
+]
 resolver = "2"
 
 [workspace.package]
@@ -421,7 +427,7 @@ v8-default = ["v8", "wasmer/v8-default"]
 engine = []
 cache = ["wasmer-cache"]
 wast = ["wasmer-wast"]
-wasi = ["wasmer-wasix", "tokio"]
+wasi = ["wasmer-wasix", "tokio", "dep:wasixv2"]
 wat = ["wasmer/wat"]
 compiler = ["wasmer/compiler", "backend", "wasmer-compiler/translator"]
 singlepass = ["compiler", "wasmer-compiler-singlepass", "wasmer/singlepass"]

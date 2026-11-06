@@ -20,6 +20,9 @@ mod cache;
 mod filesystem;
 mod hash;
 
+#[cfg(feature = "module-cache")]
+pub mod module_cache;
+
 pub use crate::cache::Cache;
 #[cfg(feature = "filesystem")]
 pub use crate::filesystem::FileSystemCache;

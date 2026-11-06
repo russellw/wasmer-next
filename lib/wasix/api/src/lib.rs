@@ -10,7 +10,15 @@ pub mod browser;
 pub mod terminal;
 
 mod package;
-pub use package::{Package, install_packages};
+pub use package::{
+    Package, PackageInstallSource, PreparedPackageSources, command_config, install_package_sources,
+    install_package_sources_with_root_overlays, install_packages, prepare_package_sources,
+};
+#[cfg(feature = "resolved-packages")]
+pub use package::{
+    ResolvedCommand, ResolvedLayout, ResolvedReaderProvider, ResolvedReaderVolume,
+    ResolvedVolumeRequest, preflight_resolved_filesystem,
+};
 
 mod directory;
 pub use directory::{DirectoryEntry, populate_directory};
@@ -2074,6 +2082,457 @@ pub fn targets_wasixv2(module: &Module) -> bool {
 #[cfg(all(test, feature = "tokio", not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "sys")]
+    mod dylink_preparation {
+        use super::*;
+        use std::sync::Weak;
+        use wasixv2_exec::{Abi, AbiInstance, Preparation, PreparedImage, Role, Wasixv2};
+        use wasmer::{Function, FunctionEnv, Imports, Instance, RuntimeError, StoreMut};
+
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Mode {
+            Ordinary,
+            Prepared,
+            Pending,
+            PrepareError,
+            BindError,
+            WrongMemory,
+        }
+        #[derive(Default)]
+        struct Probe {
+            events: Mutex<Vec<&'static str>>,
+            owner: Mutex<Weak<()>>,
+            error: Arc<()>,
+        }
+        #[derive(Debug, thiserror::Error)]
+        #[error("original base preparation error")]
+        struct OriginalError(Arc<()>);
+
+        #[derive(Clone)]
+        struct Base {
+            probe: Arc<Probe>,
+            mode: Mode,
+        }
+        struct Policy;
+        impl wasixv2_dylink::LoadPolicy for Policy {
+            fn paths(
+                &self,
+                name: &[u8],
+                _: Option<&[u8]>,
+                _: &[String],
+                _: &[u8],
+            ) -> Result<Vec<Vec<u8>>, String> {
+                Ok(vec![[b"/prepared/".as_slice(), name].concat()])
+            }
+            fn scope(&self, _: u32, _: usize, native: Vec<usize>) -> Option<Vec<usize>> {
+                Some(native)
+            }
+        }
+        impl Abi<MachineSyscalls> for Base {
+            fn name(&self) -> &'static str {
+                "dylink-base-preparation-proof"
+            }
+            fn matches(&self, _: &Module) -> bool {
+                true
+            }
+            fn matches_image(&self, _: &[u8]) -> bool {
+                true
+            }
+            fn for_image(&self, module: &Module) -> Option<Arc<dyn Abi<MachineSyscalls>>> {
+                wasixv2_dylink::compose(module, Arc::new(self.clone()), Arc::new(Policy))
+            }
+            fn imports(
+                &self,
+                store: &mut StoreMut<'_>,
+                env: &FunctionEnv<ExecEnv<MachineSyscalls>>,
+                module: &Module,
+            ) -> Imports {
+                let mut imports = Wasixv2.imports(store, env, module);
+                imports.define("proof", "value", Function::new_typed(store, || 3i32));
+                imports
+            }
+            fn prepare<'a>(
+                &'a self,
+                cx: &'a Preparation<'a, MachineSyscalls>,
+            ) -> LocalFuture<'a, Result<Option<Box<dyn PreparedImage<MachineSyscalls>>>, ExecError>>
+            {
+                Box::pin(async move {
+                    self.probe.events.lock().unwrap().push("base-prepare");
+                    if self.mode == Mode::PrepareError {
+                        return Err(ExecError::StoreMode(RuntimeError::user(Box::new(
+                            OriginalError(self.probe.error.clone()),
+                        ))));
+                    }
+                    if self.mode == Mode::Ordinary {
+                        return Ok(None);
+                    }
+                    let owner = Arc::new(());
+                    *self.probe.owner.lock().unwrap() = Arc::downgrade(&owner);
+                    let imports = cx
+                        .with_store(|_, store| {
+                            let mut imports = Imports::new();
+                            imports.define(
+                                "proof",
+                                "value",
+                                Function::new_typed(store, move || {
+                                    let _ = &owner;
+                                    17i32
+                                }),
+                            );
+                            if self.mode == Mode::WrongMemory {
+                                let ty = cx.imported_memory().unwrap().ty(store);
+                                imports.define(
+                                    "env",
+                                    "memory",
+                                    wasmer::Memory::new(store, ty).unwrap(),
+                                );
+                            }
+                            imports
+                        })
+                        .await;
+                    let prepared = Prepared {
+                        base: self.clone(),
+                        imports,
+                    };
+                    if self.mode == Mode::Pending {
+                        std::future::pending::<()>().await;
+                    }
+                    self.probe.events.lock().unwrap().push("base-prepared");
+                    Ok(Some(
+                        Box::new(prepared) as Box<dyn PreparedImage<MachineSyscalls>>
+                    ))
+                })
+            }
+            fn bind(
+                &self,
+                instance: &Instance,
+                store: &mut StoreMut<'_>,
+                task: TaskId,
+                role: Role,
+            ) -> Result<Arc<dyn AbiInstance<MachineSyscalls>>, ExecError> {
+                self.probe.events.lock().unwrap().push("ordinary-bind");
+                assert!(
+                    self.mode == Mode::Ordinary,
+                    "prepared bind must not fall back"
+                );
+                Wasixv2.bind(instance, store, task, role)
+            }
+        }
+        struct Prepared {
+            base: Base,
+            imports: Imports,
+        }
+        impl Drop for Prepared {
+            fn drop(&mut self) {
+                self.base.probe.events.lock().unwrap().push("prepared-drop");
+            }
+        }
+        impl PreparedImage<MachineSyscalls> for Prepared {
+            fn imports(&self) -> &Imports {
+                &self.imports
+            }
+            fn bind(
+                self: Box<Self>,
+                instance: &Instance,
+                store: &mut StoreMut<'_>,
+                task: TaskId,
+                role: Role,
+            ) -> Result<Arc<dyn AbiInstance<MachineSyscalls>>, ExecError> {
+                self.base.probe.events.lock().unwrap().push("prepared-bind");
+                assert!(self.base.probe.owner.lock().unwrap().upgrade().is_some());
+                if self.base.mode == Mode::BindError {
+                    return Err(ExecError::StoreMode(RuntimeError::user(Box::new(
+                        OriginalError(self.base.probe.error.clone()),
+                    ))));
+                }
+                Wasixv2.bind(instance, store, task, role)
+            }
+        }
+        struct Hook {
+            probe: Arc<Probe>,
+            replace: bool,
+        }
+        impl InstantiationHook<MachineSyscalls> for Hook {
+            fn prepare_imports(
+                &self,
+                _: &Module,
+                store: &mut StoreMut<'_>,
+                env: &FunctionEnv<ExecEnv<MachineSyscalls>>,
+                imports: &mut Imports,
+            ) -> Result<Option<Box<dyn InstanceAttachment>>, RuntimeError> {
+                let mut events = self.probe.events.lock().unwrap();
+                assert!(events.contains(&"base-prepare"));
+                events.push("hook");
+                assert_eq!(
+                    imports.get_export("proof", "value"),
+                    env.as_ref(store).abi_imports().get_export("proof", "value"),
+                    "side modules must reuse the effective protected ABI imports"
+                );
+                if self.replace {
+                    imports.define("proof", "value", Function::new_typed(store, || 99i32));
+                }
+                Ok(None)
+            }
+        }
+
+        // Match the source WAT/dylink.0 fixtures in tests/custom_bindings.rs.
+        fn pic(wat: &str, needed: &[&str]) -> Vec<u8> {
+            fn leb(mut value: u32, out: &mut Vec<u8>) {
+                loop {
+                    let byte = (value & 127) as u8;
+                    value >>= 7;
+                    out.push(byte | if value == 0 { 0 } else { 128 });
+                    if value == 0 {
+                        break;
+                    }
+                }
+            }
+            let mut wasm = wat::parse_str(wat).unwrap();
+            let mut section = b"\x08dylink.0\x01\x05\x80\x04\x00\x00\x00".to_vec();
+            if !needed.is_empty() {
+                let mut names = Vec::new();
+                leb(needed.len() as u32, &mut names);
+                for name in needed {
+                    leb(name.len() as u32, &mut names);
+                    names.extend_from_slice(name.as_bytes());
+                }
+                section.push(2);
+                leb(names.len() as u32, &mut section);
+                section.extend(names);
+            }
+            wasm.push(0);
+            leb(section.len() as u32, &mut wasm);
+            wasm.extend(section);
+            wasm
+        }
+        fn main_image(startup: bool) -> Vec<u8> {
+            let (side, body, needed) = if startup {
+                (
+                    "(import \"env\" \"side_value\" (func $side (result i32)))",
+                    "call $value call $side i32.add",
+                    vec!["side.so"],
+                )
+            } else {
+                ("", "call $value", Vec::new())
+            };
+            pic(
+                &format!(
+                    r#"(module
+                (import "env" "memory" (memory 1 65536 shared))
+                (import "env" "__indirect_function_table" (table 3 funcref))
+                (import "proof" "value" (func $value (result i32)))
+                (import "wasixv2" "exit_group" (func $exit (param i32)))
+                {side}
+                (global (export "__stack_pointer") (mut i32) (i32.const 131072))
+                (export "__indirect_function_table" (table 0))
+                (func (export "_start") {body} call $exit))"#
+                ),
+                &needed,
+            )
+        }
+        async fn machine(mode: Mode, probe: Arc<Probe>, hook: Option<bool>) -> Machine {
+            let mut machine = Machine::new();
+            let mut abis = Abis::new();
+            abis.push(Arc::new(Base {
+                probe: probe.clone(),
+                mode,
+            }));
+            if let Some(replace) = hook {
+                abis.push_instantiation_hook(Arc::new(Hook { probe, replace }));
+            }
+            machine.abis = Arc::new(abis);
+            let side = pic(
+                r#"(module
+                (import "env" "memory" (memory 1 65536 shared))
+                (import "proof" "value" (func $value (result i32)))
+                (func (export "side_value") (result i32) call $value))"#,
+                &[],
+            );
+            let (uid, gid) = machine.owner;
+            let layer = Layer(Arc::new(
+                PackageFs::from_files(
+                    [("side.so".into(), OwnedBuffer::from_bytes(side))],
+                    uid,
+                    gid,
+                )
+                .unwrap(),
+            ));
+            machine
+                .mount_layer("/prepared", &layer, false)
+                .await
+                .unwrap();
+            machine
+        }
+        fn assert_original(error: RunError, probe: &Probe) {
+            let RunError::Exec(ExecError::StoreMode(error)) = error else {
+                panic!("base error must survive unchanged: {error:?}");
+            };
+            assert!(Arc::ptr_eq(
+                &error.downcast_ref::<OriginalError>().unwrap().0,
+                &probe.error
+            ));
+        }
+
+        #[tokio::test]
+        async fn base_and_startup_preparation_compose_with_and_without_protected_hooks() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    for startup in [false, true] {
+                        for mode in [Mode::Ordinary, Mode::Prepared] {
+                            for hook in [None, Some(false)] {
+                                let probe = Arc::new(Probe::default());
+                                let machine = machine(mode, probe.clone(), hook).await;
+                                let result = machine
+                                    .run(&main_image(startup), Stdio::from_fns(|_| {}, |_| {}))
+                                    .await;
+                                machine.shutdown().await;
+                                let expected = if mode == Mode::Prepared { 17 } else { 3 };
+                                assert_eq!(result.unwrap(), expected * if startup { 2 } else { 1 });
+                                let events = probe.events.lock().unwrap();
+                                let binding = if mode == Mode::Prepared {
+                                    "prepared-bind"
+                                } else {
+                                    "ordinary-bind"
+                                };
+                                assert_eq!(
+                                    events.iter().filter(|event| **event == binding).count(),
+                                    1
+                                );
+                                if mode == Mode::Prepared {
+                                    assert_eq!(
+                                        events
+                                            .iter()
+                                            .filter(|event| **event == "prepared-drop")
+                                            .count(),
+                                        1
+                                    );
+                                }
+                                assert!(
+                                    probe.owner.lock().unwrap().upgrade().is_none(),
+                                    "the retired Store releases the prepared import graph"
+                                );
+                            }
+                        }
+                    }
+                })
+                .await;
+        }
+
+        #[tokio::test]
+        async fn base_prepare_error_or_cancellation_never_reaches_protected_hooks() {
+            use std::{
+                future::Future,
+                task::{Context, Waker},
+            };
+            for mode in [Mode::PrepareError, Mode::Pending] {
+                let probe = Arc::new(Probe::default());
+                let local = tokio::task::LocalSet::new();
+                local
+                    .run_until(async {
+                        let machine = machine(mode, probe.clone(), Some(false)).await;
+                        let image = main_image(true);
+                        let mut run =
+                            Box::pin(machine.run(&image, Stdio::from_fns(|_| {}, |_| {})));
+                        if mode == Mode::Pending {
+                            assert!(
+                                run.as_mut()
+                                    .poll(&mut Context::from_waker(Waker::noop()))
+                                    .is_pending()
+                            );
+                            assert!(probe.owner.lock().unwrap().upgrade().is_some());
+                            drop(run);
+                            assert_eq!(
+                                probe.events.lock().unwrap().as_slice(),
+                                ["base-prepare", "prepared-drop"]
+                            );
+                            assert!(
+                                probe.owner.lock().unwrap().upgrade().is_some(),
+                                "transferred cleanup retains the actual Store arena"
+                            );
+                        } else {
+                            assert_original(run.await.unwrap_err(), &probe);
+                        }
+                        machine.shutdown().await;
+                        drop(machine);
+                    })
+                    .await;
+                // Runner cancellation transfers the Store to local cleanup. Kernel
+                // shutdown ends tasks; await the actual executor drain before checking
+                // that the Store-owned host import graph has been released.
+                tokio::time::timeout(std::time::Duration::from_secs(10), local)
+                    .await
+                    .expect("canceled preparation cleanup drained");
+                let events = probe.events.lock().unwrap();
+                assert!(!events.contains(&"hook"));
+                assert!(!events.contains(&"ordinary-bind"));
+                assert!(!events.contains(&"prepared-bind"));
+                assert!(probe.owner.lock().unwrap().upgrade().is_none());
+                if mode == Mode::Pending {
+                    assert_eq!(events.as_slice(), ["base-prepare", "prepared-drop"]);
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn prepared_base_bind_and_import_failures_release_startup_ownership() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    for (mode, replace) in [
+                        (Mode::BindError, false),
+                        (Mode::WrongMemory, false),
+                        (Mode::Prepared, true),
+                    ] {
+                        let probe = Arc::new(Probe::default());
+                        let mut machine = machine(mode, probe.clone(), Some(replace)).await;
+                        let error = machine
+                            .run(&main_image(true), Stdio::from_fns(|_| {}, |_| {}))
+                            .await
+                            .unwrap_err();
+                        if mode == Mode::BindError {
+                            assert_original(error, &probe);
+                        } else if mode == Mode::WrongMemory {
+                            assert!(matches!(
+                                error,
+                                RunError::Exec(ExecError::Load(LoadError::Format(Errno::EINVAL)))
+                            ));
+                            assert!(!probe.events.lock().unwrap().contains(&"hook"));
+                        } else {
+                            assert!(error.to_string().contains("replaced an earlier import"));
+                        }
+                        assert!(!probe.events.lock().unwrap().contains(&"ordinary-bind"));
+                        assert_eq!(
+                            probe
+                                .events
+                                .lock()
+                                .unwrap()
+                                .iter()
+                                .filter(|event| **event == "prepared-drop")
+                                .count(),
+                            1
+                        );
+                        assert!(probe.owner.lock().unwrap().upgrade().is_none());
+                        // A fresh process proves later Machine operations remain usable;
+                        // its new gate does not observe the failed image's registration.
+                        let mut abis = Abis::new();
+                        abis.push(Arc::new(Base {
+                            probe: Arc::new(Probe::default()),
+                            mode: Mode::Prepared,
+                        }));
+                        machine.abis = Arc::new(abis);
+                        assert_eq!(
+                            machine
+                                .run(&main_image(true), Stdio::from_fns(|_| {}, |_| {}))
+                                .await
+                                .unwrap(),
+                            34
+                        );
+                        machine.shutdown().await;
+                    }
+                })
+                .await;
+        }
+    }
 
     #[cfg(feature = "wasix1")]
     #[tokio::test]

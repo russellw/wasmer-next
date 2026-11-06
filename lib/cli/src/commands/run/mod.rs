@@ -4,6 +4,8 @@ mod runtime;
 mod target;
 #[cfg(unix)]
 mod terminal;
+#[cfg(unix)]
+mod terminal_signals;
 mod wasi;
 
 use std::{io::Write, path::PathBuf, sync::Arc, time::Duration};
@@ -15,7 +17,6 @@ use indicatif::ProgressBar;
 use wasixv2::{Image, Loader as _};
 use wasmer::{Function, Imports, Instance, Module, RuntimeError, Store, Type, Value, wat2wasm};
 use wasmer_types::target::Target;
-use wasmer_wasix::{Runtime, runtime::package_loader::builtin_loader::FileSystemCache};
 
 use crate::{
     backend::RuntimeOptions, commands::run::target::TargetOnDisk, config::WasmerEnv,
@@ -25,7 +26,6 @@ use crate::{
 use self::{
     machine::{CachedLoader, MachineProgram, runs_on_machine, wasm_runs_on_machine},
     package_source::CliPackageSource,
-    runtime::MonitoringRuntime,
     target::ExecutableTarget,
     wasi::Wasi,
 };
@@ -139,21 +139,17 @@ impl Run {
             wasmer_vm::set_stack_size(stack_size);
         }
 
-        let runtime = self.wasi.prepare_runtime(
+        let runtime = self.wasi.prepare_context(
             engine.clone(),
             &self.env,
             runtime,
             preferred_webc_version,
             self.rt.compiler_debug_dir.is_some(),
+            pb.clone(),
+            output.is_quiet_or_no_tty(),
         )?;
 
-        // This is a slow operation, so let's temporarily wrap the runtime with
-        // something that displays progress
-        let monitoring_runtime = Arc::new(
-            MonitoringRuntime::new(runtime, pb.clone(), output.is_quiet_or_no_tty())
-                .with_checkouts(FileSystemCache::new(self.env.cache_dir().join("checkouts"))),
-        );
-        let runtime: Arc<dyn Runtime + Send + Sync> = monitoring_runtime.clone();
+        let runtime = Arc::new(runtime);
         // Compiles everything the machine runs, starting with the engine picked here.
         let loader = Arc::new(CachedLoader::new(
             runtime.clone(),
@@ -163,7 +159,7 @@ impl Run {
         ));
 
         // `--use`: packages whose commands and volumes join the program's.
-        let used = self.used_packages(&monitoring_runtime)?;
+        let used = self.used_packages(&runtime)?;
 
         // A `#!` script runs as its interpreter does on Linux: the kernel's `execve` reads the
         // `#!` line and starts the interpreter it names, from the guest's filesystem.
@@ -212,13 +208,12 @@ impl Run {
                 }
             }
             ExecutableTarget::Package(pkg) => {
-                if pkg.webc_version == webc::Version::V2 {
+                if pkg.package.webc_version == webc::Version::V2 {
                     crate::warning!(
                         "WebC v2 is a deprecated format and support for it will be removed in a future release"
                     );
                 }
-                let tree = monitoring_runtime.package_tree();
-                let program = self.machine_program(&pkg, &tree)?.using(used);
+                let program = self.machine_program(&pkg)?.using(used);
                 self.execute_machine(program, loader, &engine, &handle)
             }
         }

@@ -3,7 +3,8 @@
 //! whose command runs one of them.
 
 use std::{
-    collections::{HashMap, hash_map::Entry},
+    cell::RefCell,
+    collections::HashMap,
     io,
     net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
@@ -12,43 +13,43 @@ use std::{
 
 use anyhow::{Context, Error, bail};
 use wasixv2::{
-    CommandDefaults, Console, Credentials, Dns, Image, ImageId, Layer, LoadError, Loader,
-    LocalFuture, Machine, OwnedBuffer, ProcessConfig, Signaller, Stdio, Uname, wasix1_http,
+    CommandDefaults, Console, Credentials, Dns, Image, ImageId, LoadError, Loader, LocalFuture,
+    Machine, OwnedBuffer, PackageInstallSource, ProcessConfig, ResolvedCommand as PackageCommand,
+    ResolvedLayout, ResolvedReaderVolume, ResolvedVolumeRequest, Signaller, Stdio, Uname,
+    prepare_package_sources, wasix1_http,
 };
 use wasmer::{Engine, Module};
+use wasmer_cache::module_cache::HashedModuleData;
+use wasmer_config::filesystem::MAPPED_CURRENT_DIR_DEFAULT_PATH;
 use wasmer_config::package::{PackageId, PackageSource};
+use wasmer_package::loader::LoadedPackage;
 use wasmer_types::{ModuleHash, target::Target};
-use wasmer_wasix::{
-    Runtime,
-    bin_factory::BinaryPackage,
-    runners::MAPPED_CURRENT_DIR_DEFAULT_PATH,
-    runtime::{module_cache::HashedModuleData, task_manager::VirtualTaskManagerExt as _},
-};
+
 use webc::{
     Container,
     metadata::annotations::{WASI_RUNNER_URI, Wasi as WasiAnnotation},
     v3::read::OwnedReader,
 };
 
-#[cfg(unix)]
-use super::terminal::{self, HostTerminal};
 use super::{
     CliPackageSource, GuestExit, Run, exit_with_wasi_exit_code,
-    runtime::{MonitoringRuntime, PackageTree},
+    runtime::{ModuleCompiler, PackageTree, RunContext, RunPackage},
     wasi::{DnsMode, utf8_env_part},
 };
+#[cfg(unix)]
+use super::{terminal::HostTerminal, terminal_signals::TerminalSignals};
 use crate::backend::{BackendType, RuntimeOptions};
 use crate::utils::PublishedProtocol;
 
 /// The CLI's historical rules, independent of the kernel's socket implementation.
 #[derive(Debug)]
-struct NetworkRules(virtual_net::ruleset::Ruleset);
+struct NetworkRules(wasmer_config::network_rules::Ruleset);
 
 impl wasixv2::NetworkPolicy for NetworkRules {
     fn allows_socket(&self, addr: SocketAddr, direction: wasixv2::PolicyDirection) -> bool {
         let direction = match direction {
-            wasixv2::PolicyDirection::Inbound => virtual_net::ruleset::Direction::Inbound,
-            wasixv2::PolicyDirection::Outbound => virtual_net::ruleset::Direction::Outbound,
+            wasixv2::PolicyDirection::Inbound => wasmer_config::network_rules::Direction::Inbound,
+            wasixv2::PolicyDirection::Outbound => wasmer_config::network_rules::Direction::Outbound,
         };
         self.0.allows_socket(addr, direction)
     }
@@ -71,9 +72,7 @@ pub(super) struct MachineProgram {
     /// The command's `wasi` annotation, for a package.
     wasi: Option<WasiAnnotation>,
     /// The package volumes to mount, each over the ones before it.
-    volumes: Vec<PackageVolume>,
-    /// The package tree's commands, for `/bin` and `/usr/bin`.
-    commands: Vec<PackageCommand>,
+    layout: ResolvedLayout,
     /// A host directory to map read-only to [`SCRIPT_DIR`]: that of a host script no
     /// `--volume` holds.
     script_dir: Option<PathBuf>,
@@ -92,30 +91,13 @@ enum Start {
     File(String),
 }
 
-/// A command of the package tree: `/bin/<name>` and `/usr/bin/<name>` hold its atom.
-struct PackageCommand {
-    name: String,
-    atom: OwnedBuffer,
-    /// What WASIX v1 programs that start it pass along, from its `wasi` annotation.
-    defaults: CommandDefaults,
-}
-
-/// A volume of a package in the tree, and where it goes.
-struct PackageVolume {
-    reader: Arc<OwnedReader>,
-    name: String,
-    /// An absolute guest path; `/` makes the volume a layer of the root filesystem.
-    mount_path: String,
-}
-
 impl MachineProgram {
     pub(super) fn module(path: &Path, engine: Engine, module: Module) -> Self {
         Self {
             argv0: path.display().to_string(),
             start: Start::Module { engine, module },
             wasi: None,
-            volumes: Vec::new(),
-            commands: Vec::new(),
+            layout: ResolvedLayout::default(),
             script_dir: None,
         }
     }
@@ -127,8 +109,7 @@ impl MachineProgram {
             argv0: guest.clone(),
             start: Start::File(guest),
             wasi: None,
-            volumes: Vec::new(),
-            commands: Vec::new(),
+            layout: ResolvedLayout::default(),
             script_dir,
         }
     }
@@ -153,23 +134,16 @@ impl MachineProgram {
     /// after the program's package's, so a name that has stays its, and their volumes before
     /// its volumes, which obscure them.
     pub(super) fn using(mut self, used: Vec<UsedPackage>) -> Self {
-        let mut volumes = Vec::new();
-        for package in used {
-            volumes.extend(package.volumes);
-            self.commands.extend(package.commands);
-        }
-        volumes.append(&mut self.volumes);
-        // A stable sort keeps the obscuring order among mounts at the same depth.
-        volumes.sort_by_key(|v| Path::new(&v.mount_path).components().count());
-        self.volumes = volumes;
+        self.layout = self
+            .layout
+            .using(used.into_iter().map(|package| package.layout));
         self
     }
 }
 
 /// A package `--use` names: its tree's commands and volumes.
 pub(super) struct UsedPackage {
-    volumes: Vec<PackageVolume>,
-    commands: Vec<PackageCommand>,
+    layout: ResolvedLayout,
 }
 
 /// Whether the host file at `path` is a `#!` script, which runs as its interpreter on the
@@ -189,7 +163,7 @@ pub(super) fn is_script(path: &Path) -> bool {
 /// the same image find the module by the image's identity (a package file's buffer) or, for a
 /// copy, by a hash of its bytes, without looking at them again.
 pub(super) struct CachedLoader {
-    runtime: Arc<dyn Runtime + Send + Sync>,
+    compiler: Arc<dyn ModuleCompiler>,
     options: RuntimeOptions,
     deny_multiple_wasi_versions: bool,
     /// One engine per backend: the one `wasmer run` picked, and others made when an image
@@ -217,13 +191,13 @@ impl CachedLoader {
     /// A loader that compiles on `engine`, the backend `wasmer run` picked, whatever needs
     /// no other.
     pub(super) fn new(
-        runtime: Arc<dyn Runtime + Send + Sync>,
+        compiler: Arc<dyn ModuleCompiler>,
         options: RuntimeOptions,
         engine: (BackendType, Engine),
         deny_multiple_wasi_versions: bool,
     ) -> Self {
         Self {
-            runtime,
+            compiler,
             options,
             deny_multiple_wasi_versions,
             engines: Mutex::new(vec![engine]),
@@ -259,7 +233,7 @@ impl CachedLoader {
         // Key the persistent cache by the actual compiler input, never the source's
         // legacy instrument-only hash or a package atom's unprepared hash.
         let wasm = HashedModuleData::new(instrumented);
-        let module = self.runtime.load_hashed_module(wasm, Some(&engine)).await?;
+        let module = self.compiler.compile(wasm, &engine).await?;
         validate_wasi_versions(&module, self.deny_multiple_wasi_versions)?;
         if let Some(err) = failed {
             wasixv2::warn_not_preemptible(&err);
@@ -310,42 +284,30 @@ impl Loader for CachedLoader {
 mod loader_tests {
     use super::*;
     use futures::{executor::block_on, future::BoxFuture};
-    use wasmer_wasix::{SpawnError, VirtualTaskManager, runtime::resolver::Source};
+    use wasmer_cache::module_cache::ModuleCompileError;
 
     #[derive(Debug, Default)]
-    struct RecordingRuntime {
+    struct RecordingCompiler {
         requests: Mutex<Vec<HashedModuleData>>,
         cache: Mutex<HashMap<ModuleHash, Module>>,
     }
 
-    impl Runtime for RecordingRuntime {
-        fn networking(&self) -> &virtual_net::DynVirtualNetworking {
-            unreachable!("compiling an image needs no networking")
-        }
-
-        fn task_manager(&self) -> &Arc<dyn VirtualTaskManager> {
-            unreachable!("compiling an image needs no task manager")
-        }
-
-        fn source(&self) -> Arc<dyn Source + Send + Sync> {
-            unreachable!("compiling an image needs no package resolver")
-        }
-
-        fn load_hashed_module(
-            &self,
+    impl ModuleCompiler for RecordingCompiler {
+        fn compile<'a>(
+            &'a self,
             data: HashedModuleData,
-            engine: Option<&Engine>,
-        ) -> BoxFuture<'_, Result<Module, SpawnError>> {
+            engine: &'a Engine,
+        ) -> BoxFuture<'a, Result<Module, ModuleCompileError>> {
             self.requests.lock().unwrap().push(data.clone());
             let hash = *data.hash();
             let mut cache = self.cache.lock().unwrap();
             let module = match cache.get(&hash) {
                 Some(module) => Ok(module.clone()),
-                None => Module::new(engine.unwrap(), data.wasm())
+                None => Module::new(engine, data.wasm())
                     .inspect(|module| {
                         cache.insert(hash, module.clone());
                     })
-                    .map_err(|error| SpawnError::CompileError {
+                    .map_err(|error| ModuleCompileError {
                         module_hash: hash,
                         error,
                     }),
@@ -354,11 +316,11 @@ mod loader_tests {
         }
     }
 
-    fn loader() -> (CachedLoader, Arc<RecordingRuntime>, Engine) {
+    fn loader() -> (CachedLoader, Arc<RecordingCompiler>, Engine) {
         let options = RuntimeOptions::default();
         let backend = options.get_available_backends().unwrap()[0];
         let engine = backend.get_engine(&Target::default(), &options).unwrap();
-        let runtime = Arc::new(RecordingRuntime::default());
+        let runtime = Arc::new(RecordingCompiler::default());
         let loader = CachedLoader::new(runtime.clone(), options, (backend, engine.clone()), false);
         (loader, runtime, engine)
     }
@@ -514,23 +476,27 @@ mod loader_tests {
     }
 }
 
-/// Keep version recognition in the existing WASI detector: unrelated import modules do
-/// not count, and multiple functions from one version still name only one version.
+/// Recognize function namespaces in the historical version order; HTTP is an extension.
 fn validate_wasi_versions(module: &Module, deny_multiple: bool) -> Result<(), Error> {
-    if deny_multiple && let Some(mut versions) = wasmer_wasix::get_wasi_versions(module, false) {
-        // The legacy detector also labels the HTTP extension Wasix64v1. Only an actual
-        // wasix_64v1 function namespace constitutes that WASI version for this option.
-        if !module
-            .imports()
-            .functions()
-            .any(|import| import.module() == "wasix_64v1")
-        {
-            versions.remove(&wasmer_wasix::WasiVersion::Wasix64v1);
-        }
+    if deny_multiple {
+        let versions: Vec<_> = [
+            "wasi_unstable",
+            "wasi_snapshot_preview1",
+            "wasix_32v1",
+            "wasix_64v1",
+        ]
+        .into_iter()
+        .filter(|namespace| {
+            module
+                .imports()
+                .functions()
+                .any(|import| import.module() == *namespace)
+        })
+        .collect();
         if versions.len() >= 2 {
             let names = versions
                 .iter()
-                .map(|version| format!("`{}`", version.get_namespace_str()))
+                .map(|version| format!("`{version}`"))
                 .collect::<Vec<_>>()
                 .join(", ");
             bail!(
@@ -575,7 +541,7 @@ fn mapped_commands(mappings: &[String]) -> Result<Vec<PackageCommand>, Error> {
 /// The historical guest HTTP capability, distinct from package downloads. Like v1's
 /// client_impl, use the runtime HTTP client's defaults for timeout/redirects and report no
 /// redirect URL list. The flag grants all hosts; without it no provider is installed.
-struct GuestHttpProvider(wasmer_wasix::http::DynHttpClient);
+struct GuestHttpProvider(wasmer_package::http::DynHttpClient);
 
 impl wasix1_http::HttpProvider for GuestHttpProvider {
     fn send(
@@ -595,12 +561,12 @@ impl wasix1_http::HttpProvider for GuestHttpProvider {
             }
             let response = self
                 .0
-                .request(wasmer_wasix::http::HttpRequest {
+                .request(wasmer_package::http::HttpRequest {
                     url,
                     method,
                     headers,
                     body: request.body,
-                    options: wasmer_wasix::http::HttpRequestOptions::default(),
+                    options: wasmer_package::http::HttpRequestOptions::default(),
                 })
                 .await
                 .map_err(|e| e.to_string())?;
@@ -616,36 +582,6 @@ impl wasix1_http::HttpProvider for GuestHttpProvider {
             })
         })
     }
-}
-
-/// The commands of the package tree, in the order the resolver gave them: it made each name
-/// that of the first package in the tree (the root, then its dependencies) that has it.
-///
-/// Every command becomes a file, whatever its runner, as v1 installed them: running one is
-/// `execve` of the file, which starts what some ABI serves and fails with `ENOEXEC` for
-/// anything else, as Linux's binary formats decide. A WCGI command's atom is a WASI program
-/// and runs as one, as a CGI program run by hand does; a WASM-4 cartridge is `ENOEXEC`. Only
-/// the program `wasmer run` starts itself must have the WASI runner.
-fn package_commands(pkg: &BinaryPackage) -> Result<Vec<PackageCommand>, Error> {
-    pkg.commands
-        .iter()
-        .map(|cmd| {
-            let wasi = cmd
-                .metadata()
-                .annotation::<WasiAnnotation>(WasiAnnotation::KEY)
-                .with_context(|| format!("invalid annotations on the \"{}\" command", cmd.name()))?
-                .unwrap_or_else(|| WasiAnnotation::new(cmd.name()));
-            Ok(PackageCommand {
-                name: cmd.name().to_string(),
-                atom: cmd.atom(),
-                defaults: CommandDefaults {
-                    argv0: wasi.exec_name,
-                    args: wasi.main_args.unwrap_or_default(),
-                    env: wasi.env.unwrap_or_default(),
-                },
-            })
-        })
-        .collect()
 }
 
 /// Whether the machine runs `module`, a precompiled module: one importing WASIX v2, or WASIX v1
@@ -681,11 +617,9 @@ pub(super) fn wasm_runs_on_machine(wasm: &[u8]) -> Result<bool, Error> {
 impl Run {
     /// The program to run for the package's selected command, chosen as `--entrypoint` or the
     /// package's entrypoint says. `tree` is the package tree `pkg` was loaded from.
-    pub(super) fn machine_program(
-        &self,
-        pkg: &BinaryPackage,
-        tree: &PackageTree,
-    ) -> Result<MachineProgram, Error> {
+    pub(super) fn machine_program(&self, package: &RunPackage) -> Result<MachineProgram, Error> {
+        let pkg = &package.package;
+        let tree = &package.tree;
         let name = match self.entrypoint.as_deref() {
             Some(name) => name,
             None => pkg.infer_entrypoint()?,
@@ -707,118 +641,85 @@ impl Run {
             CliPackageSource::File(path) => Some(path.as_path()),
             _ => None,
         };
+        let layout = self.package_layout(tree, pkg, file)?;
+        ResolvedLayout::validate_command_annotations(pkg)?;
         Ok(MachineProgram {
             argv0: wasi.exec_name.clone().unwrap_or_else(|| name.to_string()),
             start: Start::File(format!("/bin/{name}")),
             wasi: Some(wasi),
-            volumes: self.package_volumes(tree, file)?,
-            commands: package_commands(pkg)?,
+            layout,
             script_dir: None,
         })
     }
 
     /// The packages `--use` names, loaded through `runtime`, each with its dependencies, as
     /// v1 loaded them.
-    pub(super) fn used_packages<R>(
+    pub(super) fn used_packages(
         &self,
-        runtime: &Arc<MonitoringRuntime<R>>,
-    ) -> Result<Vec<UsedPackage>, Error>
-    where
-        R: Runtime + Send + Sync + 'static,
-    {
+        context: &Arc<RunContext>,
+    ) -> Result<Vec<UsedPackage>, Error> {
         let mut used = Vec::new();
         for name in &self.wasi.uses {
             let specifier = name
                 .parse::<PackageSource>()
                 .with_context(|| format!("Unable to parse \"{name}\" as a package specifier"))?;
-            let rt = runtime.clone();
-            let pkg = runtime
-                .task_manager()
-                .spawn_and_block_on(async move {
-                    BinaryPackage::from_registry(&specifier, rt.as_ref()).await
-                })
-                .with_context(|| format!("Unable to load \"{name}\""))?
+            let pkg = context
+                .block_on(context.load_registry(&specifier))
                 .with_context(|| format!("Unable to load \"{name}\""))?;
-            // The tree the runtime loaded last is this package's.
-            let tree = runtime.package_tree();
-            used.push(UsedPackage {
-                volumes: self.package_volumes(&tree, None)?,
-                commands: package_commands(&pkg)?,
-            });
+            let layout = self.package_layout(&pkg.tree, &pkg.package, None)?;
+            ResolvedLayout::validate_command_annotations(&pkg.package)?;
+            used.push(UsedPackage { layout });
         }
         Ok(used)
     }
 
-    /// The volumes of the tree's filesystem table, each after the ones it obscures and parents
-    /// before what is mounted inside them. A package directory's own table maps host
-    /// directories instead; they arrive as `--volume`s. `file` is the file the tree's root was
-    /// loaded from, when it was not downloaded.
-    fn package_volumes(
+    /// Supply only the selected mapping's known reader. A selected read/parse error
+    /// is final; the shared installer never substitutes an opaque backing after it.
+    fn package_layout(
         &self,
         tree: &PackageTree,
+        package: &LoadedPackage,
         file: Option<&Path>,
-    ) -> Result<Vec<PackageVolume>, Error> {
-        let mut volumes = Vec::new();
-        let mut readers: HashMap<&PackageId, Reader> = HashMap::new();
-        // Mappings earlier in the table obscure later ones, so they are mounted last.
-        for mapping in tree.filesystem.iter().rev() {
-            let is_root = tree.root.as_ref() == Some(&mapping.package);
-            if is_root && tree.root_is_local_dir {
-                continue;
-            }
-            let mount_path = mapping.mount_path.to_str().with_context(|| {
-                format!(
-                    "the mount path {} is not UTF-8",
-                    mapping.mount_path.display()
-                )
-            })?;
-            if !mount_path.starts_with('/') {
-                bail!(
-                    "the package \"{}\" mounts a volume at a relative path, {mount_path}",
-                    mapping.package
-                );
-            }
-            let reader = match readers.entry(&mapping.package) {
-                Entry::Occupied(entry) => entry.into_mut(),
-                Entry::Vacant(entry) => {
-                    let container = tree.containers.get(&mapping.package).with_context(|| {
-                        format!(
-                            "the package \"{}\" is not in the dependency tree",
-                            mapping.package
+    ) -> Result<ResolvedLayout, Error> {
+        let readers: RefCell<HashMap<PackageId, Reader>> = RefCell::new(HashMap::new());
+        let provider =
+            |request: ResolvedVolumeRequest<'_>| -> io::Result<Option<ResolvedReaderVolume>> {
+                let mut readers = readers.borrow_mut();
+                let reader = match readers.entry(request.package.clone()) {
+                    std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let selected_file =
+                            match (file, tree.root.as_ref() == Some(request.package)) {
+                                (Some(path), true) => Some(path),
+                                _ => tree.files.get(request.package).map(PathBuf::as_path),
+                            };
+                        entry.insert(
+                            Reader::open(request.package, request.container, selected_file)
+                                .map_err(io::Error::other)?,
                         )
-                    })?;
-                    let file = match (file, is_root) {
-                        (Some(path), true) => Some(path),
-                        _ => tree.files.get(&mapping.package).map(PathBuf::as_path),
-                    };
-                    entry.insert(Reader::open(&mapping.package, container, file)?)
-                }
+                    }
+                };
+                let name = if reader.migrated {
+                    request.source_path.unwrap_or(request.volume_name)
+                } else {
+                    request.volume_name
+                };
+                Ok(Some(ResolvedReaderVolume {
+                    reader: reader.v3.clone(),
+                    volume_name: name.to_owned(),
+                    source_path: if reader.migrated {
+                        None
+                    } else {
+                        request.source_path.map(str::to_owned)
+                    },
+                    migrated_from_v2: reader.migrated,
+                }))
             };
-            // A v2 mapping names the "atom" volume and a path in it, which migration made a
-            // volume of its own.
-            let name = match (reader.migrated, &mapping.original_path) {
-                (true, Some(path)) => path.clone(),
-                _ => mapping.volume_name.clone(),
-            };
-            // Migration keeps only the parts of "atom" an `fs` table names, so a v2 package
-            // without one (whose "atom" v1 mounted at `/`) has nothing to mount.
-            if reader.migrated && reader.v3.get_volume(&name).is_err() {
-                tracing::warn!(
-                    package = %mapping.package,
-                    volume = %name,
-                    "the webc v2 package has no `fs` table; its \"atom\" volume is not mounted",
-                );
-                continue;
-            }
-            volumes.push(PackageVolume {
-                reader: reader.v3.clone(),
-                name,
-                mount_path: mount_path.to_string(),
-            });
-        }
-        // A stable sort keeps the obscuring order among mounts at the same depth.
-        volumes.sort_by_key(|v| Path::new(&v.mount_path).components().count());
-        Ok(volumes)
+        Ok(ResolvedLayout::new(
+            package,
+            tree.root_is_local_dir,
+            Some(&provider),
+        )?)
     }
 
     /// Runs `program` on a machine whose images compile with `loader`, driven on the tokio
@@ -847,6 +748,7 @@ impl Run {
         let terminal = (!self.wasi.no_tty).then(HostTerminal::detect).flatten();
         #[cfg(unix)]
         let console = terminal
+            .as_ref()
             .map(|terminal| terminal.console(&stdio))
             .transpose()
             .context("cannot use the terminal as the guest's console")?;
@@ -862,57 +764,34 @@ impl Run {
             env: self.machine_env(machine.default_env(), wasi)?,
             stdio,
         };
-        let (root_volumes, volumes): (Vec<_>, Vec<_>) = program
-            .volumes
-            .iter()
-            .partition(|v| Path::new(&v.mount_path) == Path::new("/"));
+        let mut layout = program.layout.clone();
+        layout.override_commands(mapped_commands);
+        let sources = [PackageInstallSource::Resolved(&layout)];
+        let mut prepared = handle.block_on(
+            tokio::task::LocalSet::new().run_until(prepare_package_sources(&machine, &sources)),
+        )?;
         let (have_current_dir, host_dirs) = self.wasi.build_mapped_directories()?;
         // Nothing can be mounted over the root, so a host directory for `/` joins its layers,
         // over the package's.
         let (root_dirs, host_dirs): (Vec<_>, Vec<_>) = host_dirs
             .into_iter()
             .partition(|dir| Path::new(&dir.guest) == Path::new("/"));
-        let mounts = volumes.iter().map(|v| v.mount_path.clone());
+        let mounts = prepared.mount_paths().map(str::to_owned);
         let hiding = program
-            .mount_hiding_the_command(mounts.chain(host_dirs.iter().map(|d| d.guest.clone())));
-        // Each volume becomes a filesystem once, wherever it is mounted.
-        let mut layers = VolumeLayers::default();
+            .mount_hiding_the_command(mounts.chain(host_dirs.iter().map(|dir| dir.guest.clone())));
+        handle
+            .block_on(tokio::task::LocalSet::new().run_until(prepared.prepare_roots(&machine)))?;
         let mut root_layers = Vec::new();
-        for volume in root_volumes {
-            let layer = layers.get(&machine, volume).with_context(|| {
-                format!("cannot mount the package volume \"{}\" at /", volume.name)
-            })?;
-            root_layers.push(layer);
-        }
-        // Over the package's volumes, as v1 wrote them into the root after merging those.
-        let commands = mapped_commands
-            .iter()
-            .chain(&program.commands)
-            .map(|cmd| (cmd.name.clone(), cmd.atom.clone()));
-        root_layers.extend(
-            machine
-                .commands_layer(commands)
-                .context("cannot install the package's commands in /bin and /usr/bin")?,
-        );
         for dir in root_dirs {
             let layer = machine
                 .host_dir_layer(&dir.host)
                 .with_context(|| format!("cannot map {} to /", dir.host.display()))?;
             root_layers.push(layer);
         }
-        handle
-            .block_on(
-                tokio::task::LocalSet::new().run_until(machine.mount_root_layers(root_layers)),
-            )
-            .context("cannot stack the root filesystem's layers")?;
-        let defaults = program
-            .commands
-            .iter()
-            .chain(&mapped_commands)
-            .map(|cmd| (cmd.name.clone(), cmd.defaults.clone()));
-        machine
-            .set_wasix1_command_defaults(defaults)
-            .context("cannot configure the package's commands")?;
+        handle.block_on(
+            tokio::task::LocalSet::new()
+                .run_until(prepared.mount_roots(&mut machine, &root_layers)),
+        )?;
         // v1's precedence: the command's `cwd` annotation, then `--cwd`, then the mapped current
         // directory.
         let cwd = wasi
@@ -929,20 +808,7 @@ impl Run {
         // The machine's host calls are not `Send`, so drive it on this thread, in a `LocalSet`
         // for the host work it spawns.
         let run = handle.block_on(tokio::task::LocalSet::new().run_until(async {
-            for volume in volumes {
-                let context = || {
-                    format!(
-                        "cannot mount the package volume \"{}\" at {}",
-                        volume.name, volume.mount_path
-                    )
-                };
-                let layer = layers.get(&machine, volume).with_context(context)?;
-                // Writable like v1's package mounts; changes stay in memory.
-                machine
-                    .mount_layer(&volume.mount_path, &layer, true)
-                    .await
-                    .with_context(context)?;
-            }
+            prepared.mount_volumes(&machine).await?;
             // `--volume`s go on top, so they win over a package volume at the same path.
             for dir in &host_dirs {
                 machine
@@ -980,24 +846,38 @@ impl Run {
                 .collect::<Result<Vec<_>, Error>>()?;
             // Installed before the guest starts, so no signal takes the host's default action.
             #[cfg(unix)]
-            forward_signals(handle, machine.signaller(), terminal)
+            let forwarders = forward_signals(handle, machine.signaller(), terminal.clone())
                 .context("cannot install signal handlers")?;
             #[cfg(not(unix))]
-            forward_signals(handle, machine.signaller())
+            let forwarders = forward_signals(handle, machine.signaller())
                 .context("cannot install signal handlers")?;
             // Restored when the run ends, before `wasmer` reports anything or exits.
             #[cfg(unix)]
-            let _raw = terminal
-                .map(|terminal| terminal.raw())
-                .transpose()
-                .context("cannot put the terminal in raw mode")?;
-            let status = match &program.start {
-                Start::Module { engine, module } => {
-                    machine.run_module(engine, module, config).await
+            let raw = match terminal.as_ref().map(|terminal| terminal.raw()).transpose() {
+                Ok(raw) => raw,
+                Err(err) => {
+                    forwarders.shutdown().await;
+                    return Err(Error::new(err).context("cannot put the terminal in raw mode"));
                 }
-                Start::File(path) => machine.run_file(engine, path, config).await,
             };
-            Ok::<_, Error>(status)
+            use futures_util::FutureExt as _;
+            let status = std::panic::AssertUnwindSafe(async {
+                match &program.start {
+                    Start::Module { engine, module } => {
+                        machine.run_module(engine, module, config).await
+                    }
+                    Start::File(path) => machine.run_file(engine, path, config).await,
+                }
+            })
+            .catch_unwind()
+            .await;
+            forwarders.shutdown().await;
+            #[cfg(unix)]
+            drop(raw);
+            match status {
+                Ok(status) => Ok::<_, Error>(status),
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
         }));
         let result = match run {
             Ok(Ok(0)) => Ok(()),
@@ -1060,8 +940,7 @@ impl Run {
             builder = builder.network_policy(Arc::new(NetworkRules(rules)));
         }
         if wasi.http_client {
-            let client =
-                wasmer_wasix::http::default_http_client().context("No HTTP client available")?;
+            let client = wasmer_package::http::reqwest::ReqwestHttpClient::default();
             builder = builder.wasix1_http_provider(Arc::new(GuestHttpProvider(Arc::new(client))));
         }
         if let Some((console, fds)) = console {
@@ -1142,8 +1021,7 @@ impl Run {
 
     fn reject_options_unsupported_by_the_machine(&self, is_package: bool) -> Result<(), Error> {
         let wasi = &self.wasi;
-        #[allow(unused_mut)]
-        let mut given = vec![
+        let given = [
             (
                 "--enable-async-threads",
                 wasi.enable_async_threads.is_some(),
@@ -1160,14 +1038,6 @@ impl Run {
             // A trap kills the process with its signal; the kernel writes no core.
             ("--coredump-on-trap", self.coredump_on_trap.is_some()),
         ];
-        #[cfg(feature = "journal")]
-        given.extend([
-            ("--journal", !wasi.read_only_journals.is_empty()),
-            ("--journal-writable", !wasi.writable_journals.is_empty()),
-            ("--snapshot-on", !wasi.snapshot_on.is_empty()),
-            ("--snapshot-period", wasi.snapshot_interval.is_some()),
-            ("--stop-after-snapshot", wasi.stop_after_snapshot),
-        ]);
 
         let unsupported: Vec<_> = given
             .into_iter()
@@ -1292,12 +1162,35 @@ fn raise_open_file_limit() {
     }
 }
 
+/// Every forwarder is retired before its run releases raw mode. Drop also aborts tasks
+/// on an unexpected outer unwind; ordinary errors and guest panics use shutdown's join.
+#[derive(Default)]
+struct SignalForwarders(Vec<tokio::task::JoinHandle<()>>);
+
+impl SignalForwarders {
+    async fn shutdown(mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+        for task in self.0.drain(..) {
+            let _ = task.await;
+        }
+    }
+}
+impl Drop for SignalForwarders {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
+}
+
 #[cfg(unix)]
 fn forward_signals(
     runtime: &tokio::runtime::Handle,
     signaller: Signaller,
     terminal: Option<HostTerminal>,
-) -> io::Result<()> {
+) -> io::Result<SignalForwarders> {
     use tokio::signal::unix::{SignalKind, signal};
 
     // Host signal, its number in the guest's ABI, and whether a terminal sends it.
@@ -1311,11 +1204,22 @@ fn forward_signals(
     ];
 
     let _context = runtime.enter();
+    // Complete every fallible registration before starting any task.
+    let streams = FORWARDED
+        .into_iter()
+        .map(|(host, guest, from_terminal)| {
+            signal(SignalKind::from_raw(host)).map(|stream| (host, guest, from_terminal, stream))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let changes = terminal
+        .as_ref()
+        .map(|_| TerminalSignals::new())
+        .transpose()?;
     let console = terminal.is_some();
-    for (host, guest, from_terminal) in FORWARDED {
-        let mut stream = signal(SignalKind::from_raw(host))?;
+    let mut tasks = SignalForwarders::default();
+    for (host, guest, from_terminal, mut stream) in streams {
         let signaller = signaller.clone();
-        runtime.spawn(async move {
+        tasks.0.push(runtime.spawn(async move {
             let mut interrupts = Interrupts::default();
             while stream.recv().await.is_some() {
                 if console && host == libc::SIGHUP {
@@ -1331,55 +1235,31 @@ fn forward_signals(
                 }
                 interrupts.forward(&signaller);
             }
-        });
+        }));
     }
-    if let Some(terminal) = terminal {
-        forward_terminal_changes(runtime, signaller, terminal)?;
-    }
-    Ok(())
-}
-
-/// What happens to the host's `terminal` while the guest has it as its console: a new window
-/// size goes to the console (SIGWINCH), and a stop of `wasmer` (SIGTSTP) gives the terminal
-/// its settings back until `wasmer` is continued (SIGCONT), when it is raw again, at the size
-/// it has then.
-#[cfg(unix)]
-fn forward_terminal_changes(
-    runtime: &tokio::runtime::Handle,
-    signaller: Signaller,
-    terminal: HostTerminal,
-) -> io::Result<()> {
-    use tokio::signal::unix::{SignalKind, signal};
-
-    for host in [libc::SIGWINCH, libc::SIGTSTP, libc::SIGCONT] {
-        let mut stream = signal(SignalKind::from_raw(host))?;
-        let signaller = signaller.clone();
-        runtime.spawn(async move {
-            while stream.recv().await.is_some() {
-                if host == libc::SIGTSTP {
-                    terminal::suspend();
-                    // The stop SIGTSTP would have been, now that the terminal is restored. To
-                    // this thread, which stops before it goes on to raw mode again: a signal
-                    // to the process might be taken by another thread, later.
-                    // SAFETY: a signal to the calling thread.
-                    unsafe { libc::raise(libc::SIGSTOP) };
-                }
-                if host != libc::SIGWINCH {
-                    terminal::resume();
+    if let Some((terminal, mut changes)) = terminal.zip(changes) {
+        tasks.0.push(runtime.spawn(async move {
+            loop {
+                if let Err(err) = changes.recv().await {
+                    tracing::warn!(%err, "cannot forward terminal changes");
+                    break;
                 }
                 signaller.console_resize(terminal.size());
             }
-        });
+        }));
     }
-    Ok(())
+    Ok(tasks)
 }
 
 /// Forwards Ctrl-C as `SIGINT`; see the Unix version. Exits with 3, as the C runtime does.
 #[cfg(windows)]
-fn forward_signals(runtime: &tokio::runtime::Handle, signaller: Signaller) -> io::Result<()> {
+fn forward_signals(
+    runtime: &tokio::runtime::Handle,
+    signaller: Signaller,
+) -> io::Result<SignalForwarders> {
     let _context = runtime.enter();
     let mut ctrl_c = tokio::signal::windows::ctrl_c()?;
-    runtime.spawn(async move {
+    Ok(SignalForwarders(vec![runtime.spawn(async move {
         let mut interrupts = Interrupts::default();
         while ctrl_c.recv().await.is_some() {
             if interrupts.press(&signaller) {
@@ -1387,8 +1267,7 @@ fn forward_signals(runtime: &tokio::runtime::Handle, signaller: Signaller) -> io
             }
             interrupts.forward(&signaller);
         }
-    });
-    Ok(())
+    })]))
 }
 
 /// Sends `sig` to the guest; for a terminal's signal, returns whether some process has it
@@ -1403,23 +1282,6 @@ fn forward(signaller: &Signaller, sig: i32, terminal: bool) -> bool {
         tracing::warn!(sig, %err, "cannot forward a signal to the guest");
         false
     })
-}
-
-/// The layer of each package volume mounted so far, by its package's reader and its name.
-#[derive(Default)]
-struct VolumeLayers(HashMap<(*const OwnedReader, String), Layer>);
-
-impl VolumeLayers {
-    /// The layer of `volume`, made the first time.
-    fn get(&mut self, machine: &Machine, volume: &PackageVolume) -> Result<Layer, Error> {
-        let key = (Arc::as_ptr(&volume.reader), volume.name.clone());
-        if let Some(layer) = self.0.get(&key) {
-            return Ok(layer.clone());
-        }
-        let layer = machine.package_layer(&volume.reader, &volume.name)?;
-        self.0.insert(key, layer.clone());
-        Ok(layer)
-    }
 }
 
 /// A package's webc v3 reader, which the machine's package volumes need.
@@ -1481,8 +1343,8 @@ impl Reader {
 #[cfg(test)]
 mod tests {
     use super::NetworkRules;
-    use virtual_net::ruleset::{Direction, Ruleset};
     use wasixv2::{NetworkPolicy, PolicyDirection};
+    use wasmer_config::network_rules::{Direction, Ruleset};
 
     #[test]
     fn machine_network_rules_keep_v1_address_direction_and_deny_precedence() {

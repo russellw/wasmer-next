@@ -1,151 +1,230 @@
-//! The runtime `wasmer run` resolves, downloads and compiles packages with.
-
+//! Package acquisition and module compilation used by `wasmer run`.
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
-use anyhow::Error;
+use anyhow::{Context as _, Error};
 use futures::future::BoxFuture;
 use indicatif::ProgressBar;
+use sha2::Digest as _;
 use wasmer::{Engine, Module};
-use wasmer_config::package::{PackageId, PackageSource};
-use wasmer_wasix::{
-    SpawnError,
-    bin_factory::BinaryPackage,
-    runtime::{
-        ModuleInput,
-        module_cache::progress::{ModuleLoadProgress, ModuleLoadProgressReporter},
-        package_loader::{builtin_loader::FileSystemCache, load_package_tree},
-        resolver::{PackageSummary, QueryError, Resolution, ResolvedFileSystemMapping},
+use wasmer_cache::module_cache::{
+    self, HashedModuleData, ModuleCache, ModuleCompileError,
+    progress::{ModuleLoadProgress, ModuleLoadProgressReporter},
+};
+use wasmer_config::{
+    filesystem::MappedDirectory,
+    package::{PackageHash, PackageId, PackageSource},
+};
+use wasmer_package::{
+    loader::{LoadedPackage, PackageDownloader},
+    resolver::{
+        self, PackageInfo, PackageSummary, QueryError, Resolution, ResolvedFileSystemMapping,
+        Source,
     },
 };
 use webc::Container;
 
-/// Special wasix runtime implementation for the CLI.
-///
-/// Wraps an underlying runtime and adds progress monitoring for package
-/// compilation, and keeps the containers of the package tree it loads.
-#[derive(Debug)]
-pub struct MonitoringRuntime<R> {
-    pub runtime: Arc<R>,
-    progress: ProgressBar,
-    quiet_mode: bool,
-    tree: Arc<Mutex<PackageTree>>,
-    /// The package loader's download cache, where loaded packages' files are.
-    checkouts: Option<Arc<FileSystemCache>>,
+/// The compilation service used for the machine's prepared module bytes.
+pub(super) trait ModuleCompiler: Send + Sync {
+    fn compile<'a>(
+        &'a self,
+        input: HashedModuleData,
+        engine: &'a Engine,
+    ) -> BoxFuture<'a, Result<Module, ModuleCompileError>>;
 }
 
-impl<R> MonitoringRuntime<R> {
-    pub fn new(runtime: R, progress: ProgressBar, quiet_mode: bool) -> Self {
-        MonitoringRuntime {
-            runtime: Arc::new(runtime),
-            progress,
-            quiet_mode,
-            tree: Arc::default(),
-            checkouts: None,
+#[derive(Debug)]
+struct ExecutorOwner(Option<tokio::runtime::Runtime>);
+impl Drop for ExecutorOwner {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.0.take() {
+            runtime.shutdown_timeout(std::time::Duration::ZERO);
         }
     }
-
-    /// Tells where the package loader caches downloads, so the tree records each package's
-    /// file.
-    pub fn with_checkouts(mut self, checkouts: FileSystemCache) -> Self {
-        self.checkouts = Some(Arc::new(checkouts));
-        self
-    }
-
-    /// The containers and volume mappings of the package tree loaded last.
-    pub fn package_tree(&self) -> PackageTree {
-        self.tree.lock().unwrap().clone()
-    }
 }
 
-/// What the machine needs of a loaded package tree, which a `BinaryPackage` does not keep: the
-/// containers whose volumes its filesystem table mounts.
+/// Host services for resolving package bytes and compiling modules.
+#[derive(Debug)]
+pub(super) struct RunContext {
+    executor: ExecutorOwner,
+    pub engine: Engine,
+    source: Arc<dyn Source + Send + Sync>,
+    downloader: PackageDownloader,
+    module_cache: Arc<dyn ModuleCache + Send + Sync>,
+    progress: ProgressBar,
+    quiet_mode: bool,
+    files: Mutex<HashMap<PackageId, PathBuf>>,
+}
+
 #[derive(Debug, Clone, Default)]
-pub struct PackageTree {
-    /// Every container loaded, by package.
+pub(super) struct PackageTree {
     pub containers: HashMap<PackageId, Container>,
-    /// The file each downloaded package was loaded from.
     pub files: HashMap<PackageId, PathBuf>,
-    /// The tree's filesystem table; mappings earlier in the list obscure later ones.
     pub filesystem: Vec<ResolvedFileSystemMapping>,
-    /// The root package, if a tree was loaded.
     pub root: Option<PackageId>,
-    /// Whether the root is a package directory, whose own mappings name host directories.
     pub root_is_local_dir: bool,
 }
 
-impl<R: wasmer_wasix::Runtime + Send + Sync> wasmer_wasix::Runtime for MonitoringRuntime<R> {
-    fn networking(&self) -> &virtual_net::DynVirtualNetworking {
-        self.runtime.networking()
-    }
+#[derive(Debug, Clone)]
+pub(super) struct RunPackage {
+    pub package: LoadedPackage,
+    pub tree: PackageTree,
+    pub additional_host_mapped_directories: Vec<MappedDirectory>,
+}
 
-    fn task_manager(&self) -> &Arc<dyn wasmer_wasix::VirtualTaskManager> {
-        self.runtime.task_manager()
-    }
-
-    fn package_loader(
-        &self,
-    ) -> Arc<dyn wasmer_wasix::runtime::package_loader::PackageLoader + Send + Sync> {
-        let inner = self.runtime.package_loader();
-        Arc::new(MonitoringPackageLoader {
-            inner,
-            progress: self.progress.clone(),
-            tree: self.tree.clone(),
-            checkouts: self.checkouts.clone(),
-        })
-    }
-
-    fn module_cache(
-        &self,
-    ) -> Arc<dyn wasmer_wasix::runtime::module_cache::ModuleCache + Send + Sync> {
-        self.runtime.module_cache()
-    }
-
-    fn source(&self) -> Arc<dyn wasmer_wasix::runtime::resolver::Source + Send + Sync> {
-        let inner = self.runtime.source();
-        Arc::new(MonitoringSource {
-            inner,
-            progress: self.progress.clone(),
-        })
-    }
-
-    fn engine(&self) -> Engine {
-        self.runtime.engine()
-    }
-
-    fn new_store(&self) -> wasmer::Store {
-        self.runtime.new_store()
-    }
-
-    fn resolve_module<'a>(
-        &'a self,
-        input: ModuleInput<'a>,
-        engine: Option<&Engine>,
-        on_progress: Option<ModuleLoadProgressReporter>,
-    ) -> BoxFuture<'a, Result<Module, SpawnError>> {
-        // If a progress reporter is already provided, or quiet mode is enabled,
-        // just delegate to the inner runtime.
-        if on_progress.is_some() || self.quiet_mode {
-            return self.runtime.resolve_module(input, engine, on_progress);
+impl RunContext {
+    pub fn new(
+        executor: tokio::runtime::Runtime,
+        engine: Engine,
+        source: impl Source + Send + Sync + 'static,
+        downloader: PackageDownloader,
+        module_cache: Arc<dyn ModuleCache + Send + Sync>,
+        progress: ProgressBar,
+        quiet_mode: bool,
+    ) -> Self {
+        Self {
+            executor: ExecutorOwner(Some(executor)),
+            engine,
+            source: Arc::new(MonitoringSource {
+                inner: Arc::new(source),
+                progress: progress.clone(),
+            }),
+            downloader,
+            module_cache,
+            progress,
+            quiet_mode,
+            files: Mutex::default(),
         }
+    }
 
-        // Compile with progress monitoring through the progress bar.
+    pub fn block_on<F: std::future::Future>(&self, future: F) -> F::Output {
+        self.executor.0.as_ref().unwrap().handle().block_on(future)
+    }
 
-        use std::fmt::Write as _;
+    async fn load_container(&self, summary: &PackageSummary) -> Result<Container, Error> {
+        let id = summary.package_id();
+        self.progress.set_message(format!("Downloading {id}"));
+        let container = self.downloader.load(summary).await?;
+        if let Some(file) = self
+            .downloader
+            .cache()
+            .map(|cache| cache.path(&summary.dist.webc_sha256))
+            .filter(|path| path.is_file())
+        {
+            self.files.lock().unwrap().insert(id, file);
+        }
+        Ok(container)
+    }
 
-        let short_hash = input.hash().short_hash();
-        let progress_msg = match &input {
-            ModuleInput::Bytes(_) | ModuleInput::Hashed(_) => {
-                format!("Compiling module ({short_hash})")
+    pub async fn load_registry(&self, specifier: &PackageSource) -> Result<RunPackage, Error> {
+        let summary = self.source.latest(specifier).await.map_err(|error| {
+            resolver::ResolveError::Registry {
+                package: specifier.clone(),
+                error,
             }
-            ModuleInput::Command(cmd) => format!("Compiling {}", cmd.name()),
+        })?;
+        let root = self.load_container(&summary).await?;
+        let resolution =
+            resolver::resolve(&summary.package_id(), &summary.pkg, self.source.as_ref())
+                .await
+                .context("Dependency resolution failed")?;
+        self.load_resolved(root, resolution, false).await
+    }
+
+    pub async fn load_webc(&self, root: Container) -> Result<RunPackage, Error> {
+        let id = PackageInfo::package_id_from_manifest(root.manifest())?
+            .or_else(|| {
+                root.webc_hash()
+                    .map(|hash| PackageId::Hash(PackageHash::from_sha256_bytes(hash)))
+            })
+            .ok_or_else(|| Error::msg("webc file did not provide its hash"))?;
+        let info = PackageInfo::from_manifest(id, root.manifest(), root.version())?;
+        let resolution = resolver::resolve(&info.id, &info, self.source.as_ref()).await?;
+        self.load_resolved(root, resolution, false).await
+    }
+
+    pub async fn load_dir(&self, dir: &Path) -> Result<RunPackage, Error> {
+        let hash = sha2::Sha256::digest(dir.display().to_string().as_bytes()).into();
+        let id = PackageId::Hash(PackageHash::from_sha256_bytes(hash));
+        let manifest_path = dir.join("wasmer.toml");
+        let root: Container =
+            wasmer_package::package::Package::from_manifest(&manifest_path)?.into();
+        let info = PackageInfo::from_manifest(id, root.manifest(), root.version())?;
+        let resolution = resolver::resolve(&info.id, &info, self.source.as_ref()).await?;
+        let mut package = self.load_resolved(root, resolution, true).await?;
+        let manifest = std::fs::read_to_string(&manifest_path).unwrap();
+        let manifest: wasmer_config::package::Manifest = toml::from_str(&manifest).unwrap();
+        package.additional_host_mapped_directories.extend(
+            manifest
+                .fs
+                .into_iter()
+                .map(|(guest, host)| {
+                    anyhow::Ok(MappedDirectory {
+                        host: dir.join(host).canonicalize()?,
+                        guest,
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        Ok(package)
+    }
+
+    async fn load_resolved(
+        &self,
+        root: Container,
+        resolution: Resolution,
+        local: bool,
+    ) -> Result<RunPackage, Error> {
+        let mut containers = wasmer_package::loader::fetch_dependencies(
+            &resolution.package,
+            &resolution.graph,
+            |summary| async move { self.load_container(&summary).await },
+        )
+        .await?;
+        containers.insert(resolution.package.root_package.clone(), root);
+        wasixv2::preflight_resolved_filesystem(&containers, &resolution.package, local)?;
+        let package = LoadedPackage::from_containers(resolution, containers)?;
+        let files = self.files.lock().unwrap();
+        let tree = PackageTree {
+            containers: package.containers.clone(),
+            files: files
+                .iter()
+                .filter(|(id, _)| package.containers.contains_key(*id))
+                .map(|(id, path)| (id.clone(), path.clone()))
+                .collect(),
+            filesystem: package.resolution.package.filesystem.clone(),
+            root: Some(package.resolution.package.root_package.clone()),
+            root_is_local_dir: local,
         };
+        Ok(RunPackage {
+            package,
+            tree,
+            additional_host_mapped_directories: Vec::new(),
+        })
+    }
 
+    async fn compile_module(
+        &self,
+        input: HashedModuleData,
+        engine: &Engine,
+    ) -> Result<Module, ModuleCompileError> {
+        if self.quiet_mode {
+            return module_cache::load_module(
+                engine,
+                self.module_cache.as_ref(),
+                *input.hash(),
+                input.wasm(),
+                None,
+            )
+            .await;
+        }
+        use std::fmt::Write as _;
+        let short_hash = input.hash().short_hash();
+        let progress_msg = format!("Compiling module ({short_hash})");
         let pb = self.progress.clone();
-
         let on_progress = Some(ModuleLoadProgressReporter::new({
             let base_msg = progress_msg.clone();
             move |prog| {
@@ -179,8 +258,6 @@ impl<R: wasmer_wasix::Runtime + Send + Sync> wasmer_wasix::Runtime for Monitorin
             }
         }));
 
-        let engine = engine.cloned();
-
         let style = indicatif::ProgressStyle::default_bar()
             .template("{spinner} {wide_bar:.cyan/blue} {msg}")
             .expect("invalid progress bar template");
@@ -193,83 +270,109 @@ impl<R: wasmer_wasix::Runtime + Send + Sync> wasmer_wasix::Runtime for Monitorin
         }
         self.progress.set_message(progress_msg);
 
-        let f = async move {
-            let res = self
-                .runtime
-                .resolve_module(input, engine.as_ref(), on_progress)
-                .await;
+        let result = module_cache::load_module(
+            engine,
+            self.module_cache.as_ref(),
+            *input.hash(),
+            input.wasm(),
+            on_progress,
+        )
+        .await;
+        self.progress
+            .set_style(indicatif::ProgressStyle::default_spinner());
+        self.progress.reset();
+        self.progress.finish_and_clear();
+        result
+    }
+}
 
-            // Hide the progress bar and reset it to the default spinner style.
-            // Needed because future module downloads should not show a bar.
-            self.progress
-                .set_style(indicatif::ProgressStyle::default_spinner());
-            self.progress.reset();
-            self.progress.finish_and_clear();
-
-            res
-        };
-
-        Box::pin(f)
+impl ModuleCompiler for RunContext {
+    fn compile<'a>(
+        &'a self,
+        input: HashedModuleData,
+        engine: &'a Engine,
+    ) -> BoxFuture<'a, Result<Module, ModuleCompileError>> {
+        Box::pin(self.compile_module(input, engine))
     }
 }
 
 #[derive(Debug)]
 struct MonitoringSource {
-    inner: Arc<dyn wasmer_wasix::runtime::resolver::Source + Send + Sync>,
+    inner: Arc<dyn Source + Send + Sync>,
     progress: ProgressBar,
 }
-
 #[async_trait::async_trait]
-impl wasmer_wasix::runtime::resolver::Source for MonitoringSource {
+impl Source for MonitoringSource {
     async fn query(&self, package: &PackageSource) -> Result<Vec<PackageSummary>, QueryError> {
         self.progress.set_message(format!("Looking up {package}"));
         self.inner.query(package).await
     }
 }
 
-#[derive(Debug)]
-struct MonitoringPackageLoader {
-    inner: Arc<dyn wasmer_wasix::runtime::package_loader::PackageLoader + Send + Sync>,
-    progress: ProgressBar,
-    tree: Arc<Mutex<PackageTree>>,
-    checkouts: Option<Arc<FileSystemCache>>,
-}
+#[cfg(all(test, feature = "sys"))]
+mod tests {
+    use super::*;
+    use wasmer_cache::module_cache::SharedCache;
+    use wasmer_package::http::{HttpClient, HttpRequest, HttpResponse};
 
-#[async_trait::async_trait]
-impl wasmer_wasix::runtime::package_loader::PackageLoader for MonitoringPackageLoader {
-    async fn load(&self, summary: &PackageSummary) -> Result<Container, Error> {
-        let pkg_id = summary.package_id();
-        self.progress.set_message(format!("Downloading {pkg_id}"));
-
-        let container = self.inner.load(summary).await?;
-        let file = self
-            .checkouts
-            .as_ref()
-            .map(|cache| cache.path(&summary.dist.webc_sha256))
-            .filter(|path| path.is_file());
-        let mut tree = self.tree.lock().unwrap();
-        if let Some(file) = file {
-            tree.files.insert(pkg_id.clone(), file);
+    #[derive(Debug)]
+    struct NoHttp;
+    impl HttpClient for NoHttp {
+        fn request(&self, _: HttpRequest) -> BoxFuture<'_, Result<HttpResponse, Error>> {
+            panic!("unexpected HTTP request for local preflight fixture")
         }
-        tree.containers.insert(pkg_id, container.clone());
-        Ok(container)
     }
 
-    async fn load_package_tree(
-        &self,
-        root: &Container,
-        resolution: &Resolution,
-        root_is_local_dir: bool,
-    ) -> Result<BinaryPackage, Error> {
-        {
-            let mut tree = self.tree.lock().unwrap();
-            let id = resolution.package.root_package.clone();
-            tree.containers.insert(id.clone(), root.clone());
-            tree.filesystem = resolution.package.filesystem.clone();
-            tree.root = Some(id);
-            tree.root_is_local_dir = root_is_local_dir;
-        }
-        // Through `self`, so the dependencies' containers are kept too.
-        load_package_tree(root, self, resolution, root_is_local_dir).await
+    #[test]
+    fn filesystem_failure_precedes_command_failure_and_local_root_skips_its_volume() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/integration/cli/tests/packages/nested-mounted-paths/out.webc");
+        let root = wasmer_package::utils::from_disk(fixture).unwrap();
+        let id = PackageId::Hash(PackageHash::from_sha256_bytes([0; 32]));
+        let mut info =
+            PackageInfo::from_manifest(id.clone(), root.manifest(), root.version()).unwrap();
+        info.dependencies.clear();
+        info.entrypoint = None;
+        info.commands = vec![resolver::Command {
+            name: "absent-command".to_string(),
+        }];
+        info.filesystem = vec![resolver::FileSystemMapping {
+            volume_name: "absent-volume".to_string(),
+            mount_path: "/app".to_string(),
+            original_path: None,
+            dependency_name: None,
+        }];
+        let source = resolver::InMemorySource::new();
+        let context = RunContext::new(
+            tokio::runtime::Runtime::new().unwrap(),
+            Engine::default(),
+            source,
+            PackageDownloader::new(Arc::new(NoHttp)),
+            Arc::new(SharedCache::default()),
+            ProgressBar::hidden(),
+            true,
+        );
+        let resolution = context
+            .block_on(resolver::resolve(&id, &info, context.source.as_ref()))
+            .unwrap();
+        let error = context
+            .block_on(context.load_resolved(root.clone(), resolution.clone(), false))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("doesn't have a \"absent-volume\" volume"),
+            "{error:#}"
+        );
+
+        let error = context
+            .block_on(context.load_resolved(root, resolution, true))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Unable to find the \"absent-command\" command metadata"),
+            "{error:#}"
+        );
     }
 }

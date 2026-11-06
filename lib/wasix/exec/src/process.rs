@@ -48,9 +48,46 @@ struct HandoffState {
     /// The result was taken.
     taken: bool,
     waker: Option<Waker>,
+    cancellation: Option<crate::cancellation::WeakCancellation>,
 }
 
 impl Handoff {
+    /// Cancellation authority follows only this exact image; result delivery is unchanged.
+    pub(crate) fn bind_cancellation(
+        self: &Arc<Self>,
+        cancellation: Option<&crate::cancellation::Cancellation>,
+    ) {
+        let Some(cancellation) = cancellation else {
+            return;
+        };
+        let (accepted, previous) = {
+            let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            let previous = state
+                .cancellation
+                .as_ref()
+                .and_then(|owner| owner.upgrade());
+            let accepted = previous
+                .as_ref()
+                .is_none_or(|owner| owner.same(cancellation));
+            if accepted {
+                state.cancellation = Some(cancellation.downgrade());
+            }
+            (accepted, previous)
+        };
+        drop(previous);
+        if accepted {
+            cancellation.bind_image(self.clone());
+        }
+    }
+    pub(crate) fn cancellation(&self) -> Option<crate::cancellation::Cancellation> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .cancellation
+            .as_ref()
+            .and_then(|owner| owner.upgrade())
+    }
+
     /// The run that took over ended with `result`; only the first result counts.
     fn complete(&self, result: Result<i32, ExecError>) {
         let waker = {
@@ -110,6 +147,9 @@ impl Drop for Takeover {
 /// reach.
 pub(crate) trait Spawn: Send + Sync {
     fn spawn(&self, task: TaskId, image: Image);
+    fn spawn_owned(&self, _: TaskId, _: Image, _: crate::spawn_custody::Publication) {
+        panic!("this spawner does not accept host-only child custody")
+    }
     fn fork(&self, task: TaskId, image: asyncify::ForkImage);
     /// Starts `image` as `task`, whose run goes on there, and reports how it ends to
     /// `handoff`.
@@ -146,17 +186,15 @@ where
     S: Syscalls + Control + Send + Sync + 'static,
 {
     fn spawn(&self, task: TaskId, image: Image) {
-        let (engine, syscalls, host, abis) = (
-            self.engine.clone(),
-            self.syscalls.clone(),
-            self.host.clone(),
-            self.abis.clone(),
-        );
-        // Without a thread the process died; nothing waits for its status.
-        let _ = self.start(task, move |cleanup| {
-            let run = run_new_image(engine, image, syscalls, task, host, abis, cleanup);
-            async move { report_failure(task, run.await) }
-        });
+        self.spawn_image_owned(task, image, None);
+    }
+    fn spawn_owned(
+        &self,
+        task: TaskId,
+        image: Image,
+        publication: crate::spawn_custody::Publication,
+    ) {
+        self.spawn_image_owned(task, image, Some(publication));
     }
 
     fn fork(&self, task: TaskId, image: asyncify::ForkImage) {
@@ -179,6 +217,14 @@ where
     }
 
     fn take_over(&self, task: TaskId, image: Image, handoff: Arc<Handoff>) {
+        let transfer = handoff
+            .cancellation()
+            .map(|authority| authority.transfer(task));
+        #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+        if matches!(transfer, Some(crate::cancellation::Transfer::Refused)) {
+            handoff.complete(Err(ExecError::Dropped));
+            return;
+        }
         let (engine, syscalls, host, abis) = (
             self.engine.clone(),
             self.syscalls.clone(),
@@ -195,6 +241,11 @@ where
         if let Err(status) = started {
             handoff.complete(Ok(status));
         }
+        if let Some(crate::cancellation::Transfer::Reserved(transfer)) = transfer {
+            // Successful spawn owns release. Failed spawn already faulted and
+            // released the task through start's existing failure path.
+            transfer.relinquish();
+        }
     }
 }
 
@@ -209,21 +260,78 @@ impl<S> Spawner<S>
 where
     S: Syscalls + Control + Send + Sync + 'static,
 {
+    fn spawn_image_owned(
+        &self,
+        task: TaskId,
+        image: Image,
+        publication: Option<crate::spawn_custody::Publication>,
+    ) {
+        let (engine, syscalls, host, abis) = (
+            self.engine.clone(),
+            self.syscalls.clone(),
+            self.host.clone(),
+            self.abis.clone(),
+        );
+        // Without a thread the process died; nothing waits for its status.
+        let _ = self.start_inner(
+            task,
+            move |cleanup| {
+                let run = run_new_image(engine, image, syscalls, task, host, abis, cleanup);
+                async move { report_failure(task, run.await) }
+            },
+            publication,
+        );
+    }
+
     /// Runs the process `task` on a host thread of its own. The run ends the process itself when
     /// its image fails; when no thread can start, the process dies of SIGSEGV here, and
     /// `Err` has its status.
     fn start<F, R>(&self, task: TaskId, run: R) -> Result<(), i32>
     where
-        R: FnOnce(Arc<wasixv2_host::LoaderCleanup>) -> F + Send + 'static,
+        R: FnOnce(crate::cleanup::RunCleanup) -> F + Send + 'static,
         F: Future<Output = ()> + 'static,
     {
+        self.start_inner(task, run, None)
+    }
+
+    fn start_inner<F, R>(
+        &self,
+        task: TaskId,
+        run: R,
+        publication: Option<crate::spawn_custody::Publication>,
+    ) -> Result<(), i32>
+    where
+        R: FnOnce(crate::cleanup::RunCleanup) -> F + Send + 'static,
+        F: Future<Output = ()> + 'static,
+    {
+        let startup = publication
+            .as_ref()
+            .map(|publication| publication.startup(self.syscalls.clone(), task));
+        let owned = startup.is_some();
+        let finished = startup.as_ref().map(|startup| startup.finished.clone());
+        let entered = startup.as_ref().map(|startup| startup.entered.clone());
+        let terminal = startup.as_ref().map(|startup| startup.terminal.clone());
+        #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+        let authority = startup.as_ref().map(|startup| startup.authority.clone());
         let host = self.host.clone();
         let syscalls = self.syscalls.clone();
         let owning_thread = self.abis.requires_owning_thread();
+        #[cfg(feature = "sys")]
+        let native = self.engine.is_sys();
+        #[cfg(not(feature = "sys"))]
+        let native = false;
         let start = Box::new(move || {
             let profile = crate::thread::OwningThread::required(owning_thread);
-            let cleanup = wasixv2_host::LoaderCleanup::new(host);
+            let cleanup =
+                crate::cleanup::RunCleanup::new(wasixv2_host::LoaderCleanup::new(host), native);
+            #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+            let cleanup = match authority {
+                Some(authority) => cleanup.with_cancellation(authority),
+                None => cleanup,
+            };
             let scope = cleanup.clone();
+            #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+            let terminal_authority = cleanup.cancellation().cloned();
             Box::pin(async move {
                 let profile = match profile {
                     Ok(profile) => profile,
@@ -235,36 +343,104 @@ where
                                 drop(run(scope))
                             }));
                         let error = match dropped {
+                            Ok(()) if owned => error,
                             Ok(()) => crate::reject_profile(&*syscalls, task, error),
+                            Err(panic) if owned => crate::panic_error(task, panic),
                             Err(panic) => crate::host_panicked(&*syscalls, task, panic),
                         };
                         report_failure(task, Err(error));
                         return;
                     }
                 };
+                // Once entered, the executor must drive this worker through cancellation,
+                // physical retirement and group_wait. It may discard a never-polled factory,
+                // or an old worker whose authority already transferred to its successor.
+                if let Some(entered) = entered {
+                    entered.store(true, std::sync::atomic::Ordering::Release);
+                }
+                let terminal_syscalls = syscalls.clone();
                 match profile {
                     Some(profile) => {
-                        let guest = async move { run(scope).await };
-                        if let Err(panic) = crate::catch_panic(profile.run(&cleanup, guest)).await {
-                            drop(crate::host_panicked(&*syscalls, task, panic));
+                        let guest = async move {
+                            let cancellation = scope.cancellation().cloned();
+                            if crate::cancellation::execution(cancellation.as_ref(), async move {
+                                Box::pin(run(scope)).await
+                            })
+                            .await
+                            .is_some()
+                                && let Some(finished) = finished
+                            {
+                                finished.store(true, std::sync::atomic::Ordering::Release);
+                            }
+                        };
+                        if let Err(panic) =
+                            crate::catch_panic(profile.run_with_keepalive(&cleanup, guest, startup))
+                                .await
+                        {
+                            let error = if owned {
+                                crate::panic_error(task, panic)
+                            } else {
+                                crate::host_panicked(&*syscalls, task, panic)
+                            };
+                            report_failure(task, Err(error));
                         }
                     }
                     None => {
                         cleanup
-                            .run(async move {
-                                if let Err(panic) =
-                                    crate::catch_panic(async move { run(scope).await }).await
-                                {
-                                    drop(crate::host_panicked(&*syscalls, task, panic));
-                                }
-                            })
+                            .run_with_keepalive(
+                                async move {
+                                    let cancellation = scope.cancellation().cloned();
+                                    let result =
+                                        crate::catch_panic(crate::cancellation::execution(
+                                            cancellation.as_ref(),
+                                            async move { Box::pin(run(scope)).await },
+                                        ))
+                                        .await;
+                                    if let Err(panic) = result {
+                                        let error = if owned {
+                                            crate::panic_error(task, panic)
+                                        } else {
+                                            crate::host_panicked(&*syscalls, task, panic)
+                                        };
+                                        report_failure(task, Err(error));
+                                    } else if matches!(result, Ok(Some(())))
+                                        && let Some(finished) = finished
+                                    {
+                                        finished.store(true, std::sync::atomic::Ordering::Release);
+                                    }
+                                },
+                                startup,
+                            )
                             .await
                     }
                 }
+                if terminal
+                    .as_ref()
+                    .is_some_and(|terminal| terminal.load(std::sync::atomic::Ordering::Acquire))
+                {
+                    #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+                    if terminal_authority
+                        .as_ref()
+                        .expect("published child authority")
+                        .terminal_owner()
+                        .await
+                        .is_some()
+                    {
+                        return;
+                    }
+                    terminal_syscalls.fault(task, Signal::SIGSEGV.0);
+                    finish_task(&*terminal_syscalls, task).await;
+                }
             }) as wasixv2_host::LocalFuture<'static, ()>
         });
+        if let Some(publication) = publication {
+            publication.accept();
+        }
         if let Err(err) = self.host.executor().spawn_thread(start) {
             tracing::warn!(%err, "cannot start a process on a thread of its own");
+            if owned {
+                return Err(128 + Signal::SIGSEGV.0);
+            }
             let status = fault(&*self.syscalls, task, Signal::SIGSEGV.0);
             self.syscalls.release(task);
             return Err(status);
@@ -282,22 +458,28 @@ pub(crate) async fn run<S>(
     task: TaskId,
     host: Arc<dyn Host>,
     abis: Arc<Abis<S>>,
-    cleanup: Arc<wasixv2_host::LoaderCleanup>,
+    cleanup: crate::cleanup::RunCleanup,
 ) -> Result<i32, ExecError>
 where
     S: Syscalls + Control + Send + Sync + 'static,
 {
     let engine = store.engine().clone();
-    let first = crate::run_image(
-        store,
-        module,
-        syscalls.clone(),
-        task,
-        host.clone(),
-        abis.clone(),
-        cleanup.clone(),
+    let Some(first) = crate::cancellation::execution(
+        cleanup.cancellation(),
+        crate::run_image(
+            store,
+            module,
+            syscalls.clone(),
+            task,
+            host.clone(),
+            abis.clone(),
+            cleanup.clone(),
+        ),
     )
-    .await;
+    .await
+    else {
+        return Err(ExecError::Dropped);
+    };
     finish(engine, first, syscalls, task, host, abis, cleanup).await
 }
 
@@ -310,7 +492,7 @@ async fn run_forked<S>(
     task: TaskId,
     host: Arc<dyn Host>,
     abis: Arc<Abis<S>>,
-    cleanup: Arc<wasixv2_host::LoaderCleanup>,
+    cleanup: crate::cleanup::RunCleanup,
 ) -> Result<i32, ExecError>
 where
     S: Syscalls + Control + Send + Sync + 'static,
@@ -343,16 +525,28 @@ pub(crate) async fn run_exec<S>(
     task: TaskId,
     host: Arc<dyn Host>,
     abis: Arc<Abis<S>>,
-    cleanup: Arc<wasixv2_host::LoaderCleanup>,
+    cleanup: crate::cleanup::RunCleanup,
 ) -> Result<i32, ExecError>
 where
     S: Syscalls + Control + Send + Sync + 'static,
 {
-    let first = match syscalls.exec_wait(task).await {
+    let Some(waited) =
+        crate::cancellation::execution(cleanup.cancellation(), syscalls.exec_wait(task)).await
+    else {
+        return Err(ExecError::Dropped);
+    };
+    let first = match waited {
         // Killed meanwhile: it ends as the kill says.
         Err(status) => Ok(Ended::Exited(status)),
         Ok(()) => {
-            let loaded = abis.loader().load(&engine, &image).await;
+            let Some(loaded) = crate::cancellation::execution(
+                cleanup.cancellation(),
+                abis.loader().load(&engine, &image),
+            )
+            .await
+            else {
+                return Err(ExecError::Dropped);
+            };
             drop(image);
             match loaded {
                 Ok((image_engine, module)) => {
@@ -367,7 +561,12 @@ where
                         abis.clone(),
                         cleanup.clone(),
                     );
-                    run.await
+                    let Some(ended) =
+                        crate::cancellation::execution(cleanup.cancellation(), run).await
+                    else {
+                        return Err(ExecError::Dropped);
+                    };
+                    ended
                 }
                 Err(err) => Err(ExecError::Load(err)),
             }
@@ -386,7 +585,7 @@ async fn finish<S>(
     task: TaskId,
     host: Arc<dyn Host>,
     abis: Arc<Abis<S>>,
-    cleanup: Arc<wasixv2_host::LoaderCleanup>,
+    cleanup: crate::cleanup::RunCleanup,
 ) -> Result<i32, ExecError>
 where
     S: Syscalls + Control + Send + Sync + 'static,
@@ -421,10 +620,22 @@ where
             Ended::Exec(image) => image,
         };
         // `de_thread`: the old image is gone from every thread before the new one starts.
-        if let Err(status) = syscalls.exec_wait(task).await {
+        let Some(waited) =
+            crate::cancellation::execution(cleanup.cancellation(), syscalls.exec_wait(task)).await
+        else {
+            return Err(ExecError::Dropped);
+        };
+        if let Err(status) = waited {
             break status;
         }
-        let loaded = abis.loader().load(&engine, &image).await;
+        let Some(loaded) = crate::cancellation::execution(
+            cleanup.cancellation(),
+            abis.loader().load(&engine, &image),
+        )
+        .await
+        else {
+            return Err(ExecError::Dropped);
+        };
         drop(image);
         ended = match loaded {
             Ok((image_engine, module)) => {
@@ -439,7 +650,11 @@ where
                     abis.clone(),
                     cleanup.clone(),
                 );
-                run.await.unwrap_or_else(|err| Ended::Fault {
+                let Some(ended) = crate::cancellation::execution(cleanup.cancellation(), run).await
+                else {
+                    return Err(ExecError::Dropped);
+                };
+                ended.unwrap_or_else(|err| Ended::Fault {
                     task,
                     handoff: None,
                     signal: Signal::SIGSEGV.0,
@@ -465,10 +680,14 @@ where
             },
         };
     };
-    // A zombie leader stays until its group is empty.
+    finish_task(&*syscalls, task).await;
+    Ok(status)
+}
+
+/// A zombie leader stays until its group is empty, including after cancellation.
+pub(crate) async fn finish_task<S: Control>(syscalls: &S, task: TaskId) {
     syscalls.group_wait(task).await;
     syscalls.release(task);
-    Ok(status)
 }
 
 /// The image of a vfork child's `execve`.
@@ -479,7 +698,7 @@ async fn run_new_image<S>(
     task: TaskId,
     host: Arc<dyn Host>,
     abis: Arc<Abis<S>>,
-    cleanup: Arc<wasixv2_host::LoaderCleanup>,
+    cleanup: crate::cleanup::RunCleanup,
 ) -> Result<i32, ExecError>
 where
     S: Syscalls + Control + Send + Sync + 'static,
@@ -579,9 +798,13 @@ pub(crate) async fn spawn_image<S: 'static>(
     env: &AsyncFunctionEnvMut<ExecEnv<S>>,
     task: TaskId,
     image: Image,
+    publication: Option<crate::spawn_custody::Publication>,
 ) {
     let spawner = env.read().await.data().proc.spawner.clone();
-    spawner.spawn(task, image);
+    match publication {
+        Some(publication) => spawner.spawn_owned(task, image, publication),
+        None => spawner.spawn(task, image),
+    }
 }
 
 /// Starts `image`, which an `execve` of the task the instance behind `env` runs as gave the
@@ -685,7 +908,7 @@ pub(super) mod tests {
     }
 
     impl Recorder {
-        fn queue(&self, task: TaskId, action: GuestAction) {
+        pub(crate) fn queue(&self, task: TaskId, action: GuestAction) {
             if let Some(flag) = &self.resume_flag {
                 flag.raise();
             }

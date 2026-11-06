@@ -13,7 +13,7 @@ use wasixv2_syscalls::{
     SyscallRet, TaskId,
 };
 use wasixv2_vfs_mem::MemFs;
-use wasmer::{FunctionEnv, Imports, Instance, Module, Store};
+use wasmer::{FunctionEnv, Imports, Instance, Module, Store, StoreMut};
 
 type ExitGate = Arc<Mutex<Option<Arc<LoaderGate>>>>;
 #[derive(Default)]
@@ -53,7 +53,7 @@ impl Abi<Stack> for CaptureNative {
     }
     fn imports(
         &self,
-        store: &mut Store,
+        store: &mut StoreMut<'_>,
         env: &FunctionEnv<ExecEnv<Stack>>,
         module: &Module,
     ) -> Imports {
@@ -62,7 +62,7 @@ impl Abi<Stack> for CaptureNative {
     fn bind(
         &self,
         instance: &Instance,
-        store: &mut Store,
+        store: &mut StoreMut<'_>,
         task: TaskId,
         role: Role,
     ) -> Result<Arc<dyn AbiInstance<Stack>>, ExecError> {

@@ -33,20 +33,11 @@
 
 mod hashed_module;
 
-mod fallback;
 #[cfg(feature = "sys-thread")]
 mod filesystem;
-pub mod progress;
-mod shared;
-mod thread_local;
-mod types;
-
-pub use self::{
-    fallback::FallbackCache,
-    hashed_module::HashedModuleData,
-    shared::SharedCache,
-    thread_local::ThreadLocalCache,
-    types::{CacheError, ModuleCache},
+pub use self::hashed_module::HashedModuleData;
+pub use wasmer_cache::module_cache::{
+    CacheError, FallbackCache, ModuleCache, SharedCache, ThreadLocalCache, progress,
 };
 use wasmer_types::ModuleHash;
 

@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use wasixv2_abi::Signal;
 use wasixv2_syscalls::{Control, Errno, SysErr, SysResult, Syscalls, TaskId};
-use wasmer::{AsyncFunctionEnvMut, Function, FunctionEnv, Imports, RuntimeError, Store, Value};
+use wasmer::{AsyncFunctionEnvMut, Function, FunctionEnv, Imports, RuntimeError, StoreMut, Value};
 
 use crate::{
     ExecEnv, IMPORT_MODULE,
@@ -46,8 +46,11 @@ pub(crate) fn child_pid(tag: &asyncify::Tag) -> Option<i32> {
 
 /// Replaces the imports that unwind the stack with their asyncify versions, for an instrumented
 /// module.
-pub(crate) fn imports<S>(store: &mut Store, env: &FunctionEnv<ExecEnv<S>>, imports: &mut Imports)
-where
+pub(crate) fn imports<S>(
+    store: &mut StoreMut<'_>,
+    env: &FunctionEnv<ExecEnv<S>>,
+    imports: &mut Imports,
+) where
     S: Syscalls + Control + Send + Sync + 'static,
 {
     // The rewinding guest calls clone (or clone3) again; the kernel must see it only once.
