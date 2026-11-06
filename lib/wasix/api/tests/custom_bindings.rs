@@ -188,6 +188,10 @@ fn leb(mut value: u32, out: &mut Vec<u8>) {
 }
 // Match api::retirement and wasix1::dynamic's source-built dylink.0 fixtures.
 fn pic(wat: &str, needed: &[&str]) -> Vec<u8> {
+    pic_with_weak_imports(wat, needed, &[])
+}
+
+fn pic_with_weak_imports(wat: &str, needed: &[&str], weak: &[&str]) -> Vec<u8> {
     let mut wasm = wat::parse_str(wat).unwrap();
     let mut data = vec![8];
     data.extend_from_slice(b"dylink.0");
@@ -208,6 +212,20 @@ fn pic(wat: &str, needed: &[&str]) -> Vec<u8> {
         data.push(2);
         leb(names.len() as u32, &mut data);
         data.extend(names);
+    }
+    if !weak.is_empty() {
+        let mut flags = Vec::new();
+        leb(weak.len() as u32, &mut flags);
+        for name in weak {
+            for name in ["env", name] {
+                leb(name.len() as u32, &mut flags);
+                flags.extend_from_slice(name.as_bytes());
+            }
+            leb(0x11, &mut flags); // UNDEFINED | BINDING_WEAK
+        }
+        data.push(4);
+        leb(flags.len() as u32, &mut data);
+        data.extend(flags);
     }
     wasm.push(0);
     leb(data.len() as u32, &mut wasm);
@@ -479,6 +497,81 @@ async fn guest_definition_precedes_declared_host_fallback_and_type_errors_stay_e
                 "a matching guest definition's type mismatch must not fall back to the host"
             );
             assert!(events.lock().unwrap().is_empty());
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn standalone_weak_main_keeps_guest_precedence_and_declared_host_fallback() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            for (guest, expected, host_calls) in [
+                ("", 1, 1),
+                (
+                    r#"(func (export "value") (result i32) i32.const 79)"#,
+                    79,
+                    0,
+                ),
+                (
+                    r#"(func (export "value") (result i64) i64.const 79)"#,
+                    -1,
+                    0,
+                ),
+            ] {
+                let main = pic_with_weak_imports(
+                    &format!(
+                        r#"(module
+        (import "env" "memory" (memory 1 65536 shared))
+        (import "env" "__indirect_function_table" (table 3 funcref))
+        (import "env" "__stack_pointer" (global (mut i32)))
+        (import "env" "__memory_base" (global i32))
+        (import "env" "__table_base" (global i32))
+        (import "env" "value" (func $value (result i32)))
+        (import "wasixv2" "exit_group" (func $exit (param i32)))
+        {guest}
+        (func (export "_start")
+          (call $exit (i32.ne (call $value) (i32.const {expected})))))"#
+                    ),
+                    &[],
+                    &["value"],
+                );
+                let events = Arc::new(Mutex::new(Vec::new()));
+                let machine = Machine::builder()
+                    .instantiation_hook(Arc::new(Hook {
+                        next: AtomicUsize::new(1),
+                        events: events.clone(),
+                        omit: false,
+                        thread: None,
+                    }))
+                    .build();
+                let result = machine
+                    .run_process(
+                        &main,
+                        ProcessConfig {
+                            args: vec!["standalone-weak".into()],
+                            env: vec![],
+                            stdio: Stdio::from_fns(|_| {}, |_| {}),
+                        },
+                    )
+                    .await;
+                if expected == -1 {
+                    assert!(
+                        result.is_err(),
+                        "wrong guest type must reject host fallback"
+                    );
+                } else {
+                    assert_eq!(result.unwrap(), 0);
+                }
+                assert_eq!(
+                    events
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|(_, event)| *event == "call")
+                        .count(),
+                    host_calls
+                );
+            }
         })
         .await;
 }

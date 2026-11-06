@@ -155,6 +155,25 @@ impl Plan {
                 "only direct functions can be retried",
             ));
         }
+        Self::retry_import(modules, dependencies, root, global_scope, caller, ordinal)
+            .map(|(_, target)| target)
+    }
+
+    /// Resolve one existing import without replanning other bindings or layout.
+    #[cfg(any(feature = "sys", feature = "js"))]
+    pub(crate) fn retry_import(
+        modules: &[Module],
+        dependencies: &[Vec<usize>],
+        root: usize,
+        global_scope: &[usize],
+        caller: usize,
+        ordinal: usize,
+    ) -> Result<(FixupKind, Option<BindingTarget>), PlanError> {
+        let import = modules
+            .get(caller)
+            .and_then(|module| module.imports.get(ordinal))
+            .ok_or(PlanError::Graph("missing import"))?;
+        let kind = classify(import)?;
         if root >= modules.len() || dependencies.len() != modules.len() {
             return Err(PlanError::Graph("missing original load group"));
         }
@@ -167,18 +186,18 @@ impl Plan {
             .copied()
             .collect::<Vec<_>>();
         let Some((provider, export)) = find(modules, caller, import, &lookup) else {
-            return Ok(None);
+            return Ok((kind, None));
         };
         bind(
             caller,
             import,
-            FixupKind::DirectFunction,
+            kind,
             provider,
             export,
             &mut BTreeMap::new(),
             &mut 0,
         )
-        .map(Some)
+        .map(|target| (kind, Some(target)))
     }
 
     /// Existing NOW bindings are retained by the live image, not resolved again when

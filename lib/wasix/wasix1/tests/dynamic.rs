@@ -19,6 +19,15 @@ fn pic(wat: &str, needed: &[&str]) -> Vec<u8> {
 }
 
 fn pic_with_table(wat: &str, needed: &[&str], table_entries: u32) -> Vec<u8> {
+    pic_with_import_flags(wat, needed, table_entries, &[])
+}
+
+fn pic_with_import_flags(
+    wat: &str,
+    needed: &[&str],
+    table_entries: u32,
+    imports: &[(&str, &str, wasmparser::SymbolFlags)],
+) -> Vec<u8> {
     let mut image = wat::parse_str(wat).unwrap();
     let mut section = vec![8];
     section.extend_from_slice(b"dylink.0");
@@ -40,10 +49,183 @@ fn pic_with_table(wat: &str, needed: &[&str], table_entries: u32) -> Vec<u8> {
         leb(names.len() as u32, &mut section);
         section.extend(names);
     }
+    if !imports.is_empty() {
+        let mut flags = Vec::new();
+        leb(imports.len() as u32, &mut flags);
+        for (module, name, value) in imports {
+            for name in [module, name] {
+                leb(name.len() as u32, &mut flags);
+                flags.extend_from_slice(name.as_bytes());
+            }
+            leb(value.bits(), &mut flags);
+        }
+        section.push(4);
+        leb(flags.len() as u32, &mut section);
+        section.extend(flags);
+    }
     image.push(0);
     leb(section.len() as u32, &mut image);
     image.extend(section);
     image
+}
+
+#[test]
+fn weak_direct_main_imports_load_with_or_without_dependencies_and_trap_if_called() {
+    for (profile, needed, flags) in [
+        ("standalone", &[][..], wasmparser::SymbolFlags::BINDING_WEAK),
+        (
+            "startup",
+            &["side.so"][..],
+            wasmparser::SymbolFlags::UNDEFINED | wasmparser::SymbolFlags::BINDING_WEAK,
+        ),
+    ] {
+        for (name, body, expected) in [("unused", "", 0), ("called", "call $optional", 132)] {
+            let main = pic_with_import_flags(
+                &format!(
+                    r#"(module
+      (import "env" "memory" (memory 1 65536 shared))
+      (import "env" "__indirect_function_table" (table 3 funcref))
+      (import "env" "__stack_pointer" (global (mut i32)))
+      (import "env" "__memory_base" (global i32))
+      (import "env" "__table_base" (global i32))
+      (import "env" "optional_tls_initializer" (func $optional))
+      (import "GOT.func" "optional_tls_initializer" (global $optional_ptr (mut i32)))
+      (import "GOT.mem" "optional_data" (global $optional_data (mut i32)))
+      (import "wasi_snapshot_preview1" "sched_yield" (func (result i32)))
+      (func (export "_start")
+        (if (i32.or (global.get $optional_ptr) (global.get $optional_data)) (then unreachable))
+        {body}))"#
+                ),
+                needed,
+                0,
+                &[
+                    ("env", "optional_tls_initializer", flags),
+                    ("env", "optional_data", flags),
+                ],
+            );
+            let library = pic(
+                r#"(module
+      (import "env" "memory" (memory 1 65536 shared))
+      (import "env" "__indirect_function_table" (table 0 funcref))
+      (import "env" "__memory_base" (global i32))
+      (import "env" "__table_base" (global i32)))"#,
+                &[],
+            );
+            assert_eq!(
+                run(
+                    &format!("weak-{profile}-{name}"),
+                    &main,
+                    &[("side.so", library)]
+                ),
+                expected
+            );
+        }
+    }
+}
+
+#[test]
+fn unannotated_direct_imports_still_fail_instantiation() {
+    let main = main_image_with(
+        "",
+        "",
+        &[],
+        0,
+        r#"(import "env" "missing_strong" (func))"#,
+        "",
+        "",
+    );
+    let error = run_result("missing-strong", &main, &[]).unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("missing_strong"), "{message}");
+    assert!(message.contains("unknown import"), "{message}");
+}
+
+#[test]
+fn side_undefined_weak_direct_imports_load_and_trap_only_when_called() {
+    for (name, body, expected) in [("unused", "", 0), ("called", "call $optional", 132)] {
+        let library = pic_with_import_flags(
+            &format!(
+                r#"(module
+      (import "env" "memory" (memory 1 65536 shared))
+      (import "env" "__indirect_function_table" (table 0 funcref))
+      (import "env" "__memory_base" (global i32))
+      (import "env" "__table_base" (global i32))
+      (import "env" "optional_tls_initializer" (func $optional))
+      (func (export "value") (result i32) {body} i32.const 42))"#
+            ),
+            &[],
+            0,
+            &[(
+                "env",
+                "optional_tls_initializer",
+                wasmparser::SymbolFlags::UNDEFINED | wasmparser::SymbolFlags::BINDING_WEAK,
+            )],
+        );
+        let main = main_image(
+            r#"(local.set $handle (call $load (i32.const 0)))
+      (call $check (call_indirect (type $result)
+        (call $lookup (local.get $handle) (i32.const 28) (i32.const 5)))
+        (i32.const 42) (i32.const 1))"#,
+            "",
+            &[],
+        );
+        assert_eq!(
+            run(&format!("side-weak-{name}"), &main, &[("side.so", library)]),
+            expected,
+        );
+    }
+}
+
+#[test]
+fn weak_main_direct_import_uses_a_real_main_or_startup_dependency_definition() {
+    let provider = r#"(func (export "optional_value") (result i32) i32.const 42)"#;
+    for (name, needed, local) in [
+        ("main", &[][..], provider),
+        ("dependency", &["side.so"][..], ""),
+    ] {
+        let main = pic_with_import_flags(
+            &format!(
+                r#"(module
+      (import "env" "memory" (memory 1 65536 shared))
+      (import "env" "__indirect_function_table" (table 3 funcref))
+      (import "env" "__stack_pointer" (global (mut i32)))
+      (import "env" "__memory_base" (global i32))
+      (import "env" "__table_base" (global i32))
+      (import "env" "optional_value" (func $optional (result i32)))
+      (import "wasi_snapshot_preview1" "proc_exit" (func $exit (param i32)))
+      {local}
+      (func (export "_start")
+        (if (i32.ne (call $optional) (i32.const 42))
+          (then (call $exit (i32.const 1))))))"#
+            ),
+            needed,
+            0,
+            &[(
+                "env",
+                "optional_value",
+                wasmparser::SymbolFlags::UNDEFINED | wasmparser::SymbolFlags::BINDING_WEAK,
+            )],
+        );
+        let library = pic(
+            &format!(
+                r#"(module
+      (import "env" "memory" (memory 1 65536 shared))
+      (import "env" "__indirect_function_table" (table 0 funcref))
+      (import "env" "__memory_base" (global i32))
+      (import "env" "__table_base" (global i32))
+      {provider})"#
+            ),
+            &[],
+        );
+        assert_eq!(
+            run(
+                &format!("weak-provider-{name}"),
+                &main,
+                &[("side.so", library)]
+            ),
+            0,
+        );
+    }
 }
 
 struct Programs(PathBuf);
@@ -218,6 +400,14 @@ const CLOSURE_BACKING: &str = r#"
 "#;
 
 fn run(name: &str, main: &[u8], images: &[(&str, Vec<u8>)]) -> i32 {
+    run_result(name, main, images).unwrap()
+}
+
+fn run_result(
+    name: &str,
+    main: &[u8],
+    images: &[(&str, Vec<u8>)],
+) -> Result<i32, wasixv2::RunError> {
     let programs = Programs::new(name, images);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -239,7 +429,6 @@ fn run(name: &str, main: &[u8], images: &[(&str, Vec<u8>)]) -> i32 {
                 },
             )
             .await
-            .unwrap()
     })
 }
 

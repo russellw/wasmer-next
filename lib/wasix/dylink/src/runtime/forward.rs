@@ -47,6 +47,7 @@ impl Cache {
     }
 }
 
+#[cfg(all(test, feature = "engine-tests"))]
 pub(super) fn instantiate(
     cache: &Cache,
     store: &mut impl AsStoreMut,
@@ -85,7 +86,7 @@ pub(super) fn traps(
     )
 }
 
-fn instantiate_targets(
+pub(super) fn instantiate_targets(
     cache: &Cache,
     store: &mut impl AsStoreMut,
     table: &Table,

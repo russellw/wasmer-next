@@ -138,7 +138,31 @@ impl<S: Syscalls + Control + Send + Sync + 'static> Image<S> {
         if let Some(base) = &base {
             imports.extend(base.imports());
         }
-        let startup = self.prepare_startup(cx, &imports).await?;
+        let mut startup = self.prepare_startup(cx, &imports).await?;
+        if startup.is_none() {
+            let graph = {
+                let mut state = lock(&self.root.state);
+                weak_main_fixups(&imports, Arc::make_mut(&mut state.graph)).map_err(load_error)?;
+                state.graph.clone()
+            };
+            let (weak, forwarders) = cx
+                .with_store(|_, store| {
+                    main_imports(&self.root.forward_code, store, &imports, &graph, &[0])
+                })
+                .await
+                .map_err(load_error)?;
+            if weak.iter().next().is_some() {
+                startup = Some(Prepared {
+                    root: self.root.clone(),
+                    base: self.base.clone(),
+                    prepared_base: None,
+                    imports: weak,
+                    forwarders,
+                    tls: vec![0],
+                    bound: None,
+                });
+            }
+        }
         if base.is_none() && startup.is_none() {
             return Ok(None);
         }
@@ -380,7 +404,11 @@ fn main_imports(
                 pending.push((
                     fixup.import,
                     signature.clone(),
-                    graph.target_address(&fixup.target, tls)?,
+                    if fixup.target == BindingTarget::WeakZero {
+                        None
+                    } else {
+                        Some(graph.target_address(&fixup.target, tls)?)
+                    },
                 ));
             }
             _ => {}
@@ -395,7 +423,7 @@ fn main_imports(
             .iter()
             .map(|(_, ty, slot)| (ty.clone(), *slot))
             .collect::<Vec<_>>();
-        let forwarder = forward::instantiate(code, store, &table, base, &targets)?;
+        let forwarder = forward::instantiate_targets(code, store, &table, base, &targets)?;
         for (number, (ordinal, _, _)) in pending.iter().enumerate() {
             let import = &main.metadata.imports()[*ordinal];
             imports.define(
@@ -411,6 +439,56 @@ fn main_imports(
         forwarders.push(BoundModule::new(&forwarder));
     }
     Ok((imports, forwarders))
+}
+
+// lld retains undefined weak imports even without NEEDED libraries. GOT references
+// stay zero; unused direct imports instantiate and trap only on an unresolved call.
+fn weak_main_fixups(base: &Imports, graph: &mut Graph) -> Result<()> {
+    let modules = graph
+        .libraries
+        .iter()
+        .map(|lib| lib.metadata.clone())
+        .collect::<Vec<_>>();
+    let dependencies = graph
+        .libraries
+        .iter()
+        .map(|lib| lib.dependencies.clone())
+        .collect::<Vec<_>>();
+    for (ordinal, import) in modules[0].imports().iter().enumerate() {
+        if !(matches!(import.module.as_str(), "GOT.func" | "GOT.mem")
+            || import.module == "env" && matches!(import.ty, ExternType::Function(_)))
+            || !import.flags.contains(wasmparser::SymbolFlags::BINDING_WEAK)
+            || base.get_export(&import.module, &import.name).is_some()
+            || graph.libraries[0]
+                .fixups
+                .iter()
+                .any(|fixup| fixup.import == ordinal)
+        {
+            continue;
+        }
+        let (mut kind, mut target) =
+            crate::Plan::retry_import(&modules, &dependencies, 0, &graph.global, 0, ordinal)
+                .map_err(failure)?;
+        // Guest definitions precede declared host fallbacks, just as in Plan.
+        if kind == FixupKind::DirectFunction
+            && target.is_none()
+            && graph.host_imports.as_ref().is_some_and(|declarations| {
+                declarations.provides_import(&import.module, &import.name)
+            })
+        {
+            kind = FixupKind::Host;
+            target = Some(BindingTarget::Host);
+        }
+        // Freeze the first binding so a later GLOBAL load cannot change the
+        // meaning of this import when a new peer Store joins the same image.
+        graph.libraries[0].fixups.push(crate::Fixup {
+            module: 0,
+            import: ordinal,
+            kind,
+            target: target.unwrap_or(BindingTarget::WeakZero),
+        });
+    }
+    Ok(())
 }
 
 async fn collect<S: wasixv2_syscalls::LoaderControl>(
@@ -802,6 +880,34 @@ impl<S: Syscalls + Control + Send + Sync + 'static> StoreImage<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn standalone_weak_binding_stays_frozen_after_a_later_global_definition() {
+        let root = Root::new(crate::tests::bytes(
+            r#"(module (import "env" "late" (func)))"#,
+            [0; 4],
+            &[],
+            &[],
+            &[("env", "late", wasmparser::SymbolFlags::BINDING_WEAK)],
+        ));
+        let mut graph = (*root.graph()).clone();
+        weak_main_fixups(&Imports::new(), &mut graph).unwrap();
+        let frozen = graph.libraries[0].fixups.clone();
+        assert_eq!(frozen.len(), 1);
+        assert_eq!(frozen[0].target, BindingTarget::WeakZero);
+        graph.libraries.push(
+            Library::new(
+                crate::tests::bytes(r#"(module (func (export "late")))"#, [0; 4], &[], &[], &[]),
+                None,
+            )
+            .unwrap(),
+        );
+        graph.global.push(1);
+        graph.assign_slots(1).unwrap();
+        graph.seal(1, 1).unwrap();
+        weak_main_fixups(&Imports::new(), &mut graph).unwrap();
+        assert_eq!(graph.libraries[0].fixups, frozen);
+    }
+
     #[test]
     fn startup_policy_ignores_secure_environment_and_preserves_first_value_order() {
         let mut startup = LoaderStartup {

@@ -948,12 +948,16 @@ impl Local {
                                 .lazy
                                 .get(&ordinal)
                                 .ok_or_else(|| failure("missing deferred function slot"))?;
-                            pending.push((ordinal, signature.clone(), lazy.slot));
+                            pending.push((ordinal, signature.clone(), Some(lazy.slot)));
+                            continue;
+                        }
+                        if fixup.is_some_and(|f| f.target == BindingTarget::WeakZero) {
+                            pending.push((ordinal, signature.clone(), None));
                             continue;
                         }
                         let BindingTarget::Function { module, index, .. } = &fixup.unwrap().target
                         else {
-                            return Err(failure("missing weak direct function is unsupported"));
+                            return Err(failure("invalid direct function binding"));
                         };
                         let provider = if *module < work.previous {
                             local.instances.get(*module)
@@ -968,7 +972,7 @@ impl Local {
                             Some(Extern::Function(engine_function(provider, *index)?))
                         } else {
                             let slot = graph.target_address(&fixup.unwrap().target, &tls)?;
-                            pending.push((ordinal, signature.clone(), slot));
+                            pending.push((ordinal, signature.clone(), Some(slot)));
                             None
                         }
                     }
@@ -995,7 +999,7 @@ impl Local {
                     .iter()
                     .map(|(_, ty, slot)| (ty.clone(), *slot))
                     .collect::<Vec<_>>();
-                let forwarder = forward::instantiate(
+                let forwarder = forward::instantiate_targets(
                     &local.forward_code,
                     store,
                     &local.table,
@@ -1071,7 +1075,11 @@ impl Local {
             for (ordinal, import) in graph.libraries[index].metadata.imports().iter().enumerate() {
                 if matches!(import.ty, ExternType::Function(_)) {
                     if graph.libraries[index].fixups.iter().any(|fixup| {
-                        fixup.import == ordinal && fixup.target == BindingTarget::Deferred
+                        fixup.import == ordinal
+                            && matches!(
+                                fixup.target,
+                                BindingTarget::Deferred | BindingTarget::WeakZero
+                            )
                     }) {
                         function += 1;
                         continue;
