@@ -121,7 +121,9 @@ impl NativeWasi {
                 } else {
                     format!("/{name}")
                 };
-                machine.mount_host_dir(&path, host, false).await?;
+                machine
+                    .mount_host_dir(&path, std::path::Path::new(&host), false)
+                    .await?;
                 input_preopens.push((path.into_bytes(), name.into_bytes()));
             }
             let process = machine
