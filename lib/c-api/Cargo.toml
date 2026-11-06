@@ -38,6 +38,9 @@ wasmer-wasix = { path = "../wasix-legacy", version = "=0.705.0", features = [
   "host-vnet",
   "sys",
 ], default-features = false, optional = true }
+wasixv2 = { path = "../wasix/api", default-features = false, features = ["tokio", "wasix1", "host-network"], optional = true }
+wasixv2-exec = { path = "../wasix/exec", default-features = false, optional = true }
+wasixv2-wasix1 = { path = "../wasix/wasix1", default-features = false, optional = true }
 anyhow.workspace = true
 enumset.workspace = true
 libc.workspace = true
@@ -57,17 +60,18 @@ tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
 [dev-dependencies]
 field-offset.workspace = true
 inline-c.workspace = true
+tokio = { workspace = true, features = ["time"] }
 wat.workspace = true
 
 [features]
 default = ["wat", "sys-default", "cranelift", "compiler", "wasi", "middlewares"]
 wat = ["wasmer-api/wat", "wasmer-c-api-imports/wat"]
-wasi = ["wasmer-wasix"]
+wasi = ["wasmer-wasix", "dep:wasixv2", "dep:wasixv2-exec", "dep:wasixv2-wasix1"]
 middlewares = ["compiler", "wasmer-middlewares", "wasmer-api/wasmparser"]
 engine = ["compiler"]
 
 # Enable the `sys` backend.
-sys = ["wasmer-api/sys", "wasmer-compiler", "wasmer-c-api-imports/sys"]
+sys = ["wasmer-api/sys", "wasmer-api/experimental-async", "wasmer-compiler", "wasmer-c-api-imports/sys", "wasixv2?/sys", "wasixv2-exec?/sys", "wasixv2-wasix1?/sys"]
 
 # Enable the `singlepass` compiler.
 singlepass = [

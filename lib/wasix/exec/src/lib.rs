@@ -14,6 +14,7 @@ mod contexts;
 mod cooperative;
 mod cputime;
 mod dynamic;
+mod embedding;
 mod fork;
 mod function;
 mod generated;
@@ -24,6 +25,20 @@ mod memory_image;
 #[cfg(all(target_os = "linux", feature = "sys"))]
 mod pagemap;
 mod preempt;
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+pub use cancellation::OwnedEntryWaiter;
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+use cancellation::PreinstalledTerminalCustody;
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+pub use embedding::HostCallHandoff;
+pub use embedding::HostEnvironment;
+
+/// A committed image transition uses a typed abort, including when a C API
+/// instance start propagates it through an instantiation trampoline.
+pub fn is_call_handoff(error: &RuntimeError) -> bool {
+    process::pending_marker(error).is_some()
+}
+
 mod preparation;
 mod process;
 mod spawn_custody;
@@ -43,7 +58,8 @@ use std::{
 };
 
 pub use abi::{
-    Abi, AbiInstance, Abis, Entry, EntryReturn, PreparedImage, Role, Sigreturn, VforkResume,
+    Abi, AbiInstance, Abis, Entry, EntryReturn, ExecProcessLease, PreparedImage, Role, Sigreturn,
+    VforkResume,
 };
 pub use cleanup::local_cleanup_runner;
 pub use contexts::{context_operations_supported, process_fork_allowed};
@@ -598,7 +614,7 @@ pub(crate) enum Ended {
     /// The task's thread group, or for a thread the task itself, exited.
     Exited(i32),
     /// `execve` replaced the image.
-    Exec(Image),
+    Exec(process::ExecImage),
     /// The guest trapped while the instance ran as `task`: a hardware fault, signal `signal`.
     /// `report` says what happened, for the host when the fault kills the process.
     Fault {
@@ -645,13 +661,12 @@ async fn ended<S: Syscalls + Control + Send + Sync + 'static>(
         Ok(Exited(status)) => return Ended::Exited(status),
         Err(err) => err,
     };
-    let err = match err.downcast::<process::ExecNew>() {
-        Ok(process::ExecNew(image)) => return Ended::Exec(image),
-        Err(err) => err,
-    };
-    if err.downcast_ref::<process::Detached>().is_some() {
-        let handoff = cx.with(|env, _| env.proc.handoff.clone()).await;
-        return Ended::Detached(handoff);
+    if let Some(handoff) = process::pending_marker(&err) {
+        match handoff.claim() {
+            Ok(process::PendingOutcome::Exec { image, .. }) => return Ended::Exec(image),
+            Ok(process::PendingOutcome::Detached) => return Ended::Detached(handoff.clone()),
+            Err(error) => tracing::warn!(%error, "cannot claim committed image outcome"),
+        }
     }
     let (syscalls, task, handoff) = cx
         .with(|env, _| (env.syscalls.clone(), env.task, env.proc.handoff.clone()))
@@ -932,21 +947,18 @@ where
         .map(|gate| Binding::new(&*abi, gate, task))
         .transpose()
         .map_err(|e| ExecError::Load(LoadError::Format(e)))?;
-    let spawner = process::spawner(
-        store.engine().clone(),
-        syscalls.clone(),
-        host.clone(),
-        abis.clone(),
-    );
     let handoff = Arc::new(process::Handoff::default());
     handoff.bind_cancellation(cleanup.cancellation());
-    let proc = process::ProcExports::new(spawner, handoff.clone());
-    let env = FunctionEnv::new(
-        &mut store,
-        ExecEnv::new(syscalls.clone(), task, proc, host.clone()),
+    let env = embedding::environment(
+        &mut store.as_store_mut(),
+        syscalls.clone(),
+        task,
+        host.clone(),
+        abis.clone(),
+        cleanup.shared().clone(),
+        handoff.clone(),
     );
-    env.as_mut(&mut store).cleanup = Some(cleanup.shared().clone());
-    abis.install_hooks(&mut store.as_store_mut(), &env);
+    // environment() installs this cleanup scope and registered hooks exactly once.
     let mut imports = imports(&*abi, &mut store.as_store_mut(), &env, module);
     let size = fork.map(|image| image.memory.size());
     let imported = import_memory(&mut store.as_store_mut(), module, &mut imports, size)?;
@@ -1050,6 +1062,9 @@ where
             }
             None => abi.bind(&instance, &mut store.as_store_mut(), task, Role::Process)?,
         };
+        handoff
+            .retain_process(task, &*bound)
+            .map_err(ExecError::CustomBinding)?;
         let shared = memory.as_shared(&store);
         #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
         let foreign = memory
@@ -1666,16 +1681,19 @@ async fn complete_inner<S: Syscalls + Control + 'static, T>(
                     }
                     // The kernel queues the image with the action; without one, the empty image
                     // fails to load and the process dies as past any `execve`'s point of no return.
+                    let process = syscalls.tgid(task);
                     let image = syscalls
-                        .take_image(task)
+                        .take_image(process)
                         .unwrap_or_else(|| Image::copied(Vec::new()));
                     let Some(parent) = vfork_parent else {
-                        return Outcome::Unwind(RuntimeError::user(Box::new(process::ExecNew(
-                            image,
-                        ))));
+                        return Outcome::Unwind(process::commit_exec(env, process, image).await);
+                    };
+                    let image = match process::exec_image(env, process, image).await {
+                        Ok(image) => image,
+                        Err(error) => return Outcome::Unwind(error),
                     };
                     let publication = spawn.and_then(|spawn| spawn.publication(task));
-                    process::spawn_image(env, task, image, publication).await;
+                    process::spawn_image(env, process, image, publication).await;
                     match vfork_resume(env, parent, task).await {
                         Some(VforkResume::Unwind(err)) => return Outcome::Unwind(err),
                         Some(VforkResume::ReturnSuccess) => {
@@ -1734,6 +1752,10 @@ async fn complete_inner<S: Syscalls + Control + 'static, T>(
                     let image = syscalls
                         .take_image(leader)
                         .unwrap_or_else(|| Image::copied(Vec::new()));
+                    let image = match process::exec_image(env, leader, image).await {
+                        Ok(image) => image,
+                        Err(error) => return Outcome::Unwind(error),
+                    };
                     process::take_over(env, leader, image).await;
                 }
                 GuestAction::ExitMm { task: dead } => {
@@ -1783,6 +1805,10 @@ async fn complete_inner<S: Syscalls + Control + 'static, T>(
     let errno = match (ret, handled) {
         (Ok(value), _) => return Outcome::Return(Ok(value)),
         (Err(SysErr::Errno(errno)), _) => errno,
+        // Linux/v2 has no WASI capability errno. The v1 adapter projects typed
+        // namespace verdicts before this shared completion boundary.
+        (Err(SysErr::NamespaceBoundary), _) => Errno::ENOENT,
+        (Err(SysErr::NamespaceMutation), _) => Errno::EACCES,
         (Err(SysErr::GuestUnwind), _) => unreachable!("checked before guest work"),
         (Err(SysErr::RestartBlock), None | Some(true)) => {
             // Linux's arch/x86/kernel/signal.c:arch_do_signal_or_restart re-enters the
@@ -1831,7 +1857,7 @@ async fn vfork_resume<S: Control + 'static>(
     child: TaskId,
 ) -> Option<VforkResume> {
     if parent.resumes == Resume::Gone {
-        let detached = RuntimeError::user(Box::new(process::Detached));
+        let detached = process::commit_detached(env).await;
         return Some(VforkResume::Unwind(detached));
     }
     process::switch(env, parent.task).await;

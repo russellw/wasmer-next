@@ -193,7 +193,8 @@ pub(crate) async fn path_create_directory<S: Syscalls + Control + 'static>(
         frame
             .syscalls
             .mkdirat(&frame.caller(), Fd(fd), path, DIR_MODE)
-            .await?;
+            .await
+            .map_err(|error| crate::errno::mutation(error, Errno::ACCES))?;
         Ok(())
     })
     .await
@@ -235,7 +236,8 @@ async fn unlink<S: Syscalls + Control + 'static>(
         frame
             .syscalls
             .unlinkat(&frame.caller(), Fd(fd), path, flags)
-            .await?;
+            .await
+            .map_err(|error| crate::errno::mutation(error, Errno::ACCES))?;
         Ok(())
     })
     .await
@@ -352,7 +354,8 @@ pub(crate) async fn path_link<S: Syscalls + Control + 'static>(
         frame
             .syscalls
             .linkat(&frame.caller(), Fd(old_fd), old, Fd(new_fd), new, flags)
-            .await?;
+            .await
+            .map_err(|error| crate::errno::mutation(error, Errno::INVAL))?;
         Ok(())
     })
     .await

@@ -371,20 +371,9 @@ fn shared_object_dir() -> PathBuf {
     shared_object_dir.pop();
 
     assert_eq!(shared_object_dir.file_name(), Some(OsStr::new("build")));
+    // The parent is Cargo's actual profile directory, including a configured
+    // target directory, cross-compilation triple or custom profile name.
     shared_object_dir.pop();
-    shared_object_dir.pop(); // "debug" or "release"
-
-    // We either find `target` or the target triple if cross-compiling.
-    if shared_object_dir.file_name() != Some(OsStr::new("target")) {
-        let target = env::var("TARGET").unwrap();
-        if shared_object_dir.file_name() != Some(OsStr::new("llvm-cov-target")) {
-            assert_eq!(shared_object_dir.file_name(), Some(OsStr::new(&target)));
-        } else {
-            shared_object_dir.set_file_name(&target);
-        }
-    }
-
-    shared_object_dir.push(env::var("PROFILE").unwrap());
 
     shared_object_dir
 }

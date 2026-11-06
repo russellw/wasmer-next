@@ -28,6 +28,13 @@ pub use package::{
 mod directory;
 pub use directory::{DirectoryEntry, populate_directory};
 
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+mod embedding;
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+pub use embedding::{
+    BootstrappedProcess, DirectoryBootstrap, EmbeddingProcess, NamespaceBootstrap,
+};
+
 use std::{
     collections::HashSet,
     future::Future,
@@ -68,8 +75,8 @@ use wasixv2_kernel::{FilesystemType, FsParam, HostClock, Kernel, SyscallEntry, T
 use wasixv2_pages::{Provider, SharedPages};
 use wasixv2_syscalls::{Layered, TaskId};
 use wasixv2_trace::Trace;
-pub use wasixv2_vfs::Filesystem;
-use wasixv2_vfs::{Cred, Ctx, Errno, LookupFlags, MountFlags, NAME_MAX, Vfs};
+use wasixv2_vfs::{Cred, Ctx, Errno, LookupFlags, MountFlags, Vfs};
+pub use wasixv2_vfs::{Filesystem, NAME_MAX};
 use wasixv2_vfs_mem::{Limits, MemFs, QuotaLimits};
 use wasixv2_vfs_overlay::{MAX_LOWERS, OverlayFs};
 use wasixv2_vfs_package::PackageFs;
@@ -504,11 +511,7 @@ impl MachineBuilder {
         let root = root
             .unwrap_or_else(|| default_root(&host, &network.resolv_conf(), &user, uname.release()));
         #[cfg(feature = "wasix1")]
-        let wasix1 = Wasix1Commands {
-            http_provider,
-            wasix1_limits,
-            ..Wasix1Commands::default()
-        };
+        let wasix1 = Wasix1Commands::new(http_provider, wasix1_limits);
         let mut configured_abis = abis(
             loader,
             #[cfg(feature = "js")]
@@ -829,6 +832,33 @@ impl Machine {
             .map_err(errno_to_io)
     }
 
+    /// Captures a host directory as an owned, unattached directory capability.
+    /// Capturing it does not make the directory visible in this Machine's root.
+    /// It fixes filesystem configuration, as starting a process does.
+    pub fn capture_host_directory(
+        &self,
+        host_dir: &Path,
+        read_only: bool,
+    ) -> io::Result<wasixv2_vfs::File> {
+        let options = wasixv2_vfs_host::Options {
+            read_only,
+            owner: self.owner,
+        };
+        let fs = wasixv2_vfs_host::open(host_dir, self.host.clone(), options)?;
+        let source = fs.info().name.as_bytes().to_vec();
+        self.in_use.store(true, Ordering::Relaxed);
+        Ok(self.vfs().create_mount(
+            fs,
+            source,
+            MountFlags {
+                read_only,
+                ..MountFlags::default()
+            },
+            read_only,
+            self.vfs().namespace().owner().clone(),
+        ))
+    }
+
     /// Maps the host directory `host_dir` to `guest`. The guest cannot reach anything outside
     /// `host_dir`; files the host user owns appear as owned by the machine's user.
     pub async fn mount_host_dir(
@@ -1061,6 +1091,22 @@ impl Machine {
     /// [`Machine::signal`]'s list while the returned guard lives; the guard kills it unless
     /// told that the run released it.
     async fn start(&self, config: ProcessConfig) -> Result<(TaskId, Running<'_>), RunError> {
+        let (task, running, ()) = self
+            .start_with(config, |config| {
+                std::future::ready(self.syscalls.inner.spawn(config).map(|task| (task, ())))
+            })
+            .await?;
+        Ok((task, running))
+    }
+
+    async fn start_with<T, F>(
+        &self,
+        config: ProcessConfig,
+        spawn: impl FnOnce(ProcessConfig) -> F,
+    ) -> Result<(TaskId, Running<'_>, T), RunError>
+    where
+        F: Future<Output = Result<(TaskId, T), Errno>>,
+    {
         self.in_use.store(true, Ordering::Relaxed);
         #[cfg(feature = "wasix1")]
         self.resolve_wasix1_commands().await;
@@ -1077,7 +1123,8 @@ impl Machine {
                     fds[2].then(|| config.stdio.stderr.clone()),
                 ]
             });
-        let task = (self.syscalls.inner.spawn(config))
+        let (task, metadata) = spawn(config)
+            .await
             .map_err(|errno| RunError::Spawn(errno_to_io(errno)))?;
         self.running.lock().unwrap().push(task);
         let running = Running {
@@ -1104,7 +1151,7 @@ impl Machine {
             }
             .map_err(|errno| RunError::Console(errno_to_io(errno)))?;
         }
-        Ok((task, running))
+        Ok((task, running, metadata))
     }
 
     fn check_thread_profile(&self) -> Result<(), RunError> {
@@ -1275,13 +1322,29 @@ fn boot(
 /// The package commands WASIX v1 programs start with their defaults: the names registered,
 /// until the first process resolves them to the files in `files`, which `Wasix1` reads.
 #[cfg(feature = "wasix1")]
-#[derive(Default)]
 struct Wasix1Commands {
     names: Mutex<Vec<(String, CommandDefaults)>>,
     files: Arc<std::sync::RwLock<wasixv2_wasix1::Commands>>,
-    http_provider: Option<Arc<dyn wasix1_http::HttpProvider>>,
-    #[cfg(feature = "wasix1")]
-    wasix1_limits: wasixv2_wasix1::Limits,
+    abi: Arc<wasixv2_wasix1::Wasix1>,
+}
+
+#[cfg(feature = "wasix1")]
+impl Wasix1Commands {
+    fn new(
+        http_provider: Option<Arc<dyn wasix1_http::HttpProvider>>,
+        limits: wasixv2_wasix1::Limits,
+    ) -> Self {
+        let files = Arc::default();
+        let mut abi = wasixv2_wasix1::Wasix1::with_commands(Arc::clone(&files)).with_limits(limits);
+        if let Some(provider) = http_provider {
+            abi = abi.with_http_provider(provider);
+        }
+        Self {
+            names: Mutex::default(),
+            files,
+            abi: Arc::new(abi),
+        }
+    }
 }
 
 /// The guest ABIs programs may target, `wasixv2` first, and how their images compile: by
@@ -1306,14 +1369,7 @@ fn abis(
     }
     abis.push(Arc::new(Wasixv2));
     #[cfg(feature = "wasix1")]
-    {
-        let mut abi = wasixv2_wasix1::Wasix1::with_commands(wasix1.files.clone())
-            .with_limits(wasix1.wasix1_limits);
-        if let Some(provider) = &wasix1.http_provider {
-            abi = abi.with_http_provider(provider.clone());
-        }
-        abis.push(Arc::new(abi));
-    }
+    abis.push(wasix1.abi.clone());
     abis
 }
 
@@ -1997,7 +2053,7 @@ pub fn default_root(
             let file = vfs.open(&cx, &top, path.as_bytes(), &how).await?;
             file.write_at(contents.as_bytes(), 0).await?;
         }
-        Ok::<_, Errno>(())
+        Ok::<_, wasixv2_vfs::PathError>(())
     };
     now(layout).expect("a new memory filesystem takes the default layout");
     root
@@ -2141,7 +2197,7 @@ async fn mount_kernel_filesystems(kernel: &Kernel, host: &Arc<dyn Host>) {
             mount("/dev/pts", kernel.devpts(), flags(false, true)).await;
         }
         mount("/tmp", tmpfs(0o1777), flags(true, false)).await;
-        Ok::<_, Errno>(())
+        Ok::<_, wasixv2_vfs::PathError>(())
     };
     mounts
         .await

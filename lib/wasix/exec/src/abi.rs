@@ -140,8 +140,22 @@ pub enum Role {
     Thread,
 }
 
+/// Lifetime-only custody for compat process registration across image replacement.
+/// It must own no Store, instance, memory or guest callback.
+pub trait ExecProcessLease: Send + Sync + 'static {}
+
 /// The per-instance half of an [`Abi`]: entry points and the guest-visible interruptions.
 pub trait AbiInstance<S: 'static>: Send + Sync {
+    /// Acquires the exact process registration before entry, or moves an already
+    /// held vfork child's registration. `process` is its leader, never a thread ID.
+    fn retain_exec_process(
+        &self,
+        process: TaskId,
+    ) -> Result<Option<Box<dyn ExecProcessLease>>, RuntimeError> {
+        let _ = process;
+        Ok(None)
+    }
+
     /// The current store's function table, if the ABI supplies one.
     fn function_table(&self) -> Option<&wasmer::Table> {
         None

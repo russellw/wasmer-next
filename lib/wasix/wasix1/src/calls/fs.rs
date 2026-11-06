@@ -757,7 +757,21 @@ pub(crate) async fn fd_renumber<S: Syscalls + Control + 'static>(
     to: i32,
 ) -> Result<i32, RuntimeError> {
     shim::errno(&env, async |frame| {
-        crate::rights::duplicate(frame, Fd(from)).await?;
+        let set = frame.bind_descriptors(&[Fd(from), Fd(to)])?;
+        if !set.get(Fd(from)).is_some_and(|entry| entry.present) {
+            return shim::fail(Errno::BADF);
+        }
+        if from != to
+            && set
+                .get(Fd(to))
+                .and_then(|entry| entry.attachment.as_ref())
+                .and_then(|attachment| attachment.downcast_ref::<crate::rights::Record>())
+                .and_then(|record| record.legacy.as_ref())
+                .is_some_and(|object| !object.stdio)
+        {
+            return shim::fail(Errno::NOTSUP);
+        }
+        crate::rights::duplicate(frame, Fd(from), false).await?;
         let caller = frame.caller();
         if from == to {
             // `dup2` of a descriptor onto itself only checks that it is open.
@@ -785,7 +799,7 @@ pub(crate) async fn fd_dup<S: Syscalls + Control + 'static>(
     out: i32,
 ) -> Result<i32, RuntimeError> {
     shim::errno(&env, async |frame| {
-        crate::rights::duplicate(frame, Fd(fd)).await?;
+        crate::rights::duplicate(frame, Fd(fd), false).await?;
         let new = frame.syscalls.dup(&frame.caller(), Fd(fd)).await?;
         frame.proc().await?.net.timeouts.copy(Fd(fd), new);
         frame.write(out as u32, &(new.0 as u32)).await
@@ -802,8 +816,9 @@ pub(crate) async fn fd_dup2<S: Syscalls + Control + 'static>(
     out: i32,
 ) -> Result<i32, RuntimeError> {
     shim::errno(&env, async |frame| {
-        crate::rights::duplicate(frame, Fd(fd)).await?;
-        let cmd = match cloexec as u8 {
+        crate::rights::duplicate(frame, Fd(fd), cloexec != 0).await?;
+        let legacy = crate::rights::record(frame, Fd(fd)).await?.legacy.is_some();
+        let cmd = match if legacy { 0 } else { cloexec as u8 } {
             0 => FcntlCmd::F_DUPFD,
             _ => FcntlCmd::F_DUPFD_CLOEXEC,
         };
@@ -824,6 +839,19 @@ pub(crate) async fn fd_fdflags_get<S: Syscalls + Control + 'static>(
 ) -> Result<i32, RuntimeError> {
     shim::errno(&env, async |frame| {
         crate::rights::require(frame, &[(wasixv2_abi::Fd(fd), Rights::empty())]).await?;
+        let record = crate::rights::record(frame, Fd(fd)).await?;
+        if record.legacy.is_some() {
+            return frame
+                .write(
+                    out as u32,
+                    &if record.cloexec {
+                        Fdflagsext::CLOEXEC
+                    } else {
+                        Fdflagsext::empty()
+                    },
+                )
+                .await;
+        }
         let flags = frame
             .syscalls
             .fcntl64(&frame.caller(), Fd(fd), FcntlCmd::F_GETFD, 0)
@@ -849,10 +877,19 @@ pub(crate) async fn fd_fdflags_set<S: Syscalls + Control + 'static>(
             true => FdFlags::FD_CLOEXEC,
             false => FdFlags(0),
         };
+        let legacy = crate::rights::record(frame, Fd(fd)).await?.legacy.is_some();
         frame
             .syscalls
-            .fcntl64(&frame.caller(), Fd(fd), FcntlCmd::F_SETFD, cloexec.0)
+            .fcntl64(
+                &frame.caller(),
+                Fd(fd),
+                FcntlCmd::F_SETFD,
+                if legacy { 0 } else { cloexec.0 },
+            )
             .await?;
+        if legacy {
+            crate::rights::set_legacy_cloexec(frame, Fd(fd), cloexec.0 != 0).await?;
+        }
         Ok(())
     })
     .await
