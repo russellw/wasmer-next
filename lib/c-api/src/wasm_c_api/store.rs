@@ -29,13 +29,153 @@ struct ManagedStore {
     owner: wasmer_api::sys::NativeCleanupOwner,
     driver: RefCell<Option<Rc<Driver>>>,
     cleanup_fences: RefCell<Vec<Box<dyn Fn() -> bool>>>,
+    #[cfg(feature = "wasi")]
+    endpoints: RefCell<Vec<Weak<dyn ContinuationEndpoint>>>,
 }
 
 #[cfg(feature = "sys")]
-struct Driver {
+pub(crate) struct Driver {
     runtime: std::sync::Arc<tokio::runtime::Runtime>,
     local: tokio::task::LocalSet,
     active: std::cell::Cell<bool>,
+    owner: wasmer_api::sys::NativeCleanupOwner,
+    enrolled: RefCell<Vec<Rc<std::cell::Cell<bool>>>>,
+}
+
+#[cfg(all(feature = "sys", feature = "wasi"))]
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct CompletedHandoff(RuntimeError);
+#[cfg(all(feature = "sys", feature = "wasi"))]
+pub(crate) fn completed_handoff(error: RuntimeError) -> RuntimeError {
+    RuntimeError::user(Box::new(CompletedHandoff(error)))
+}
+
+#[cfg(all(feature = "sys", feature = "wasi"))]
+pub(crate) trait ContinuationEndpoint {
+    fn matches(&self, store: &mut StoreMut<'_>, error: &RuntimeError) -> bool;
+    fn prepare(
+        self: Rc<Self>,
+        store: &StoreRef,
+        error: &RuntimeError,
+    ) -> Result<LocalContinuation, RuntimeError>;
+    fn cancel_unclaimed(
+        self: Rc<Self>,
+        store: &StoreRef,
+        error: &RuntimeError,
+    ) -> Result<(), RuntimeError>;
+}
+
+#[cfg(all(feature = "sys", feature = "wasi"))]
+pub(crate) struct LocalContinuation {
+    pub(crate) store: StoreRef,
+    pub(crate) run: Option<
+        Box<
+            dyn FnOnce() -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<(), RuntimeError>>>,
+            >,
+        >,
+    >,
+    pub(crate) cancel: Option<Box<dyn FnOnce()>>,
+}
+#[cfg(all(feature = "sys", feature = "wasi"))]
+impl Drop for LocalContinuation {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            cancel();
+        }
+    }
+}
+
+/// Captured before admission; owns only the existing local executor and cleanup pump.
+#[cfg(feature = "sys")]
+#[derive(Clone)]
+pub(crate) struct CleanupRetirement {
+    driver: Rc<Driver>,
+    owner: wasmer_api::sys::NativeCleanupOwner,
+}
+#[cfg(feature = "sys")]
+impl CleanupRetirement {
+    pub(crate) fn retain(
+        &self,
+        mut future: std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>,
+    ) {
+        let driver = self.driver.clone();
+        self.owner.retain(Box::pin(std::future::poll_fn(move |cx| {
+            let _runtime = driver.runtime.enter();
+            let _local = driver.local.enter();
+            future.as_mut().poll(cx)
+        })));
+    }
+    #[cfg(feature = "wasi")]
+    pub(crate) fn drive_after_settlement(&self, completed: Rc<std::cell::Cell<bool>>) {
+        let driver = self.driver.clone();
+        self.owner.after_pump(Box::new(move || {
+            if completed.get() {
+                return;
+            }
+            if driver.active.get() {
+                // The same LocalSet is already being polled. Enroll this exact
+                // cleanup in its existing poller, never recursively enter it.
+                driver.enrolled.borrow_mut().push(completed);
+                return;
+            }
+            driver.drain_retirement(completed);
+        }));
+    }
+}
+
+#[cfg(feature = "sys")]
+struct CallOwner {
+    driver: Rc<Driver>,
+    #[cfg(feature = "wasi")]
+    pending: RefCell<std::collections::VecDeque<LocalContinuation>>,
+}
+
+#[cfg(feature = "sys")]
+impl CallOwner {
+    async fn drain(&self) -> Option<RuntimeError> {
+        #[cfg(feature = "wasi")]
+        {
+            let mut outcome = None;
+            loop {
+                let next = self.pending.borrow_mut().pop_front();
+                let Some(mut next) = next else {
+                    return outcome;
+                };
+                let driver = match &next.store.inner.mode {
+                    StoreMode::Native(native) => match native.driver() {
+                        Ok(driver) => driver,
+                        Err(error) => {
+                            outcome = Some(error);
+                            continue;
+                        }
+                    },
+                    StoreMode::Plain(_) => {
+                        outcome = Some(RuntimeError::new("native continuation lost its Store"));
+                        continue;
+                    }
+                };
+                let future = next.run.take().expect("queued continuation has one entry")();
+                let result = if Rc::ptr_eq(&self.driver, &driver) {
+                    future.await
+                } else {
+                    driver.run_local(future).await
+                };
+                if let Err(error) = result {
+                    outcome = Some(error);
+                }
+                // A final Store retirement must see no escaped Driver clone.
+                drop(driver);
+                drop(next);
+            }
+        }
+        #[cfg(not(feature = "wasi"))]
+        {
+            let _ = &self.driver;
+            None
+        }
+    }
 }
 
 impl StoreRef {
@@ -63,6 +203,8 @@ impl StoreRef {
                         owner,
                         driver: RefCell::new(None),
                         cleanup_fences: RefCell::default(),
+                        #[cfg(feature = "wasi")]
+                        endpoints: RefCell::default(),
                     }),
                 }),
             });
@@ -127,16 +269,54 @@ impl StoreRef {
                 })
             }
         }) {
+            #[cfg(all(feature = "sys", feature = "wasi"))]
+            if let Err(error) = &result {
+                self.forward_handoff(error, None)?;
+            }
             return result;
         }
         match &self.inner.mode {
             StoreMode::Plain(_) => self.with_mut(|store| function.call(store, &args))?,
             #[cfg(feature = "sys")]
-            StoreMode::Native(native) => {
-                let driver = native.driver()?;
-                driver.run(function.call_async(native.store.as_ref().unwrap(), args))?
-            }
+            StoreMode::Native(native) => self.native_call(native, function, args),
         }
+    }
+
+    #[cfg(feature = "sys")]
+    fn native_call(
+        &self,
+        native: &ManagedStore,
+        function: &Function,
+        args: Vec<Value>,
+    ) -> Result<Box<[Value]>, RuntimeError> {
+        let driver = native.driver()?;
+        let owner = Rc::new(CallOwner {
+            driver: driver.clone(),
+            #[cfg(feature = "wasi")]
+            pending: RefCell::default(),
+        });
+        let erased: Rc<dyn std::any::Any> = owner.clone();
+        let store = native.store.as_ref().unwrap();
+        let call = wasmer_api::sys::call_async_with_local_owner(
+            function,
+            store,
+            args,
+            Rc::downgrade(&erased),
+        );
+        driver.run(async {
+            use wasmer_api::AsStoreAsync;
+            let result = call.await;
+            // Native settlement notification precedes the actual unlock.
+            drop(store.write_lock().await);
+            #[cfg(feature = "wasi")]
+            if let Err(error) = &result {
+                self.forward_handoff(error, Some(&owner))?;
+            }
+            match owner.drain().await {
+                Some(error) => Err(error),
+                None => result,
+            }
+        })?
     }
 
     pub(crate) fn instantiate(
@@ -154,6 +334,13 @@ impl StoreRef {
                 })
             }
         }) {
+            #[cfg(all(feature = "sys", feature = "wasi"))]
+            match &result {
+                Err(error) | Ok(Err(InstantiationError::Start(error))) => {
+                    self.forward_handoff(error, None)?
+                }
+                _ => (),
+            }
             return result;
         }
         match &self.inner.mode {
@@ -198,8 +385,15 @@ impl StoreRef {
                     )
                 });
                 let trampoline = trampoline?;
-                let driver = native.driver()?;
-                driver.run(trampoline.call_async(native.store.as_ref().unwrap(), Vec::new()))??;
+                if let Err(error) = self.native_call(native, &trampoline, Vec::new()) {
+                    #[cfg(feature = "wasi")]
+                    if wasixv2_exec::is_call_handoff(&error)
+                        || error.downcast_ref::<CompletedHandoff>().is_some()
+                    {
+                        return Ok(Err(InstantiationError::Start(error)));
+                    }
+                    return Err(error);
+                }
                 let value = result
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
@@ -256,22 +450,82 @@ impl StoreRef {
     }
 
     #[cfg(feature = "sys")]
-    pub(crate) fn cleanup_retirement(
+    pub(crate) fn cleanup_owner(
         &self,
-        mut future: std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>,
-    ) -> Result<Box<dyn FnOnce()>, RuntimeError> {
+    ) -> Result<wasmer_api::sys::NativeCleanupOwner, RuntimeError> {
+        match &self.inner.mode {
+            StoreMode::Native(native) => Ok(native.owner.clone()),
+            StoreMode::Plain(_) => Err(RuntimeError::new("Store has no native cleanup owner")),
+        }
+    }
+
+    #[cfg(feature = "sys")]
+    pub(crate) fn retirement_owner(&self) -> Result<CleanupRetirement, RuntimeError> {
         let StoreMode::Native(native) = &self.inner.mode else {
             return Err(RuntimeError::new("Store has no native cleanup owner"));
         };
-        let driver = native.driver()?;
-        let owner = native.owner.clone();
-        Ok(Box::new(move || {
-            owner.retain(Box::pin(std::future::poll_fn(move |cx| {
-                let _runtime = driver.runtime.enter();
-                let _local = driver.local.enter();
-                future.as_mut().poll(cx)
-            })));
-        }))
+        Ok(CleanupRetirement {
+            driver: native.driver()?,
+            owner: native.owner.clone(),
+        })
+    }
+
+    #[cfg(feature = "sys")]
+    pub(crate) fn cleanup_retirement(
+        &self,
+        future: std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>,
+    ) -> Result<Box<dyn FnOnce()>, RuntimeError> {
+        let owner = self.retirement_owner()?;
+        Ok(Box::new(move || owner.retain(future)))
+    }
+
+    #[cfg(all(feature = "sys", feature = "wasi"))]
+    pub(crate) fn register_endpoint(
+        &self,
+        endpoint: Weak<dyn ContinuationEndpoint>,
+    ) -> Result<(), RuntimeError> {
+        match &self.inner.mode {
+            StoreMode::Native(native) => {
+                native.endpoints.borrow_mut().push(endpoint);
+                Ok(())
+            }
+            StoreMode::Plain(_) => Err(RuntimeError::new("Store has no native continuation owner")),
+        }
+    }
+
+    #[cfg(all(feature = "sys", feature = "wasi"))]
+    fn forward_handoff(
+        &self,
+        error: &RuntimeError,
+        explicit: Option<&Rc<CallOwner>>,
+    ) -> Result<(), RuntimeError> {
+        let StoreMode::Native(native) = &self.inner.mode else {
+            return Ok(());
+        };
+        let weak = native.endpoints.borrow().clone();
+        let endpoints = weak
+            .into_iter()
+            .filter_map(|endpoint| endpoint.upgrade())
+            .collect::<Vec<_>>();
+        let endpoint = self.with_mut(|store| {
+            endpoints
+                .into_iter()
+                .find(|endpoint| endpoint.matches(store, error))
+        })?;
+        let Some(endpoint) = endpoint else {
+            return Ok(());
+        };
+        let owner = explicit
+            .cloned()
+            .or_else(wasmer_api::sys::current_native_local_owner::<CallOwner>);
+        let Some(owner) = owner else {
+            // Never claim work that has no exact outer local dispatcher.
+            return endpoint.cancel_unclaimed(self, error);
+        };
+        owner.pending.borrow_mut().reserve(1);
+        let continuation = endpoint.prepare(self, error)?;
+        owner.pending.borrow_mut().push_back(continuation);
+        Ok(())
     }
 
     pub fn downgrade(&self) -> WeakStoreRef {
@@ -296,6 +550,8 @@ impl ManagedStore {
             runtime: std::sync::Arc::new(runtime),
             local: tokio::task::LocalSet::new(),
             active: std::cell::Cell::new(false),
+            owner: self.owner.clone(),
+            enrolled: RefCell::default(),
         });
         *self.driver.borrow_mut() = Some(driver.clone());
         Ok(driver)
@@ -304,6 +560,110 @@ impl ManagedStore {
 
 #[cfg(feature = "sys")]
 impl Driver {
+    async fn drive<R>(&self, future: impl std::future::Future<Output = R>) -> R {
+        struct Clear(wasmer_api::sys::NativeCleanupOwner);
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                self.0.clear_idle_waker();
+            }
+        }
+        let _clear = Clear(self.owner.clone());
+        let mut future = std::pin::pin!(future);
+        let mut output = None;
+        std::future::poll_fn(|cx| {
+            let _ = self.owner.poll_idle(cx);
+            if output.is_none() {
+                if let std::task::Poll::Ready(value) = future.as_mut().poll(cx) {
+                    output = Some(value);
+                }
+            }
+            // The guest can finish a nested local observer which clears the
+            // same pump's drain registration. Reinstall before waiting for any
+            // enrolled retirement, then recheck flags changed by that poll.
+            let _ = self.owner.poll_idle(cx);
+            let waiting = {
+                let mut enrolled = self.enrolled.borrow_mut();
+                enrolled.retain(|completed| !completed.get());
+                !enrolled.is_empty()
+            };
+            if !waiting && output.is_some() {
+                std::task::Poll::Ready(output.take().unwrap())
+            } else {
+                std::task::Poll::Pending
+            }
+        })
+        .await
+    }
+
+    #[cfg(feature = "wasi")]
+    async fn run_local<R>(&self, future: impl std::future::Future<Output = R>) -> R {
+        assert!(!self.active.replace(true), "recursive native LocalSet poll");
+        struct Reset<'a>(&'a std::cell::Cell<bool>);
+        impl Drop for Reset<'_> {
+            fn drop(&mut self) {
+                self.0.set(false);
+            }
+        }
+        let _reset = Reset(&self.active);
+        let mut run = std::pin::pin!(self.local.run_until(self.drive(future)));
+        std::future::poll_fn(|cx| {
+            let _runtime = self.runtime.enter();
+            std::future::Future::poll(run.as_mut(), cx)
+        })
+        .await
+    }
+
+    #[cfg(feature = "wasi")]
+    fn drain_retirement(&self, completed: Rc<std::cell::Cell<bool>>) {
+        use std::{
+            sync::{Arc, Condvar, Mutex},
+            task::{Context, Wake, Waker},
+        };
+        #[derive(Default)]
+        struct WakeSignal(Mutex<bool>, Condvar);
+        impl Wake for WakeSignal {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                *self.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+                self.1.notify_one();
+            }
+        }
+        struct Clear(wasmer_api::sys::NativeCleanupOwner);
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                self.0.clear_idle_waker();
+            }
+        }
+        let _clear = Clear(self.owner.clone());
+        let signal = Arc::new(WakeSignal::default());
+        let waker = Waker::from(signal.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut panic = None;
+        loop {
+            *signal.0.lock().unwrap_or_else(|e| e.into_inner()) = false;
+            attempt_retirement(&mut panic, || {
+                let _runtime = self.runtime.enter();
+                let local = self.local.run_until(std::future::pending::<()>());
+                let _ = std::pin::pin!(local).as_mut().poll(&mut cx);
+                let _local = self.local.enter();
+                let _ = self.owner.poll_idle(&mut cx);
+            });
+            if completed.get() {
+                break;
+            }
+            // Runtime/LocalSet entry guards never span the blocking wait.
+            let mut ready = signal.0.lock().unwrap_or_else(|e| e.into_inner());
+            while !*ready {
+                ready = signal.1.wait(ready).unwrap_or_else(|e| e.into_inner());
+            }
+        }
+        if let Some(panic) = panic {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
     fn run<R>(&self, future: impl std::future::Future<Output = R>) -> Result<R, RuntimeError> {
         // This blocking boundary is not a Tokio task. A callback with an exact
         // parked loan takes the synchronous path before reaching the driver.
@@ -324,7 +684,9 @@ impl Driver {
             }
         }
         let _reset = Reset(&self.active);
-        Ok(self.runtime.block_on(self.local.run_until(future)))
+        Ok(self
+            .runtime
+            .block_on(self.local.run_until(self.drive(future))))
     }
 }
 
