@@ -19,6 +19,7 @@ use crate::{
 /// this borrow or an async store handle beyond the preparation call.
 pub struct Preparation<'a, S: 'static> {
     cx: Outside<'a, S>,
+    local_cleanup: Option<wasixv2_host::LocalCleanupRunner>,
     module: &'a Module,
     role: Role,
     imported: Option<&'a Memory>,
@@ -34,6 +35,10 @@ pub(crate) struct Bootstrap {
 }
 
 impl<S: Syscalls + Control + Send + Sync + 'static> Preparation<'_, S> {
+    pub fn local_cleanup(&self) -> Option<wasixv2_host::LocalCleanupRunner> {
+        self.local_cleanup.clone()
+    }
+
     pub fn module(&self) -> &Module {
         self.module
     }
@@ -223,6 +228,9 @@ where
     };
     let binding_cell = RefCell::new(binding.take());
     let preparation = Preparation {
+        local_cleanup: scope
+            .as_ref()
+            .and_then(|scope| crate::local_cleanup_runner(&store, scope.clone())),
         cx: Outside { env, store: &store },
         module,
         role,

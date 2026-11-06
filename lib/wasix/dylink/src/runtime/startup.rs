@@ -69,13 +69,18 @@ impl Drop for Pending {
             return;
         }
         let owner = self.owner.clone();
-        self.cleanup.spawn(Box::pin(async move {
-            for lease in leases {
-                lease.release().await;
-            }
-            drop(closing);
-            drop(owner);
-        }));
+        let job: wasixv2_host::LocalLoaderCleanupJob = Box::new(move |_| {
+            Box::pin(async move {
+                for lease in leases {
+                    lease.release().await;
+                }
+                drop(closing);
+                drop(owner);
+            })
+        });
+        if let Err(job) = self.cleanup.submit_local(job) {
+            self.cleanup.spawn(job(None));
+        }
     }
 }
 
@@ -612,6 +617,10 @@ impl<S: Syscalls + Control + Send + Sync + 'static> StoreImage<S> {
                     local.stage.as_mut().unwrap().apply(store, &table)?;
                     let mut stage = local.stage.take().unwrap();
                     local.leases.append(&mut stage.leases);
+                    local.closure_pools.append(&mut stage.closure_pools);
+                    if let Some(slots) = stage.closure_slots.take() {
+                        local.closure_slots = slots;
+                    }
                     local.forwarders.append(&mut stage.forwarders);
                     for module in stage.modules.into_values() {
                         local.instances.push(module.publish()?);
@@ -671,6 +680,10 @@ impl<S: Syscalls + Control + Send + Sync + 'static> StoreImage<S> {
             .ok_or_else(|| failure("missing startup admission"))?;
         let transaction = syscalls.loader_activate(task, closing).map_err(failure)?;
         let mut coordinator = load::Coordinator {
+            local_cleanup: wasixv2_exec::local_cleanup_runner(
+                &store,
+                bound.pending.cleanup.clone(),
+            ),
             transaction: Some(transaction),
             cleanup: None,
             root: self.root.clone(),
@@ -918,6 +931,7 @@ mod tests {
         let library =
             || Library::new(crate::tests::bytes("(module)", [0; 4], &[], &[], &[]), None).unwrap();
         let mut graph = Graph {
+            closures: Default::default(),
             host_imports: None,
             libraries: vec![library(), library(), library(), library()],
             global: vec![0, 1, 2, 3],

@@ -118,7 +118,7 @@ impl OwningThread {
 
     pub(crate) async fn run<R>(
         self,
-        cleanup: &Arc<wasixv2_host::LoaderCleanup>,
+        cleanup: impl Into<crate::cleanup::RunCleanup>,
         guest: impl std::future::Future<Output = R>,
     ) -> R {
         use std::{
@@ -127,6 +127,7 @@ impl OwningThread {
             task::Poll,
         };
         self.authorize().expect("private owning-thread permit");
+        let cleanup = cleanup.into();
         let mut runner = Some(Box::pin(cleanup.run_with_keepalive(guest, self.lease)));
         let result = poll_fn(|cx| {
             match catch_unwind(AssertUnwindSafe(|| {
@@ -280,7 +281,10 @@ where
         let host = self.host.clone();
         host.executor().spawn_thread(Box::new(move || {
             let profile = OwningThread::required(self.abis.requires_owning_thread());
-            let cleanup = wasixv2_host::LoaderCleanup::new(self.host.clone());
+            let cleanup = crate::cleanup::RunCleanup::new(wasixv2_host::LoaderCleanup::new(self.host.clone()), {
+                #[cfg(feature = "sys")] { self.engine.is_sys() }
+                #[cfg(not(feature = "sys"))] { false }
+            });
             let syscalls = self.syscalls.clone();
             let profiled = matches!(&profile, Ok(Some(_)));
             let run = self.run(task, tid, start_arg, cleanup.clone(), profiled);
@@ -372,7 +376,7 @@ where
         task: TaskId,
         tid: i32,
         start_arg: u32,
-        cleanup: Arc<wasixv2_host::LoaderCleanup>,
+        cleanup: crate::cleanup::RunCleanup,
         profiled: bool,
     ) {
         let (syscalls, host) = (self.syscalls.clone(), self.host.clone());
@@ -420,7 +424,7 @@ where
         task: TaskId,
         tid: i32,
         start_arg: u32,
-        cleanup: Arc<wasixv2_host::LoaderCleanup>,
+        cleanup: crate::cleanup::RunCleanup,
     ) -> Result<Ended, ExecError> {
         self.abi.attach_cleanup(&cleanup);
         let mut admission = if let Some(gate) = self.syscalls.loader_gate(task) {
@@ -440,9 +444,10 @@ where
         };
         let mut store = Store::new(self.engine.clone());
         self.abis.configure_store(&mut store)?;
-        let invocations = crate::instantiation::NativeInvocations::bind(
+        let invocations = crate::instantiation::NativeInvocations::bind_with_cleanup(
             &mut store,
             self.abis.requires_owning_thread(),
+            &cleanup,
         )?;
         let spawner = process::spawner(
             self.engine.clone(),
@@ -459,7 +464,7 @@ where
                 self.host.clone(),
             ),
         );
-        env.as_mut(&mut store).cleanup = Some(cleanup);
+        env.as_mut(&mut store).cleanup = Some(cleanup.shared().clone());
         self.abis.install_hooks(&mut store, &env);
         let mut imports = crate::imports(&*self.abi, &mut store, &env, &self.module);
         let memory = self.memory.clone().try_attach(&mut store)?;
@@ -541,6 +546,7 @@ where
                 data.threads = Some(self.clone());
                 data.proc.set_module(&self.module);
                 data.asyncify = asyncify;
+                data.contexts_supported = !self.abis.requires_owning_thread();
                 let memory = env.as_ref(&store).memory().unwrap().clone();
                 if let Some(attached) = attached {
                     attached
@@ -621,15 +627,28 @@ where
                     .cx()
                     .with(|env, _| env.asyncify.as_ref().and_then(|a| a.buffer_address()))
                     .await;
-                crate::cooperative::drive(&entry, &*abi, abi.start_thread(&entry, tid, start_arg))
-                    .await
+                crate::cooperative::drive(
+                    &entry,
+                    &*abi,
+                    crate::contexts::drive(&entry, &mut attachments, {
+                        let abi = abi.clone();
+                        let env = entry.cx().env.clone();
+                        let store = entry.store();
+                        async move {
+                            abi.start_thread(&Entry::new(&env, &store), tid, start_arg)
+                                .await
+                        }
+                    }),
+                )
+                .await
             }
             Err(err) => Err(err),
         };
         let on_return = abi.on_thread_return();
-        if let Some(attachments) = &mut attachments {
-            attachments.settle().await;
-        }
+        let result = match &mut attachments {
+            Some(attachments) => attachments.finish(result).await,
+            None => result,
+        };
         let ended = crate::ended(entry.cx(), result, on_return, Role::Thread).await;
         if let Some(attachments) = &mut attachments {
             attachments.deactivate().await;
@@ -662,6 +681,10 @@ mod tests {
         let mut abis = Abis::new();
         abis.push(selected.clone());
         let abis = Arc::new(abis);
+        let cleanup = crate::cleanup::RunCleanup::new(
+            wasixv2_host::LoaderCleanup::new(Arc::new(NoThreads)),
+            store.engine().is_sys(),
+        );
         let mut ready = futures::executor::block_on(crate::instantiate(
             store,
             &module,
@@ -669,7 +692,7 @@ mod tests {
             TaskId(1),
             Arc::new(NoThreads),
             abis.clone(),
-            wasixv2_host::LoaderCleanup::new(Arc::new(NoThreads)),
+            cleanup.clone(),
             None,
         ))
         .unwrap();
@@ -705,12 +728,7 @@ mod tests {
                 .await
                 .unwrap();
             let ended = image
-                .call_entry(
-                    TaskId(2),
-                    2,
-                    0,
-                    wasixv2_host::LoaderCleanup::new(Arc::new(NoThreads)),
-                )
+                .call_entry(TaskId(2), 2, 0, cleanup.clone())
                 .await
                 .unwrap();
             assert!(matches!(ended, Ended::Exited(0)));
@@ -777,11 +795,15 @@ mod tests {
             Arc::default(),
         );
         for id in 2..6 {
+            let cleanup = crate::cleanup::RunCleanup::new(
+                wasixv2_host::LoaderCleanup::new(Arc::new(NoThreads)),
+                store.engine().is_sys(),
+            );
             let ended = futures::executor::block_on(image.clone().call_entry(
                 TaskId(id),
                 id as i32,
                 0,
-                wasixv2_host::LoaderCleanup::new(Arc::new(NoThreads)),
+                cleanup,
             ))
             .unwrap();
             assert!(matches!(ended, Ended::Fault { .. }));
@@ -823,12 +845,11 @@ mod admission_tests {
             Arc::new(Abis::wasixv2()),
             Arc::default(),
         );
-        let result = futures::executor::block_on(image.call_entry(
-            TaskId(7),
-            7,
-            0,
+        let cleanup = crate::cleanup::RunCleanup::new(
             wasixv2_host::LoaderCleanup::new(Arc::new(NoThreads)),
-        ));
+            store.engine().is_sys(),
+        );
+        let result = futures::executor::block_on(image.call_entry(TaskId(7), 7, 0, cleanup));
         assert!(matches!(
             result,
             Err(ExecError::Load(crate::LoadError::Format(

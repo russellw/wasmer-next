@@ -10,6 +10,7 @@ pub(super) struct Coordinator<S: Syscalls + Control + Send + Sync + 'static> {
     pub(super) store: StoreAsync,
     pub(super) syscalls: Arc<S>,
     pub(super) cleanup_scope: Arc<wasixv2_host::LoaderCleanup>,
+    pub(super) local_cleanup: Option<wasixv2_host::LocalCleanupRunner>,
     pub(super) task: TaskId,
 }
 impl<S: Syscalls + Control + Send + Sync + 'static> Coordinator<S> {
@@ -69,13 +70,17 @@ impl<S: Syscalls + Control + Send + Sync + 'static> Drop for Coordinator<S> {
             let root = self.root.clone();
             let syscalls = self.syscalls.clone();
             let env = self.env.clone();
-            self.cleanup_scope.spawn(Box::pin(async move {
+            let future = Box::pin(async move {
                 let _keep_env = env;
                 if let Err(error) = pending.await {
                     let _ = syscalls.loader_fatal(root.gate().unwrap());
                     tracing::error!(mm=root.gate().map(|gate|gate.mm()).unwrap_or(0),%error,"loader cleanup failed");
                 }
-            }));
+            });
+            match &self.local_cleanup {
+                Some(local) => local.spawn(future),
+                None => self.cleanup_scope.spawn(future),
+            }
         }
     }
 }
@@ -99,6 +104,10 @@ pub(super) async fn cleanup<S: wasixv2_syscalls::LoaderControl + Send + Sync + '
                 local.leases.extend(std::mem::take(&mut stage.leases));
                 for module in stage.modules.into_values() {
                     local.instances.push(module.publish()?);
+                }
+                local.closure_pools.extend(stage.closure_pools);
+                if let Some(slots) = stage.closure_slots.take() {
+                    local.closure_slots = slots;
                 }
                 local.forwarders.extend(stage.forwarders);
                 local.tls = stage.tls;
@@ -312,6 +321,7 @@ impl<S: Syscalls + Control + Send + Sync + 'static> StoreImage<S> {
         )
         .await?;
         let mut coordinator = Coordinator {
+            local_cleanup: wasixv2_exec::local_cleanup_runner(&store, cleanup_scope.clone()),
             transaction: Some(transaction),
             cleanup: None,
             root: self.root.clone(),

@@ -1,4 +1,5 @@
 //! Per-image EH/PIC loader. Shared state contains plans/source, never store-local functions.
+mod closures;
 mod forward;
 mod graph;
 mod load;
@@ -49,6 +50,14 @@ enum Context<'a, S: 'static> {
     Entry(&'a Entry<'a, S>),
 }
 impl<S: Send + Sync + 'static> Context<'_, S> {
+    async fn local_cleanup(&self) -> Option<wasixv2_host::LocalCleanupRunner> {
+        let scope = self.with(|env, _| env.loader_cleanup().cloned()).await?;
+        let store = match self {
+            Self::Import(env) => env.as_store_async().store(),
+            Self::Entry(entry) => entry.store(),
+        };
+        wasixv2_exec::local_cleanup_runner(&store, scope)
+    }
     async fn with<R>(&self, f: impl FnOnce(&mut ExecEnv<S>, &mut StoreMut<'_>) -> R) -> R {
         match self {
             Self::Import(env) => {
@@ -217,6 +226,7 @@ impl Root {
                     .ok_or_else(|| failure("main alignment"))?,
             )?;
             let mut graph = Graph {
+                closures: Default::default(),
                 host_imports: None,
                 libraries: vec![main],
                 global: vec![0],
@@ -235,6 +245,7 @@ impl Root {
                 let _ = error.set(e.to_string());
                 (
                     Graph {
+                        closures: Default::default(),
                         host_imports: None,
                         libraries: Vec::new(),
                         global: Vec::new(),
@@ -330,12 +341,13 @@ impl Root {
         let root = Arc::downgrade(self);
         let runner = Arc::downgrade(scope);
         scope
-            .on_retire(
+            .on_retire_local(
                 &self.owner,
-                Box::new(move || {
+                Box::new(move |local_cleanup| {
                     Box::pin(async move {
                         if let (Some(root), Some(scope)) = (root.upgrade(), runner.upgrade())
-                            && let Err(error) = root.retire_common(&*syscalls, &scope).await
+                            && let Err(error) =
+                                root.retire_common(&*syscalls, &scope, local_cleanup).await
                         {
                             let _ = syscalls.loader_fatal(root.gate().unwrap());
                             tracing::error!(%error, "logical image retirement failed");
@@ -349,6 +361,7 @@ impl Root {
         self: &Arc<Self>,
         syscalls: &S,
         scope: &Arc<wasixv2_host::LoaderCleanup>,
+        local_cleanup: Option<wasixv2_host::LocalCleanupRunner>,
     ) -> Result<()> {
         let gate = self.gate()?;
         if self.retired.load(Ordering::Acquire)
@@ -382,6 +395,7 @@ impl Root {
             leases
         };
         LeaseLedger {
+            local_cleanup,
             root: self.clone(),
             cleanup: scope.clone(),
             leases,
@@ -739,6 +753,8 @@ impl<S: Syscalls + Control + Send + Sync + 'static> Image<S> {
                 leases: Vec::new(),
                 generation: 0,
                 lazy_targets: BTreeMap::new(),
+                closure_pools: Vec::new(),
+                closure_slots: Default::default(),
             })),
             _type: std::marker::PhantomData,
         }))
@@ -755,6 +771,8 @@ struct Local {
     leases: Vec<Box<dyn LoaderReservation>>,
     generation: u64,
     lazy_targets: BTreeMap<u32, Option<(usize, u32)>>,
+    closure_pools: Vec<BoundModule>,
+    closure_slots: BTreeMap<u32, closures::Slot>,
 }
 impl Local {
     #[cfg(all(test, feature = "engine-tests"))]
@@ -1074,6 +1092,7 @@ impl Local {
                 .resolve_aliases(&functions);
         }
         local.stage_lazy(store, &graph, base_imports)?;
+        local.stage_closures(store, &graph.closures, base_imports)?;
         // A LAZY module may own several trap instances, in addition to its
         // ordinary forwarder. Publication must not allocate after commit.
         local
@@ -1148,7 +1167,7 @@ impl Local {
                 self.stage.as_mut().unwrap().lazy_slots.push(LazySlot {
                     slot: lazy.slot,
                     before,
-                    function,
+                    function: Value::FuncRef(Some(function)),
                     applied: false,
                 });
             }
@@ -1157,6 +1176,7 @@ impl Local {
     }
 }
 struct LeaseLedger {
+    local_cleanup: Option<wasixv2_host::LocalCleanupRunner>,
     cleanup: Arc<wasixv2_host::LoaderCleanup>,
     root: Arc<Root>,
     leases: Vec<Box<dyn LoaderReservation>>,
@@ -1187,10 +1207,14 @@ impl Drop for LeaseLedger {
     fn drop(&mut self) {
         if let Some(pending) = self.take_pending() {
             let owner = self.root.owner.clone();
-            self.cleanup.spawn(Box::pin(async move {
+            let future = Box::pin(async move {
                 pending.await;
                 drop(owner);
-            }));
+            });
+            match &self.local_cleanup {
+                Some(local) => local.spawn(future),
+                None => self.cleanup.spawn(future),
+            }
         }
     }
 }
@@ -1200,12 +1224,15 @@ struct LocalStage {
     tls: Vec<u32>,
     leases: Vec<Box<dyn LoaderReservation>>,
     lazy_targets: BTreeMap<u32, Option<(usize, u32)>>,
+    closure_pools: Vec<BoundModule>,
+    closure_slots: Option<BTreeMap<u32, closures::Slot>>,
+    descriptors: Vec<closures::DescriptorWrite>,
     lazy_slots: Vec<LazySlot>,
 }
 struct LazySlot {
     slot: u32,
     before: Value,
-    function: wasmer::Function,
+    function: Value,
     applied: bool,
 }
 impl LocalStage {
@@ -1216,6 +1243,9 @@ impl LocalStage {
             tls: Vec::new(),
             leases: Vec::new(),
             lazy_targets: BTreeMap::new(),
+            closure_pools: Vec::new(),
+            closure_slots: Default::default(),
+            descriptors: Vec::new(),
             lazy_slots: Vec::new(),
         });
         stage.tls = tls;
@@ -1225,12 +1255,11 @@ impl LocalStage {
         for module in self.modules.values_mut() {
             module.apply(store)?;
         }
+        for descriptor in &mut self.descriptors {
+            descriptor.apply(store)?;
+        }
         for slot in &mut self.lazy_slots {
-            table.set(
-                store,
-                slot.slot,
-                Value::FuncRef(Some(slot.function.clone())),
-            )?;
+            table.set(store, slot.slot, slot.function.clone())?;
             slot.applied = true;
         }
         Ok(())
@@ -1239,6 +1268,9 @@ impl LocalStage {
         for slot in self.lazy_slots.iter_mut().rev().filter(|slot| slot.applied) {
             table.set(store, slot.slot, slot.before.clone())?;
             slot.applied = false;
+        }
+        for descriptor in self.descriptors.iter_mut().rev() {
+            descriptor.rollback(store)?;
         }
         for module in self.modules.values_mut() {
             module.rollback(store)?;
@@ -1494,6 +1526,10 @@ impl<S: Syscalls + Control + Send + Sync + 'static> StoreImage<S> {
                     for module in staged.modules.into_values() {
                         local.instances.push(module.publish()?);
                     }
+                    local.closure_pools.extend(staged.closure_pools);
+                    if let Some(slots) = staged.closure_slots.take() {
+                        local.closure_slots = slots;
+                    }
                     local.forwarders.extend(staged.forwarders);
                     local.tls = staged.tls;
                     local.lazy_targets = staged.lazy_targets;
@@ -1514,6 +1550,7 @@ impl<S: Syscalls + Control + Send + Sync + 'static> StoreImage<S> {
                     .await?;
                 if let Some(stage) = stage {
                     LeaseLedger {
+                        local_cleanup: cx.local_cleanup().await,
                         cleanup: self
                             .cleanup
                             .get()
@@ -1606,6 +1643,7 @@ async fn retire_local(
     root: Arc<Root>,
     local: Arc<Mutex<Local>>,
     cleanup: Arc<wasixv2_host::LoaderCleanup>,
+    local_cleanup: Option<wasixv2_host::LocalCleanupRunner>,
 ) {
     let leases = {
         let mut local = lock(&local);
@@ -1616,6 +1654,7 @@ async fn retire_local(
         leases
     };
     LeaseLedger {
+        local_cleanup,
         root,
         cleanup,
         leases,
@@ -1629,16 +1668,81 @@ impl<S: Syscalls + Control + Send + Sync + 'static> AbiInstance<S> for StoreImag
         self.inner.function_table()
     }
 
+    fn function_cacheable(&self, function: u32) -> bool {
+        !self.root.graph().closures.slots.contains_key(&function)
+            && self.inner.function_cacheable(function)
+    }
+
+    fn closure_allocate<'a>(
+        &'a self,
+        env: &'a AsyncFunctionEnvMut<ExecEnv<S>>,
+        caller: &'a Caller<'_>,
+        closure: wasixv2_abi::U32Ptr,
+    ) -> LocalFuture<'a, SysResult<i32>> {
+        Box::pin(async move {
+            self.mutate_closure(env, caller, closures::Operation::Allocate(closure))
+                .await
+        })
+    }
+
+    fn closure_prepare<'a>(
+        &'a self,
+        env: &'a AsyncFunctionEnvMut<ExecEnv<S>>,
+        caller: &'a Caller<'_>,
+        backing: u32,
+        closure: u32,
+        argument_types: wasixv2_syscalls::UserSlice,
+        result_types: wasixv2_syscalls::UserSlice,
+        environment: u32,
+    ) -> LocalFuture<'a, SysResult<i32>> {
+        Box::pin(async move {
+            let signature = closures::signature(caller, argument_types, result_types).await?;
+            self.mutate_closure(
+                env,
+                caller,
+                closures::Operation::Prepare {
+                    backing,
+                    closure,
+                    signature,
+                    environment,
+                },
+            )
+            .await
+        })
+    }
+
+    fn closure_free<'a>(
+        &'a self,
+        env: &'a AsyncFunctionEnvMut<ExecEnv<S>>,
+        caller: &'a Caller<'_>,
+        closure: u32,
+    ) -> LocalFuture<'a, SysResult<i32>> {
+        Box::pin(async move {
+            self.mutate_closure(env, caller, closures::Operation::Free(closure))
+                .await
+        })
+    }
+
     fn retire<'a>(&'a self, entry: &'a Entry<'a, S>) -> LocalFuture<'a, Result<()>> {
         Box::pin(async move {
             self.retired.store(true, Ordering::Release);
             if let Some(scope) = self.cleanup.get() {
-                retire_local(self.root.clone(), self.local.clone(), scope.clone()).await;
+                let local_cleanup =
+                    wasixv2_exec::local_cleanup_runner(&entry.store(), scope.clone());
+                retire_local(
+                    self.root.clone(),
+                    self.local.clone(),
+                    scope.clone(),
+                    local_cleanup.clone(),
+                )
+                .await;
                 // exec may already have replaced this task's mm. Retire only the
                 // original gate when its last user left; fault release is checked
                 // again by the weak final-runner callback after release_task.
                 let syscalls = entry.with_store(|data, _| data.syscalls().clone()).await;
-                self.root.retire_common(&*syscalls, scope).await?;
+                self.root
+                    .retire_common(&*syscalls, scope, local_cleanup)
+                    .await?;
             }
             self.inner.retire(entry).await
         })
@@ -1656,15 +1760,15 @@ impl<S: Syscalls + Control + Send + Sync + 'static> AbiInstance<S> for StoreImag
                 let runner = Arc::downgrade(&scope);
                 let retired = self.retired.clone();
                 scope
-                    .on_retire(
+                    .on_retire_local(
                         &self.root.owner,
-                        Box::new(move || {
+                        Box::new(move |local_cleanup| {
                             Box::pin(async move {
                                 retired.store(true, Ordering::Release);
                                 if let (Some(root), Some(local), Some(scope)) =
                                     (root.upgrade(), local.upgrade(), runner.upgrade())
                                 {
-                                    retire_local(root, local, scope).await;
+                                    retire_local(root, local, scope, local_cleanup).await;
                                 }
                             })
                         }),
@@ -1681,7 +1785,7 @@ impl<S: Syscalls + Control + Send + Sync + 'static> AbiInstance<S> for StoreImag
             entry
                 .with_store(|_, store| self.main_prepare(store, &graph))
                 .await?;
-            if graph.libraries.len() > 1 {
+            if graph.libraries.len() > 1 || !graph.closures.slots.is_empty() {
                 let (syscalls, task) = entry
                     .with_store(|data, _| (data.syscalls().clone(), data.task()))
                     .await;
@@ -1690,6 +1794,10 @@ impl<S: Syscalls + Control + Send + Sync + 'static> AbiInstance<S> for StoreImag
                 let mut tls = lock(&self.local).tls.clone();
                 tls.resize(graph.libraries.len(), 0);
                 let mut ledger = LeaseLedger {
+                    local_cleanup: wasixv2_exec::local_cleanup_runner(
+                        &entry.store(),
+                        scope.clone(),
+                    ),
                     cleanup: self
                         .cleanup
                         .get()
@@ -1752,6 +1860,10 @@ impl<S: Syscalls + Control + Send + Sync + 'static> AbiInstance<S> for StoreImag
                         local.leases.extend(std::mem::take(&mut stage.leases));
                         for module in stage.modules.into_values() {
                             local.instances.push(module.publish()?);
+                        }
+                        local.closure_pools.extend(stage.closure_pools);
+                        if let Some(slots) = stage.closure_slots.take() {
+                            local.closure_slots = slots;
                         }
                         local.forwarders.extend(stage.forwarders);
                         local.tls = stage.tls;
@@ -2371,6 +2483,7 @@ mod lease_cancellation_tests {
         assert!(!completed.load(Ordering::Acquire));
         assert!(JOBS.with(|jobs| jobs.borrow().is_empty()));
         let ledger = LeaseLedger {
+            local_cleanup: None,
             cleanup: wasixv2_host::LoaderCleanup::new(Arc::new(QueueHost)),
             root,
             leases: stage.take().unwrap().leases,
@@ -2392,6 +2505,7 @@ mod lease_cancellation_tests {
         let ready = Arc::new(AtomicBool::new(false));
         let completed = Arc::new(AtomicBool::new(false));
         let ledger = LeaseLedger {
+            local_cleanup: None,
             cleanup: wasixv2_host::LoaderCleanup::new(Arc::new(QueueHost)),
             root: root.clone(),
             pending: None,
@@ -2567,7 +2681,7 @@ mod lazy_tests {
         local.stage.as_mut().unwrap().lazy_slots.push(LazySlot {
             slot: u32::MAX,
             before: Value::FuncRef(None),
-            function: old,
+            function: Value::FuncRef(Some(old)),
             applied: false,
         });
         assert!(
@@ -2647,7 +2761,7 @@ mod lazy_tests {
         second.stage.as_mut().unwrap().lazy_slots.push(LazySlot {
             slot: u32::MAX,
             before: Value::FuncRef(None),
-            function: old_second,
+            function: Value::FuncRef(Some(old_second)),
             applied: false,
         });
         assert!(
@@ -3061,6 +3175,7 @@ mod symbol_tests {
                 &[],
             );
             let graph = Graph {
+                closures: Default::default(),
                 host_imports: None,
                 libraries: vec![Library::new(source.clone(), None).unwrap()],
                 global: vec![0],
@@ -3089,6 +3204,8 @@ mod symbol_tests {
                 leases: Vec::new(),
                 generation: 0,
                 lazy_targets: BTreeMap::new(),
+                closure_pools: Vec::new(),
+                closure_slots: Default::default(),
             };
             for value in [base, 8192] {
                 global.set(&mut store, Value::I32(value)).unwrap();
@@ -3169,6 +3286,7 @@ mod cyclic_tests {
             .unwrap()
         };
         let mut graph = Graph {
+            closures: Default::default(),
             host_imports: None,
             libraries: vec![
                 Library::new(crate::tests::bytes("(module)", [0; 4], &[], &[], &[]), None).unwrap(),
@@ -3219,6 +3337,8 @@ mod cyclic_tests {
             leases: Vec::new(),
             generation: 0,
             lazy_targets: BTreeMap::new(),
+            closure_pools: Vec::new(),
+            closure_slots: Default::default(),
         };
         (graph, local, store, imports)
     }
