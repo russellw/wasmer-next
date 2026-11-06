@@ -1,3 +1,6 @@
+#[cfg(feature = "sys")]
+use crate::network_api::HostNetwork;
+use crate::network_api::{DynNetworkProvider, NetworkError};
 use crate::{
     Command, CommandSelector, Error, FileSystem, MountMode, Package, PackageLoadOptions,
     PackageLoadProgress, PackageSource, Result, SandboxFileSystem, Wasmer, process::ProcessControl,
@@ -15,7 +18,6 @@ use std::{
     },
     time::Duration,
 };
-use virtual_net::{DynVirtualNetworking, NetworkError, host::LocalNetworking};
 
 /// Builds a process-free sandbox.
 #[derive(Debug)]
@@ -28,7 +30,7 @@ pub struct SandboxBuilder {
     mounts: Vec<MountSpec>,
     workspace_provider: Option<Arc<dyn FileSystem>>,
     network: NetworkPolicy,
-    network_provider: Option<DynVirtualNetworking>,
+    network_provider: Option<DynNetworkProvider>,
 }
 
 /// A value that can be mounted into a sandbox as an external filesystem.
@@ -162,7 +164,7 @@ impl SandboxBuilder {
     /// hatch is intended for SDK facades and embedders that bridge sockets to
     /// a platform facility, such as a browser service worker.
     #[must_use]
-    pub fn network_provider(mut self, provider: DynVirtualNetworking) -> Self {
+    pub fn network_provider(mut self, provider: DynNetworkProvider) -> Self {
         self.network_provider = Some(provider);
         self
     }
@@ -220,12 +222,22 @@ impl SandboxBuilder {
             mounts.push(mount);
         }
 
-        let provider = self.network_provider.or_else(|| match self.network {
-            NetworkPolicy::Disabled => None,
-            NetworkPolicy::Host => {
-                Some(Arc::new(LocalNetworking::default()) as DynVirtualNetworking)
+        let provider = match (self.network_provider, self.network) {
+            (Some(provider), _) => Some(provider),
+            (None, NetworkPolicy::Disabled) => None,
+            #[cfg(not(feature = "sys"))]
+            (None, NetworkPolicy::Host) => {
+                return Err(Error::CapabilityUnavailable {
+                    capability: "native host networking requires the sys feature",
+                });
             }
-        });
+            #[cfg(feature = "sys")]
+            (None, NetworkPolicy::Host) => {
+                Some(HostNetwork::new().map_err(|error| Error::InternalState {
+                    message: format!("initialize host network: {error:?}"),
+                })? as DynNetworkProvider)
+            }
+        };
         // Probes own a separate existing provider group. Every Machine receives
         // its own namespace and group from this same immutable provider choice.
         let probe_network = provider.as_ref().map(|provider| {
@@ -291,7 +303,7 @@ pub(crate) struct SandboxInner {
     pub(crate) env: BTreeMap<String, String>,
     pub(crate) mounts: Vec<MountSpec>,
     pub(crate) provider_runtime: ProviderRuntime,
-    network_provider: Option<DynVirtualNetworking>,
+    network_provider: Option<DynNetworkProvider>,
     probe_network: Option<Arc<ProviderNetwork>>,
     lifecycle: Mutex<Lifecycle>,
     changed: tokio::sync::Notify,
@@ -604,7 +616,7 @@ impl Ports {
                 self.sandbox.ensure_open()?;
                 match result {
                     Ok(()) => return Ok(()),
-                    Err(NetworkError::Unsupported) => {
+                    Err(NetworkError::EOPNOTSUPP) => {
                         return Err(Error::CapabilityUnavailable {
                             capability: "port probing requires sandbox networking",
                         });

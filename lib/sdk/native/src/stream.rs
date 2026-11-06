@@ -356,7 +356,7 @@ mod tests {
 
     use super::{PipeCloser, bounded_pipe};
     use std::sync::Arc;
-    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+    use tokio::io::{AsyncRead, ReadBuf};
 
     #[tokio::test]
     async fn pipe_preserves_bytes_and_delivers_eof() {

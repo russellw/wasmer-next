@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 use tokio::sync::Semaphore;
-use virtual_net::{VirtualNetworking, VirtualTcpSocket};
+use wasmer_sdk::network_api::{NetworkError, NetworkProvider, NetworkResult, TcpStream, WaitQueue};
 use wasmer_sdk::{CacheConfig, ExitReason, PackageSource, Result, Wasmer, WasmerConfig};
 
 // Linux ABI sockaddr and connect sequence follows api/tests/net.rs.
@@ -32,12 +32,13 @@ impl Drop for Canceled {
     }
 }
 #[async_trait]
-impl VirtualNetworking for PendingProvider {
+impl NetworkProvider for PendingProvider {
     async fn connect_tcp(
         &self,
         _local: SocketAddr,
         _peer: SocketAddr,
-    ) -> virtual_net::Result<Box<dyn VirtualTcpSocket + Sync>> {
+        _queue: WaitQueue,
+    ) -> NetworkResult<Arc<dyn TcpStream>> {
         let _canceled = Canceled(self.canceled.clone());
         self.started.add_permits(1);
         std::future::pending().await
@@ -121,13 +122,13 @@ type ResolveCall = (String, Option<u16>, Option<std::net::IpAddr>);
 #[derive(Debug)]
 struct DnsProvider {
     calls: std::sync::Mutex<Vec<ResolveCall>>,
-    error: Option<virtual_net::NetworkError>,
+    error: Option<NetworkError>,
     pending: bool,
     started: Semaphore,
     canceled: Arc<AtomicUsize>,
 }
 impl DnsProvider {
-    fn new(error: Option<virtual_net::NetworkError>, pending: bool) -> Self {
+    fn new(error: Option<NetworkError>, pending: bool) -> Self {
         Self {
             calls: std::sync::Mutex::default(),
             error,
@@ -138,13 +139,13 @@ impl DnsProvider {
     }
 }
 #[async_trait]
-impl VirtualNetworking for DnsProvider {
+impl NetworkProvider for DnsProvider {
     async fn resolve(
         &self,
         host: &str,
         port: Option<u16>,
         dns_server: Option<std::net::IpAddr>,
-    ) -> virtual_net::Result<Vec<std::net::IpAddr>> {
+    ) -> NetworkResult<Vec<std::net::IpAddr>> {
         self.calls
             .lock()
             .unwrap()
@@ -214,10 +215,7 @@ async fn v1_resolve_preserves_custom_provider_original_name_port_and_authoritati
                 ("MiXeD.Invalid.".into(), None, None),
             ]
         );
-        for (error, errno) in [
-            (virtual_net::NetworkError::Unsupported, 58),
-            (virtual_net::NetworkError::PermissionDenied, 2),
-        ] {
+        for (error, errno) in [(NetworkError::EOPNOTSUPP, 58), (NetworkError::EACCES, 2)] {
             let denied = Arc::new(DnsProvider::new(Some(error), false));
             let sandbox = client
                 .sandboxes()

@@ -1,22 +1,19 @@
 use super::ProviderNetwork;
+use crate::network_api::{
+    DatagramInfo, DatagramReceiveLease, DatagramReceiver, DynNetworkProvider, NetworkCloseMode,
+    NetworkProvider, NetworkResult as NetResult, ReceivedDatagram, TcpListener, TcpStream,
+    UdpSocket,
+};
 use std::{
     collections::VecDeque,
-    mem::MaybeUninit,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown as TcpShutdown, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    task::{Context, Poll},
     time::Duration,
 };
 use tokio::sync::Notify;
-use virtual_net::tcp_pair::TcpSocketHalf;
-use virtual_net::{
-    DynVirtualNetworking, InterestHandler, NetworkError, Result as NetResult, SocketStatus,
-    VirtualConnectedSocket, VirtualConnectionlessSocket, VirtualIoSource, VirtualNetworking,
-    VirtualSocket, VirtualTcpListener, VirtualTcpSocket, VirtualUdpSocket,
-};
 use wasixv2_abi::Errno;
 use wasixv2_vnet::{
     Answer, Backend, BackendDatagram, BackendStream, Found, InboundSink, Lookup, LookupDone,
@@ -71,12 +68,82 @@ impl Drop for DropMark {
     }
 }
 
+struct TestTcp {
+    socket: Arc<wasixv2_vnet::MemoryStream>,
+    local: SocketAddr,
+}
+impl TestTcp {
+    fn pair(local: SocketAddr, peer: SocketAddr) -> (Arc<Self>, Arc<Self>) {
+        let [one, two] =
+            wasixv2_vnet::MemoryStream::pair([local, peer], [WaitQueue::new(), WaitQueue::new()]);
+        (
+            Arc::new(Self { socket: one, local }),
+            Arc::new(Self {
+                socket: two,
+                local: peer,
+            }),
+        )
+    }
+}
+impl Pollable for TestTcp {
+    fn poll(&self, table: Option<&mut PollTable<'_>>) -> PollMask {
+        self.socket.poll(table)
+    }
+}
+impl BackendStream for TestTcp {
+    fn state(&self) -> StreamState {
+        self.socket.state()
+    }
+    fn read(&self, buf: &mut [u8], peek: bool) -> NetResult<usize> {
+        self.socket.read(buf, peek)
+    }
+    fn write(&self, data: &[u8]) -> NetResult<usize> {
+        self.socket.write(data)
+    }
+    fn write_urgent(&self, data: &[u8]) -> NetResult<usize> {
+        self.socket.write_urgent(data)
+    }
+    fn read_urgent(&self, peek: bool) -> NetResult<u8> {
+        self.socket.read_urgent(peek)
+    }
+    fn at_mark(&self) -> bool {
+        self.socket.at_mark()
+    }
+    fn shutdown(&self, how: wasixv2_vnet::Shutdown) -> NetResult<()> {
+        self.socket.shutdown(how)
+    }
+    fn take_error(&self) -> Option<Errno> {
+        self.socket.take_error()
+    }
+    fn peer_addr(&self) -> SocketAddr {
+        self.socket.peer_addr()
+    }
+    fn input_len(&self) -> usize {
+        self.socket.input_len()
+    }
+}
+#[async_trait::async_trait]
+impl TcpStream for TestTcp {
+    fn local_addr(&self) -> NetResult<SocketAddr> {
+        Ok(self.local)
+    }
+    fn flush(&self) -> NetResult<()> {
+        Ok(())
+    }
+    fn set_socket_option(&self, level: i32, name: i32, value: &[u8]) -> NetResult<()> {
+        self.socket.set_option(level, name, value)
+    }
+    async fn close(&self, _mode: NetworkCloseMode) -> NetResult<()> {
+        self.socket.shutdown(wasixv2_vnet::Shutdown::Both)
+    }
+}
+
 type ResolveCall = (String, Option<u16>, Option<IpAddr>);
 
 struct FakeProvider {
-    tcp: Mutex<Option<Box<dyn VirtualTcpSocket + Sync>>>,
-    udp: Mutex<Option<Box<dyn VirtualUdpSocket + Sync>>>,
-    listener: Mutex<Option<Box<dyn VirtualTcpListener + Sync>>>,
+    tcp: Mutex<Option<Arc<dyn TcpStream>>>,
+    udp: Mutex<Option<Arc<dyn UdpSocket>>>,
+    listener: Mutex<Option<Arc<dyn TcpListener>>>,
     connect_gate: Option<Gate>,
     resolve_gate: Option<Gate>,
     dns_answer: Vec<IpAddr>,
@@ -110,38 +177,40 @@ impl FakeProvider {
 }
 
 #[async_trait::async_trait]
-impl VirtualNetworking for FakeProvider {
+impl NetworkProvider for FakeProvider {
     async fn connect_tcp(
         &self,
         addr: SocketAddr,
         peer: SocketAddr,
-    ) -> NetResult<Box<dyn VirtualTcpSocket + Sync>> {
+        _queue: WaitQueue,
+    ) -> NetResult<Arc<dyn TcpStream>> {
         self.tcp_calls.lock().unwrap().push((addr, peer));
         if let Some(gate) = &self.connect_gate {
             gate.stop().await;
         }
-        self.tcp
-            .lock()
-            .unwrap()
-            .take()
-            .ok_or(NetworkError::ConnectionRefused)
+        self.tcp.lock().unwrap().take().ok_or(Errno::ECONNREFUSED)
     }
 
     async fn bind_udp(
         &self,
         addr: SocketAddr,
+        _v6only: bool,
         reuse_port: bool,
         reuse_addr: bool,
-    ) -> NetResult<Box<dyn VirtualUdpSocket + Sync>> {
+        queue: WaitQueue,
+    ) -> NetResult<Arc<dyn UdpSocket>> {
         self.udp_calls
             .lock()
             .unwrap()
             .push((addr, reuse_port, reuse_addr));
-        self.udp
+        let socket = self
+            .udp
             .lock()
             .unwrap()
             .take()
-            .ok_or(NetworkError::AddressNotAvailable)
+            .ok_or(Errno::EADDRNOTAVAIL)?;
+        socket.attach(Some(queue))?;
+        Ok(socket)
     }
 
     async fn listen_tcp(
@@ -150,7 +219,9 @@ impl VirtualNetworking for FakeProvider {
         only_v6: bool,
         reuse_port: bool,
         reuse_addr: bool,
-    ) -> NetResult<Box<dyn VirtualTcpListener + Sync>> {
+        _backlog: u32,
+        _queue: WaitQueue,
+    ) -> NetResult<Arc<dyn TcpListener>> {
         self.listen_calls
             .lock()
             .unwrap()
@@ -159,7 +230,7 @@ impl VirtualNetworking for FakeProvider {
             .lock()
             .unwrap()
             .take()
-            .ok_or(NetworkError::AddressNotAvailable)
+            .ok_or(Errno::EADDRNOTAVAIL)
     }
 
     async fn resolve(
@@ -183,17 +254,16 @@ fn services_network(
     provider: Arc<FakeProvider>,
 ) -> (Arc<ProviderNetwork>, crate::service::Services) {
     let services = crate::service::Services::new().expect("start provider services");
-    let provider: DynVirtualNetworking = provider;
+    let provider: DynNetworkProvider = provider;
     (ProviderNetwork::new(provider, services.clone()), services)
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn tcp_provider_keeps_custom_peer_peek_and_remote_half_close() {
     let peer = "198.51.100.24:8443".parse().unwrap();
-    let (local_socket, mut remote_socket) =
-        TcpSocketHalf::channel(64, "192.0.2.7:40123".parse().unwrap(), peer);
+    let (local_socket, remote_socket) = TestTcp::pair("192.0.2.7:40123".parse().unwrap(), peer);
     let provider = Arc::new(FakeProvider::new());
-    *provider.tcp.lock().unwrap() = Some(Box::new(local_socket));
+    *provider.tcp.lock().unwrap() = Some(local_socket);
     let (network, services) = services_network(provider.clone());
 
     let stream = network
@@ -206,8 +276,10 @@ async fn tcp_provider_keeps_custom_peer_peek_and_remote_half_close() {
         vec![("0.0.0.0:0".parse().unwrap(), peer)]
     );
 
-    assert_eq!(remote_socket.try_send(b"hello").unwrap(), 5);
-    remote_socket.shutdown(TcpShutdown::Write).unwrap();
+    assert_eq!(remote_socket.write(b"hello").unwrap(), 5);
+    remote_socket
+        .shutdown(wasixv2_vnet::Shutdown::Write)
+        .unwrap();
 
     let mut first = [0; 3];
     assert_eq!(stream.read(&mut first, true).unwrap(), 3);
@@ -234,142 +306,117 @@ struct Packet {
 struct FakeUdp {
     addr: SocketAddr,
     packets: Arc<Mutex<VecDeque<Packet>>>,
-    broadcast: bool,
-    loop_v4: bool,
-    loop_v6: bool,
-    multicast_ttl_v4: u32,
-    ttl: u32,
+    peer: Mutex<Option<SocketAddr>>,
+    queue: Mutex<WaitQueue>,
+    closed: AtomicBool,
 }
-
 impl FakeUdp {
     fn new(addr: SocketAddr, packets: Arc<Mutex<VecDeque<Packet>>>) -> Self {
         Self {
             addr,
             packets,
-            broadcast: false,
-            loop_v4: false,
-            loop_v6: false,
-            multicast_ttl_v4: 1,
-            ttl: 64,
+            peer: Mutex::default(),
+            queue: Mutex::default(),
+            closed: AtomicBool::new(false),
         }
     }
 }
-
-impl VirtualIoSource for FakeUdp {
-    fn remove_handler(&mut self) {}
-
-    fn poll_read_ready(&mut self, _: &mut Context<'_>) -> Poll<NetResult<usize>> {
-        match self.packets.lock().unwrap().front() {
-            Some(packet) => Poll::Ready(Ok(packet.bytes.len())),
-            None => Poll::Pending,
+impl Pollable for FakeUdp {
+    fn poll(&self, mut table: Option<&mut PollTable<'_>>) -> PollMask {
+        if let Some(table) = &mut table {
+            table.wait_on(&self.queue.lock().unwrap());
         }
-    }
-
-    fn poll_write_ready(&mut self, _: &mut Context<'_>) -> Poll<NetResult<usize>> {
-        Poll::Ready(Ok(usize::MAX))
-    }
-}
-
-impl VirtualSocket for FakeUdp {
-    fn set_ttl(&mut self, ttl: u32) -> NetResult<()> {
-        self.ttl = ttl;
-        Ok(())
-    }
-
-    fn ttl(&self) -> NetResult<u32> {
-        Ok(self.ttl)
-    }
-
-    fn addr_local(&self) -> NetResult<SocketAddr> {
-        Ok(self.addr)
-    }
-
-    fn status(&self) -> NetResult<SocketStatus> {
-        Ok(SocketStatus::Opened)
-    }
-
-    fn set_handler(&mut self, _: Box<dyn InterestHandler + Send + Sync>) -> NetResult<()> {
-        Ok(())
+        if self.closed.load(Ordering::SeqCst) {
+            return PollMask::HUP;
+        }
+        let mut mask = PollMask::OUT;
+        if !self.packets.lock().unwrap().is_empty() {
+            mask |= PollMask::IN;
+        }
+        mask
     }
 }
-
-impl VirtualConnectionlessSocket for FakeUdp {
-    fn try_send_to(&mut self, data: &[u8], _: SocketAddr) -> NetResult<usize> {
+impl BackendDatagram for FakeUdp {
+    fn send_to(&self, data: &[u8], _: SocketAddr) -> NetResult<usize> {
         Ok(data.len())
     }
-
-    fn try_recv_from(
-        &mut self,
-        buf: &mut [MaybeUninit<u8>],
-        peek: bool,
-    ) -> NetResult<(usize, SocketAddr)> {
+    fn connect(&self, peer: Option<SocketAddr>) -> NetResult<()> {
+        *self.peer.lock().unwrap() = peer;
+        Ok(())
+    }
+    fn take_error(&self) -> Option<Errno> {
+        None
+    }
+    fn recv_from(&self, buf: &mut [u8], peek: bool) -> NetResult<(usize, usize, SocketAddr)> {
         let mut packets = self.packets.lock().unwrap();
-        let packet = packets.front().cloned().ok_or(NetworkError::WouldBlock)?;
-        for (slot, byte) in buf.iter_mut().zip(packet.bytes.iter()) {
-            slot.write(*byte);
+        let packet = packets.front().cloned().ok_or(Errno::EAGAIN)?;
+        if self
+            .peer
+            .lock()
+            .unwrap()
+            .is_some_and(|peer| peer != packet.from)
+        {
+            packets.pop_front();
+            drop(packets);
+            let queue = self.queue.lock().unwrap().clone();
+            queue.wake(PollMask::IN);
+            return Err(Errno::EAGAIN);
         }
+        let copied = buf.len().min(packet.bytes.len());
+        buf[..copied].copy_from_slice(&packet.bytes[..copied]);
         if !peek {
             packets.pop_front();
         }
-        Ok((packet.bytes.len(), packet.from))
+        Ok((copied, packet.bytes.len(), packet.from))
+    }
+    fn input_len(&self) -> usize {
+        self.packets
+            .lock()
+            .unwrap()
+            .front()
+            .map_or(0, |packet| packet.bytes.len())
+    }
+    fn attach(&self, queue: Option<WaitQueue>) -> NetResult<()> {
+        *self.queue.lock().unwrap() = queue.ok_or(Errno::EINVAL)?;
+        Ok(())
     }
 }
-
-impl VirtualUdpSocket for FakeUdp {
-    fn set_broadcast(&mut self, broadcast: bool) -> NetResult<()> {
-        self.broadcast = broadcast;
+#[async_trait::async_trait]
+impl UdpSocket for FakeUdp {
+    // This pull-only fixture explicitly does not provide a producer driver.
+    fn install_receiver(
+        &self,
+        _: Arc<dyn DatagramReceiver>,
+    ) -> NetResult<Arc<dyn DatagramReceiveLease>> {
+        Err(Errno::EOPNOTSUPP)
+    }
+    fn peer_addr(&self) -> NetResult<Option<SocketAddr>> {
+        Ok(*self.peer.lock().unwrap())
+    }
+    fn local_addr(&self) -> NetResult<SocketAddr> {
+        Ok(self.addr)
+    }
+    fn recv_packet(&self, buf: &mut [u8], peek: bool) -> NetResult<ReceivedDatagram> {
+        self.recv_from(buf, peek).map(|(copied, full, source)| {
+            (
+                copied,
+                full,
+                DatagramInfo {
+                    source,
+                    destination: self.addr,
+                    interface: 0,
+                },
+            )
+        })
+    }
+    fn set_socket_option(&self, _: i32, _: i32, _: &[u8]) -> NetResult<()> {
+        Err(Errno::EOPNOTSUPP)
+    }
+    async fn close(&self, _mode: NetworkCloseMode) -> NetResult<()> {
+        self.closed.store(true, Ordering::SeqCst);
+        let queue = self.queue.lock().unwrap().clone();
+        queue.wake(PollMask::HUP);
         Ok(())
-    }
-
-    fn broadcast(&self) -> NetResult<bool> {
-        Ok(self.broadcast)
-    }
-
-    fn set_multicast_loop_v4(&mut self, val: bool) -> NetResult<()> {
-        self.loop_v4 = val;
-        Ok(())
-    }
-
-    fn multicast_loop_v4(&self) -> NetResult<bool> {
-        Ok(self.loop_v4)
-    }
-
-    fn set_multicast_loop_v6(&mut self, val: bool) -> NetResult<()> {
-        self.loop_v6 = val;
-        Ok(())
-    }
-
-    fn multicast_loop_v6(&self) -> NetResult<bool> {
-        Ok(self.loop_v6)
-    }
-
-    fn set_multicast_ttl_v4(&mut self, ttl: u32) -> NetResult<()> {
-        self.multicast_ttl_v4 = ttl;
-        Ok(())
-    }
-
-    fn multicast_ttl_v4(&self) -> NetResult<u32> {
-        Ok(self.multicast_ttl_v4)
-    }
-
-    fn join_multicast_v4(&mut self, _: Ipv4Addr, _: Ipv4Addr) -> NetResult<()> {
-        Ok(())
-    }
-
-    fn leave_multicast_v4(&mut self, _: Ipv4Addr, _: Ipv4Addr) -> NetResult<()> {
-        Ok(())
-    }
-
-    fn join_multicast_v6(&mut self, _: Ipv6Addr, _: u32) -> NetResult<()> {
-        Ok(())
-    }
-
-    fn leave_multicast_v6(&mut self, _: Ipv6Addr, _: u32) -> NetResult<()> {
-        Ok(())
-    }
-
-    fn addr_peer(&self) -> NetResult<Option<SocketAddr>> {
-        Ok(None)
     }
 }
 
@@ -393,7 +440,7 @@ async fn udp_provider_preserves_peek_truncation_zero_packets_and_custom_peer() {
         },
     ])));
     let provider = Arc::new(FakeProvider::new());
-    *provider.udp.lock().unwrap() = Some(Box::new(FakeUdp::new(
+    *provider.udp.lock().unwrap() = Some(Arc::new(FakeUdp::new(
         "192.0.2.7:49000".parse().unwrap(),
         packets.clone(),
     )));
@@ -464,10 +511,9 @@ async fn close_joins_pending_connect_and_dns_and_rejects_new_work() {
     let connect_gate = Gate::new();
     let resolve_gate = Gate::new();
     let peer = "198.51.100.45:9443".parse().unwrap();
-    let (local_socket, _remote_socket) =
-        TcpSocketHalf::channel(64, "192.0.2.9:40123".parse().unwrap(), peer);
+    let (local_socket, _remote_socket) = TestTcp::pair("192.0.2.9:40123".parse().unwrap(), peer);
     let mut provider = FakeProvider::new();
-    provider.tcp = Mutex::new(Some(Box::new(local_socket)));
+    provider.tcp = Mutex::new(Some(local_socket));
     provider.connect_gate = Some(connect_gate.clone());
     provider.resolve_gate = Some(resolve_gate.clone());
     let provider = Arc::new(provider);
@@ -582,40 +628,29 @@ struct FakeListener {
     removed: Arc<AtomicUsize>,
 }
 
-impl VirtualIoSource for FakeListener {
-    fn remove_handler(&mut self) {
-        self.removed.fetch_add(1, Ordering::SeqCst);
-    }
-
-    fn poll_read_ready(&mut self, _: &mut Context<'_>) -> Poll<NetResult<usize>> {
-        Poll::Pending
-    }
-
-    fn poll_write_ready(&mut self, _: &mut Context<'_>) -> Poll<NetResult<usize>> {
-        Poll::Ready(Ok(0))
+impl Pollable for FakeListener {
+    fn poll(&self, _: Option<&mut PollTable<'_>>) -> PollMask {
+        self.handler_set.store(true, Ordering::SeqCst);
+        PollMask::empty()
     }
 }
-
-impl VirtualTcpListener for FakeListener {
-    fn try_accept(&mut self) -> NetResult<(Box<dyn VirtualTcpSocket + Sync>, SocketAddr)> {
-        Err(NetworkError::WouldBlock)
+#[async_trait::async_trait]
+impl TcpListener for FakeListener {
+    fn try_accept(&self, _: WaitQueue) -> NetResult<(Arc<dyn TcpStream>, SocketAddr)> {
+        Err(Errno::EAGAIN)
     }
-
-    fn set_handler(&mut self, _: Box<dyn InterestHandler + Send + Sync>) -> NetResult<()> {
-        self.handler_set.store(true, Ordering::SeqCst);
-        Ok(())
-    }
-
-    fn addr_local(&self) -> NetResult<SocketAddr> {
+    fn local_addr(&self) -> NetResult<SocketAddr> {
         Ok(self.addr)
     }
-
-    fn set_ttl(&mut self, _: u8) -> NetResult<()> {
+    fn set_backlog(&self, _: u32) -> NetResult<()> {
         Ok(())
     }
-
-    fn ttl(&self) -> NetResult<u8> {
-        Ok(64)
+    fn set_socket_option(&self, _: i32, _: i32, _: &[u8]) -> NetResult<()> {
+        Err(Errno::EOPNOTSUPP)
+    }
+    async fn close(&self, _mode: NetworkCloseMode) -> NetResult<()> {
+        self.removed.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 }
 
@@ -637,7 +672,7 @@ async fn publication_drop_cancels_listener_and_close_joins_its_lease() {
     let handler_set = Arc::new(AtomicBool::new(false));
     let removed = Arc::new(AtomicUsize::new(0));
     let provider = Arc::new(FakeProvider::new());
-    *provider.listener.lock().unwrap() = Some(Box::new(FakeListener {
+    *provider.listener.lock().unwrap() = Some(Arc::new(FakeListener {
         addr: host,
         handler_set: handler_set.clone(),
         removed: removed.clone(),
@@ -661,4 +696,321 @@ async fn publication_drop_cancels_listener_and_close_joins_its_lease() {
         .expect("network close succeeds");
     assert_eq!(removed.load(Ordering::SeqCst), 1);
     services.close().await.expect("join provider services");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn udp_endpoint_preserves_fresh_defaults_failed_revision_and_same_bound_source_fence() {
+    use wasixv2_vnet::endpoint::{
+        EndpointBindPurpose, EndpointBindRequest, EndpointChoice, EndpointGroupId, EndpointKind,
+        EndpointQuery, EndpointSource, EndpointSourceId, UdpTxConfig,
+    };
+    let local: SocketAddr = "192.0.2.7:49000".parse().unwrap();
+    let peer: SocketAddr = "203.0.113.9:5300".parse().unwrap();
+    let other: SocketAddr = "203.0.113.10:5300".parse().unwrap();
+    let socket = Arc::new(FakeUdp::new(local, Arc::new(Mutex::default())));
+    let provider = Arc::new(FakeProvider::new());
+    *provider.udp.lock().unwrap() = Some(socket.clone());
+    let (network, services) = services_network(provider.clone());
+    let endpoints = network.endpoint_namespace().unwrap();
+    let queue = WaitQueue::new();
+    let first = EndpointSourceId(10);
+    let bound = endpoints
+        .bind(
+            EndpointBindRequest {
+                source_id: first,
+                kind: EndpointKind::Datagram,
+                requested: "0.0.0.0:0".parse().unwrap(),
+                explicit: true,
+                purpose: EndpointBindPurpose::Bind,
+                domain: wasixv2_vnet::Domain::Inet,
+                v6only: false,
+                reuse_addr: false,
+                reuse_port: false,
+            },
+            queue.clone(),
+        )
+        .unwrap()
+        .unwrap();
+    wait_until(|| bound.local_addr() == Ok(local)).await;
+    let source = |id| EndpointSource {
+        id,
+        group_id: EndpointGroupId(1),
+        bound: local,
+        domain: wasixv2_vnet::Domain::Inet,
+        requested_bind: Some("0.0.0.0:0".parse().unwrap()),
+        binding: Some(bound.clone()),
+    };
+    let config = |source_id, revision, peer, recv_v4_errors| UdpTxConfig {
+        source_id,
+        revision,
+        peer,
+        recv_v4_errors,
+        recv_v6_errors: false,
+    };
+    let query = EndpointQuery {
+        kind: EndpointKind::Datagram,
+        source_id: first,
+        bound: Some(local),
+        requested_bind: Some("0.0.0.0:0".parse().unwrap()),
+        binding: Some(bound.clone()),
+        effective_source: Some(local),
+        destination: peer,
+        local_binding: false,
+    };
+    let EndpointChoice::Provider(target) = endpoints.select(&query).unwrap() else {
+        panic!("configured provider selected");
+    };
+    assert_eq!(bound.connect_datagram(first, Some(peer)), Some(Ok(())));
+    let tx = endpoints
+        .datagram(source(first), config(first, 1, None, false), queue.clone())
+        .unwrap();
+    assert_eq!(
+        socket.peer_addr(),
+        Ok(Some(peer)),
+        "TX configuration metadata must not reconnect/disconnect the core-owned association"
+    );
+    // This provider rejects every option callback: untouched false defaults must not call it.
+    assert_eq!(tx.send_to(1, &target, local, peer, b"one"), Ok(3));
+    tx.configure(config(first, 2, Some(peer), true));
+    assert_eq!(tx.take_error(), Some(Errno::EOPNOTSUPP));
+    assert_eq!(
+        tx.send_to(2, &target, local, peer, b"two"),
+        Err(Errno::EAGAIN)
+    );
+    assert_eq!(
+        tx.send_to(1, &target, local, peer, b"old"),
+        Err(Errno::EAGAIN),
+        "failed newer configuration invalidates the previously applied revision"
+    );
+    tx.configure(config(first, 1, None, false));
+    assert_eq!(
+        socket.peer_addr(),
+        Ok(Some(peer)),
+        "an older desired revision cannot replay physical state after a newer failure"
+    );
+    let second = EndpointSourceId(11);
+    assert_eq!(bound.connect_datagram(second, Some(other)), Some(Ok(())));
+    tx.configure(config(first, 3, Some(peer), false));
+    assert_eq!(
+        socket.peer_addr(),
+        Ok(Some(other)),
+        "a retained old TX must not mutate the same bound socket after source renewal"
+    );
+    assert_eq!(
+        tx.send_to(3, &target, local, peer, b"stale"),
+        Err(Errno::ECANCELED)
+    );
+    assert!(
+        matches!(
+            endpoints.datagram(source(first), config(first, 4, None, false), queue),
+            Err(Errno::ECANCELED)
+        ),
+        "TX construction cannot reauthorize an old captured source"
+    );
+    network.close().await.unwrap();
+    services.close().await.unwrap();
+    assert!(socket.closed.load(Ordering::SeqCst));
+}
+
+// Empty controlled driver: unlike the pull-only FakeUdp this owns one push registration.
+// Callbacks are intentionally synchronous at installation, as custom providers may be.
+struct PushUdp {
+    socket: FakeUdp,
+    receiver: Mutex<Option<Arc<dyn DatagramReceiver>>>,
+    lease: Arc<PushReceiveLease>,
+    before_ready: Mutex<Option<wasixv2_vnet::endpoint::DatagramDelivery>>,
+}
+impl std::fmt::Debug for PushUdp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PushUdp").finish_non_exhaustive()
+    }
+}
+impl Pollable for PushUdp {
+    fn poll(&self, table: Option<&mut PollTable<'_>>) -> PollMask {
+        self.socket.poll(table)
+    }
+}
+impl BackendDatagram for PushUdp {
+    fn send_to(&self, bytes: &[u8], peer: SocketAddr) -> NetResult<usize> {
+        self.socket.send_to(bytes, peer)
+    }
+    fn connect(&self, peer: Option<SocketAddr>) -> NetResult<()> {
+        self.socket.connect(peer)
+    }
+    fn take_error(&self) -> Option<Errno> {
+        self.socket.take_error()
+    }
+    fn recv_from(&self, bytes: &mut [u8], peek: bool) -> NetResult<(usize, usize, SocketAddr)> {
+        if self.receiver.lock().unwrap().is_some() {
+            return Err(Errno::EBUSY);
+        }
+        self.socket.recv_from(bytes, peek)
+    }
+    fn input_len(&self) -> usize {
+        self.socket.input_len()
+    }
+    fn attach(&self, queue: Option<WaitQueue>) -> NetResult<()> {
+        self.socket.attach(queue)
+    }
+}
+#[async_trait::async_trait]
+impl UdpSocket for PushUdp {
+    fn install_receiver(
+        &self,
+        receiver: Arc<dyn DatagramReceiver>,
+    ) -> NetResult<Arc<dyn DatagramReceiveLease>> {
+        {
+            let mut current = self.receiver.lock().unwrap();
+            if current.is_some() {
+                return Err(Errno::EBUSY);
+            }
+            *current = Some(receiver.clone());
+        }
+        let info = DatagramInfo {
+            source: "203.0.113.9:5300".parse().unwrap(),
+            destination: self.socket.addr,
+            interface: 0,
+        };
+        *self.before_ready.lock().unwrap() = Some(receiver.received(info, b"before-ready"));
+        receiver.ready();
+        Ok(self.lease.clone())
+    }
+    fn peer_addr(&self) -> NetResult<Option<SocketAddr>> {
+        UdpSocket::peer_addr(&self.socket)
+    }
+    fn recv_packet(&self, bytes: &mut [u8], peek: bool) -> NetResult<ReceivedDatagram> {
+        if self.receiver.lock().unwrap().is_some() {
+            return Err(Errno::EBUSY);
+        }
+        self.socket.recv_packet(bytes, peek)
+    }
+    fn local_addr(&self) -> NetResult<SocketAddr> {
+        self.socket.local_addr()
+    }
+    fn set_socket_option(&self, level: i32, name: i32, value: &[u8]) -> NetResult<()> {
+        self.socket.set_socket_option(level, name, value)
+    }
+    async fn close(&self, mode: NetworkCloseMode) -> NetResult<()> {
+        self.socket.close(mode).await
+    }
+}
+#[derive(Default)]
+struct PushReceiveLease {
+    closing: AtomicBool,
+    acknowledged: AtomicBool,
+    changed: Notify,
+}
+#[async_trait::async_trait]
+impl DatagramReceiveLease for PushReceiveLease {
+    async fn wait_ready(&self) -> NetResult<()> {
+        Ok(())
+    }
+    async fn close(&self) -> NetResult<()> {
+        self.closing.store(true, Ordering::SeqCst);
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.acknowledged.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            changed.await;
+        }
+    }
+}
+impl Drop for PushReceiveLease {
+    fn drop(&mut self) {
+        self.closing.store(true, Ordering::SeqCst);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn udp_endpoint_push_registration_fences_callbacks_and_joins_withdrawal() {
+    use wasixv2_abi::MsgFlags;
+    use wasixv2_vnet::endpoint::{DatagramDelivery, PublicationState};
+    use wasixv2_vnet::{Domain, Net, NetConfig, Network, SocketKind};
+
+    let services = crate::service::Services::new().unwrap();
+    let provider = Arc::new(FakeProvider::new());
+    let local = "127.0.0.1:43138".parse().unwrap();
+    let push = Arc::new(PushUdp {
+        socket: FakeUdp::new(local, Arc::default()),
+        receiver: Mutex::default(),
+        lease: Arc::default(),
+        before_ready: Mutex::default(),
+    });
+    *provider.udp.lock().unwrap() = Some(push.clone());
+    let network = ProviderNetwork::new(provider.clone(), services.clone());
+    let net = Net::new(NetConfig::default(), Some(network.clone()));
+    let socket = net
+        .socket(Domain::Inet, SocketKind::Datagram, 0, 1)
+        .unwrap();
+    let admission = socket.bind_admission(local, false).unwrap().unwrap();
+    tokio::time::timeout(WAIT, async {
+        loop {
+            match admission.complete() {
+                Ok(()) => break,
+                Err(Errno::EAGAIN) => tokio::task::yield_now().await,
+                Err(error) => panic!("canonical bind failed: {error:?}"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    drop(admission);
+    wait_until(|| {
+        net.endpoint_publications()
+            .iter()
+            .any(|status| status.state == PublicationState::Ready)
+    })
+    .await;
+    assert_eq!(
+        *push.before_ready.lock().unwrap(),
+        Some(DatagramDelivery::Dropped)
+    );
+    assert_eq!(push.recv_packet(&mut [0; 1], false), Err(Errno::EBUSY));
+    let receiver = push.receiver.lock().unwrap().as_ref().unwrap().clone();
+    let info = DatagramInfo {
+        source: "203.0.113.9:5300".parse().unwrap(),
+        destination: local,
+        interface: 0,
+    };
+    assert_eq!(
+        receiver.received(info, b"ready-member"),
+        DatagramDelivery::Queued
+    );
+    let mut bytes = [0; 32];
+    let message = socket.recv(&mut bytes, MsgFlags::empty()).unwrap();
+    assert_eq!(&bytes[..message.len], b"ready-member");
+    assert_eq!(message.from, Some(info.source));
+    assert_eq!(
+        socket.recv(&mut bytes, MsgFlags::empty()),
+        Err(Errno::EAGAIN)
+    );
+    assert_eq!(provider.udp_calls.lock().unwrap().len(), 1);
+
+    drop(socket);
+    wait_until(|| push.lease.closing.load(Ordering::SeqCst)).await;
+    assert!(net.endpoint_publications().is_empty());
+    receiver.ready();
+    receiver.failed(Errno::EIO);
+    assert_eq!(receiver.received(info, b"late"), DatagramDelivery::Retired);
+    assert!(net.endpoint_publications().is_empty());
+    let closing = tokio::spawn({
+        let network = network.clone();
+        async move { network.close().await }
+    });
+    wait_until(|| network.group.closed()).await;
+    assert!(
+        !closing.is_finished(),
+        "Group close must retain the accepted receive lease until its withdrawal ACK"
+    );
+    push.lease.acknowledged.store(true, Ordering::SeqCst);
+    push.lease.changed.notify_waiters();
+    tokio::time::timeout(WAIT, closing)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    services.close().await.unwrap();
 }

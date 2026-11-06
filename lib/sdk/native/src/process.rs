@@ -282,6 +282,7 @@ pub(crate) struct ProcessControl {
     outputs: Vec<PipeCloser>,
     exit: AtomicU8,
     observer: wasixv2::RunObserver,
+    network_cancel: Option<crate::provider_net::NetworkCancel>,
     completed: watch::Sender<Option<std::result::Result<i32, String>>>,
     #[cfg(feature = "napi-v8")]
     napi: Mutex<Option<wasmer_napi::NapiCtx>>,
@@ -301,6 +302,7 @@ impl ProcessControl {
         signaller: Signaller,
         stdin: Option<PipeCloser>,
         outputs: Vec<PipeCloser>,
+        network_cancel: Option<crate::provider_net::NetworkCancel>,
         #[cfg(feature = "napi-v8")] napi: wasmer_napi::NapiCtx,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -310,6 +312,7 @@ impl ProcessControl {
             outputs,
             exit: AtomicU8::new(EXIT_NONE),
             observer,
+            network_cancel,
             completed: watch::channel(None).0,
             #[cfg(feature = "napi-v8")]
             napi: Mutex::new(Some(napi)),
@@ -357,18 +360,26 @@ impl ProcessControl {
         }
     }
     pub(crate) fn kill(&self) {
+        let running = self.record_exit_if_running(EXIT_TERMINATED_FORCED);
+        if let Some(network) = &self.network_cancel {
+            network.cancel();
+        }
         for output in &self.outputs {
             output.close();
         }
-        if self.record_exit_if_running(EXIT_TERMINATED_FORCED) {
+        if running {
             self.force_exit();
         }
     }
     fn kill_timed_out(&self) {
+        let running = self.record_exit_if_running(EXIT_TIMED_OUT);
+        if let Some(network) = &self.network_cancel {
+            network.cancel();
+        }
         for output in &self.outputs {
             output.close();
         }
-        if self.record_exit_if_running(EXIT_TIMED_OUT) {
+        if running {
             self.force_exit();
         }
     }
@@ -380,10 +391,10 @@ impl ProcessControl {
     fn force_exit(&self) {
         self.signal(9);
         #[cfg(feature = "napi-v8")]
-        if self.observer.observed_result().is_none() {
-            if let Some(napi) = self.napi.lock().unwrap().as_ref() {
-                napi.runtime_control().terminate_all();
-            }
+        if self.observer.observed_result().is_none()
+            && let Some(napi) = self.napi.lock().unwrap().as_ref()
+        {
+            napi.runtime_control().terminate_all();
         }
         if let Some(stdin) = &self.stdin {
             stdin.close();
@@ -415,5 +426,266 @@ impl Drop for Process {
         if self.completed.is_none() && !self.control.try_join_exited() {
             self.control.kill();
         }
+    }
+}
+
+#[cfg(test)]
+mod close_escalation {
+    use crate::network_api::{BackendStream, NetworkCloseMode, PollMask, PollTable, Pollable};
+    use crate::network_api::{NetworkError, NetworkProvider, NetworkResult, TcpStream, WaitQueue};
+    use crate::{CacheConfig, ExitReason, PackageSource, Result, Wasmer, WasmerConfig};
+    use futures::FutureExt;
+    use std::sync::atomic::AtomicBool;
+    use std::{
+        net::SocketAddr,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
+    use tokio::sync::Notify;
+    use wasixv2_vnet::{Shutdown, StreamState};
+
+    // Same connect sequence as tests/network.rs, with an explicit observed zero exit.
+    const CONNECT_WAT: &str = r#"(module
+      (import "wasixv2" "socket" (func $socket(param i32 i32 i32)(result i32)))
+      (import "wasixv2" "connect" (func $connect(param i32 i32 i32)(result i32)))
+      (import "wasixv2" "exit_group" (func $exit(param i32)))
+      (memory(export "memory")1)
+      (data(i32.const 16)"\02\00\01\bb\c6\33\64\50\00\00\00\00\00\00\00\00")
+      (func(export "_start")
+        (drop(call $connect(call $socket(i32.const 2)(i32.const 1)(i32.const 0))(i32.const 16)(i32.const 16)))
+        (call $exit(i32.const 0)) unreachable))"#;
+
+    #[derive(Debug, Default)]
+    struct CloseState {
+        normal: AtomicUsize,
+        cancel: AtomicUsize,
+        active: AtomicUsize,
+        normal_started: Notify,
+        cancel_started: Notify,
+        acknowledged: AtomicBool,
+        actual_completions: AtomicUsize,
+        changed: Notify,
+    }
+    impl CloseState {
+        fn acknowledge(&self) {
+            assert!(!self.acknowledged.swap(true, Ordering::SeqCst));
+            self.actual_completions.fetch_add(1, Ordering::SeqCst);
+            self.changed.notify_waiters();
+        }
+    }
+    struct Active(Arc<CloseState>);
+    impl Drop for Active {
+        fn drop(&mut self) {
+            self.0.active.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    struct EscalatingStream {
+        state: Arc<CloseState>,
+        options: std::sync::Mutex<Vec<(i32, i32, Vec<u8>)>>,
+    }
+    impl Pollable for EscalatingStream {
+        fn poll(&self, _: Option<&mut PollTable<'_>>) -> PollMask {
+            if self.state.acknowledged.load(Ordering::SeqCst) {
+                PollMask::HUP | PollMask::IN
+            } else {
+                PollMask::OUT
+            }
+        }
+    }
+    impl BackendStream for EscalatingStream {
+        fn state(&self) -> StreamState {
+            if self.state.acknowledged.load(Ordering::SeqCst) {
+                StreamState::Closed
+            } else {
+                StreamState::Established
+            }
+        }
+        fn read(&self, _: &mut [u8], _: bool) -> NetworkResult<usize> {
+            Err(NetworkError::EAGAIN)
+        }
+        fn write(&self, data: &[u8]) -> NetworkResult<usize> {
+            Ok(data.len())
+        }
+        fn write_urgent(&self, _: &[u8]) -> NetworkResult<usize> {
+            Err(NetworkError::EOPNOTSUPP)
+        }
+        fn read_urgent(&self, _: bool) -> NetworkResult<u8> {
+            Err(NetworkError::EOPNOTSUPP)
+        }
+        fn at_mark(&self) -> bool {
+            false
+        }
+        fn shutdown(&self, _: Shutdown) -> NetworkResult<()> {
+            Ok(())
+        }
+        fn take_error(&self) -> Option<NetworkError> {
+            None
+        }
+        fn peer_addr(&self) -> SocketAddr {
+            "198.51.100.80:443".parse().unwrap()
+        }
+        fn input_len(&self) -> usize {
+            0
+        }
+    }
+    #[async_trait::async_trait]
+    impl TcpStream for EscalatingStream {
+        fn local_addr(&self) -> NetworkResult<SocketAddr> {
+            Ok("127.0.0.1:45001".parse().unwrap())
+        }
+        fn flush(&self) -> NetworkResult<()> {
+            Ok(())
+        }
+        fn set_socket_option(&self, level: i32, name: i32, value: &[u8]) -> NetworkResult<()> {
+            match (level, name) {
+                (1, 13) | (6, 1) | (1, 9) | (1, 5) | (1, 7) | (1, 8) | (0, 2) | (41, 16) => {
+                    self.options
+                        .lock()
+                        .unwrap()
+                        .push((level, name, value.to_vec()));
+                    Ok(())
+                }
+                _ => Err(NetworkError::EOPNOTSUPP),
+            }
+        }
+        async fn close(&self, mode: NetworkCloseMode) -> NetworkResult<()> {
+            self.state.active.fetch_add(1, Ordering::SeqCst);
+            let _active = Active(self.state.clone());
+            match mode {
+                NetworkCloseMode::Normal => {
+                    self.state.normal.fetch_add(1, Ordering::SeqCst);
+                    self.state.normal_started.notify_one();
+                }
+                NetworkCloseMode::Cancel => {
+                    self.state.cancel.fetch_add(1, Ordering::SeqCst);
+                    self.state.cancel_started.notify_one();
+                }
+            }
+            loop {
+                let changed = self.state.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if self.state.acknowledged.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
+                changed.await;
+            }
+        }
+    }
+    #[derive(Debug)]
+    struct Provider {
+        state: Arc<CloseState>,
+        calls: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl NetworkProvider for Provider {
+        async fn connect_tcp(
+            &self,
+            _: SocketAddr,
+            _: SocketAddr,
+            _: WaitQueue,
+        ) -> NetworkResult<Arc<dyn TcpStream>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Arc::new(EscalatingStream {
+                state: self.state.clone(),
+                options: std::sync::Mutex::default(),
+            }))
+        }
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn explicit_kill_escalates_inflight_close_and_joins_both_without_rewriting_observed_exit()
+    -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let directory = tempfile::TempDir::new()?;
+            let client = Wasmer::with_config(WasmerConfig {
+                cache: CacheConfig {
+                    root: directory.path().join("cache"),
+                },
+                output_bytes: 1024,
+            })?;
+            let state = Arc::new(CloseState::default());
+            let provider = Arc::new(Provider {
+                state: state.clone(),
+                calls: AtomicUsize::new(0),
+            });
+            let sandbox = client
+                .sandboxes()
+                .create()
+                .package(PackageSource::bytes(wat::parse_str(CONNECT_WAT).unwrap()))
+                .network_provider(provider.clone())
+                .await?;
+            let mut process = sandbox.command("main").spawn().await?;
+            state.normal_started.notified().await;
+            assert_eq!(state.normal.load(Ordering::SeqCst), 1);
+            assert_eq!(state.active.load(Ordering::SeqCst), 1);
+            assert!(
+                process.wait().now_or_never().is_none(),
+                "ordinary wait remains pending through close"
+            );
+            assert!(
+                !process
+                    .control()
+                    .network_cancel
+                    .as_ref()
+                    .unwrap()
+                    .requested(),
+                "dropping the subscriber cannot even enqueue an owner-cancel request"
+            );
+            tokio::task::yield_now().await;
+            assert_eq!(
+                state.cancel.load(Ordering::SeqCst),
+                0,
+                "dropping a wait subscription must not request owner cancellation"
+            );
+            // The shared native Run observer is the actual exec/admission boundary; close
+            // can start earlier during descriptor retirement, so do not infer exit from it.
+            while !process.control().try_join_exited() {
+                tokio::task::yield_now().await;
+            }
+            process.kill()?;
+            assert!(
+                process
+                    .control()
+                    .network_cancel
+                    .as_ref()
+                    .unwrap()
+                    .requested()
+            );
+            state.cancel_started.notified().await;
+            assert_eq!(state.cancel.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                state.active.load(Ordering::SeqCst),
+                2,
+                "the Normal close future must remain owned after escalation"
+            );
+            assert_eq!(state.actual_completions.load(Ordering::SeqCst), 0);
+            assert!(
+                process.try_wait()?.is_none(),
+                "Cancel is a request, not an actual retirement acknowledgement"
+            );
+            state.acknowledge();
+            let output = process.wait().await?;
+            assert_eq!(output.status.code(), 0);
+            assert_eq!(
+                output.reason,
+                ExitReason::Exited,
+                "cleanup cancellation cannot rewrite the guest's already observed exit"
+            );
+            assert_eq!(process.wait().await?, output);
+            assert_eq!(state.active.load(Ordering::SeqCst), 0);
+            assert_eq!(state.actual_completions.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                provider.calls.load(Ordering::SeqCst),
+                1,
+                "escalation must not create a replacement socket"
+            );
+            sandbox.close().await?;
+            client.shutdown().await
+        })
+        .await
+        .expect("explicit close escalation joined the shared actual completion")
     }
 }
