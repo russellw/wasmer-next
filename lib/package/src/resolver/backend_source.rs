@@ -398,23 +398,26 @@ fn decode_summary(
                 pirita_sha256_hash: v2_pirita_sha256_hash,
                 pirita_download_url: v2_pirita_download_url,
                 webc_manifest: v2_manifest,
+                webc_size: _,
             },
         v3:
             WebQueryGetPackageVersionDistribution {
                 pirita_sha256_hash: v3_pirita_sha256_hash,
                 pirita_download_url: v3_pirita_download_url,
                 webc_manifest: v3_manifest,
+                webc_size: v3_size,
             },
         ..
     } = pkg_version;
 
-    let (version, pirita_sha256_hash, pirita_download_url, manifest) =
+    let (version, pirita_sha256_hash, pirita_download_url, manifest, webc_size) =
         if preferred_webc_version == webc::Version::V3 {
             (
                 webc::Version::V3,
                 v3_pirita_sha256_hash,
                 v3_pirita_download_url,
                 v3_manifest,
+                v3_size,
             )
         } else {
             (
@@ -422,6 +425,7 @@ fn decode_summary(
                 v2_pirita_sha256_hash,
                 v2_pirita_download_url,
                 v2_manifest,
+                None,
             )
         };
 
@@ -444,7 +448,11 @@ fn decode_summary(
 
     Ok(PackageSummary {
         pkg: PackageInfo::from_manifest(id, &manifest, version)?,
-        dist: DistributionInfo { webc, webc_sha256 },
+        dist: DistributionInfo {
+            webc,
+            webc_sha256,
+            webc_size,
+        },
     })
 }
 
@@ -651,6 +659,7 @@ pub const WASMER_WEBC_QUERY_ALL: &str = r#"{
             piritaDownloadUrl
             piritaSha256Hash
             webcManifest
+            webcSize
           }
         }
     }
@@ -701,6 +710,7 @@ impl PackageWebc {
         Ok(PackageSummary {
             pkg: info,
             dist: DistributionInfo {
+                webc_size: None,
                 webc: self.webc_url,
                 // TODO: replace with different hash type?
                 webc_sha256: WebcHash(hash.as_sha256().context("invalid hash")?.0),
@@ -770,6 +780,25 @@ pub struct WebQueryGetPackageVersionDistribution {
     pub pirita_sha256_hash: Option<String>,
     #[serde(rename = "webcManifest")]
     pub webc_manifest: Option<String>,
+    #[serde(
+        rename = "webcSize",
+        default,
+        deserialize_with = "advisory_artifact_size"
+    )]
+    pub webc_size: Option<u64>,
+}
+
+// This field is advisory: invalid values must not discard otherwise valid URL,
+// checksum and manifest metadata. GraphQL Int is signed and limited to 32 bits.
+fn advisory_artifact_size<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = <serde_json::Value as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(value
+        .as_i64()
+        .and_then(|size| i32::try_from(size).ok())
+        .and_then(|size| u64::try_from(size).ok()))
 }
 
 #[cfg(test)]
@@ -792,7 +821,7 @@ mod tests {
     //      -d '@wasmer_pack_cli_request.json' > wasmer_pack_cli_response.json
     const WASMER_PACK_CLI_REQUEST: &[u8] = br#"
     {
-        "query":"{\n    getPackage(name: \"wasmer/wasmer-pack-cli\") {\n        packageName\n        namespace\n        versions {\n          version\n          isArchived\n          v2: distribution(version: V2) {\n            piritaDownloadUrl\n            piritaSha256Hash\n            webcManifest\n          }\n          v3: distribution(version: V3) {\n            piritaDownloadUrl\n            piritaSha256Hash\n            webcManifest\n          }\n        }\n    }\n    info {\n        defaultFrontend\n    }\n}"
+        "query":"{\n    getPackage(name: \"wasmer/wasmer-pack-cli\") {\n        packageName\n        namespace\n        versions {\n          version\n          isArchived\n          v2: distribution(version: V2) {\n            piritaDownloadUrl\n            piritaSha256Hash\n            webcManifest\n          }\n          v3: distribution(version: V3) {\n            piritaDownloadUrl\n            piritaSha256Hash\n            webcManifest\n            webcSize\n          }\n        }\n    }\n    info {\n        defaultFrontend\n    }\n}"
     }
     "#;
     const WASMER_PACK_CLI_RESPONSE: &[u8] = br#"
@@ -953,6 +982,59 @@ mod tests {
         }
     }
 
+    #[test]
+    fn artifact_size_is_advisory_and_stays_with_the_selected_v3_distribution() {
+        use serde_json::json;
+
+        let v2_hash = WebcHash::sha256(b"different distribution");
+        let v3_hash = WebcHash::sha256(b"selected distribution");
+        for (size, expected) in [
+            (None, None),
+            (Some(json!(null)), None),
+            (Some(json!(-1)), None),
+            (Some(json!(1.5)), None),
+            (Some(json!("128")), None),
+            (Some(json!({ "size": 128 })), None),
+            (Some(json!([128])), None),
+            (Some(json!(true)), None),
+            (Some(json!(i64::from(i32::MAX) + 1)), None),
+            (Some(json!(0)), Some(0)),
+            (Some(json!(128)), Some(128)),
+            (Some(json!(i32::MAX)), Some(i32::MAX as u64)),
+        ] {
+            let mut version = json!({
+                "version": "1.0.0",
+                "v2": {
+                    "piritaDownloadUrl": "https://example.test/other.webc",
+                    "piritaSha256Hash": v2_hash.as_hex(),
+                    "webcManifest": serde_json::to_string(&Manifest::default()).unwrap(),
+                    "webcSize": 999,
+                },
+                "v3": {
+                    "piritaDownloadUrl": "https://example.test/selected.webc",
+                    "piritaSha256Hash": v3_hash.as_hex(),
+                    "webcManifest": serde_json::to_string(&Manifest::default()).unwrap(),
+                },
+            });
+            if let Some(size) = size {
+                version["v3"]["webcSize"] = size;
+            }
+            let version: WebQueryGetPackageVersion = serde_json::from_value(version).unwrap();
+            let selected = decode_summary("test", "size", version.clone(), webc::Version::V3)
+                .expect("invalid advisory size must not discard valid package metadata");
+            assert_eq!(selected.dist.webc_size, expected);
+            assert_eq!(
+                selected.dist.webc.as_str(),
+                "https://example.test/selected.webc"
+            );
+            assert_eq!(selected.dist.webc_sha256, v3_hash);
+            let other = decode_summary("test", "size", version, webc::Version::V2).unwrap();
+            assert_eq!(other.dist.webc_size, None);
+            assert_eq!(other.dist.webc.as_str(), "https://example.test/other.webc");
+            assert_eq!(other.dist.webc_sha256, v2_hash);
+        }
+    }
+
     #[tokio::test]
     async fn run_known_query() {
         let response = HttpResponse {
@@ -981,6 +1063,7 @@ mod tests {
                     filesystem: vec![],
                 },
                 dist: DistributionInfo {
+                    webc_size: None,
                     webc: "https://storage.googleapis.com/wapm-registry-prod/webc/wasmer/wasmer-pack-cli/0.6.0/wasmer-pack-cli-0.6.0.webc"
                         .parse()
                         .unwrap(),

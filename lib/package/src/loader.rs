@@ -1225,6 +1225,7 @@ mod tests {
                 filesystem: Vec::new(),
             },
             dist: DistributionInfo {
+                webc_size: None,
                 webc: "https://wasmer.io/python/python".parse().unwrap(),
                 webc_sha256: [0xaa; 32].into(),
             },
@@ -1294,6 +1295,7 @@ mod tests {
                 filesystem: Vec::new(),
             },
             dist: DistributionInfo {
+                webc_size: None,
                 webc: "https://wasmer.io/python/python".parse().unwrap(),
                 webc_sha256: [0xbb; 32].into(),
             },
@@ -1531,6 +1533,7 @@ mod tests {
             .save_impl(
                 Bytes::from_static(b"test1"),
                 &DistributionInfo {
+                    webc_size: None,
                     webc: Url::parse("file:///test1.webc").unwrap(),
                     webc_sha256: WebcHash::sha256(b"test1"),
                 },
@@ -1541,6 +1544,7 @@ mod tests {
             .save_impl(
                 Bytes::from_static(b"test2"),
                 &DistributionInfo {
+                    webc_size: None,
                     webc: Url::parse("file:///test2.webc").unwrap(),
                     webc_sha256: WebcHash::sha256(b"test2"),
                 },
@@ -1703,6 +1707,7 @@ mod tests {
                     filesystem: Vec::new(),
                 },
                 dist: DistributionInfo {
+                    webc_size: None,
                     webc: "https://example.test/package.webc".parse().unwrap(),
                     webc_sha256: WebcHash::sha256(body),
                 },
@@ -1740,8 +1745,10 @@ mod tests {
                 }
                 let client = BodyClient::new(body.clone(), headers);
                 let (events, observer) = observe(&client);
+                let mut summary = summary(&body);
+                summary.dist.webc_size = Some(body.len() as u64);
                 PackageDownloader::new(client)
-                    .load_with_progress(&summary(&body), Some(observer))
+                    .load_with_progress(&summary, Some(observer))
                     .await
                     .unwrap();
                 let events = events.lock().unwrap();
@@ -2072,8 +2079,10 @@ mod tests {
             let body = gzip(&archive.into_inner().unwrap());
             let client = BodyClient::new(body.clone(), HeaderMap::new());
             let (events, observer) = observe(&client);
+            let mut summary = summary(&body);
+            summary.dist.webc_size = Some(body.len() as u64);
             PackageDownloader::new(client)
-                .load_with_progress(&summary(&body), Some(observer))
+                .load_with_progress(&summary, Some(observer))
                 .await
                 .unwrap();
             let events = events.lock().unwrap();

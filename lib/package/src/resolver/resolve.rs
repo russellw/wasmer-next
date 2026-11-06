@@ -940,6 +940,7 @@ mod tests {
                 filesystem: Vec::new(),
             };
             let dist = DistributionInfo {
+                webc_size: None,
                 webc: format!("http://localhost/{name}@{version}")
                     .parse()
                     .unwrap(),
@@ -1914,6 +1915,7 @@ mod tests {
             });
         }
         let dist = DistributionInfo {
+            webc_size: None,
             webc: "http://localhost/child@1.0.0".parse().unwrap(),
             webc_sha256: [0; 32].into(),
         };

@@ -63,6 +63,7 @@ impl PackageSummary {
 
         let pkg = PackageInfo::from_manifest(id, manifest, container.version())?;
         let dist = DistributionInfo {
+            webc_size: None,
             webc: url,
             webc_sha256,
         };
@@ -270,6 +271,9 @@ pub struct DistributionInfo {
     pub webc: Url,
     /// A SHA-256 checksum for the `*.webc` file.
     pub webc_sha256: WebcHash,
+    /// Advisory raw V3 artifact size from the same registry distribution as the
+    /// URL and checksum. It is not an HTTP transfer or decoded-wrapper size.
+    pub webc_size: Option<u64>,
 }
 
 /// The SHA-256 hash of a `*.webc` file.

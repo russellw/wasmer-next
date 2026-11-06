@@ -1,0 +1,115 @@
+{
+  "scope": "Linux native SDK recovery; browser/Node source and builds remain on hold",
+  "recovered_from": {
+    "repository": "private wasmerio/wasmer-next",
+    "revision": "f8355f3a7e804656ac072c546ce6fd606026004d",
+    "path": "lib/sdk/rust"
+  },
+  "upstream": {
+    "repository": "https://github.com/wasmerio/wasmer-sdk",
+    "revision": "2a1382f163316097bebac67b9c7dd20a47f685b6",
+    "transportRevision": "32f497ec6d238c6e44e898a28442bc5b87643615"
+  },
+  "original_files": {
+    "Cargo.toml": {
+      "git_blob": "3e2dfb5c9487da7463467122cacaef17a90be6ea",
+      "sha256": "986e2dcd9c49471aaf0f78679b5e309c1cb4cddd45bb8bcf797046f56c5a0333"
+    },
+    "LICENSE": {
+      "git_blob": "cdcdf1abfdba2c8cddbce6c44acbcccded6f742f",
+      "sha256": "6350e730ed61a3ec83b5843634aa0a476505ec9b96792600606ced736835b45c"
+    },
+    "README.md": {
+      "git_blob": "6f2554bf4a22d34166118c3ae5bbd743f8040a4d",
+      "sha256": "e4ce9d59e2af16895a91ba68f997af2e90473bac337c5144bc49d9574dcd0b69"
+    },
+    "src/capture.rs": {
+      "git_blob": "e91e2f9e66a5e80b758f77fafdf2599492522018",
+      "sha256": "be2246784ba236b4e341efc74573b26df2f235904f9e60d8e223c3a5d92077a8"
+    },
+    "src/client.rs": {
+      "git_blob": "acf0acc0bf93820065204e561eefcd174c623c12",
+      "sha256": "3a7e48724340e51cd60861055b886367893e6c289e2a222b823ba5ade04920f8"
+    },
+    "src/command.rs": {
+      "git_blob": "cef0ff81fb2a8331595f12f084d5159b95ed1cda",
+      "sha256": "530c23e175442d9b91c6bcf57af17105a5cbfd697eb611ef82c204c86896765b"
+    },
+    "src/error.rs": {
+      "git_blob": "68c96b56977e4f5b3cca548074ef9c48fe855181",
+      "sha256": "41a87225da7a5f8b0ddb739032d29d68c6e85f2241664dd4ca603b743986ff24"
+    },
+    "src/fs.rs": {
+      "git_blob": "fd9850ac55233bfdb9766b4763470e962f710a99",
+      "sha256": "0bf735fb34f4c693fa47236b070987e01a645eb79aca92f6735764595ac7d345"
+    },
+    "src/lib.rs": {
+      "git_blob": "a8970d6ba39828ce9b021a11803dcb14d29053ff",
+      "sha256": "535b9e98ec6fd2b50609e41720f92f7ba62c285e588001ece5935f78baa8bbb1"
+    },
+    "src/package.rs": {
+      "git_blob": "605a20375191a6e44465a2675fdb526d9717996e",
+      "sha256": "b4a4961e3fd8cb1a01d0b4b5061f6df400e700277d1fc4d360e70bd1fef1c475"
+    },
+    "src/package/definition.rs": {
+      "git_blob": "a529c5d03fb3ebd22b7b37eb048a57d495643d4b",
+      "sha256": "e8c6e0cfccb83d50823ad804be94fc233a7b7d53d5c3bc75c00bb7f7ef56a2b2"
+    },
+    "src/package_progress.rs": {
+      "git_blob": "31b1384dbd3845e80e145b6cdc91e6913a9d9257",
+      "sha256": "310144bbaf342ec99d345544854fc32d3ebcd4491a3f96bd547b0dbbde924ef1"
+    },
+    "src/process.rs": {
+      "git_blob": "ad7b2b7c8bfddc2d16d8dac92dc46ec26768e81f",
+      "sha256": "75e67cb21abae80774a17782474990eb3911b6dda143c5c750b5fd4d4f98ee52"
+    },
+    "src/provider_fs.rs": {
+      "git_blob": "bd89b23c2db42a691d5a6af3bbd538b4a0564507",
+      "sha256": "e457b751a78db7a3ae2923785913533771e19e9d3e69a9a87bb6c1557f511544"
+    },
+    "src/sandbox.rs": {
+      "git_blob": "5d257aed03c9552570819b88665c74de386926c0",
+      "sha256": "f63d2374792b29bd9a7e341e7332c1eb936589865105e683e6d34760b8a743be"
+    },
+    "src/stream.rs": {
+      "git_blob": "5b8d6b2f7e18d654950ef738deafe2f08b7f306d",
+      "sha256": "ca189db1d5d1b331c381143d0d0c0fd580debb2574e11469ec56e5a6752df9bb"
+    },
+    "src/terminal.rs": {
+      "git_blob": "982d4e410b8429cc3d691463901188f9e559e0eb",
+      "sha256": "491b443f7c952969ed42c53bf2ad8517800739a0e97b92862e674f7167896e87"
+    },
+    "tests/external_mount.rs": {
+      "git_blob": "9a768dd9d568ada02022430d3724924a0ce0e0af",
+      "sha256": "b6c7cec36509686affda429d87d6da5de0cd00967f2cc14cd2973a353b56a7f4"
+    },
+    "tests/fixtures/package-files.wasm": {
+      "git_blob": "88098dc59ed33ed9bdc52a1771784682b8b8c01c",
+      "sha256": "07a1929ff95676500a8b89dfe7c9d46efb1daeff3152961ade6b08935d8ea0a4"
+    },
+    "tests/fixtures/package-files.wat": {
+      "git_blob": "9cfd5386b3b7af3d7273ddc27189f449ed26b547",
+      "sha256": "6e135fd96d30d4d962efb70b14ae1848636be7d71bdcacf276da5aac68fb6a5c"
+    },
+    "tests/local_package.rs": {
+      "git_blob": "bf108dceeff0bc74e168f36359c3e7a00e91c329",
+      "sha256": "5db56f7553dcf2d090352cd20298ce90f6660f239555bffd4f23f28324927de8"
+    },
+    "tests/local_package_mount.rs": {
+      "git_blob": "d6f10177008633212a285e42edf4126526646ee8",
+      "sha256": "04b4821d8acf6fe4498186d9b01312ad198e8c948ed8c4a41a1030a4bc0a7969"
+    },
+    "tests/package_definition.rs": {
+      "git_blob": "c84c05aa3312bf6d6e6731333a817b960e54951c",
+      "sha256": "2c3e05b07f657102de229b172cd59afc7823148a5076050c6d6b0841c7c11935"
+    },
+    "tests/ports.rs": {
+      "git_blob": "c3084751e4e0d85bf90e3ab05c52dbd66af1df53",
+      "sha256": "c9f661198f78bddfd9e82c4573e45e7cd40ded57113a5acd792443efa3b39799"
+    },
+    "tests/process.rs": {
+      "git_blob": "2591dd55f44a4b49a760d7042dce3ed81411ccdc",
+      "sha256": "f3aa82ca758cd57ad8201b09cb96d4e9c3dedec43f1b848dd9e2caf63a58c5de"
+    }
+  }
+}

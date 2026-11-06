@@ -51,6 +51,49 @@ impl FileSystem {
         lock.canonicalize_without_inode(path)
     }
 
+    /// Update an existing node's timestamps without opening it or changing atime.
+    /// The memory filesystem has no symlink-follow resolver: following a link is
+    /// unsupported, while nofollow updates that link's own metadata.
+    pub fn set_node_times(
+        &self,
+        path: &Path,
+        atime: Option<u64>,
+        mtime: Option<u64>,
+        follow_symlinks: bool,
+    ) -> Result<()> {
+        let mut fs = self.inner.write().map_err(|_| FsError::Lock)?;
+        let (_, target) = fs.canonicalize(path)?;
+        match target {
+            InodeResolution::Found(inode) => {
+                let node = fs.storage.get_mut(inode).ok_or(FsError::EntryNotFound)?;
+                if follow_symlinks && matches!(node, Node::Symlink(_)) {
+                    return Err(FsError::Unsupported);
+                }
+                let metadata = node.metadata_mut();
+                if let Some(atime) = atime {
+                    metadata.accessed = atime;
+                }
+                if let Some(mtime) = mtime {
+                    metadata.modified = mtime;
+                }
+                Ok(())
+            }
+            InodeResolution::Redirect(filesystem, path) => {
+                drop(fs);
+                let filesystem_ref: &dyn crate::FileSystem = filesystem.as_ref();
+                if let Some(memory) = filesystem_ref.downcast_ref::<Self>() {
+                    return memory.set_node_times(&path, atime, mtime, follow_symlinks);
+                }
+                let metadata = filesystem.symlink_metadata(&path)?;
+                if metadata.is_dir() || (!follow_symlinks && metadata.ft.is_symlink()) {
+                    return Err(FsError::Unsupported);
+                }
+                let mut file = filesystem.new_open_options().read(true).open(path)?;
+                file.set_times(atime, mtime)
+            }
+        }
+    }
+
     /// Merge all items from a given source path (directory) of a different file
     /// system into this file system.
     ///
@@ -1653,6 +1696,41 @@ mod test_filesystem {
                 "`hello2.txt` has been renamed to `world2.txt`",
             );
         }
+    }
+
+    #[test]
+    fn test_node_times_preserve_other_times_and_nofollow_metadata() {
+        let fs = FileSystem::default();
+        fs.create_dir(path!("/folder")).unwrap();
+        let file = fs
+            .new_open_options()
+            .write(true)
+            .create_new(true)
+            .open(path!("/file"))
+            .unwrap();
+        fs.set_node_times(path!("/folder/../file"), Some(10), Some(20), true)
+            .unwrap();
+        fs.set_node_times(path!("/file"), None, Some(30), true)
+            .unwrap();
+        assert_eq!((file.last_accessed(), file.last_modified()), (10, 30));
+        fs.set_node_times(path!("/folder"), Some(40), Some(50), true)
+            .unwrap();
+        let directory = fs.metadata(path!("/folder")).unwrap();
+        assert_eq!((directory.accessed, directory.modified), (40, 50));
+        fs.create_symlink(path!("/file"), path!("/link")).unwrap();
+        fs.set_node_times(path!("/link"), Some(60), Some(70), false)
+            .unwrap();
+        let link = fs.symlink_metadata(path!("/link")).unwrap();
+        assert_eq!((link.accessed, link.modified), (60, 70));
+        assert_eq!(
+            fs.set_node_times(path!("/link"), Some(80), Some(90), true),
+            Err(FsError::Unsupported)
+        );
+        assert_eq!((file.last_accessed(), file.last_modified()), (10, 30));
+        assert_eq!(
+            fs.set_node_times(path!("/missing"), None, Some(1), true),
+            Err(FsError::EntryNotFound)
+        );
     }
 
     #[tokio::test]

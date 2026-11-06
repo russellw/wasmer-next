@@ -469,6 +469,7 @@ mod tests {
         source.add(PackageSummary {
             pkg: dep_info,
             dist: DistributionInfo {
+                webc_size: None,
                 webc: "http://localhost/wasmer-static-web-server.webc"
                     .parse()
                     .unwrap(),

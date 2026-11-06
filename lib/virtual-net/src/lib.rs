@@ -484,6 +484,44 @@ impl<R: VirtualConnectedSocket + ?Sized> VirtualConnectedSocketExt for R {
     }
 }
 
+/// Receive into initialized storage without exposing uninitialized output.
+/// Providers must initialize every byte of the successful prefix reported by
+/// `VirtualConnectedSocket::try_recv`, as for its existing AsyncRead adapter.
+pub fn try_recv_initialized<S: VirtualConnectedSocket + ?Sized>(
+    socket: &mut S,
+    buf: &mut [u8],
+    peek: bool,
+) -> Result<usize> {
+    let mut scratch = vec![MaybeUninit::<u8>::new(0); buf.len()];
+    let count = socket.try_recv(&mut scratch, peek)?;
+    if count > scratch.len() {
+        return Err(NetworkError::InvalidData);
+    }
+    // SAFETY: the provider's receive contract initializes the successful prefix;
+    // the checked count stays within scratch; no error output is copied.
+    let received = unsafe { std::slice::from_raw_parts(scratch.as_ptr().cast::<u8>(), count) };
+    buf[..count].copy_from_slice(received);
+    Ok(count)
+}
+
+/// Datagram counterpart of `try_recv_initialized`, preserving provider peek and
+/// sender semantics. Providers initialize the successful returned prefix.
+pub fn try_recv_from_initialized<S: VirtualConnectionlessSocket + ?Sized>(
+    socket: &mut S,
+    buf: &mut [u8],
+    peek: bool,
+) -> Result<(usize, SocketAddr)> {
+    let mut scratch = vec![MaybeUninit::<u8>::new(0); buf.len()];
+    let (count, peer) = socket.try_recv_from(&mut scratch, peek)?;
+    if count > scratch.len() {
+        return Err(NetworkError::InvalidData);
+    }
+    // SAFETY: same provider-owned initialized-prefix contract as stream receive.
+    let received = unsafe { std::slice::from_raw_parts(scratch.as_ptr().cast::<u8>(), count) };
+    buf[..count].copy_from_slice(received);
+    Ok((count, peer))
+}
+
 /// Connectionless sockets are able to send and receive datagrams and stream
 /// bytes to multiple addresses at the same time (peer-to-peer)
 pub trait VirtualConnectionlessSocket: VirtualSocket + fmt::Debug + Send + Sync + 'static {

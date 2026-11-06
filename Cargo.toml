@@ -53,6 +53,7 @@ members = [
   "lib/config",
   "lib/derive",
   "lib/napi",
+  "lib/sdk/native",
   "lib/sys-utils",
   "lib/types",
   "lib/package-sdk",

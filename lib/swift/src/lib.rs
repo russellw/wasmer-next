@@ -459,6 +459,7 @@ mod tests {
             )
             .unwrap(),
             dist: DistributionInfo {
+                webc_size: None,
                 webc: "https://example.invalid/dependency.webc".parse().unwrap(),
                 webc_sha256: hash,
             },
