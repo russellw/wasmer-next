@@ -42,6 +42,12 @@ tests and strict lint passed, followed by the integrated CLI journal check,
 package-volume mounting also passed 20 component tests. Full CLI/SDK consumer
 migration and the remaining stream requirements above are still open.
 
+Swift now uses the v2 machine and shared package installer; its 11 component
+tests pass. CLI terminal ownership and signal retirement are integrated; both
+signal tests pass. The combined CLI/Swift Cargo check passes at `6a1602ee31b`.
+Strict lint still reports existing resolver/CLI findings outside these changes.
+These completed ports do not close the remaining C API and SDK migrations.
+
 ### Current unfinished source handoffs
 
 These private branches preserve ongoing work. Their component results do not
