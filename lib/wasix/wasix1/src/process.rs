@@ -15,12 +15,58 @@ use crate::calls;
 pub struct ProcState {
     /// Loaded on the process's first v1 call; see [`calls::startup::load`].
     pub(crate) startup: OnceLock<Arc<Startup>>,
+    startup_input: Mutex<StartupPolicy>,
     pub net: calls::sock::State,
     pub proc: calls::proc::State,
     pub(crate) clocks: calls::clock::State,
 }
 
+/// Explicit startup input for a host-owned v1 environment. Paths are Machine
+/// paths; names are the bytes announced by fd_prestat_dir_name. An empty list
+/// requests no preopened descriptors.
+#[derive(Debug, Clone, Default)]
+pub struct StartupInput {
+    pub args: Vec<Vec<u8>>,
+    pub env: Vec<Vec<u8>>,
+    pub preopens: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+#[derive(Default, Clone)]
+struct StartupPolicy {
+    input: Option<Arc<StartupInput>>,
+    sealed: bool,
+}
+
 impl ProcState {
+    /// Configures a host environment once, before its first startup load begins.
+    /// This controls only v1 startup buffers and preopens, not kernel procfs data.
+    pub fn set_startup_input(&self, input: StartupInput) -> Result<(), wasixv2_abi::Errno> {
+        let mut policy = self.startup_input.lock().unwrap();
+        if policy.sealed || policy.input.is_some() {
+            return Err(wasixv2_abi::Errno::EBUSY);
+        }
+        if input
+            .args
+            .iter()
+            .chain(&input.env)
+            .any(|value| value.contains(&0))
+            || input
+                .preopens
+                .iter()
+                .any(|(path, name)| path.contains(&0) || name.contains(&0))
+        {
+            return Err(wasixv2_abi::Errno::EINVAL);
+        }
+        policy.input = Some(Arc::new(input));
+        Ok(())
+    }
+
+    pub(crate) fn seal_startup_input(&self) -> Option<Arc<StartupInput>> {
+        let mut policy = self.startup_input.lock().unwrap();
+        policy.sealed = true;
+        policy.input.clone()
+    }
+
     /// The state of a child that `fork` or `vfork` makes of this process: it has the same
     /// descriptors, so it announces the same preopens and keeps what the families know about
     /// them (epoll data and socket timeouts), and the same arguments,
@@ -32,6 +78,7 @@ impl ProcState {
         }
         Self {
             startup,
+            startup_input: Mutex::new(self.startup_input.lock().unwrap().clone()),
             net: self.net.fork(),
             proc: self.proc.fork(),
             clocks: self.clocks.fork(),
@@ -163,6 +210,64 @@ impl Procs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_startup_input_preserves_bytes_and_fork_configuration() {
+        let state = ProcState::default();
+        state
+            .set_startup_input(StartupInput {
+                args: vec![b"program".to_vec(), vec![0xff, b'x']],
+                env: vec![vec![b'K', b'=', 0xfe]],
+                preopens: vec![],
+            })
+            .unwrap();
+        let child = state.fork();
+        let input = child.seal_startup_input().unwrap();
+        assert_eq!(input.args[1], [0xff, b'x']);
+        assert_eq!(input.env[0], [b'K', b'=', 0xfe]);
+        assert!(input.preopens.is_empty());
+        assert_eq!(
+            child.set_startup_input(StartupInput::default()),
+            Err(wasixv2_abi::Errno::EBUSY)
+        );
+        assert!(Arc::ptr_eq(&input, &state.seal_startup_input().unwrap()));
+
+        let default = ProcState::default();
+        assert!(default.seal_startup_input().is_none());
+        assert_eq!(
+            default.set_startup_input(StartupInput::default()),
+            Err(wasixv2_abi::Errno::EBUSY)
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn host_startup_configuration_cannot_race_past_first_load() {
+        for _ in 0..32 {
+            let state = Arc::new(ProcState::default());
+            let ready = Arc::new(std::sync::Barrier::new(2));
+            let configure = std::thread::spawn({
+                let state = state.clone();
+                let ready = ready.clone();
+                move || {
+                    ready.wait();
+                    state.set_startup_input(StartupInput {
+                        args: vec![b"configured".to_vec()],
+                        ..StartupInput::default()
+                    })
+                }
+            });
+            ready.wait();
+            let input = state.seal_startup_input();
+            match configure.join().unwrap() {
+                Ok(()) => assert_eq!(input.unwrap().args, [b"configured".to_vec()]),
+                Err(error) => {
+                    assert_eq!(error, wasixv2_abi::Errno::EBUSY);
+                    assert!(input.is_none());
+                }
+            }
+        }
+    }
 
     fn strings(list: &[&str]) -> Vec<Vec<u8>> {
         list.iter().map(|s| s.as_bytes().to_vec()).collect()

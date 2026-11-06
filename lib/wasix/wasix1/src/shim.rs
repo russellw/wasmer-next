@@ -153,7 +153,7 @@ impl<'a, S: Syscalls + Control + 'static> Frame<'a, S> {
     /// The process's arguments, environment and preopens, loaded on first use.
     pub async fn startup(&self) -> V1Result<Arc<Startup>> {
         let proc = self.proc().await?;
-        Ok(crate::calls::startup::load(self, &proc).await)
+        Ok(crate::calls::startup::load(self, &proc).await?)
     }
 
     /// Reads a `T` from guest memory (never scratch) at `addr`.

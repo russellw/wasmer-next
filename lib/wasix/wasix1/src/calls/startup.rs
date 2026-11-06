@@ -32,32 +32,44 @@ const PREOPENS: [(&[u8], &[u8]); 3] = [(b"/", b"/"), (b".", b"."), (b"/", b"/")]
 pub(crate) async fn load<S: Syscalls + Control + 'static>(
     frame: &Frame<'_, S>,
     proc: &ProcState,
-) -> Arc<Startup> {
+) -> SysResult<Arc<Startup>> {
     if let Some(startup) = proc.startup.get() {
-        return startup.clone();
+        return Ok(startup.clone());
     }
-    let (args, env) = read_block(frame).await.unwrap_or_else(|err| {
-        tracing::warn!(
-            ?err,
-            "cannot read the startup block; no arguments or environment"
-        );
-        Default::default()
-    });
-    let opened = open_preopens(frame).await;
+    let input = proc.seal_startup_input();
+    let (args, env) = match &input {
+        Some(input) => (input.args.clone(), input.env.clone()),
+        None => read_block(frame).await.unwrap_or_else(|err| {
+            tracing::warn!(
+                ?err,
+                "cannot read the startup block; no arguments or environment"
+            );
+            Default::default()
+        }),
+    };
+    let paths: Vec<(&[u8], &[u8])> = match &input {
+        Some(input) => input
+            .preopens
+            .iter()
+            .map(|(path, name)| (path.as_slice(), name.as_slice()))
+            .collect(),
+        None => PREOPENS.to_vec(),
+    };
+    let opened = match open_preopens(frame, &paths, input.is_some()).await {
+        Ok(opened) => opened,
+        Err(error) => return proc.startup.get().cloned().ok_or(error),
+    };
     let startup = Arc::new(Startup {
         args,
         env,
         preopens: opened.iter().map(|(preopen, _)| preopen.clone()).collect(),
     });
     if proc.startup.set(startup.clone()).is_ok() {
-        return startup;
+        return Ok(startup);
     }
     // Another thread of the process won the race; its preopens are the ones the guest sees.
-    for (preopen, binding) in &opened {
-        let caller = Caller::new(frame.task, &frame.mem).with_descriptors(binding);
-        let _ = frame.syscalls.close(&caller, preopen.fd).await;
-    }
-    proc.startup.get().expect("set by the winner").clone()
+    close_preopens(frame, &opened).await;
+    Ok(proc.startup.get().expect("set by the winner").clone())
 }
 
 type Strings = Vec<Vec<u8>>;
@@ -104,9 +116,11 @@ fn parse_block(block: &[u8], base: u32) -> Option<(Strings, Strings)> {
 
 async fn open_preopens<S: Syscalls + Control + 'static>(
     frame: &Frame<'_, S>,
-) -> Vec<(Preopen, DescriptorSet)> {
+    paths: &[(&[u8], &[u8])],
+    strict: bool,
+) -> SysResult<Vec<(Preopen, DescriptorSet)>> {
     let mut preopens = Vec::new();
-    for (path, name) in PREOPENS {
+    for &(path, name) in paths {
         match open_dir(frame, path).await {
             Ok((fd, binding)) => preopens.push((
                 Preopen {
@@ -115,12 +129,26 @@ async fn open_preopens<S: Syscalls + Control + 'static>(
                 },
                 binding,
             )),
+            Err(err) if strict => {
+                close_preopens(frame, &preopens).await;
+                return Err(err);
+            }
             Err(err) => {
                 tracing::warn!(?err, path = %String::from_utf8_lossy(path), "cannot preopen")
             }
         }
     }
-    preopens
+    Ok(preopens)
+}
+
+async fn close_preopens<S: Syscalls + Control + 'static>(
+    frame: &Frame<'_, S>,
+    opened: &[(Preopen, DescriptorSet)],
+) {
+    for (preopen, binding) in opened {
+        let caller = Caller::new(frame.task, &frame.mem).with_descriptors(binding);
+        let _ = frame.syscalls.close(&caller, preopen.fd).await;
+    }
 }
 
 async fn open_dir<S: Syscalls + Control + 'static>(
