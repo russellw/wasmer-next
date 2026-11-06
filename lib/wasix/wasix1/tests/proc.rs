@@ -827,6 +827,105 @@ fn spawn_from_a_nonmain_context_preserves_guest_fork_restrictions() {
     assert_eq!(std::fs::read(programs.0.join("out.txt")).unwrap(), b"child");
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+mod spawn_cancellation {
+    use super::*;
+    use std::future::Future;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use wasixv2_kernel::{Dispatch, HostClock, Kernel, SyscallEntry};
+    use wasixv2_syscalls::{
+        Caller, Control, Layer, Layered, MaybeFuture, PidView, SysResult, Syscall, SyscallRet,
+    };
+
+    #[derive(Default)]
+    struct Probe {
+        child: AtomicU32,
+        dropped: AtomicBool,
+    }
+    struct PendingAction(Arc<Probe>);
+    impl Drop for PendingAction {
+        fn drop(&mut self) {
+            self.0.dropped.store(true, Ordering::Release);
+        }
+    }
+    struct BlockChdir(Arc<Probe>);
+    impl Layer<Kernel> for BlockChdir {
+        fn call<'a>(
+            &'a self,
+            caller: &'a Caller<'_>,
+            call: Syscall,
+            next: &'a Kernel,
+        ) -> MaybeFuture<'a, SysResult<SyscallRet>> {
+            MaybeFuture::Future(Box::pin(async move {
+                if matches!(call, Syscall::Chdir { .. }) {
+                    let _pending = PendingAction(self.0.clone());
+                    self.0.child.store(caller.task().0, Ordering::Release);
+                    return std::future::pending().await;
+                }
+                Dispatch.call(caller, call, next).await
+            }))
+        }
+    }
+
+    /// The real kernel must forget the child, including its pid and vfork wait,
+    /// after the retained import is canceled during child-only file actions.
+    #[tokio::test]
+    async fn pending_file_action_cancellation_reaps_the_exact_child() {
+        tokio::task::LocalSet::new().run_until(async {
+            let probe = Arc::new(Probe::default());
+            let host: Arc<dyn wasixv2::Host> = Arc::new(wasixv2::TokioHost::default());
+            let root = Arc::new(wasixv2_vfs_mem::MemFs::new(Arc::new(HostClock(host.clone())), 0o777, 1, 1));
+            let mut abis = wasixv2_exec::Abis::new();
+            abis.push(Arc::new(wasixv2_wasix1::Wasix1::new()));
+            let abis = Arc::new(abis);
+            let kernel = Kernel::new(host.clone(), root).with_binfmt(abis.clone());
+            let config = || ProcessConfig { args: vec!["spawn-cancel".into()], env: vec![], stdio: Stdio::from_fns(|_| {}, |_| {}) };
+            let parent = kernel.spawn(config()).unwrap();
+            let observer = kernel.spawn(config()).unwrap();
+            let syscalls = Arc::new(Layered::new(SyscallEntry(BlockChdir(probe.clone())), kernel));
+            let source = r#"(module
+              (import "wasix_32v1" "proc_spawn2" (func $spawn
+                (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+              (import "wasix_32v1" "context_create" (func $create (param i32 i32) (result i32)))
+              (import "wasix_32v1" "context_switch" (func $switch (param i64) (result i32)))
+              (memory (export "memory") 1)
+              (table 2 funcref)
+              (elem (i32.const 1) $context)
+              (data (i32.const 16) "/missing")
+              (data (i32.const 32) "/")
+              (data (i32.const 128) "\03")
+              (data (i32.const 140) "\20\00\00\00\01\00\00\00")
+              (func $context
+                (drop (call $spawn (i32.const 16) (i32.const 8) (i32.const 0) (i32.const 0)
+                  (i32.const 0) (i32.const 0) (i32.const 128) (i32.const 1)
+                  (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 300)))
+                unreachable)
+              (func (export "_start")
+                (if (call $create (i32.const 400) (i32.const 1)) (then unreachable))
+                (drop (call $switch (i64.load (i32.const 400)))) unreachable))"#;
+            let store = wasmer::Store::default();
+            let module = wasixv2_exec::load(store.engine(), &wat::parse_str(source).unwrap()).unwrap();
+            let mut run = Box::pin(wasixv2_exec::run_with_abis(store, &module, syscalls.clone(), parent, host, abis));
+            let child = tokio::time::timeout(std::time::Duration::from_secs(5), std::future::poll_fn(|cx| {
+                assert!(run.as_mut().poll(cx).is_pending(), "spawn must be suspended in the child");
+                let child = probe.child.load(Ordering::Acquire);
+                if child == 0 { std::task::Poll::Pending } else { std::task::Poll::Ready(wasixv2_syscalls::TaskId(child)) }
+            })).await.unwrap();
+            assert_ne!(child, parent);
+            assert_ne!(syscalls.pid_in(observer, child), 0);
+            drop(run);
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !probe.dropped.load(Ordering::Acquire) || syscalls.pid_in(observer, child) != 0 {
+                    tokio::task::yield_now().await;
+                }
+            }).await.expect("physical import retirement and exact child reap");
+            assert_eq!(syscalls.take_pending(child), None);
+            syscalls.fault(parent, 9); syscalls.release(parent);
+            syscalls.fault(observer, 9); syscalls.release(observer);
+        }).await;
+    }
+}
+
 /// The Rust-style legacy call has three independent pipes and drops every empty CR/LF
 /// argument. The child observes the requested cwd and inherited environment, echoes its
 /// stdin to stdout/stderr, then exits with 7.

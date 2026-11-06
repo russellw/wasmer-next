@@ -123,6 +123,15 @@ impl OwningThread {
         cleanup: impl Into<crate::cleanup::RunCleanup>,
         guest: impl std::future::Future<Output = R>,
     ) -> R {
+        self.run_with_keepalive(cleanup, guest, ()).await
+    }
+
+    pub(crate) async fn run_with_keepalive<R>(
+        self,
+        cleanup: impl Into<crate::cleanup::RunCleanup>,
+        guest: impl std::future::Future<Output = R>,
+        keepalive: impl std::any::Any,
+    ) -> R {
         use std::{
             future::{Future, poll_fn},
             panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
@@ -130,7 +139,9 @@ impl OwningThread {
         };
         self.authorize().expect("private owning-thread permit");
         let cleanup = cleanup.into();
-        let mut runner = Some(Box::pin(cleanup.run_with_keepalive(guest, self.lease)));
+        let mut runner = Some(Box::pin(
+            cleanup.run_with_keepalive(guest, (self.lease, keepalive)),
+        ));
         let result = poll_fn(|cx| {
             match catch_unwind(AssertUnwindSafe(|| {
                 runner.as_mut().unwrap().as_mut().poll(cx)

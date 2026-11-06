@@ -147,6 +147,9 @@ impl Drop for Takeover {
 /// reach.
 pub(crate) trait Spawn: Send + Sync {
     fn spawn(&self, task: TaskId, image: Image);
+    fn spawn_owned(&self, _: TaskId, _: Image, _: crate::spawn_custody::Publication) {
+        panic!("this spawner does not accept host-only child custody")
+    }
     fn fork(&self, task: TaskId, image: asyncify::ForkImage);
     /// Starts `image` as `task`, whose run goes on there, and reports how it ends to
     /// `handoff`.
@@ -183,17 +186,15 @@ where
     S: Syscalls + Control + Send + Sync + 'static,
 {
     fn spawn(&self, task: TaskId, image: Image) {
-        let (engine, syscalls, host, abis) = (
-            self.engine.clone(),
-            self.syscalls.clone(),
-            self.host.clone(),
-            self.abis.clone(),
-        );
-        // Without a thread the process died; nothing waits for its status.
-        let _ = self.start(task, move |cleanup| {
-            let run = run_new_image(engine, image, syscalls, task, host, abis, cleanup);
-            async move { report_failure(task, run.await) }
-        });
+        self.spawn_image_owned(task, image, None);
+    }
+    fn spawn_owned(
+        &self,
+        task: TaskId,
+        image: Image,
+        publication: crate::spawn_custody::Publication,
+    ) {
+        self.spawn_image_owned(task, image, Some(publication));
     }
 
     fn fork(&self, task: TaskId, image: asyncify::ForkImage) {
@@ -259,6 +260,29 @@ impl<S> Spawner<S>
 where
     S: Syscalls + Control + Send + Sync + 'static,
 {
+    fn spawn_image_owned(
+        &self,
+        task: TaskId,
+        image: Image,
+        publication: Option<crate::spawn_custody::Publication>,
+    ) {
+        let (engine, syscalls, host, abis) = (
+            self.engine.clone(),
+            self.syscalls.clone(),
+            self.host.clone(),
+            self.abis.clone(),
+        );
+        // Without a thread the process died; nothing waits for its status.
+        let _ = self.start_inner(
+            task,
+            move |cleanup| {
+                let run = run_new_image(engine, image, syscalls, task, host, abis, cleanup);
+                async move { report_failure(task, run.await) }
+            },
+            publication,
+        );
+    }
+
     /// Runs the process `task` on a host thread of its own. The run ends the process itself when
     /// its image fails; when no thread can start, the process dies of SIGSEGV here, and
     /// `Err` has its status.
@@ -267,6 +291,24 @@ where
         R: FnOnce(crate::cleanup::RunCleanup) -> F + Send + 'static,
         F: Future<Output = ()> + 'static,
     {
+        self.start_inner(task, run, None)
+    }
+
+    fn start_inner<F, R>(
+        &self,
+        task: TaskId,
+        run: R,
+        publication: Option<crate::spawn_custody::Publication>,
+    ) -> Result<(), i32>
+    where
+        R: FnOnce(crate::cleanup::RunCleanup) -> F + Send + 'static,
+        F: Future<Output = ()> + 'static,
+    {
+        let startup = publication
+            .as_ref()
+            .map(|publication| publication.startup(self.syscalls.clone(), task));
+        let owned = startup.is_some();
+        let finished = startup.as_ref().map(|startup| startup.finished.clone());
         let host = self.host.clone();
         let syscalls = self.syscalls.clone();
         let owning_thread = self.abis.requires_owning_thread();
@@ -290,7 +332,9 @@ where
                                 drop(run(scope))
                             }));
                         let error = match dropped {
+                            Ok(()) if owned => error,
                             Ok(()) => crate::reject_profile(&*syscalls, task, error),
+                            Err(panic) if owned => crate::panic_error(task, panic),
                             Err(panic) => crate::host_panicked(&*syscalls, task, panic),
                         };
                         report_failure(task, Err(error));
@@ -300,26 +344,56 @@ where
                 match profile {
                     Some(profile) => {
                         let guest = async move { run(scope).await };
-                        if let Err(panic) = crate::catch_panic(profile.run(&cleanup, guest)).await {
-                            drop(crate::host_panicked(&*syscalls, task, panic));
+                        let guest = async move {
+                            guest.await;
+                            if let Some(finished) = finished {
+                                finished.store(true, std::sync::atomic::Ordering::Release);
+                            }
+                        };
+                        if let Err(panic) =
+                            crate::catch_panic(profile.run_with_keepalive(&cleanup, guest, startup))
+                                .await
+                        {
+                            let error = if owned {
+                                crate::panic_error(task, panic)
+                            } else {
+                                crate::host_panicked(&*syscalls, task, panic)
+                            };
+                            report_failure(task, Err(error));
                         }
                     }
                     None => {
                         cleanup
-                            .run(async move {
-                                if let Err(panic) =
-                                    crate::catch_panic(async move { run(scope).await }).await
-                                {
-                                    drop(crate::host_panicked(&*syscalls, task, panic));
-                                }
-                            })
+                            .run_with_keepalive(
+                                async move {
+                                    if let Err(panic) =
+                                        crate::catch_panic(async move { run(scope).await }).await
+                                    {
+                                        let error = if owned {
+                                            crate::panic_error(task, panic)
+                                        } else {
+                                            crate::host_panicked(&*syscalls, task, panic)
+                                        };
+                                        report_failure(task, Err(error));
+                                    } else if let Some(finished) = finished {
+                                        finished.store(true, std::sync::atomic::Ordering::Release);
+                                    }
+                                },
+                                startup,
+                            )
                             .await
                     }
                 }
             }) as wasixv2_host::LocalFuture<'static, ()>
         });
+        if let Some(publication) = publication {
+            publication.accept();
+        }
         if let Err(err) = self.host.executor().spawn_thread(start) {
             tracing::warn!(%err, "cannot start a process on a thread of its own");
+            if owned {
+                return Err(128 + Signal::SIGSEGV.0);
+            }
             let status = fault(&*self.syscalls, task, Signal::SIGSEGV.0);
             self.syscalls.release(task);
             return Err(status);
@@ -677,9 +751,13 @@ pub(crate) async fn spawn_image<S: 'static>(
     env: &AsyncFunctionEnvMut<ExecEnv<S>>,
     task: TaskId,
     image: Image,
+    publication: Option<crate::spawn_custody::Publication>,
 ) {
     let spawner = env.read().await.data().proc.spawner.clone();
-    spawner.spawn(task, image);
+    match publication {
+        Some(publication) => spawner.spawn_owned(task, image, publication),
+        None => spawner.spawn(task, image),
+    }
 }
 
 /// Starts `image`, which an `execve` of the task the instance behind `env` runs as gave the
@@ -783,7 +861,7 @@ pub(super) mod tests {
     }
 
     impl Recorder {
-        fn queue(&self, task: TaskId, action: GuestAction) {
+        pub(crate) fn queue(&self, task: TaskId, action: GuestAction) {
             if let Some(flag) = &self.resume_flag {
                 flag.raise();
             }

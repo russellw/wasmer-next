@@ -263,6 +263,12 @@ impl Wasix1Instance {
         self.set_started();
     }
 
+    /// An abandoned host-only spawn never resumes a guest vfork continuation.
+    pub(crate) fn discard_spawn(&self, child: TaskId) {
+        if let Some(vfork) = self.vforks.lock().unwrap().remove(&child) {
+            self.procs.remove(child, &vfork.state);
+        }
+    }
     /// Records the vfork child `child`, which now runs in this instance.
     pub(crate) fn add_vfork(&self, child: TaskId, vfork: Vfork) {
         self.vforks.lock().unwrap().insert(child, vfork);

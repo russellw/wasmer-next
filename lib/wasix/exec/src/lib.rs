@@ -26,6 +26,8 @@ mod pagemap;
 mod preempt;
 mod preparation;
 mod process;
+mod spawn_custody;
+pub use spawn_custody::HostSpawn;
 mod signal;
 mod thread;
 mod unwind;
@@ -733,17 +735,22 @@ fn unreachable_trap() -> Result<i32, RuntimeError> {
 /// Reports a host panic and kills the thread group of `task` with SIGSEGV, as a kernel oops
 /// kills the task it hit (`make_task_dead`).
 fn host_panicked<S: Control>(syscalls: &S, task: TaskId, panic: Box<dyn Any + Send>) -> ExecError {
+    let error = panic_error(task, panic);
+    // The kernel's state may be what panicked; a second panic changes nothing.
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        process::fault(syscalls, task, Signal::SIGSEGV.0);
+        syscalls.release(task);
+    }));
+    error
+}
+
+fn panic_error(task: TaskId, panic: Box<dyn Any + Send>) -> ExecError {
     let message = panic
         .downcast_ref::<&str>()
         .map(|s| s.to_string())
         .or_else(|| panic.downcast_ref::<String>().cloned())
         .unwrap_or_else(|| "a panic without a message".to_string());
     tracing::error!(tid = task.0, "the host panicked running a guest: {message}");
-    // The kernel's state may be what panicked; a second panic changes nothing.
-    let _ = catch_unwind(AssertUnwindSafe(|| {
-        process::fault(syscalls, task, Signal::SIGSEGV.0);
-        syscalls.release(task);
-    }));
     ExecError::Panic(message)
 }
 
@@ -1545,6 +1552,27 @@ pub async fn complete<S: Syscalls + Control + 'static, T>(
     task: TaskId,
     ret: SysResult<T>,
 ) -> Outcome<T> {
+    complete_inner(env, syscalls, task, ret, None).await
+}
+
+/// Completion of a host-only spawn, retaining its child across task switches.
+pub async fn complete_with_spawn<S: Syscalls + Control + 'static, T>(
+    env: &AsyncFunctionEnvMut<ExecEnv<S>>,
+    syscalls: &S,
+    task: TaskId,
+    ret: SysResult<T>,
+    spawn: &HostSpawn,
+) -> Outcome<T> {
+    complete_inner(env, syscalls, task, ret, Some(spawn)).await
+}
+
+async fn complete_inner<S: Syscalls + Control + 'static, T>(
+    env: &AsyncFunctionEnvMut<ExecEnv<S>>,
+    syscalls: &S,
+    task: TaskId,
+    ret: SysResult<T>,
+    spawn: Option<&HostSpawn>,
+) -> Outcome<T> {
     if matches!(ret, Err(SysErr::GuestUnwind)) {
         finish_import(env).await;
         return Outcome::Unwind(RuntimeError::new(
@@ -1615,11 +1643,18 @@ pub async fn complete<S: Syscalls + Control + 'static, T>(
                     task: to,
                     ret: value,
                 } => {
+                    if let Some(spawn) = spawn {
+                        // No await after consuming SwitchTask may precede this capture.
+                        spawn.switched(task, to);
+                    }
                     process::switch(env, to).await;
                     task = to;
                     switched = Some(value);
                 }
                 GuestAction::Exec { vfork_parent } => {
+                    if let (Some(spawn), Some(parent)) = (spawn, vfork_parent) {
+                        spawn.returning(task, parent);
+                    }
                     // The kernel queues the image with the action; without one, the empty image
                     // fails to load and the process dies as past any `execve`'s point of no return.
                     let image = syscalls
@@ -1630,7 +1665,8 @@ pub async fn complete<S: Syscalls + Control + 'static, T>(
                             image,
                         ))));
                     };
-                    process::spawn_image(env, task, image).await;
+                    let publication = spawn.and_then(|spawn| spawn.publication(task));
+                    process::spawn_image(env, task, image, publication).await;
                     match vfork_resume(env, parent, task).await {
                         Some(VforkResume::Unwind(err)) => return Outcome::Unwind(err),
                         Some(VforkResume::ReturnSuccess) => {
@@ -1660,12 +1696,21 @@ pub async fn complete<S: Syscalls + Control + 'static, T>(
                     };
                 }
                 GuestAction::VforkReturn { parent, child } => {
+                    if let Some(spawn) = spawn {
+                        spawn.returning(child, parent);
+                    }
                     // The child ended; nothing runs as it any more, and all its time is charged.
                     // Its memory is the parent's, which stays.
                     env.read().await.data().sample_cpu();
                     let memory = GuestMemory { env };
-                    syscalls.exit_mm(&Caller::new(child, &memory)).await;
+                    match spawn {
+                        Some(spawn) => spawn.exit_mm(child).await,
+                        None => syscalls.exit_mm(&Caller::new(child, &memory)).await,
+                    }
                     syscalls.release(child);
+                    if let Some(spawn) = spawn {
+                        spawn.released(child);
+                    }
                     match vfork_resume(env, parent, child).await {
                         Some(VforkResume::Unwind(err)) => return Outcome::Unwind(err),
                         Some(VforkResume::ReturnSuccess) => {

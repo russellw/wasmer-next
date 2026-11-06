@@ -517,25 +517,25 @@ async fn in_vfork_child<S: 'static>(env: &Env<S>) -> Result<bool, RuntimeError> 
 
 /// Whether control returns to a guest vfork continuation or stays inside `spawn`.
 #[derive(Clone, Copy)]
-enum VforkContinuation {
+enum VforkContinuation<'a> {
     Guest,
-    Spawn,
+    Spawn(&'a wasixv2_exec::HostSpawn),
 }
 
 /// Starts a vfork child of the calling task: the instance runs as the child afterwards.
 /// Returns the parent's compat state, or the errno of a failed `clone`.
 async fn vfork<S: Syscalls + Control + 'static>(
     env: &Env<S>,
-    continuation: VforkContinuation,
+    continuation: VforkContinuation<'_>,
 ) -> Result<Result<Parent, i32>, RuntimeError> {
     let fork_allowed = match continuation {
         VforkContinuation::Guest => wasixv2_exec::process_fork_allowed(env).await,
         // Spawn never copies or returns through a guest child activation. File actions
         // and exec stay in this import; the parent resumes the same retained invocation.
-        VforkContinuation::Spawn => true,
+        VforkContinuation::Spawn(_) => true,
     };
     let mut parent = None;
-    let done = shim::call(env, async |frame| {
+    let body = async |frame: &Frame<'_, S>| {
         parent = Some(Parent {
             state: frame.proc().await?,
             task: frame.task,
@@ -552,8 +552,11 @@ async fn vfork<S: Syscalls + Control + 'static>(
             )
             .await?;
         Ok(())
-    })
-    .await?;
+    };
+    let done = match continuation {
+        VforkContinuation::Guest => shim::call(env, body).await?,
+        VforkContinuation::Spawn(spawn) => shim::call_with_spawn(env, body, spawn).await?,
+    };
     match done {
         Done::Switched(_) => Ok(Ok(parent.expect("read before the clone"))),
         Done::Err(errno) => Ok(Err(i32::from(errno.0))),
@@ -863,53 +866,83 @@ async fn spawn<S: Syscalls + Control + 'static>(
         return Ok(i32::from(errno.0));
     }
     let request = request.expect("decoded above");
-    let parent = match vfork(env, VforkContinuation::Spawn).await? {
+    let abi = env
+        .read()
+        .await
+        .data()
+        .abi()
+        .cloned()
+        .ok_or_else(|| RuntimeError::new("spawn before ABI binding"))?;
+    let mut custody = wasixv2_exec::HostSpawn::new(env, move |child| {
+        abi.as_any()
+            .downcast_ref::<Wasix1Instance>()
+            .expect("spawn uses v1 bookkeeping")
+            .discard_spawn(child);
+    })
+    .await?;
+    let parent = match vfork(env, VforkContinuation::Spawn(&custody)).await? {
         Ok(parent) => parent,
         Err(errno) => return Ok(errno),
     };
     let mut child = None;
-    let done = shim::call(env, async |frame| {
-        if child.is_none() {
-            child = Some(start_vfork_child(frame, &parent, None));
-        }
-        spawn_child(frame, &request).await
-    })
+    let done = shim::call_with_spawn(
+        env,
+        async |frame| {
+            if child.is_none() {
+                child = Some(start_vfork_child(frame, &parent, None));
+            }
+            spawn_child(frame, &request).await
+        },
+        &custody,
+    )
     .await?;
     let (_, pid) = child.expect("set as the child");
     match done {
         // `execve` succeeded and the parent resumed.
         Done::Switched(_) => {
+            custody.finish();
             shim::errno(env, async |frame| frame.write(pid_out as u32, &pid).await).await
         }
         // Still the child: end it, which resumes the parent, and reap it.
         Done::Err(errno) => {
-            let exited = shim::call(env, async |frame| {
-                frame
-                    .syscalls
-                    .exit_group(&frame.caller(), EXEC_FAILED)
-                    .await?;
-                Ok(())
-            })
+            let exited = shim::call_with_spawn(
+                env,
+                async |frame| {
+                    frame
+                        .syscalls
+                        .exit_group(&frame.caller(), EXEC_FAILED)
+                        .await?;
+                    Ok(())
+                },
+                &custody,
+            )
             .await?;
             if !matches!(exited, Done::Switched(_)) {
                 return Err(RuntimeError::new("a spawned child did not end"));
             }
-            shim::call(env, async |frame| {
-                let info = frame.mem.alloc_mut::<Siginfo>()?;
-                frame
-                    .syscalls
-                    .waitid(
-                        &frame.caller(),
-                        Idtype::P_PID,
-                        pid,
-                        info,
-                        WaitOptions::WEXITED,
-                        RusagePtr::NULL,
-                    )
-                    .await?;
-                Ok(())
-            })
+            let reaped = shim::call_with_spawn(
+                env,
+                async |frame| {
+                    let info = frame.mem.alloc_mut::<Siginfo>()?;
+                    frame
+                        .syscalls
+                        .waitid(
+                            &frame.caller(),
+                            Idtype::P_PID,
+                            pid,
+                            info,
+                            WaitOptions::WEXITED,
+                            RusagePtr::NULL,
+                        )
+                        .await?;
+                    Ok(())
+                },
+                &custody,
+            )
             .await?;
+            if matches!(reaped, Done::Ok(())) {
+                custody.finish();
+            }
             Ok(i32::from(errno.0))
         }
         Done::Ok(()) | Done::Unwinding => Err(RuntimeError::new(

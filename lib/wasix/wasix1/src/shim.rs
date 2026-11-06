@@ -188,7 +188,29 @@ pub enum Done<T> {
 /// Runs `body` as one v1 call (see the module docs).
 pub async fn call<S, T>(
     env: &Env<S>,
+    body: impl AsyncFnMut(&Frame<'_, S>) -> V1Result<T>,
+) -> Result<Done<T>, RuntimeError>
+where
+    S: Syscalls + Control + 'static,
+{
+    call_inner(env, body, None).await
+}
+
+pub(crate) async fn call_with_spawn<S, T>(
+    env: &Env<S>,
+    body: impl AsyncFnMut(&Frame<'_, S>) -> V1Result<T>,
+    spawn: &wasixv2_exec::HostSpawn,
+) -> Result<Done<T>, RuntimeError>
+where
+    S: Syscalls + Control + 'static,
+{
+    call_inner(env, body, Some(spawn)).await
+}
+
+async fn call_inner<S, T>(
+    env: &Env<S>,
     mut body: impl AsyncFnMut(&Frame<'_, S>) -> V1Result<T>,
+    spawn: Option<&wasixv2_exec::HostSpawn>,
 ) -> Result<Done<T>, RuntimeError>
 where
     S: Syscalls + Control + 'static,
@@ -234,7 +256,13 @@ where
             Err(Error::V1(errno)) => (Ok(None), Some(errno)),
         };
         let ret = frame.unwind().finish(env, ret).await?;
-        return Ok(match complete(env, &*syscalls, task, ret).await {
+        let outcome = match spawn {
+            Some(spawn) => {
+                wasixv2_exec::complete_with_spawn(env, &*syscalls, task, ret, spawn).await
+            }
+            None => complete(env, &*syscalls, task, ret).await,
+        };
+        return Ok(match outcome {
             // A body cannot go on halfway, so a call that saved how to continue
             // (`ERESTART_RESTARTBLOCK`) runs again from the start too.
             Outcome::Rerun | Outcome::Restart => continue,
