@@ -748,19 +748,38 @@ mod tests {
             .unwrap()
             .retain(Box::pin(async move {
                 deletion.await.unwrap();
+                std::future::poll_fn(|_| {
+                    let ready = {
+                        let environment = weak.upgrade();
+                        environment.as_ref().is_some_and(|environment| {
+                            let environment = environment.borrow();
+                            environment.as_ref().is_some_and(|environment| {
+                                match &environment.inner {
+                                    WasiBackend::Native(native) => native
+                                        .endpoint
+                                        .handoff
+                                        .borrow()
+                                        .as_ref()
+                                        .is_some_and(HostCallHandoff::is_detached),
+                                    #[cfg(feature = "v8")]
+                                    WasiBackend::Legacy(_) => false,
+                                }
+                            })
+                        })
+                    };
+                    // Retain can signal during enqueue BEFORE claim. After
+                    // claim, CallOwner drains its continuation, whose first
+                    // poll_idle repolls this same retained finalizer. No extra
+                    // wake, spin, env ownership or borrow crosses Pending.
+                    if ready {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                })
+                .await;
+                checked_detached.set(checked_detached.get() + 1);
                 let environment = weak.upgrade().unwrap().borrow_mut().take().unwrap();
-                let WasiBackend::Native(native) = &environment.inner else {
-                    panic!("native backend required");
-                };
-                if native
-                    .endpoint
-                    .handoff
-                    .borrow()
-                    .as_ref()
-                    .is_some_and(HostCallHandoff::is_detached)
-                {
-                    checked_detached.set(checked_detached.get() + 1);
-                }
                 // Exercise the actual exported destructor, on its original owner.
                 deleting_at.set(Some(Instant::now()));
                 wasi_env_delete(Some(environment));
@@ -987,22 +1006,34 @@ mod tests {
             vec![wasm_val_t::from_value(&Value::I64(0x123456789), &store.inner).unwrap()].into();
         let trap = unsafe { wasm_func_call(Some(&mut run), Some(&args), &mut results) };
         let returned_at = Instant::now();
-        assert!(probe_error.borrow().is_none(), "{:?}", probe_error.borrow());
+        let diagnostic = format!(
+            "trap={:?}; finalized={}; environment_present={}; observed_ready={}; detached={}",
+            trap.as_ref().map(|trap| trap.inner.message()),
+            finalized.get(),
+            environment.borrow().is_some(),
+            observed.get(),
+            detached.get(),
+        );
+        assert!(
+            probe_error.borrow().is_none(),
+            "{:?}; {diagnostic}",
+            probe_error.borrow()
+        );
         assert!(
             trap.is_some(),
-            "Detached completion remains a trap, never fabricated i64 results"
+            "Detached completion remains a trap, never fabricated i64 results; {diagnostic}"
         );
         assert_eq!(results.as_slice()[0].kind, wasm_valkind_enum::WASM_I64 as u8);
         assert_eq!(unsafe { results.as_slice()[0].of.int64_t }, 0x123456789);
         assert_eq!(
             observed.get(),
             1,
-            "the exact successor was READY and sleeping"
+            "the exact successor was READY and sleeping; {diagnostic}"
         );
         assert_eq!(
             detached.get(),
             1,
-            "public deletion followed actual Detached publication"
+            "public deletion followed actual Detached claim; {diagnostic}"
         );
         assert_eq!(finalized.get(), 1);
         assert!(
