@@ -313,18 +313,21 @@ impl Command {
         let mut builder =
             builder.instantiation_hook(Arc::new(wasmer_napi::NapiHook::new(napi.clone())));
         if let Some(options) = terminal {
-            builder = builder.console(
-                wasixv2::Console {
-                    input,
-                    output: stdout.clone(),
-                    size: wasixv2::WindowSize {
-                        cols: options.columns as u16,
-                        rows: options.rows as u16,
-                        ..Default::default()
+            builder = builder
+                .console_input_eof(wasixv2::ConsoleInputEof::Finite)
+                .console_stdio_outputs(true)
+                .console(
+                    wasixv2::Console {
+                        input,
+                        output: stdout.clone(),
+                        size: wasixv2::WindowSize {
+                            cols: options.columns as u16,
+                            rows: options.rows as u16,
+                            ..Default::default()
+                        },
                     },
-                },
-                [true; 3],
-            );
+                    [true; 3],
+                );
         }
         let mut machine = builder.build();
         let prepare = async {

@@ -104,7 +104,8 @@ async fn disabled_networking_denies_even_private_loopback_bind() -> Result<()> {
       (data(i32.const 16)"\02\00\1f\90\7f\00\00\01\00\00\00\00\00\00\00\00")
       (func(export "_start")
         (if(i32.ge_s(call $bind(call $socket(i32.const 2)(i32.const 1)(i32.const 0))(i32.const 16)(i32.const 16))(i32.const 0))
-          (then(call $exit(i32.const 99))))))"#).unwrap();
+          (then(call $exit(i32.const 99))))
+        (call $exit(i32.const 0))))"#).unwrap();
     let sandbox = client
         .sandboxes()
         .create()

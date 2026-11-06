@@ -1,4 +1,6 @@
 //! Mounted user callbacks stay off the SDK LocalSet and retain cleanup custody.
+#![recursion_limit = "256"]
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::{
@@ -174,7 +176,7 @@ impl File for ProviderFile {
             .map_err(|error| FsError::Io(error.to_string()))?;
         let entries = self
             .peer
-            .read_dir("/")
+            .read_dir(".")
             .map_err(|error| FsError::Io(error.to_string()))?;
         assert!(entries.iter().any(|entry| entry.name == "peer.txt"));
         self.entered.add_permits(1);
