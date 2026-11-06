@@ -584,7 +584,13 @@ mod tests {
                 Poll::Pending => None,
             }
         }
-        fn status(syscalls: &MachineSyscalls, leader: u32) -> Option<String> {
+        #[derive(Debug)]
+        enum Status {
+            Pending,
+            Missing,
+            Present(String),
+        }
+        fn status(syscalls: &MachineSyscalls, leader: u32) -> Result<Status, String> {
             let vfs = syscalls.inner.vfs();
             let root = vfs.root();
             let cred = wasixv2_vfs::Cred::root();
@@ -600,13 +606,30 @@ mod tests {
                 mode: 0,
                 lookup: wasixv2_vfs::LookupFlags::follow(),
             };
-            let file =
-                immediate(vfs.open(&cx, &root, format!("/proc/{leader}/stat").as_bytes(), &how))?
-                    .ok()?;
+            let file = match immediate(vfs.open(
+                &cx,
+                &root,
+                format!("/proc/{leader}/stat").as_bytes(),
+                &how,
+            )) {
+                None => return Ok(Status::Pending),
+                Some(Err(wasixv2_vfs::PathError::Errno(wasixv2_vfs::Errno::ENOENT))) => {
+                    return Ok(Status::Missing);
+                }
+                Some(Err(error)) => return Err(format!("procstat open: {error:?}")),
+                Some(Ok(file)) => file,
+            };
             let mut bytes = [0; 4096];
             // Procfs snapshots are canonical immediate reads, always from offset ZERO.
-            let count = immediate(file.read_at(&mut bytes, 0))?.ok()?;
-            String::from_utf8(bytes[..count].to_vec()).ok()
+            let count = match immediate(file.read_at(&mut bytes, 0)) {
+                None => return Ok(Status::Pending),
+                Some(Err(wasixv2_vfs::Errno::ENOENT)) => return Ok(Status::Missing),
+                Some(Err(error)) => return Err(format!("procstat read: {error:?}")),
+                Some(Ok(count)) => count,
+            };
+            String::from_utf8(bytes[..count].to_vec())
+                .map(Status::Present)
+                .map_err(|error| format!("procstat UTF8: {error}"))
         }
         fn module(store: &mut wasm_store_t, source: &str) -> Box<wasm_module_t> {
             let bytes: wasm_byte_vec_t = wat::parse_str(source).unwrap().into();
@@ -662,11 +685,15 @@ mod tests {
             (import "wasix_32v1" "thread_sleep" (func $sleep (param i64) (result i32)))
             (import "wasix_32v1" "proc_exit2" (func $exit (param i32)))
             (memory (export "memory") 1) (data (i32.const 100) "READY")
+            (data (i32.const 200) "AFTER-SLEEP")
             (func (export "_start")
                 i32.const 0 i32.const 100 i32.store i32.const 4 i32.const 5 i32.store
                 i32.const 1 i32.const 0 i32.const 1 i32.const 8 call $write
                 if unreachable end
                 i64.const 30000000000 call $sleep drop
+                i32.const 0 i32.const 200 i32.store i32.const 4 i32.const 11 i32.store
+                i32.const 1 i32.const 0 i32.const 1 i32.const 8 call $write
+                if unreachable end
                 i32.const 77 call $exit unreachable))"#,
         )
         .unwrap();
@@ -706,6 +733,9 @@ mod tests {
         let observed = Rc::new(Cell::new(0));
         let detached = Rc::new(Cell::new(0));
         let finalized = Rc::new(Cell::new(0));
+        let deletion_started = Rc::new(Cell::new(None));
+        let deleting_at = deletion_started.clone();
+        let probe_error = Rc::new(RefCell::new(None));
         let cleaned = Arc::new(AtomicBool::new(false));
         let (delete, deletion) = tokio::sync::oneshot::channel();
         let delete = RefCell::new(Some(delete));
@@ -732,6 +762,7 @@ mod tests {
                     checked_detached.set(checked_detached.get() + 1);
                 }
                 // Exercise the actual exported destructor, on its original owner.
+                deleting_at.set(Some(Instant::now()));
                 wasi_env_delete(Some(environment));
                 deleted.set(deleted.get() + 1);
             }));
@@ -739,6 +770,7 @@ mod tests {
         let observer_syscalls = syscalls.clone();
         let observer_capture = capture.clone();
         let completion = cleaned.clone();
+        let failed_probe = probe_error.clone();
         let deadline = Cell::new(None);
         let data = Box::into_raw(Box::new(Probe(Box::new(move || {
             let limit = deadline.get().unwrap_or_else(|| {
@@ -756,13 +788,21 @@ mod tests {
                 .0
                 .iter()
                 .any(|(bytes, _)| bytes == b"READY");
-            let sleeping = status(&observer_syscalls, leader).is_some_and(|line| {
-                let Some((head, tail)) = line.rsplit_once(')') else {
-                    return false;
-                };
-                head == format!("{leader} (child.wasm")
-                    && tail.split_whitespace().next() == Some("S")
-            });
+            let sleeping = match status(&observer_syscalls, leader) {
+                Ok(Status::Pending | Status::Missing) => false,
+                Ok(Status::Present(line)) => {
+                    let Some((head, tail)) = line.rsplit_once(')') else {
+                        *failed_probe.borrow_mut() = Some(format!("malformed procstat: {line:?}"));
+                        return 2;
+                    };
+                    head == format!("{leader} (child.wasm")
+                        && tail.split_whitespace().next() == Some("S")
+                }
+                Err(error) => {
+                    *failed_probe.borrow_mut() = Some(error);
+                    return 2;
+                }
+            };
             if !(ready && sleeping) {
                 return 0;
             }
@@ -946,6 +986,8 @@ mod tests {
         let mut results: wasm_val_vec_t =
             vec![wasm_val_t::from_value(&Value::I64(0x123456789), &store.inner).unwrap()].into();
         let trap = unsafe { wasm_func_call(Some(&mut run), Some(&args), &mut results) };
+        let returned_at = Instant::now();
+        assert!(probe_error.borrow().is_none(), "{:?}", probe_error.borrow());
         assert!(
             trap.is_some(),
             "Detached completion remains a trap, never fabricated i64 results"
@@ -963,6 +1005,11 @@ mod tests {
             "public deletion followed actual Detached publication"
         );
         assert_eq!(finalized.get(), 1);
+        assert!(
+            returned_at.duration_since(deletion_started.get().expect("public delete was invoked"))
+                < Duration::from_secs(5),
+            "public cancellation must finish well before the successor's 30s natural sleep"
+        );
         assert!(environment.borrow().is_none());
         assert!(cleaned.load(Ordering::SeqCst));
         assert!(!cleanup.is_open());
@@ -979,9 +1026,29 @@ mod tests {
                 .i32(),
             Some(0)
         );
+        let worker_resumed = store
+            .inner
+            .with_mut(|s| {
+                let mut bytes = [0; 4];
+                parent_instance
+                    .inner
+                    .exports
+                    .get_memory("memory")
+                    .unwrap()
+                    .view(s)
+                    .read(200, &mut bytes)
+                    .unwrap();
+                u32::from_le_bytes(bytes)
+            })
+            .unwrap();
+        assert_eq!(
+            worker_resumed, 0,
+            "the old nonleader must not resume after exec"
+        );
+        let terminal_status = status(&syscalls, leader);
         assert!(
-            status(&syscalls, leader).is_none(),
-            "the canceled successor task is released"
+            matches!(&terminal_status, Ok(Status::Missing)),
+            "only canonical ENOENT proves successor retirement: {terminal_status:?}"
         );
         let state = capture.queue.lock().unwrap();
         assert!(
