@@ -113,7 +113,7 @@ impl NativeWasi {
             .iter()
             .map(|(key, value)| format!("{key}={}", String::from_utf8_lossy(value)))
             .collect();
-        let (process, environment) = store.run_host(async {
+        let (process, environment, input, descriptors) = store.run_host(async {
             let machine = Arc::new(Machine::new());
             // Legacy read/write/create directory rights cover the original
             // preview1 bits; later socket/WASIX rights are not inherited.
@@ -136,7 +136,7 @@ impl NativeWasi {
                     lookup_name,
                     attachment: Some(
                         mapped_rights
-                            .attachment()
+                            .named_attachment(name.as_bytes())
                             .map_err(|error| anyhow::anyhow!("{error:?}"))?,
                     ),
                 });
@@ -154,7 +154,7 @@ impl NativeWasi {
                         directories,
                         root_attachment: Some(
                             PreopenRights::ALL
-                                .attachment()
+                                .named_attachment(b"/")
                                 .map_err(|error| anyhow::anyhow!("{error:?}"))?,
                         ),
                         root_fallback,
@@ -171,19 +171,16 @@ impl NativeWasi {
             if boot.task != process.task() {
                 anyhow::bail!("namespace bootstrap belongs to another process");
             }
-            wasi.set_startup_input_with_descriptors(
-                StartupInput {
-                    args: startup_args,
-                    env: startup_env,
-                    preopens: input_preopens,
-                },
-                StartupDescriptors {
-                    descriptors: boot.descriptors,
-                    binding: boot.binding,
-                    virtual_root: Some(root_fd),
-                },
-            )
-            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            let input = StartupInput {
+                args: startup_args,
+                env: startup_env,
+                preopens: input_preopens,
+            };
+            let descriptors = StartupDescriptors {
+                descriptors: boot.descriptors,
+                binding: boot.binding,
+                virtual_root: Some(root_fd),
+            };
             let environment = store.with_mut(|store| {
                 let environment = HostEnvironment::new(
                     store,
@@ -195,7 +192,7 @@ impl NativeWasi {
                 environment.set_binding(store, wasi.unattached());
                 environment
             })?;
-            Ok::<_, anyhow::Error>((process, environment))
+            Ok::<_, anyhow::Error>((process, environment, input, descriptors))
         })??;
         let asynchronous = store.async_store()?;
         let local =
@@ -206,17 +203,32 @@ impl NativeWasi {
             scope.upgrade().is_none_or(|scope| !scope.is_open())
         }))?;
         let retiring_env = environment.clone();
+        let retiring_store = asynchronous.store();
         let retire = store.cleanup_retirement(Box::pin(local.run(async move {
-            let mut guard = asynchronous.write_lock().await;
+            let mut guard = retiring_store.write_lock().await;
             retiring_env.deactivate(&mut guard.as_store_mut());
         })))?;
-        Ok(Self {
+        let result = Self {
             process: Some(process),
             env: environment,
             retire: Some(retire),
             stdout,
             stderr,
-        })
+        };
+        let process = result
+            .process
+            .as_ref()
+            .and_then(EmbeddingProcess::wasix1)
+            .ok_or_else(|| anyhow::anyhow!("process owner is closed"))?;
+        // Retirement custody and the loader fence are installed before admission.
+        // No C API handle is published until this completes with memory still absent.
+        store.run_host(process.configure_and_prepare_startup(
+            &asynchronous,
+            &result.env,
+            input,
+            descriptors,
+        ))??;
+        Ok(result)
     }
 
     pub(super) fn import_object(

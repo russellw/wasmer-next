@@ -982,6 +982,249 @@ fn vfork_and_exec() {
     assert_eq!(stdout, b"child");
 }
 
+/// Preparing a host namespace needs no guest memory. Its live descriptor metadata,
+/// rather than the original bootstrap fd list, survives the runner's actual exec handoff.
+#[test]
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+fn prepared_host_namespace_survives_exec_with_live_names_rights_and_new_arguments() {
+    use wasixv2::{DirectoryBootstrap, NamespaceBootstrap};
+    use wasixv2_exec::{HostEnvironment, local_cleanup_runner, run_with_abis};
+    use wasixv2_wasix1::{PreopenRights, StartupDescriptors, StartupInput, abi::fs::Rights};
+    use wasmer::{AsStoreAsync, AsStoreMut, Module, Store};
+
+    let reduced = (Rights::PATH_OPEN
+        | Rights::FD_READDIR
+        | Rights::FD_FILESTAT_GET
+        | Rights::FD_FDSTAT_SET_FLAGS)
+        .0;
+    let module = |body: &str| {
+        format!(
+            r#"(module
+      (import "wasix_32v1" "proc_exec3" (func $exec (param i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+      (import "wasix_32v1" "fd_renumber" (func $renumber (param i32 i32) (result i32)))
+      (import "wasix_32v1" "fd_close" (func $close (param i32) (result i32)))
+      (import "wasix_32v1" "fd_pipe" (func $pipe (param i32 i32) (result i32)))
+      (import "wasix_32v1" "fd_fdflags_set" (func $setflags (param i32 i32) (result i32)))
+      (import "wasix_32v1" "fd_fdflags_get" (func $getflags (param i32 i32) (result i32)))
+      (import "wasix_32v1" "fd_fdstat_set_rights" (func $reduce (param i32 i64 i64) (result i32)))
+      (import "wasix_32v1" "fd_fdstat_get" (func $stat (param i32 i32) (result i32)))
+      (import "wasix_32v1" "fd_prestat_get" (func $prestat (param i32 i32) (result i32)))
+      (import "wasix_32v1" "fd_prestat_dir_name" (func $name (param i32 i32 i32) (result i32)))
+      (import "wasix_32v1" "fd_readdir" (func $readdir (param i32 i32 i32 i64 i32) (result i32)))
+      (import "wasix_32v1" "args_sizes_get" (func $argc (param i32 i32) (result i32)))
+      (import "wasix_32v1" "args_get" (func $argv (param i32 i32) (result i32)))
+      (import "wasix_32v1" "environ_sizes_get" (func $envc (param i32 i32) (result i32)))
+      (import "wasix_32v1" "environ_get" (func $env (param i32 i32) (result i32)))
+      (import "wasix_32v1" "proc_exit2" (func $exit (param i32)))
+      (memory (export "memory") 1)
+      (data (i32.const 3000) "/opaque//alias")
+      (data (i32.const 3040) "/prog/child.wasm")
+      (data (i32.const 3080) "child\n")
+      (data (i32.const 3100) "NEW=yes\n")
+      (func $check (param $step i32) (param $actual i32) (param $expected i32)
+        (if (i32.ne (local.get $actual) (local.get $expected))
+          (then (call $exit (local.get $step)))))
+      (func $bytes (param $step i32) (param $actual i32) (param $expected i32) (param $len i32)
+        (local $i i32)
+        (loop $next
+          (if (i32.lt_u (local.get $i) (local.get $len)) (then
+            (call $check (local.get $step)
+              (i32.load8_u (i32.add (local.get $actual) (local.get $i)))
+              (i32.load8_u (i32.add (local.get $expected) (local.get $i))))
+            (local.set $i (i32.add (local.get $i) (i32.const 1)))
+            (br $next)))))
+      (func (export "_start")
+        {body}
+        (call $exit (i32.const 0))))"#
+        )
+    };
+    let parent = module(&format!(
+        r#"
+        ;; Directory duplicates retain their name and their own reduced rights/flags.
+        (call $check (i32.const 1) (call $renumber (i32.const 4) (i32.const 20)) (i32.const 0))
+        (call $check (i32.const 2) (call $reduce (i32.const 20) (i64.const {reduced}) (i64.const 0)) (i32.const 0))
+        (call $check (i32.const 3) (call $setflags (i32.const 20) (i32.const 1)) (i32.const 0))
+        ;; Stdio's object kind follows a duplicate at any number, and remains replaceable.
+        (call $check (i32.const 4) (call $renumber (i32.const 0) (i32.const 21)) (i32.const 0))
+        (call $check (i32.const 5) (call $renumber (i32.const 4) (i32.const 21)) (i32.const 0))
+        (call $check (i32.const 6) (call $renumber (i32.const 0) (i32.const 22)) (i32.const 0))
+        (call $check (i32.const 7) (call $setflags (i32.const 22) (i32.const 1)) (i32.const 0))
+        (call $check (i32.const 8) (call $renumber (i32.const 4) (i32.const 0)) (i32.const 0))
+        ;; A directory at fd0 is still protected, unlike a stdio object at fd22.
+        (call $check (i32.const 9) (call $renumber (i32.const 1) (i32.const 0)) (i32.const 58))
+        ;; Ordinary descriptors retain the kernel's real CLOEXEC behavior.
+        (call $check (i32.const 10) (call $pipe (i32.const 0) (i32.const 4)) (i32.const 0))
+        (call $check (i32.const 11) (call $renumber (i32.load (i32.const 0)) (i32.const 30)) (i32.const 0))
+        (call $check (i32.const 12) (call $setflags (i32.const 30) (i32.const 1)) (i32.const 0))
+        (drop (call $close (i32.load (i32.const 0))))
+        (drop (call $close (i32.load (i32.const 4))))
+        (drop (call $exec (i32.const 3040) (i32.const 16) (i32.const 3080) (i32.const 6)
+          (i32.const 3100) (i32.const 8) (i32.const 0) (i32.const 0) (i32.const 0)))
+        (call $exit (i32.const 13))"#
+    ));
+    let child = module(&format!(
+        r#"
+        (call $check (i32.const 40) (call $argc (i32.const 0) (i32.const 4)) (i32.const 0))
+        (call $check (i32.const 41) (i32.load (i32.const 0)) (i32.const 1))
+        (call $check (i32.const 42) (i32.load (i32.const 4)) (i32.const 6))
+        (call $check (i32.const 43) (call $argv (i32.const 8) (i32.const 64)) (i32.const 0))
+        (call $bytes (i32.const 44) (i32.load (i32.const 8)) (i32.const 3080) (i32.const 5))
+        (call $check (i32.const 45) (call $envc (i32.const 0) (i32.const 4)) (i32.const 0))
+        (call $check (i32.const 46) (i32.load (i32.const 0)) (i32.const 1))
+        (call $check (i32.const 47) (i32.load (i32.const 4)) (i32.const 8))
+        (call $check (i32.const 48) (call $env (i32.const 8) (i32.const 64)) (i32.const 0))
+        (call $bytes (i32.const 49) (i32.load (i32.const 8)) (i32.const 3100) (i32.const 7))
+        (call $check (i32.const 50) (call $readdir (i32.const 3) (i32.const 1000) (i32.const 256) (i64.const 0) (i32.const 0)) (i32.const 0))
+        (call $check (i32.const 51) (i32.load (i32.const 0)) (i32.const 38))
+        (call $check (i32.const 52) (i32.load (i32.const 1016)) (i32.const 14))
+        (call $bytes (i32.const 53) (i32.const 1024) (i32.const 3000) (i32.const 14))
+        (call $check (i32.const 54) (call $prestat (i32.const 20) (i32.const 0)) (i32.const 0))
+        (call $check (i32.const 55) (i32.load (i32.const 4)) (i32.const 13))
+        (call $check (i32.const 56) (call $name (i32.const 20) (i32.const 64) (i32.const 13)) (i32.const 0))
+        (call $bytes (i32.const 57) (i32.const 64) (i32.const 3001) (i32.const 13))
+        (call $check (i32.const 58) (call $stat (i32.const 20) (i32.const 128)) (i32.const 0))
+        (if (i64.ne (i64.load (i32.const 136)) (i64.const {reduced})) (then (call $exit (i32.const 59))))
+        (if (i64.ne (i64.load (i32.const 144)) (i64.const 0)) (then (call $exit (i32.const 60))))
+        (call $check (i32.const 61) (call $getflags (i32.const 20) (i32.const 0)) (i32.const 0))
+        (call $check (i32.const 62) (i32.load16_u (i32.const 0)) (i32.const 1))
+        (call $check (i32.const 63) (call $getflags (i32.const 4) (i32.const 0)) (i32.const 0))
+        (call $check (i32.const 64) (i32.load16_u (i32.const 0)) (i32.const 0))
+        (call $check (i32.const 65) (call $prestat (i32.const 0) (i32.const 0)) (i32.const 0))
+        (call $check (i32.const 66) (call $prestat (i32.const 21) (i32.const 0)) (i32.const 0))
+        (call $check (i32.const 67) (call $prestat (i32.const 22) (i32.const 0)) (i32.const 0))
+        (call $check (i32.const 68) (i32.load (i32.const 4)) (i32.const 5))
+        (call $check (i32.const 69) (call $name (i32.const 22) (i32.const 64) (i32.const 5)) (i32.const 54))
+        (call $check (i32.const 70) (call $close (i32.const 22)) (i32.const 0))
+        (call $check (i32.const 71) (call $stat (i32.const 22) (i32.const 128)) (i32.const 8))
+        (call $check (i32.const 72) (call $stat (i32.const 30) (i32.const 128)) (i32.const 8))
+        ;; Reusing a former stdio slot must not resurrect its previous announced name.
+        (call $check (i32.const 73) (call $pipe (i32.const 0) (i32.const 4)) (i32.const 0))
+        (call $check (i32.const 74) (call $renumber (i32.load (i32.const 0)) (i32.const 22)) (i32.const 0))
+        (call $check (i32.const 75) (call $prestat (i32.const 22) (i32.const 64)) (i32.const 8))"#
+    ));
+    let programs = Programs::new("prepared-exec", &[("child.wasm", &child)]);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, async {
+        let machine = Arc::new(Machine::new());
+        let source = machine.capture_host_directory(&programs.0, false).unwrap();
+        let (mut process, boot) = machine
+            .start_embedding_with_namespace(
+                ProcessConfig {
+                    args: vec!["kernel-parent".into()],
+                    env: vec!["OLD=kernel".into()],
+                    stdio: Stdio::from_fns(|_| {}, |_| {}),
+                },
+                NamespaceBootstrap {
+                    directories: vec![DirectoryBootstrap {
+                        source,
+                        lookup_name: Some(b"prog".to_vec()),
+                        attachment: Some(
+                            PreopenRights::ALL
+                                .named_attachment(b"opaque//alias")
+                                .unwrap(),
+                        ),
+                    }],
+                    root_attachment: Some(PreopenRights::ALL.named_attachment(b"/").unwrap()),
+                    root_fallback: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            boot.descriptors.iter().map(|fd| fd.0).collect::<Vec<_>>(),
+            [3, 4]
+        );
+        let wasi = process.wasix1().unwrap();
+        let mut store = Store::default();
+        let environment = HostEnvironment::new(
+            &mut store.as_store_mut(),
+            process.syscalls(),
+            process.task(),
+            process.host(),
+            process.abis(),
+        );
+        environment.set_binding(&mut store.as_store_mut(), wasi.unattached());
+        assert!(environment.environment().as_ref(&store).memory().is_none());
+        let asynchronous = store.into_async();
+        let input = StartupInput {
+            args: vec![b"explicit-old".to_vec()],
+            env: vec![b"OLD=explicit".to_vec()],
+            preopens: vec![(vec![], b"/".to_vec()), (vec![], b"opaque//alias".to_vec())],
+        };
+        let descriptors = StartupDescriptors {
+            virtual_root: Some(boot.descriptors[0]),
+            descriptors: boot.descriptors,
+            binding: boot.binding,
+        };
+        let foreign = Store::default().into_async();
+        assert!(matches!(
+            wasi.configure_and_prepare_startup(
+                &foreign,
+                &environment,
+                input.clone(),
+                descriptors.clone()
+            )
+            .await,
+            Err(wasixv2_wasix1::StartupPreparationError::Configuration(
+                wasixv2_abi::Errno::EINVAL
+            ))
+        ));
+        drop(foreign);
+        let unrelated = wasixv2_wasix1::Wasix1::new().host_process(process.task());
+        assert!(matches!(
+            unrelated
+                .configure_and_prepare_startup(
+                    &asynchronous,
+                    &environment,
+                    input.clone(),
+                    descriptors.clone()
+                )
+                .await,
+            Err(wasixv2_wasix1::StartupPreparationError::Configuration(
+                wasixv2_abi::Errno::EINVAL
+            ))
+        ));
+        drop(unrelated);
+        wasi.configure_and_prepare_startup(&asynchronous, &environment, input, descriptors)
+            .await
+            .unwrap();
+        assert_eq!(
+            wasi.set_startup_input(StartupInput::default()),
+            Err(wasixv2_abi::Errno::EBUSY)
+        );
+        let cleanup =
+            local_cleanup_runner(&asynchronous, environment.loader_cleanup().clone()).unwrap();
+        cleanup
+            .run(async {
+                let mut guard = asynchronous.write_lock().await;
+                assert!(environment.environment().as_ref(&guard).memory().is_none());
+                environment.deactivate(&mut guard.as_store_mut());
+            })
+            .await;
+        drop(environment);
+        let store = asynchronous
+            .into_store()
+            .expect("preparation retains no async Store");
+        let module = Module::new(&store, wat::parse_str(parent).unwrap()).unwrap();
+        let result = run_with_abis(
+            store,
+            &module,
+            process.syscalls(),
+            process.task(),
+            process.host(),
+            process.abis(),
+        )
+        .await;
+        process.close();
+        machine.shutdown().await;
+        assert_eq!(result.unwrap(), 0);
+    });
+}
+
 /// Without a terminal on stdio, `tty_get` reports none and v1's default size; the modes
 /// `tty_set` stores come back.
 #[test]

@@ -30,6 +30,109 @@ use crate::{
 /// The directories every v1 process starts with, as (path, announced name).
 const PREOPENS: [(&[u8], &[u8]); 3] = [(b"/", b"/"), (b".", b"."), (b"/", b"/")];
 
+pub(crate) async fn prepare_stdio<S: Syscalls + Control + 'static>(
+    frame: &Frame<'_, S>,
+) -> crate::errno::V1Result<()> {
+    use wasixv2_abi::FdFlags;
+    use wasixv2_syscalls::{DescriptorUpdate, SysErr};
+    let set = frame
+        .syscalls
+        .snapshot_descriptors(frame.task, &[Fd(0), Fd(1), Fd(2)])
+        .map_err(SysErr::from)?;
+    frame.replace_descriptors(set.clone());
+    for (fd, name) in [
+        (Fd(0), b"stdin".as_slice()),
+        (Fd(1), b"stdout".as_slice()),
+        (Fd(2), b"stderr".as_slice()),
+    ] {
+        let mut record = crate::rights::record(frame, fd).await?;
+        let flags = frame
+            .syscalls
+            .fcntl64(&frame.caller(), fd, FcntlCmd::F_GETFD, 0)
+            .await?;
+        record.cloexec = flags as u32 & FdFlags::FD_CLOEXEC.0 != 0;
+        record.legacy = Some(Arc::new(crate::rights::LegacyObject {
+            name: Arc::from(name),
+            stdio: true,
+        }));
+        frame
+            .syscalls
+            .fcntl64(&frame.caller(), fd, FcntlCmd::F_SETFD, 0)
+            .await?;
+        match frame
+            .syscalls
+            .replace_descriptor_attachment(frame.task, &set, fd, record.attachment())
+            .map_err(SysErr::from)?
+        {
+            DescriptorUpdate::Replaced => (),
+            DescriptorUpdate::Conflict => return Err(wasixv2_abi::Errno::EAGAIN.into()),
+            DescriptorUpdate::Stale => return Err(wasixv2_abi::Errno::EBADF.into()),
+        }
+    }
+    Ok(())
+}
+
+pub(crate) async fn prepare_preopen_names<S: Syscalls + Control + 'static>(
+    frame: &Frame<'_, S>,
+) -> crate::errno::V1Result<()> {
+    use wasixv2_syscalls::{DescriptorUpdate, SysErr};
+    let state = frame.proc().await?;
+    let configured = state.seal_startup_input().ok_or(Errno::INVAL)?;
+    let ready = configured.ready.as_ref().ok_or(Errno::INVAL)?;
+    frame.replace_descriptors(ready.binding.clone());
+    for (&fd, (_, name)) in ready.descriptors.iter().zip(&configured.input.preopens) {
+        let mut record = crate::rights::record(frame, fd).await?;
+        if record.legacy.is_some() {
+            continue;
+        }
+        let flags = frame
+            .syscalls
+            .fcntl64(&frame.caller(), fd, FcntlCmd::F_GETFD, 0)
+            .await?;
+        record.cloexec = flags as u32 & wasixv2_abi::FdFlags::FD_CLOEXEC.0 != 0;
+        record.legacy = Some(Arc::new(crate::rights::LegacyObject {
+            name: Arc::from(name.as_slice()),
+            stdio: false,
+        }));
+        frame
+            .syscalls
+            .fcntl64(&frame.caller(), fd, FcntlCmd::F_SETFD, 0)
+            .await?;
+        match frame
+            .syscalls
+            .replace_descriptor_attachment(frame.task, &ready.binding, fd, record.attachment())
+            .map_err(SysErr::from)?
+        {
+            DescriptorUpdate::Replaced => (),
+            DescriptorUpdate::Conflict => return Err(wasixv2_abi::Errno::EAGAIN.into()),
+            DescriptorUpdate::Stale => return Err(wasixv2_abi::Errno::EBADF.into()),
+        }
+    }
+    Ok(())
+}
+
+async fn preopen_name<S: Syscalls + Control + 'static>(
+    frame: &Frame<'_, S>,
+    fd: i32,
+    directory: bool,
+) -> crate::errno::V1Result<Arc<[u8]>> {
+    let record = crate::rights::record(frame, Fd(fd)).await?;
+    if let Some(object) = record.legacy {
+        if directory && object.stdio {
+            return shim::fail(Errno::NOTDIR);
+        }
+        return Ok(object.name.clone());
+    }
+    let startup = frame.startup().await?;
+    if !record.preopen {
+        return shim::fail(Errno::BADF);
+    }
+    startup
+        .preopen(Fd(fd))
+        .map(|preopen| Arc::from(preopen.name.as_slice()))
+        .ok_or_else(|| Errno::BADF.into())
+}
+
 /// The startup state of `proc`, loading it on first use.
 pub(crate) async fn load<S: Syscalls + Control + 'static>(
     frame: &Frame<'_, S>,
@@ -72,7 +175,7 @@ pub(crate) async fn load<S: Syscalls + Control + 'static>(
                     }
                 }
                 entries.sort_by(|a, b| a.0.cmp(&b.0));
-                Some(RootPresentation { root, entries })
+                Some(Arc::new(RootPresentation { root, entries }))
             }
             None => None,
         };
@@ -88,6 +191,20 @@ pub(crate) async fn load<S: Syscalls + Control + 'static>(
         // These are the same already installed descriptors, not descriptors
         // opened by this load. A losing thread must never close them.
         return Ok(proc.startup.get().expect("set by the winner").clone());
+    }
+    if proc.preserves_preopens() {
+        let startup = Arc::new(Startup {
+            args,
+            env,
+            preopens: vec![],
+            root: proc.inherited_root.clone(),
+        });
+        let _ = proc.startup.set(startup);
+        return Ok(proc
+            .startup
+            .get()
+            .expect("installed inherited startup")
+            .clone());
     }
     let paths: Vec<(&[u8], &[u8])> = match &input {
         Some(configured) => configured
@@ -237,8 +354,10 @@ async fn open_dir<S: Syscalls + Control + 'static>(
         inheriting: crate::abi::fs::Rights(rights.inheriting),
         preopen: true,
         socket: false,
+        legacy: None,
+        cloexec: false,
     };
-    let plan = DescriptorInstallations::new(vec![record.attachment()]);
+    let plan = DescriptorInstallations::new(vec![record.clone().attachment()]);
     let flags = OpenFlags::O_RDONLY | OpenFlags::O_DIRECTORY | OpenFlags::O_CLOEXEC;
     let path = frame.mem.alloc_cstr(path)?;
     // Trusted bootstrap uses its own cwd rather than a guest-supplied descriptor operand.
@@ -369,16 +488,10 @@ pub(crate) async fn fd_prestat_get<S: Syscalls + Control + 'static>(
     out: i32,
 ) -> Result<i32, RuntimeError> {
     shim::errno(&env, async |frame| {
-        let startup = frame.startup().await?;
-        let Some(preopen) = startup.preopen(Fd(fd)) else {
-            return shim::fail(Errno::BADF);
-        };
-        if !crate::calls::fs::is_preopen(frame, fd).await? {
-            return shim::fail(Errno::BADF);
-        }
+        let name = preopen_name(frame, fd, false).await?;
         let prestat = Prestat {
             pr_type: Preopentype::DIR,
-            pr_name_len: preopen.name.len() as u32,
+            pr_name_len: name.len() as u32,
         };
         frame.write(out as u32, &prestat).await
     })
@@ -393,17 +506,11 @@ pub(crate) async fn fd_prestat_dir_name<S: Syscalls + Control + 'static>(
     path_len: i32,
 ) -> Result<i32, RuntimeError> {
     shim::errno(&env, async |frame| {
-        let startup = frame.startup().await?;
-        let Some(preopen) = startup.preopen(Fd(fd)) else {
-            return shim::fail(Errno::BADF);
-        };
-        if !crate::calls::fs::is_preopen(frame, fd).await? {
-            return shim::fail(Errno::BADF);
-        }
-        if preopen.name.len() > path_len as u32 as usize {
+        let name = preopen_name(frame, fd, true).await?;
+        if name.len() > path_len as u32 as usize {
             return shim::fail(Errno::OVERFLOW);
         }
-        frame.write_bytes(path as u32, &preopen.name).await
+        frame.write_bytes(path as u32, &name).await
     })
     .await
 }

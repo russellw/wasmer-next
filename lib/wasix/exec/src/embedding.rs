@@ -57,6 +57,14 @@ impl<S: Syscalls + Control + Send + Sync + 'static> HostEnvironment<S> {
         &self.env
     }
 
+    pub fn store_id(&self) -> wasmer_types::StoreId {
+        self.store_id
+    }
+
+    pub fn is_initialized(&self) -> bool {
+        self.initialized.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// The same loader scope used by this environment and its future images.
     pub fn loader_cleanup(&self) -> &Arc<LoaderCleanup> {
         &self.cleanup

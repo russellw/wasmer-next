@@ -19,6 +19,30 @@ use wasmer::{AsyncFunctionEnvMut, Exports, Function, Instance, RuntimeError, Val
 
 use crate::process::{Commands, ProcState, Procs};
 
+#[derive(Debug)]
+pub enum StartupPreparationError {
+    Configuration(wasixv2_abi::Errno),
+    Guest(crate::abi::Errno),
+    Engine(RuntimeError),
+}
+impl std::fmt::Display for StartupPreparationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Configuration(error) => write!(f, "invalid startup configuration: {error:?}"),
+            Self::Guest(error) => write!(f, "startup preparation failed: {error:?}"),
+            Self::Engine(error) => std::fmt::Display::fmt(error, f),
+        }
+    }
+}
+impl std::error::Error for StartupPreparationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Engine(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
 /// `_initialize`, which reactors and some commands export; it runs before `_start`.
 const INITIALIZE: &str = "_initialize";
 const START: &str = "_start";
@@ -71,7 +95,7 @@ struct HostProcess {
     http: Arc<crate::http::State>,
     limits: crate::Limits,
     task: TaskId,
-    state: Arc<ProcState>,
+    lineage: Arc<()>,
 }
 
 impl HostProcessState {
@@ -89,13 +113,13 @@ impl HostProcessState {
             http: Arc::new(crate::http::State::new(http)),
             limits,
             task,
-            state,
+            lineage: state.lineage.clone(),
         }))
     }
 
     /// Configures the environment's exact byte buffers and explicit preopens once.
     pub fn set_startup_input(&self, input: crate::StartupInput) -> Result<(), wasixv2_abi::Errno> {
-        self.0.state.set_startup_input(input)
+        self.current_state()?.set_startup_input(input)
     }
 
     /// Configures the same startup input with indexed WASI preopen rights.
@@ -104,20 +128,104 @@ impl HostProcessState {
         input: crate::StartupInput,
         rights: Vec<crate::PreopenRights>,
     ) -> Result<(), wasixv2_abi::Errno> {
-        self.0
-            .state
+        self.current_state()?
             .set_startup_input_with_preopen_rights(input, rights)
     }
 
-    /// Selects already installed preopens with their exact bootstrap bindings.
-    pub fn set_startup_input_with_descriptors(
+    fn current_state(&self) -> Result<Arc<ProcState>, wasixv2_abi::Errno> {
+        self.0
+            .procs
+            .owned_state(self.0.task, &self.0.lineage)
+            .ok_or(wasixv2_abi::Errno::ESRCH)
+    }
+
+    /// Atomically configures and prepares an unpublished host environment.
+    ///
+    /// Retain its process and existing Store/loader cleanup owners until this
+    /// returns. After admission, error or cancellation consumes the one attempt:
+    /// retire that unpublished environment rather than retrying or exposing it.
+    pub async fn configure_and_prepare_startup<S>(
         &self,
+        store: &wasmer::StoreAsync,
+        environment: &wasixv2_exec::HostEnvironment<S>,
         input: crate::StartupInput,
         descriptors: crate::StartupDescriptors,
-    ) -> Result<(), wasixv2_abi::Errno> {
-        self.0
-            .state
-            .set_startup_input_with_descriptors(input, descriptors)
+    ) -> Result<(), crate::StartupPreparationError>
+    where
+        S: wasixv2_syscalls::Syscalls + wasixv2_syscalls::Control + Send + Sync + 'static,
+    {
+        use crate::StartupPreparationError as Error;
+        use wasmer::{AsStoreAsync, AsStoreMut, Function};
+        if store.store_id() != environment.store_id() || environment.is_initialized() {
+            return Err(Error::Configuration(wasixv2_abi::Errno::EINVAL));
+        }
+        let state = self.current_state().map_err(Error::Configuration)?;
+        struct Admission {
+            state: Arc<ProcState>,
+            admitted: bool,
+        }
+        impl Drop for Admission {
+            fn drop(&mut self) {
+                if self.admitted {
+                    self.state.finish_preparation();
+                }
+            }
+        }
+        let mut admission = Admission {
+            state: state.clone(),
+            admitted: false,
+        };
+        let function = {
+            let mut guard = store.write_lock().await;
+            let data = environment.environment().as_ref(&guard);
+            let matching = data.task() == self.0.task
+                && data.memory().is_none()
+                && data
+                    .abi()
+                    .and_then(|abi| abi.as_any().downcast_ref::<Wasix1Instance>())
+                    .is_some_and(|abi| Arc::ptr_eq(&abi.procs, &self.0.procs));
+            if !matching {
+                return Err(Error::Configuration(wasixv2_abi::Errno::EINVAL));
+            }
+            state
+                .set_startup_input_with_descriptors(input, descriptors)
+                .map_err(Error::Configuration)?;
+            admission.admitted = true;
+            Function::new_typed_with_env_async(
+                &mut guard.as_store_mut(),
+                environment.environment(),
+                |env: crate::shim::Env<S>| async move {
+                    Ok::<i32, RuntimeError>(
+                        match crate::shim::call(&env, async |frame| {
+                            crate::calls::startup::prepare_stdio(frame).await?;
+                            crate::calls::startup::prepare_preopen_names(frame).await?;
+                            frame.startup().await?;
+                            Ok(())
+                        })
+                        .await?
+                        {
+                            crate::shim::Done::Ok(()) => 0,
+                            crate::shim::Done::Err(error) => i32::from(error.0),
+                            _ => {
+                                return Err(RuntimeError::new("startup preparation changed tasks"));
+                            }
+                        },
+                    )
+                },
+            )
+        };
+        let _admission = admission;
+        let result = function
+            .call_async(store, vec![])
+            .await
+            .map_err(Error::Engine)?;
+        match result.as_ref() {
+            [Value::I32(0)] => Ok(()),
+            [Value::I32(errno)] => Err(Error::Guest(crate::abi::Errno(*errno as u16))),
+            _ => Err(Error::Engine(RuntimeError::new(
+                "invalid startup preparation result",
+            ))),
+        }
     }
 
     /// The process's import binding before the engine has produced an instance.
@@ -153,7 +261,7 @@ impl HostProcessState {
 
 impl Drop for HostProcess {
     fn drop(&mut self) {
-        self.procs.remove(self.task, &self.state);
+        self.procs.remove_lineage(self.task, &self.lineage);
     }
 }
 
@@ -186,8 +294,7 @@ impl Wasix1Instance {
         let function = |name: &str| exports.get_function(name).ok().cloned();
         let (entry, image) = match role {
             Role::Process => {
-                let state = Arc::new(ProcState::default());
-                procs.replace(task, state.clone());
+                let state = procs.next_image(task);
                 (exports.get_function(START)?.clone(), Some((task, state)))
             }
             Role::Thread => (exports.get_function(THREAD_ENTRY)?.clone(), None),
@@ -460,6 +567,49 @@ mod tests {
     use wasmer::{AsStoreMut, Imports, Module, Store};
 
     #[test]
+    fn host_owner_follows_only_its_exec_lineage_and_old_image_cleanup_cannot_remove_it() {
+        let wasi = crate::Wasix1::new();
+        let task = TaskId(11);
+        let owner = wasi.host_process(task);
+        let last_owner = owner.clone();
+        let old = owner.current_state().unwrap();
+        old.set_startup_input(crate::StartupInput::default())
+            .unwrap();
+        old.seal_startup_input();
+        let old_weak = Arc::downgrade(&old);
+        let current = wasi.procs.next_image(task);
+        wasi.procs.remove(task, &old);
+        assert!(Arc::ptr_eq(&owner.current_state().unwrap(), &current));
+        drop(old);
+        assert!(
+            old_weak.upgrade().is_none(),
+            "host owner must not pin an obsolete image"
+        );
+        assert_eq!(
+            owner.set_startup_input(crate::StartupInput::default()),
+            Err(wasixv2_abi::Errno::EBUSY)
+        );
+        let child = TaskId(12);
+        let fork = Arc::new(current.fork());
+        wasi.procs.replace(child, fork.clone());
+        drop(owner);
+        assert!(Arc::ptr_eq(&last_owner.current_state().unwrap(), &current));
+        drop(last_owner);
+        assert!(wasi.procs.owned_state(task, &current.lineage).is_none());
+        assert!(Arc::ptr_eq(&wasi.procs.get_or_create(child), &fork));
+        // A recycled task key with a new lineage cannot be removed by the old owner.
+        let owner = wasi.host_process(task);
+        let replacement = Arc::new(ProcState::default());
+        wasi.procs.replace(task, replacement.clone());
+        assert_eq!(
+            owner.set_startup_input(crate::StartupInput::default()),
+            Err(wasixv2_abi::Errno::ESRCH)
+        );
+        drop(owner);
+        assert!(Arc::ptr_eq(&wasi.procs.get_or_create(task), &replacement));
+    }
+
+    #[test]
     fn host_attachments_share_process_and_http_until_the_last_owner_drops() {
         let mut store = Store::default();
         let module = Module::new(
@@ -479,7 +629,7 @@ mod tests {
         let task = TaskId(7);
         let owner = wasi.host_process(task);
         let other_owner = owner.clone();
-        let state = owner.0.state.clone();
+        let state = owner.current_state().unwrap();
         let attached_a = owner.attach::<()>(&a, &mut store.as_store_mut());
         let attached_b = owner.attach::<()>(&b, &mut store.as_store_mut());
         let selected_a = attached_a

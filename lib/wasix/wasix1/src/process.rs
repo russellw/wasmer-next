@@ -16,6 +16,8 @@ pub struct ProcState {
     /// Loaded on the process's first v1 call; see [`calls::startup::load`].
     pub(crate) startup: OnceLock<Arc<Startup>>,
     startup_input: Mutex<StartupPolicy>,
+    pub(crate) lineage: Arc<()>,
+    pub(crate) inherited_root: Option<Arc<RootPresentation>>,
     pub net: calls::sock::State,
     pub proc: calls::proc::State,
     pub(crate) clocks: calls::clock::State,
@@ -55,6 +57,25 @@ impl PreopenRights {
             inheriting: crate::abi::fs::Rights(self.inheriting),
             preopen: true,
             socket: false,
+            legacy: None,
+            cloexec: false,
+        }))
+    }
+
+    pub fn named_attachment(self, name: &[u8]) -> Result<DescriptorAttachment, wasixv2_abi::Errno> {
+        if !self.is_valid() || name.contains(&0) {
+            return Err(wasixv2_abi::Errno::EINVAL);
+        }
+        Ok(DescriptorAttachment::new(crate::rights::Record {
+            legacy: Some(Arc::new(crate::rights::LegacyObject {
+                name: Arc::from(name),
+                stdio: false,
+            })),
+            preopen: true,
+            ..crate::rights::Record::new(
+                crate::abi::fs::Rights(self.base),
+                crate::abi::fs::Rights(self.inheriting),
+            )
         }))
     }
 
@@ -83,6 +104,7 @@ pub(crate) struct ConfiguredStartup {
 struct StartupPolicy {
     configured: Option<ConfiguredStartup>,
     sealed: bool,
+    preserve_preopens: bool,
 }
 
 impl ProcState {
@@ -103,7 +125,7 @@ impl ProcState {
     }
 
     /// Announces existing captured descriptors without reopening path strings.
-    pub fn set_startup_input_with_descriptors(
+    pub(crate) fn set_startup_input_with_descriptors(
         &self,
         input: StartupInput,
         descriptors: StartupDescriptors,
@@ -140,7 +162,7 @@ impl ProcState {
                     || ready
                         .virtual_root
                         .is_some_and(|root| !ready.descriptors.contains(&root))
-                    || ready.descriptors.iter().any(|&fd| {
+                    || ready.descriptors.iter().enumerate().any(|(index, &fd)| {
                         !unique.insert(fd)
                             || !ready.binding.get(fd).is_some_and(|entry| {
                                 entry.present
@@ -152,6 +174,11 @@ impl ProcState {
                                         })
                                         .is_some_and(|record| {
                                             record.preopen
+                                                && record.legacy.as_ref().is_none_or(|object| {
+                                                    !object.stdio
+                                                        && object.name.as_ref()
+                                                            == input.preopens[index].1.as_slice()
+                                                })
                                                 && PreopenRights {
                                                     base: record.base.0,
                                                     inheriting: record.inheriting.0,
@@ -163,6 +190,10 @@ impl ProcState {
             })
         {
             return Err(wasixv2_abi::Errno::EINVAL);
+        }
+        if ready.is_some() {
+            policy.sealed = true;
+            policy.preserve_preopens = true;
         }
         policy.configured = Some(ConfiguredStartup {
             input: Arc::new(input),
@@ -178,6 +209,33 @@ impl ProcState {
         policy.configured.clone()
     }
 
+    pub(crate) fn finish_preparation(&self) {
+        let configured = self.startup_input.lock().unwrap().configured.take();
+        drop(configured);
+    }
+
+    pub(crate) fn preserves_preopens(&self) -> bool {
+        self.startup_input.lock().unwrap().preserve_preopens
+    }
+
+    fn next_image(&self) -> Self {
+        let policy = self.startup_input.lock().unwrap();
+        Self {
+            lineage: self.lineage.clone(),
+            inherited_root: self
+                .startup
+                .get()
+                .and_then(|startup| startup.root.clone())
+                .or_else(|| self.inherited_root.clone()),
+            startup_input: Mutex::new(StartupPolicy {
+                configured: None,
+                sealed: policy.sealed,
+                preserve_preopens: policy.preserve_preopens,
+            }),
+            ..Self::default()
+        }
+    }
+
     /// The state of a child that `fork` or `vfork` makes of this process: it has the same
     /// descriptors, so it announces the same preopens and keeps what the families know about
     /// them (epoll data and socket timeouts), and the same arguments,
@@ -190,6 +248,8 @@ impl ProcState {
         Self {
             startup,
             startup_input: Mutex::new(self.startup_input.lock().unwrap().clone()),
+            lineage: Arc::new(()),
+            inherited_root: self.inherited_root.clone(),
             net: self.net.fork(),
             proc: self.proc.fork(),
             clocks: self.clocks.fork(),
@@ -204,7 +264,7 @@ pub struct Startup {
     pub args: Vec<Vec<u8>>,
     pub env: Vec<Vec<u8>>,
     pub preopens: Vec<Preopen>,
-    pub(crate) root: Option<RootPresentation>,
+    pub(crate) root: Option<Arc<RootPresentation>>,
 }
 
 #[derive(Debug)]
@@ -302,6 +362,36 @@ impl CommandDefaults {
 }
 
 impl Procs {
+    pub(crate) fn next_image(&self, task: TaskId) -> Arc<ProcState> {
+        let previous = self.procs.lock().unwrap().get(&task).cloned();
+        let state = Arc::new(previous.map_or_else(ProcState::default, |state| state.next_image()));
+        self.replace(task, state.clone());
+        state
+    }
+
+    pub(crate) fn owned_state(&self, task: TaskId, lineage: &Arc<()>) -> Option<Arc<ProcState>> {
+        self.procs
+            .lock()
+            .unwrap()
+            .get(&task)
+            .filter(|state| Arc::ptr_eq(&state.lineage, lineage))
+            .cloned()
+    }
+
+    pub(crate) fn remove_lineage(&self, task: TaskId, lineage: &Arc<()>) {
+        let removed = {
+            let mut procs = self.procs.lock().unwrap();
+            if procs
+                .get(&task)
+                .is_some_and(|state| Arc::ptr_eq(&state.lineage, lineage))
+            {
+                procs.remove(&task)
+            } else {
+                None
+            }
+        };
+        drop(removed);
+    }
     /// The state of `pid`, created empty if the process has none yet (a vfork child before its
     /// parent's state was copied, a process whose image another ABI loaded).
     pub fn get_or_create(&self, pid: TaskId) -> Arc<ProcState> {
@@ -310,24 +400,91 @@ impl Procs {
 
     /// Starts `pid` over with `state`, as a new process image does.
     pub fn replace(&self, pid: TaskId, state: Arc<ProcState>) {
-        self.procs.lock().unwrap().insert(pid, state);
+        let old = self.procs.lock().unwrap().insert(pid, state);
+        drop(old);
     }
 
     /// Drops `pid`'s state if it still is `state`, when the image that made it ends.
     pub fn remove(&self, pid: TaskId, state: &Arc<ProcState>) {
-        let mut procs = self.procs.lock().unwrap();
-        if procs
-            .get(&pid)
-            .is_some_and(|current| Arc::ptr_eq(current, state))
-        {
-            procs.remove(&pid);
-        }
+        let removed = {
+            let mut procs = self.procs.lock().unwrap();
+            if procs
+                .get(&pid)
+                .is_some_and(|current| Arc::ptr_eq(current, state))
+            {
+                procs.remove(&pid)
+            } else {
+                None
+            }
+        };
+        drop(removed);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepared_policy_releases_bootstrap_binding_and_keeps_only_immutable_exec_metadata() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Captured(Arc<AtomicUsize>);
+        impl Drop for Captured {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let state = ProcState::default();
+        state
+            .set_startup_input_with_descriptors(
+                StartupInput {
+                    preopens: vec![],
+                    ..StartupInput::default()
+                },
+                StartupDescriptors {
+                    descriptors: vec![],
+                    binding: DescriptorSet::new(Captured(dropped.clone()), vec![]),
+                    virtual_root: None,
+                },
+            )
+            .unwrap();
+        let root = Arc::new(RootPresentation {
+            root: FileId {
+                dev: (1, 2),
+                ino: 3,
+            },
+            entries: vec![(b"opaque//alias".to_vec(), 7)],
+        });
+        state
+            .startup
+            .set(Arc::new(Startup {
+                args: vec![b"old".to_vec()],
+                env: vec![b"OLD=yes".to_vec()],
+                root: Some(root.clone()),
+                ..Startup::default()
+            }))
+            .unwrap();
+        state.finish_preparation();
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        let next = state.next_image();
+        assert!(next.startup.get().is_none());
+        assert!(next.seal_startup_input().is_none());
+        assert!(Arc::ptr_eq(next.inherited_root.as_ref().unwrap(), &root));
+        assert!(Arc::ptr_eq(&state.lineage, &next.lineage));
+        assert!(next.preserves_preopens());
+        assert_eq!(
+            next.set_startup_input(StartupInput::default()),
+            Err(wasixv2_abi::Errno::EBUSY)
+        );
+        let fork = next.fork();
+        assert!(!Arc::ptr_eq(&next.lineage, &fork.lineage));
+        assert!(Arc::ptr_eq(fork.inherited_root.as_ref().unwrap(), &root));
+        assert_eq!(
+            fork.set_startup_input(StartupInput::default()),
+            Err(wasixv2_abi::Errno::EBUSY)
+        );
+    }
 
     #[test]
     fn host_ready_startup_keeps_order_bindings_and_presentation_in_one_forked_policy() {
