@@ -118,21 +118,69 @@ impl CleanupRetirement {
             future.as_mut().poll(cx)
         })));
     }
-    #[cfg(feature = "wasi")]
-    pub(crate) fn drive_after_settlement(&self, completed: Rc<std::cell::Cell<bool>>) {
-        let driver = self.driver.clone();
-        self.owner.after_pump(Box::new(move || {
+}
+
+#[cfg(all(feature = "sys", feature = "wasi"))]
+struct NativeRetirementTail {
+    store: Option<StoreRef>,
+    owner: CleanupRetirement,
+    completed: Rc<std::cell::Cell<bool>>,
+    panic: Option<RetirementPanic>,
+}
+#[cfg(all(feature = "sys", feature = "wasi"))]
+impl std::future::Future for NativeRetirementTail {
+    type Output = ();
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        let this = self.get_mut();
+        let driver = &this.owner.driver;
+        if !attempt_retirement(&mut this.panic, || driver.poll_retirement(cx)) {
+            // The native owner removed the panicked orchestration and retained
+            // its replacement drain. Repoll that transferred state, not the
+            // panicked future, through this same outer async poller.
+            cx.waker().wake_by_ref();
+        }
+        if this.completed.get() {
+            if let Some(panic) = this.panic.take() {
+                std::panic::resume_unwind(panic);
+            }
+            std::task::Poll::Ready(())
+        } else {
+            std::task::Poll::Pending
+        }
+    }
+}
+#[cfg(all(feature = "sys", feature = "wasi"))]
+impl Drop for NativeRetirementTail {
+    fn drop(&mut self) {
+        if self.completed.get() {
+            return;
+        }
+        let mut store = self.store.take();
+        let completed = self.completed.clone();
+        let mut panic = self.panic.take();
+        let unwinding = std::thread::panicking();
+        // Preserve exact Store/drain custody if the caller abandons its tail.
+        // An existing explicit driver must still be polled; retaining this job
+        // is not an autonomous producer and never blocks a foreign Tokio poll.
+        self.owner.retain(Box::pin(std::future::poll_fn(move |_| {
             if completed.get() {
-                return;
+                attempt_retirement(&mut panic, || drop(store.take()));
+                if let Some(panic) = panic.take() {
+                    if unwinding {
+                        let _ =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(panic)));
+                    } else {
+                        std::panic::resume_unwind(panic);
+                    }
+                }
+                std::task::Poll::Ready(())
+            } else {
+                std::task::Poll::Pending
             }
-            if driver.active.get() {
-                // The same LocalSet is already being polled. Enroll this exact
-                // cleanup in its existing poller, never recursively enter it.
-                driver.enrolled.borrow_mut().push(completed);
-                return;
-            }
-            driver.drain_retirement(completed);
-        }));
+        })));
     }
 }
 
@@ -596,6 +644,31 @@ impl StoreRef {
         Ok(())
     }
 
+    #[cfg(all(feature = "sys", feature = "wasi"))]
+    pub(crate) fn enroll_native_retirement(
+        &self,
+        completed: Rc<std::cell::Cell<bool>>,
+    ) -> Result<(), RuntimeError> {
+        let owner = self.retirement_owner()?;
+        {
+            let mut enrolled = owner.driver.enrolled.borrow_mut();
+            enrolled.retain(|completed| !completed.get());
+            enrolled.push(completed.clone());
+        }
+        let tail = Box::pin(NativeRetirementTail {
+            store: Some(self.clone()),
+            owner,
+            completed,
+            panic: None,
+        });
+        if let Err(tail) = wasmer_api::sys::enroll_native_ancestry_tail(tail) {
+            // No owning call future remains. Drop transfers custody to the
+            // existing cleanup owner; it does not invent a poller or dispatcher.
+            drop(tail);
+        }
+        Ok(())
+    }
+
     pub fn downgrade(&self) -> WeakStoreRef {
         WeakStoreRef {
             inner: Rc::downgrade(&self.inner),
@@ -713,54 +786,24 @@ impl Driver {
     }
 
     #[cfg(feature = "wasi")]
-    fn drain_retirement(&self, completed: Rc<std::cell::Cell<bool>>) {
-        use std::{
-            sync::{Arc, Condvar, Mutex},
-            task::{Context, Wake, Waker},
-        };
-        #[derive(Default)]
-        struct WakeSignal(Mutex<bool>, Condvar);
-        impl Wake for WakeSignal {
-            fn wake(self: Arc<Self>) {
-                self.wake_by_ref();
+    fn poll_retirement(&self, cx: &mut std::task::Context<'_>) {
+        let _runtime = self.runtime.enter();
+        if !self.active.get() {
+            self.active.set(true);
+            struct Reset<'a>(&'a std::cell::Cell<bool>);
+            impl Drop for Reset<'_> {
+                fn drop(&mut self) {
+                    self.0.set(false);
+                }
             }
-            fn wake_by_ref(self: &Arc<Self>) {
-                *self.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
-                self.1.notify_one();
-            }
+            let _reset = Reset(&self.active);
+            let local = self.local.run_until(std::future::pending::<()>());
+            let _ = std::pin::pin!(local).as_mut().poll(cx);
         }
-        struct Clear(wasmer_api::sys::NativeCleanupOwner);
-        impl Drop for Clear {
-            fn drop(&mut self) {
-                self.0.clear_idle_waker();
-            }
-        }
-        let _clear = Clear(self.owner.clone());
-        let signal = Arc::new(WakeSignal::default());
-        let waker = Waker::from(signal.clone());
-        let mut cx = Context::from_waker(&waker);
-        let mut panic = None;
-        loop {
-            *signal.0.lock().unwrap_or_else(|e| e.into_inner()) = false;
-            attempt_retirement(&mut panic, || {
-                let _runtime = self.runtime.enter();
-                let local = self.local.run_until(std::future::pending::<()>());
-                let _ = std::pin::pin!(local).as_mut().poll(&mut cx);
-                let _local = self.local.enter();
-                let _ = self.owner.poll_idle(&mut cx);
-            });
-            if completed.get() {
-                break;
-            }
-            // Runtime/LocalSet entry guards never span the blocking wait.
-            let mut ready = signal.0.lock().unwrap_or_else(|e| e.into_inner());
-            while !*ready {
-                ready = signal.1.wait(ready).unwrap_or_else(|e| e.into_inner());
-            }
-        }
-        if let Some(panic) = panic {
-            std::panic::resume_unwind(panic);
-        }
+        // Another active call already owns this LocalSet's outer poller. Its
+        // queued tasks retain that poller; only enter the spawn context here.
+        let _local = self.local.enter();
+        let _ = self.owner.poll_idle(cx);
     }
 
     fn run<R>(&self, future: impl std::future::Future<Output = R>) -> Result<R, RuntimeError> {
@@ -1319,6 +1362,117 @@ mod tests {
             "managed work must finish before cancellation"
         );
         assert!(owner.is_idle());
+    }
+
+    #[cfg(feature = "wasi")]
+    #[test]
+    fn native_post_tail_returns_to_the_source_scheduler_for_target_yield_and_timer() {
+        let target = StoreRef::new(Store::default()).unwrap();
+        let retirement = target.retirement_owner().unwrap();
+        let owner = target.cleanup_owner().unwrap();
+        let completed = Rc::new(std::cell::Cell::new(false));
+        let cleaned = completed.clone();
+        retirement.retain(Box::pin(async move {
+            let (send, receive) = tokio::sync::oneshot::channel();
+            tokio::task::spawn_local(async move {
+                // This wake belongs to source current-thread scheduler R even
+                // while the target runtime's handle is entered for this poll.
+                tokio::task::yield_now().await;
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                cleaned.set(true);
+                let _ = send.send(());
+            });
+            let _ = receive.await;
+        }));
+        let weak = target.downgrade();
+        let enrolled = completed.clone();
+        let mut source = Store::default();
+        let function = Function::new_async(
+            &mut source,
+            wasmer_api::FunctionType::new([], [wasmer_api::Type::I32]),
+            move |_| {
+                weak.upgrade()
+                    .unwrap()
+                    .enroll_native_retirement(enrolled.clone())
+                    .unwrap();
+                std::future::ready(Ok(vec![Value::I32(37)]))
+            },
+        );
+        let source = source.into_async();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let output = runtime
+            .block_on(function.call_async(&source, vec![]))
+            .unwrap();
+        assert_eq!(output[0].i32(), Some(37));
+        assert!(completed.get());
+        assert!(owner.is_idle());
+        assert_eq!(Rc::strong_count(&target.inner), 1);
+        drop(retirement);
+    }
+
+    #[cfg(feature = "wasi")]
+    #[test]
+    fn native_post_tail_drop_keeps_custody_for_an_existing_driver() {
+        let target = StoreRef::new(Store::default()).unwrap();
+        let retirement = target.retirement_owner().unwrap();
+        let driver = retirement.driver.clone();
+        let owner = target.cleanup_owner().unwrap();
+        let completed = Rc::new(std::cell::Cell::new(false));
+        let cleaned = completed.clone();
+        retirement.retain(Box::pin(async move {
+            let (send, receive) = tokio::sync::oneshot::channel();
+            tokio::task::spawn_local(async move {
+                tokio::task::yield_now().await;
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                cleaned.set(true);
+                let _ = send.send(());
+            });
+            let _ = receive.await;
+        }));
+        let weak = target.downgrade();
+        let enrolled = completed.clone();
+        let mut source = Store::default();
+        let function = Function::new_async(
+            &mut source,
+            wasmer_api::FunctionType::new([], []),
+            move |_| {
+                weak.upgrade()
+                    .unwrap()
+                    .enroll_native_retirement(enrolled.clone())
+                    .unwrap();
+                std::future::ready(Ok(Vec::new()))
+            },
+        );
+        let source = source.into_async();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut call = Box::pin(function.call_async(&source, vec![]));
+            std::future::poll_fn(|cx| {
+                assert!(call.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            assert!(!completed.get());
+            drop(call); // No synchronous wait inside this current-thread poll.
+            assert!(
+                !completed.get(),
+                "retention itself does not claim completion"
+            );
+            // Explicitly retain the existing async driver after cancellation.
+            // It, rather than a new executor/task, is the actual poll producer.
+            driver.run_local(async {}).await;
+        });
+        assert!(completed.get());
+        assert!(owner.is_idle());
+        assert_eq!(Rc::strong_count(&target.inner), 1);
+        drop(driver);
+        drop(retirement);
     }
 
     #[test]

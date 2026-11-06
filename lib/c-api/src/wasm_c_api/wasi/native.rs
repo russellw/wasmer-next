@@ -940,7 +940,6 @@ struct PredecessorRetirement {
     start: Option<Box<dyn FnOnce() -> LocalFuture<'static, ()>>>,
     running: Option<LocalFuture<'static, ()>>,
     owner: CleanupRetirement,
-    on_settled: Option<Box<dyn FnOnce()>>,
     done: bool,
 }
 impl Future for PredecessorRetirement {
@@ -952,9 +951,6 @@ impl Future for PredecessorRetirement {
                 return Poll::Pending;
             }
             this.ancestry = None;
-        }
-        if let Some(settled) = this.on_settled.take() {
-            settled();
         }
         if this.running.is_none() {
             this.running = Some(this.start.take().expect("one predecessor runner")());
@@ -987,7 +983,6 @@ impl Drop for PredecessorRetirement {
                 start: self.start.take(),
                 running: self.running.take(),
                 owner: self.owner.clone(),
-                on_settled: self.on_settled.take(),
                 done: false,
             };
             self.owner.retain(Box::pin(replacement));
@@ -1124,15 +1119,11 @@ impl Endpoint {
                 keepalive,
             )) as LocalFuture<'static, ()>
         });
-        let drive = owner.clone();
         let predecessor = PredecessorRetirement {
             ancestry,
             start: Some(start),
             running: None,
             owner: owner.clone(),
-            on_settled: (!admitted).then(|| {
-                Box::new(move || drive.drive_after_settlement(completed)) as Box<dyn FnOnce()>
-            }),
             done: false,
         };
         self.committed.set(true);
@@ -1146,6 +1137,12 @@ impl Endpoint {
                 .take()
                 .unwrap()
                 .send(Admission::Worker(Err(ExecError::Dropped)));
+        }
+        // Enroll before retain can synchronously drive cleanup/finalizers. The
+        // outer call future releases native custody and then polls this tail,
+        // allowing a foreign current-thread executor to deliver deferred wakes.
+        if !admitted {
+            store.enroll_native_retirement(completed)?;
         }
         // NativeCleanupOwner commits this concrete custody before first polling.
         owner.retain(Box::pin(predecessor));
