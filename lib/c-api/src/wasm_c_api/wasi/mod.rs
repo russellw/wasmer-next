@@ -203,11 +203,11 @@ pub unsafe extern "C" fn wasi_env_new(
     rt.set_engine(c_try!(store.with_mut(|store| store.engine().clone())));
 
     if !config.inherit_stdout {
-        config.builder.set_stdout(Box::new(Pipe::channel().0));
+        config.builder.set_stdout(Box::new(Pipe::new()));
     }
 
     if !config.inherit_stderr {
-        config.builder.set_stderr(Box::new(Pipe::channel().0));
+        config.builder.set_stderr(Box::new(Pipe::new()));
     }
 
     // TODO: impl capturer for stdin
