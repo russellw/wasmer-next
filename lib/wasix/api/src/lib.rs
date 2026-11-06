@@ -26,7 +26,9 @@ pub use directory::{DirectoryEntry, populate_directory};
 #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
 mod embedding;
 #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
-pub use embedding::EmbeddingProcess;
+pub use embedding::{
+    BootstrappedProcess, DirectoryBootstrap, EmbeddingProcess, NamespaceBootstrap,
+};
 
 use std::{
     collections::HashSet,
@@ -66,8 +68,8 @@ use wasixv2_kernel::{FilesystemType, FsParam, HostClock, Kernel, SyscallEntry, T
 use wasixv2_pages::{Provider, SharedPages};
 use wasixv2_syscalls::{Layered, TaskId};
 use wasixv2_trace::Trace;
-pub use wasixv2_vfs::Filesystem;
-use wasixv2_vfs::{Cred, Ctx, Errno, LookupFlags, MountFlags, NAME_MAX, Vfs};
+use wasixv2_vfs::{Cred, Ctx, Errno, LookupFlags, MountFlags, Vfs};
+pub use wasixv2_vfs::{Filesystem, NAME_MAX};
 use wasixv2_vfs_mem::{Limits, MemFs, QuotaLimits};
 use wasixv2_vfs_overlay::{MAX_LOWERS, OverlayFs};
 use wasixv2_vfs_package::PackageFs;
@@ -795,6 +797,33 @@ impl Machine {
             .map_err(errno_to_io)
     }
 
+    /// Captures a host directory as an owned, unattached directory capability.
+    /// Capturing it does not make the directory visible in this Machine's root.
+    /// It fixes filesystem configuration, as starting a process does.
+    pub fn capture_host_directory(
+        &self,
+        host_dir: &Path,
+        read_only: bool,
+    ) -> io::Result<wasixv2_vfs::File> {
+        let options = wasixv2_vfs_host::Options {
+            read_only,
+            owner: self.owner,
+        };
+        let fs = wasixv2_vfs_host::open(host_dir, self.host.clone(), options)?;
+        let source = fs.info().name.as_bytes().to_vec();
+        self.in_use.store(true, Ordering::Relaxed);
+        Ok(self.vfs().create_mount(
+            fs,
+            source,
+            MountFlags {
+                read_only,
+                ..MountFlags::default()
+            },
+            read_only,
+            self.vfs().namespace().owner().clone(),
+        ))
+    }
+
     /// Maps the host directory `host_dir` to `guest`. The guest cannot reach anything outside
     /// `host_dir`; files the host user owns appear as owned by the machine's user.
     pub async fn mount_host_dir(
@@ -1027,10 +1056,26 @@ impl Machine {
     /// [`Machine::signal`]'s list while the returned guard lives; the guard kills it unless
     /// told that the run released it.
     async fn start(&self, config: ProcessConfig) -> Result<(TaskId, Running), RunError> {
+        let (task, running, ()) = self
+            .start_with(|| {
+                std::future::ready(self.syscalls.inner.spawn(config).map(|task| (task, ())))
+            })
+            .await?;
+        Ok((task, running))
+    }
+
+    async fn start_with<T, F>(
+        &self,
+        spawn: impl FnOnce() -> F,
+    ) -> Result<(TaskId, Running, T), RunError>
+    where
+        F: Future<Output = Result<(TaskId, T), Errno>>,
+    {
         self.in_use.store(true, Ordering::Relaxed);
         #[cfg(feature = "wasix1")]
         self.resolve_wasix1_commands().await;
-        let task = (self.syscalls.inner.spawn(config))
+        let (task, metadata) = spawn()
+            .await
             .map_err(|errno| RunError::Spawn(errno_to_io(errno)))?;
         self.running.lock().unwrap().push(task);
         let running = Running {
@@ -1053,7 +1098,7 @@ impl Machine {
                 .await
                 .map_err(|errno| RunError::Console(errno_to_io(errno)))?;
         }
-        Ok((task, running))
+        Ok((task, running, metadata))
     }
 
     fn check_thread_profile(&self) -> Result<(), RunError> {

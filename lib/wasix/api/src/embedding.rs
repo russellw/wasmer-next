@@ -8,6 +8,8 @@ use wasixv2_syscalls::TaskId;
 
 use crate::{Machine, MachineSyscalls, ProcessConfig, RunError, Running};
 
+pub use wasixv2_kernel::{BootstrappedProcess, DirectoryBootstrap, NamespaceBootstrap};
+
 /// One process started through the Machine's ordinary configuration path.
 ///
 /// This owner contains no Store or instance. The embedder retains and settles its
@@ -30,17 +32,46 @@ impl Machine {
     ) -> Result<EmbeddingProcess, RunError> {
         self.check_thread_profile()?;
         let (task, registration) = self.start(config).await?;
-        Ok(EmbeddingProcess {
-            machine: self.clone(),
-            task,
-            registration: Some(registration),
-            #[cfg(feature = "wasix1")]
-            wasix1: Some(self.wasix1.abi.host_process(task)),
-        })
+        Ok(EmbeddingProcess::new(self.clone(), task, registration))
+    }
+
+    /// Starts a process in an explicitly granted filesystem namespace. Descriptor
+    /// identity comes from the kernel's completed bootstrap; no path is reopened.
+    pub async fn start_embedding_with_namespace(
+        self: &Arc<Self>,
+        config: ProcessConfig,
+        namespace: NamespaceBootstrap,
+    ) -> Result<(EmbeddingProcess, BootstrappedProcess), RunError> {
+        self.check_thread_profile()?;
+        let (task, registration, bootstrap) = self
+            .start_with(|| async {
+                self.syscalls
+                    .inner
+                    .spawn_with_namespace(config, namespace)
+                    .await
+                    .map(|bootstrap| (bootstrap.task, bootstrap))
+            })
+            .await?;
+        Ok((
+            EmbeddingProcess::new(self.clone(), task, registration),
+            bootstrap,
+        ))
     }
 }
 
 impl EmbeddingProcess {
+    fn new(machine: Arc<Machine>, task: TaskId, registration: Running) -> Self {
+        #[cfg(feature = "wasix1")]
+        let wasix1 = Some(machine.wasix1.abi.host_process(task));
+        Self {
+            machine,
+            task,
+            registration: Some(registration),
+            #[cfg(feature = "wasix1")]
+            wasix1,
+        }
+    }
+
     pub fn task(&self) -> TaskId {
         self.task
     }

@@ -3,7 +3,9 @@
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, sync::Arc};
 use wasixv2_abi::{Errno, OpenFlags};
-use wasixv2_vfs::{Cred, Ctx, Filesystem, FsResult, LookupFlags, OpenHow, Vfs};
+use wasixv2_vfs::{
+    Cred, Ctx, Filesystem, FsResult, LookupFlags, OpenHow, PathError, PathResult, Vfs,
+};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
@@ -101,11 +103,15 @@ pub async fn populate_directory(
             continue;
         }
         match entry {
-            DirectoryEntry::Directory { .. } => {
-                vfs.mkdir(&cx, &root, path.as_bytes(), 0o700).await?
-            }
+            DirectoryEntry::Directory { .. } => vfs
+                .mkdir(&cx, &root, path.as_bytes(), 0o700)
+                .await
+                .map_err(PathError::errno)?,
             DirectoryEntry::File { data, mode, .. } => {
-                let file = vfs.open(&cx, &root, path.as_bytes(), &how).await?;
+                let file = vfs
+                    .open(&cx, &root, path.as_bytes(), &how)
+                    .await
+                    .map_err(PathError::errno)?;
                 let mut offset = 0;
                 while offset < data.len() {
                     let n = file.write_at(&data[offset..], offset as u64).await?;
@@ -116,10 +122,10 @@ pub async fn populate_directory(
                 }
                 vfs.chmod(&cx, &file.path, *mode).await?;
             }
-            DirectoryEntry::Symlink { target, .. } => {
-                vfs.symlink(&cx, target.as_bytes(), &root, path.as_bytes())
-                    .await?
-            }
+            DirectoryEntry::Symlink { target, .. } => vfs
+                .symlink(&cx, target.as_bytes(), &root, path.as_bytes())
+                .await
+                .map_err(PathError::errno)?,
         }
     }
     for (path, entry) in names.iter().rev() {
@@ -137,7 +143,8 @@ pub async fn populate_directory(
                         ..LookupFlags::follow()
                     },
                 )
-                .await?
+                .await
+                .map_err(PathError::errno)?
             };
             vfs.chmod(&cx, &directory, *mode).await?;
         }
@@ -170,7 +177,7 @@ impl crate::Machine {
             task: 0,
             leases: None,
         };
-        let read = async {
+        let read: PathResult<()> = async {
             let file = vfs
                 .open(
                     &cx,
@@ -183,14 +190,19 @@ impl crate::Machine {
                     },
                 )
                 .await?;
-            file.readdir(0, &mut Entries).await.map(|_| ())
+            file.readdir(0, &mut Entries)
+                .await
+                .map(|_| ())
+                .map_err(PathError::from)
         }
         .await;
         match read {
-            Err(Errno::ENOENT) => vfs.mkdir(&cx, &root, path.as_bytes(), 0o777).await,
+            Err(PathError::Errno(Errno::ENOENT)) => {
+                vfs.mkdir(&cx, &root, path.as_bytes(), 0o777).await
+            }
             result => result,
         }
-        .map_err(crate::errno_to_io)
+        .map_err(|error| crate::errno_to_io(error.errno()))
     }
 }
 

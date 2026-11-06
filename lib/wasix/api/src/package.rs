@@ -871,7 +871,7 @@ mod tests {
                 vfs.lookup(&cx, &root, path, LookupFlags::follow())
                     .await
                     .err(),
-                Some(wasixv2_abi::Errno::ENOENT)
+                Some(wasixv2_vfs::PathError::Errno(wasixv2_abi::Errno::ENOENT))
             );
         }
     }
