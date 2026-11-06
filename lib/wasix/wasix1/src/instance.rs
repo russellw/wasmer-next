@@ -28,7 +28,7 @@ pub const THREAD_ENTRY: &str = "wasi_thread_start";
 pub const SIGNAL_CALLBACK: &str = "__wasm_signal";
 
 pub struct Wasix1Instance {
-    pub(crate) http: crate::http::State,
+    pub(crate) http: Arc<crate::http::State>,
     pub(crate) limits: crate::Limits,
     pub(crate) realloc: Option<Function>,
     procs: Arc<Procs>,
@@ -40,7 +40,7 @@ pub struct Wasix1Instance {
     exports: Exports,
     initialize: Option<Function>,
     /// `_start` of a process image, `wasi_thread_start` of a thread.
-    entry: Function,
+    entry: Option<Function>,
     table_cacheable: bool,
     /// The export `callback_signal` last named that exists: `__wasm_signal` unless libc
     /// named another.
@@ -58,6 +58,64 @@ pub struct Wasix1Instance {
     /// task belongs to its process for life, a vfork child that runs here is a process of its
     /// own, and a new image (`execve`) or a fork child gets an instance of its own.
     process: AtomicU64,
+}
+
+/// Compat state owned by one embedding environment, shared by its attachments.
+/// Dropping an attachment never retires this process or replaces its startup data.
+#[derive(Clone)]
+pub struct HostProcessState(Arc<HostProcess>);
+
+struct HostProcess {
+    procs: Arc<Procs>,
+    commands: Arc<RwLock<Commands>>,
+    http: Arc<crate::http::State>,
+    limits: crate::Limits,
+    task: TaskId,
+    state: Arc<ProcState>,
+}
+
+impl HostProcessState {
+    pub(crate) fn new(
+        procs: Arc<Procs>,
+        commands: Arc<RwLock<Commands>>,
+        http: Option<Arc<dyn crate::http::HttpProvider>>,
+        limits: crate::Limits,
+        task: TaskId,
+    ) -> Self {
+        let state = procs.get_or_create(task);
+        Self(Arc::new(HostProcess {
+            procs,
+            commands,
+            http: Arc::new(crate::http::State::new(http)),
+            limits,
+            task,
+            state,
+        }))
+    }
+
+    /// Captures an actual instance's handles without requiring or running `_start`.
+    /// The environment explicitly selects the returned binding; calling a function
+    /// from an older instance does not select that instance again.
+    pub fn attach<S: Send + Sync + 'static>(
+        &self,
+        instance: &Instance,
+        store: &mut wasmer::StoreMut<'_>,
+    ) -> Arc<dyn AbiInstance<S>> {
+        Arc::new(Wasix1Instance::attach(
+            self.0.procs.clone(),
+            self.0.commands.clone(),
+            self.0.http.clone(),
+            self.0.limits,
+            instance,
+            store,
+        ))
+    }
+}
+
+impl Drop for HostProcess {
+    fn drop(&mut self) {
+        self.procs.remove(self.task, &self.state);
+    }
 }
 
 /// [`Wasix1Instance::process`] before any task asked: no task id is `u32::MAX`.
@@ -95,23 +153,48 @@ impl Wasix1Instance {
             }
             Role::Thread => (exports.get_function(THREAD_ENTRY)?.clone(), None),
         };
-        Ok(Self {
-            http: crate::http::State::new(http),
+        let mut attached = Self::attach(
+            procs,
+            commands,
+            Arc::new(crate::http::State::new(http)),
+            limits,
+            instance,
+            store,
+        );
+        attached.initialize = function(INITIALIZE).filter(|_| role == Role::Process);
+        attached.entry = Some(entry);
+        *attached.image.get_mut().unwrap() = image;
+        Ok(attached)
+    }
+
+    /// Captures host handles without starting or replacing a process image.
+    pub(crate) fn attach(
+        procs: Arc<Procs>,
+        commands: Arc<RwLock<Commands>>,
+        http: Arc<crate::http::State>,
+        limits: crate::Limits,
+        instance: &Instance,
+        store: &mut wasmer::StoreMut<'_>,
+    ) -> Self {
+        let exports = &instance.exports;
+        let function = |name: &str| exports.get_function(name).ok().cloned();
+        Self {
+            http,
             limits,
             realloc: function("canonical_abi_realloc"),
             procs,
             commands,
-            image: Mutex::new(image),
+            image: Mutex::new(None),
             exports: exports.clone(),
-            initialize: function(INITIALIZE).filter(|_| role == Role::Process),
-            entry,
+            initialize: None,
+            entry: None,
             table_cacheable: wasixv2_exec::TableMetadata::bind(instance, store).cacheable(),
             signal: Mutex::new(function(SIGNAL_CALLBACK)),
             blocked: AtomicBool::new(false),
             started: AtomicBool::new(false),
             vforks: Mutex::new(HashMap::new()),
             process: AtomicU64::new(NO_PROCESS),
-        })
+        }
     }
 
     /// The process of `task` if it is the task that asked last.
@@ -219,10 +302,14 @@ impl<S: Send + Sync + 'static> AbiInstance<S> for Wasix1Instance {
     /// `_initialize` cannot fork: a fork child resumes in `_start`.
     fn start<'a>(&'a self, entry: &'a Entry<'a, S>) -> LocalFuture<'a, Result<(), RuntimeError>> {
         Box::pin(async move {
+            let function = self
+                .entry
+                .as_ref()
+                .ok_or_else(|| RuntimeError::new("host attachment has no process entry"))?;
             if let Some(initialize) = &self.initialize {
                 entry.call_once(initialize, &[]).await?;
             }
-            entry.call(START, &self.entry, &[]).await.map(drop)
+            entry.call(START, function, &[]).await.map(drop)
         })
     }
 
@@ -238,7 +325,13 @@ impl<S: Send + Sync + 'static> AbiInstance<S> for Wasix1Instance {
         start_arg: u32,
     ) -> LocalFuture<'a, Result<(), RuntimeError>> {
         let args = [Value::I32(tid), Value::I32(start_arg as i32)];
-        Box::pin(async move { entry.call(THREAD_ENTRY, &self.entry, &args).await.map(drop) })
+        Box::pin(async move {
+            let function = self
+                .entry
+                .as_ref()
+                .ok_or_else(|| RuntimeError::new("host attachment has no thread entry"))?;
+            entry.call(THREAD_ENTRY, function, &args).await.map(drop)
+        })
     }
 
     /// A v1 thread that returns from its entry exited cleanly.
@@ -301,5 +394,68 @@ impl<S: Send + Sync + 'static> AbiInstance<S> for Wasix1Instance {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+    use wasmer::{AsStoreMut, Imports, Module, Store};
+
+    #[test]
+    fn host_attachments_share_process_and_http_until_the_last_owner_drops() {
+        let mut store = Store::default();
+        let module = Module::new(
+            &store,
+            wat::parse_str(
+                r#"(module (memory (export "backing") 1)
+                (global $count (mut i32) (i32.const 0))
+                (func (export "_initialize") i32.const 1 global.set $count)
+                (func (export "count") (result i32) global.get $count))"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let a = Instance::new(&mut store, &module, &Imports::new()).unwrap();
+        let b = Instance::new(&mut store, &module, &Imports::new()).unwrap();
+        let wasi = crate::Wasix1::default();
+        let task = TaskId(7);
+        let owner = wasi.host_process(task);
+        let other_owner = owner.clone();
+        let state = owner.0.state.clone();
+        let attached_a = owner.attach::<()>(&a, &mut store.as_store_mut());
+        let attached_b = owner.attach::<()>(&b, &mut store.as_store_mut());
+        let selected_a = attached_a
+            .as_any()
+            .downcast_ref::<Wasix1Instance>()
+            .unwrap();
+        let selected_b = attached_b
+            .as_any()
+            .downcast_ref::<Wasix1Instance>()
+            .unwrap();
+        assert!(Arc::ptr_eq(&selected_a.http, &selected_b.http));
+        assert!(selected_a.entry.is_none() && selected_a.initialize.is_none());
+        assert!(selected_b.entry.is_none() && selected_b.initialize.is_none());
+        assert!(selected_a.image.lock().unwrap().is_none());
+        assert!(Arc::ptr_eq(&wasi.procs.get_or_create(task), &state));
+        for instance in [&a, &b] {
+            assert_eq!(
+                instance
+                    .exports
+                    .get_typed_function::<(), i32>(&store, "count")
+                    .unwrap()
+                    .call(&mut store)
+                    .unwrap(),
+                0
+            );
+        }
+        drop(owner);
+        assert!(Arc::ptr_eq(&wasi.procs.get_or_create(task), &state));
+        drop(other_owner);
+        let next = wasi.procs.get_or_create(task);
+        assert!(!Arc::ptr_eq(&next, &state));
+        drop(attached_a);
+        drop(attached_b);
+        assert!(Arc::ptr_eq(&wasi.procs.get_or_create(task), &next));
     }
 }

@@ -42,7 +42,7 @@ pub mod shim;
 
 use std::sync::{Arc, RwLock};
 
-pub use instance::{SIGNAL_CALLBACK, THREAD_ENTRY};
+pub use instance::{HostProcessState, SIGNAL_CALLBACK, THREAD_ENTRY};
 pub use process::{CommandDefaults, Commands, FileId};
 use wasixv2_exec::{Abi, AbiInstance, ExecEnv, ExecError, Role};
 use wasixv2_syscalls::{Control, Syscalls, TaskId};
@@ -99,6 +99,18 @@ impl Wasix1 {
     pub fn with_limits(mut self, limits: Limits) -> Self {
         self.limits = limits;
         self
+    }
+
+    /// Owns compat state for an existing kernel process without starting a new
+    /// process image. Its attachments share startup data and HTTP client handles.
+    pub fn host_process(&self, task: TaskId) -> HostProcessState {
+        HostProcessState::new(
+            self.procs.clone(),
+            self.commands.clone(),
+            self.http.clone(),
+            self.limits,
+            task,
+        )
     }
 
     /// Enables the historical v1 HTTP extension with an explicit embedder capability.
