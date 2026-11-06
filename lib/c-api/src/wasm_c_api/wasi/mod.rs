@@ -1422,7 +1422,7 @@ mod tests {
             static int invoke(wasm_func_t* function, size_t count, const int32_t* values) {
                 wasm_val_t args[6];
                 assert(count <= 6);
-                for (size_t i = 0; i < count; ++i) args[i] = WASM_I32_VAL(values[i]);
+                for (size_t i = 0; i < count; ++i) args[i] = (wasm_val_t)WASM_I32_VAL(values[i]);
                 wasm_val_vec_t arguments = WASM_EMPTY_VEC;
                 arguments.size = count;
                 arguments.data = args;
