@@ -260,7 +260,6 @@ impl StoreRef {
         &self,
         mut future: std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>,
     ) -> Result<Box<dyn FnOnce()>, RuntimeError> {
-        use std::future::Future;
         let StoreMode::Native(native) = &self.inner.mode else {
             return Err(RuntimeError::new("Store has no native cleanup owner"));
         };
