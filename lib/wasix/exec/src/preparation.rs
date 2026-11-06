@@ -162,9 +162,21 @@ impl<S: Syscalls + Control + Send + Sync + 'static> Preparation<'_, S> {
                 let pages = (layout.image_end - size).div_ceil(wasixv2_syscalls::WASM_PAGE_SIZE);
                 memory.grow(&mut *store, u32::try_from(pages).map_err(|_| bad())?)?;
             }
-            let shared = memory.as_shared(&*store).ok_or_else(bad)?;
+            #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+            let backing = memory
+                .host_memory_access(&*store)
+                .ok()
+                .map(memory::ForeignBacking::Access)
+                .or_else(|| {
+                    memory
+                        .as_shared(&*store)
+                        .map(memory::ForeignBacking::Shared)
+                })
+                .ok_or_else(bad)?;
+            #[cfg(not(all(feature = "sys", not(target_arch = "wasm32"))))]
+            let backing = memory.as_shared(&*store).ok_or_else(bad)?;
             let foreign = memory::ForeignMemory::new(
-                shared,
+                backing,
                 guard,
                 env.read_only.clone(),
                 env.page_access.clone(),

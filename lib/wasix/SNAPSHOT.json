@@ -10,7 +10,10 @@
     "napi": {
       "revision": "bdc247406e9cecd46888ce648a62d51ed2732378",
       "branch": "wasix/parity-unified",
-      "repository": "https://github.com/wasmerio/napi"
+      "repository": "https://github.com/wasmerio/napi",
+      "source_ownership": "in-repository: lib/napi (historical import revision above)",
+      "facade_recovery_delta": "1ac102cde91dec6710865f22037ac44fccc862fd",
+      "provenance": "lib/napi/SOURCE.md"
     },
     "abi": {
       "revision": "c2c28b95e0c403b224f9cf83fa0e6d56a5a2f3a0",

@@ -564,7 +564,7 @@ where
                 data.threads = Some(self.clone());
                 data.proc.set_module(&self.module);
                 data.asyncify = asyncify;
-                data.contexts_supported = !self.abis.requires_owning_thread();
+                // Context imports retain their per-call Store checks on this owning worker.
                 let memory = env.as_ref(&store).memory().unwrap().clone();
                 if let Some(attached) = attached {
                     attached

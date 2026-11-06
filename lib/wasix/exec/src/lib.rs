@@ -55,6 +55,8 @@ pub use instantiation::{
 };
 pub use loader::{Compile, LoadError, Loader};
 pub use memory::GuestMemory;
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+pub use memory::poll_native_host_reservation;
 pub use preempt::InstrumentError;
 pub use preparation::Preparation;
 pub use process::VFORK_RETURN;
@@ -917,7 +919,7 @@ where
 {
     let cleanup = cleanup.into();
     abis.configure_store(&mut store)?;
-    let contexts_supported = !abis.requires_owning_thread();
+    // Hook affinity governs the worker; each context import checks its actual Store custody.
     let invocations = instantiation::NativeInvocations::bind_with_cleanup(
         &mut store,
         abis.requires_owning_thread(),
@@ -1049,11 +1051,19 @@ where
             None => abi.bind(&instance, &mut store.as_store_mut(), task, Role::Process)?,
         };
         let shared = memory.as_shared(&store);
-        if let Some(shared) = &shared {
+        #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+        let foreign = memory
+            .host_memory_access(&store)
+            .ok()
+            .map(memory::ForeignBacking::Access)
+            .or_else(|| shared.clone().map(memory::ForeignBacking::Shared));
+        #[cfg(not(all(feature = "sys", not(target_arch = "wasm32"))))]
+        let foreign = shared.clone();
+        if let Some(foreign) = foreign {
             // Browser C1 posts registration here before attachment; foreign requests
             // may complete through the independent JS copy worker without a readiness ack.
             let foreign = memory::ForeignMemory::new(
-                shared.clone(),
+                foreign,
                 low_guard,
                 read_only.clone(),
                 syscalls.page_access(task),
@@ -1093,7 +1103,6 @@ where
         data.threads = threads;
         data.proc.set_module(module);
         data.asyncify = asyncify;
-        data.contexts_supported = contexts_supported;
         let memory = env.as_ref(&store).memory().unwrap().clone();
         if let Some(attachments) = &attachments {
             attachments
