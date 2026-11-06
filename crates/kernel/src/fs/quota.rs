@@ -40,7 +40,8 @@ impl Kernel {
         let path = self
             .vfs
             .lookup(&env.cx(), &env.fs.cwd, &name, LookupFlags::follow())
-            .await?;
+            .await
+            .map_err(|error| env.error(error))?;
         // quotactl_block -> lookup_bdev: this kernel has no mounted block filesystems.
         if path.dentry.node().file_type() != FileType::BlockDevice {
             return Err(Errno::ENOTBLK.into());

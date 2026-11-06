@@ -1968,7 +1968,8 @@ impl Kernel {
                 let found = self
                     .vfs
                     .lookup(&env.cx(), &start, path, LookupFlags::follow())
-                    .await?;
+                    .await
+                    .map_err(|error| env.error(error))?;
                 self.vfs.permission(&env.cx(), &found, MAY_WRITE).await?;
                 if found.dentry.file_type() != FileType::Socket {
                     return Err(Errno::ECONNREFUSED.into());
@@ -2017,13 +2018,16 @@ impl Kernel {
             .mknod(&env.cx(), &start, path, mode, Default::default())
             .await
         {
-            Err(errno) if errno == Errno::EEXIST => return Err(Errno::EADDRINUSE.into()),
-            result => result?,
+            Err(wasixv2_vfs::PathError::Errno(Errno::EEXIST)) => {
+                return Err(Errno::EADDRINUSE.into());
+            }
+            result => result.map_err(|error| env.error(error))?,
         }
         let found = self
             .vfs
             .lookup(&env.cx(), &start, path, LookupFlags::default())
-            .await?;
+            .await
+            .map_err(|error| env.error(error))?;
         let key = Key::Inode(found.dentry.sb().id, found.dentry.node().ino());
         if let Err(errno) = sock.bind(key, name.addr()) {
             // `unix_bind_bsd`: a socket bound meanwhile leaves no inode behind.

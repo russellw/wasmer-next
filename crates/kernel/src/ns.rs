@@ -527,6 +527,18 @@ pub(crate) struct NsProxy {
 }
 
 impl NsProxy {
+    pub(crate) fn bootstrap_mount(
+        kernel: &Kernel,
+        tree: Arc<wasixv2_vfs::MntNs>,
+    ) -> Result<Arc<Self>, Errno> {
+        let cred = Cred::new(&kernel.credentials, kernel.init_user_ns.clone());
+        let owner = cred.user_ns.clone();
+        let charge = Ucount::charge(&owner, cred.user.effective, NsKind::Mnt)?;
+        let mut proxy = (*kernel.init_ns).clone();
+        proxy.mnt = Ns::new(NsKind::Mnt, owner, Mnt { tree }, &kernel.ns_inums, charge)?;
+        Ok(Arc::new(proxy))
+    }
+
     /// `init_nsproxy`: the initial namespaces, with the mount tree `mnt`, the UTS names
     /// `uname`, the network `network`, and owned by the initial user namespace `user`.
     pub(crate) fn initial(

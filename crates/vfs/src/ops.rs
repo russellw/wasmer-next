@@ -14,12 +14,13 @@ use crate::{
     inode::{DirLock, OpenAccess},
     locks::{Break, LeaseWait, LockKey},
     mount::{Mount, Path},
-    namei::{Last, LookupFlags, Walk, lookup_one},
+    namei::{Last, LookupFlags, Walk, WalkPurpose, lookup_one},
     notify::{FsEvent, Object, Perm},
     posix_acl::{AclKind, InitAcls},
     types::{
-        Attr, Device, FileType, FsResult, MODE_PERM, NewKind, NewNode, OpenOptions, RenameMode,
-        S_ISGID, S_ISUID, S_ISVTX, S_IXGRP, SetAttr, StatFs, TimeSet, XattrSet,
+        Attr, Device, FileType, FsResult, MODE_PERM, NewKind, NewNode, OpenOptions, PathError,
+        PathResult, RenameMode, S_ISGID, S_ISUID, S_ISVTX, S_IXGRP, SetAttr, StatFs, TimeSet,
+        XattrSet,
     },
 };
 
@@ -80,7 +81,7 @@ impl Vfs {
         start: &Path,
         path: &[u8],
         flags: LookupFlags,
-    ) -> FsResult<Path> {
+    ) -> PathResult<Path> {
         if path.is_empty() && flags.empty {
             return Ok(start.clone());
         }
@@ -147,7 +148,7 @@ impl Vfs {
         start: &Path,
         path: &[u8],
         how: &OpenHow,
-    ) -> FsResult<File> {
+    ) -> PathResult<File> {
         let flags = how.flags;
         if flags.contains(OpenFlags::O_PATH) {
             let path = self.lookup(cx, start, path, how.lookup).await?;
@@ -200,23 +201,31 @@ impl Vfs {
                     Last::Normal(name) => name,
                     // A magic link's object exists; `do_open` treats it as found.
                     Last::Bind => break walk.path.clone(),
-                    _ => return Err(Errno::EISDIR),
+                    _ => return Err(Errno::EISDIR.into()),
                 };
                 if walk.flags.directory {
-                    return Err(Errno::EISDIR);
+                    return Err(Errno::EISDIR.into());
                 }
                 // The parent stays locked from the lookup to the create, so O_CREAT|O_EXCL is
                 // atomic whatever the driver does.
-                let lock = walk.path.dentry.inode().lock().await;
+                let locked_parent = walk.path.clone();
+                let lock = locked_parent.dentry.inode().lock().await;
                 // `lookup_open`: the existing object, or a new one.
                 let found = loop {
+                    walk.path = locked_parent.clone();
                     if let Some(found) = walk.child_opt_locked(&name).await? {
                         if excl {
-                            return Err(Errno::EEXIST);
+                            return Err(Errno::EEXIST.into());
                         }
                         break found;
                     }
-                    let dir = walk.path.clone();
+                    let dir = walk.creation_parent()?;
+                    let _creation_lock = if locked_parent != dir {
+                        Some(dir.dentry.inode().lock().await)
+                    } else {
+                        None
+                    };
+                    dir.dentry.node().namespace_mutation()?;
                     let mode = how.mode & MODE_PERM;
                     let (attrs, acls) = self
                         .new_node_attrs(cx, &dir, mode, FileType::Regular)
@@ -238,7 +247,7 @@ impl Vfs {
                         // Created behind the VFS (on the host side of a host directory); open
                         // what is there now.
                         Err(Errno::EEXIST) if !excl => {}
-                        Err(errno) => return Err(errno),
+                        Err(errno) => return Err(errno.into()),
                     }
                 };
                 if created.is_some() {
@@ -256,20 +265,20 @@ impl Vfs {
         // `do_open`.
         let file_type = target.dentry.file_type();
         if creating && file_type == FileType::Directory {
-            return Err(Errno::EISDIR);
+            return Err(Errno::EISDIR.into());
         }
         if let Some(dir) = found_in.filter(|_| created.is_none()) {
             self.may_create_in_sticky(cx, &dir, &target).await?;
         }
         if walk.flags.directory && file_type != FileType::Directory {
-            return Err(Errno::ENOTDIR);
+            return Err(Errno::ENOTDIR.into());
         }
         let mut truncate = false;
         if created.is_some() {
             acc_mode = 0;
         } else if file_type == FileType::Regular && flags.contains(OpenFlags::O_TRUNC) {
             if target.mnt.is_read_only() {
-                return Err(Errno::EROFS);
+                return Err(Errno::EROFS.into());
             }
             truncate = true;
         }
@@ -282,7 +291,9 @@ impl Vfs {
             truncate,
             nonotify: false,
         };
-        self.finish_open(cx, target, mode, created).await
+        self.finish_open(cx, target, mode, created)
+            .await
+            .map_err(Into::into)
     }
 
     /// Opens `target` for the caller, or takes the handle its creation returned, and builds the
@@ -520,7 +531,7 @@ impl Vfs {
         start: &Path,
         path: &[u8],
         how: &OpenHow,
-    ) -> FsResult<File> {
+    ) -> PathResult<File> {
         let lookup = LookupFlags {
             directory: true,
             ..how.lookup
@@ -732,24 +743,38 @@ impl Vfs {
         start: &Path,
         path: &[u8],
         want_dir: bool,
-    ) -> FsResult<(Path, Vec<u8>, DirLock)> {
-        let mut walk = Walk::new(self, cx, start, path, LookupFlags::default())?;
+    ) -> PathResult<(Path, Vec<u8>, DirLock)> {
+        let mut walk = Walk::with_purpose(
+            self,
+            cx,
+            start,
+            path,
+            LookupFlags::default(),
+            WalkPurpose::Parent,
+        )?;
         let last = walk.walk_parent().await?;
         let Last::Normal(name) = last else {
-            return Err(Errno::EEXIST);
+            return Err(Errno::EEXIST.into());
         };
+        walk.path.dentry.node().namespace_mutation()?;
         let trailing_slash = walk.flags.directory;
         let lock = walk.path.dentry.inode().lock().await;
         if walk.child_opt_locked(&name).await?.is_some() {
-            return Err(Errno::EEXIST);
+            return Err(Errno::EEXIST.into());
         }
         if trailing_slash && !want_dir {
-            return Err(Errno::ENOENT);
+            return Err(Errno::ENOENT.into());
         }
         Ok((walk.path, name, lock))
     }
 
-    pub async fn mkdir(&self, cx: &Ctx<'_>, start: &Path, path: &[u8], mode: u32) -> FsResult<()> {
+    pub async fn mkdir(
+        &self,
+        cx: &Ctx<'_>,
+        start: &Path,
+        path: &[u8],
+        mode: u32,
+    ) -> PathResult<()> {
         let (dir, name, _lock) = self.prepare_create(cx, start, path, true).await?;
         let mode = mode & (0o777 | S_ISVTX);
         let (attrs, acls) = self
@@ -760,7 +785,7 @@ impl Vfs {
             ..attrs
         };
         let dentry = self.create(cx, &dir, &name, &new).await?;
-        self.init_acls(&dentry, acls).await
+        self.init_acls(&dentry, acls).await.map_err(Into::into)
     }
 
     /// `mknodat`; `mode` includes the type bits.
@@ -771,7 +796,7 @@ impl Vfs {
         path: &[u8],
         mode: u32,
         dev: Device,
-    ) -> FsResult<()> {
+    ) -> PathResult<()> {
         let kind = match FileType::from_mode(mode) {
             _ if mode & 0o170000 == 0 => NewKind::Regular,
             Some(FileType::Regular) => NewKind::Regular,
@@ -779,8 +804,8 @@ impl Vfs {
             Some(FileType::BlockDevice) => NewKind::BlockDevice(dev),
             Some(FileType::Fifo) => NewKind::Fifo,
             Some(FileType::Socket) => NewKind::Socket,
-            Some(FileType::Directory) => return Err(Errno::EPERM),
-            _ => return Err(Errno::EINVAL),
+            Some(FileType::Directory) => return Err(Errno::EPERM.into()),
+            _ => return Err(Errno::EINVAL.into()),
         };
         let (dir, name, _lock) = self.prepare_create(cx, start, path, false).await?;
         let (attrs, acls) = self
@@ -788,7 +813,7 @@ impl Vfs {
             .await?;
         let new = NewNode { kind, ..attrs };
         let dentry = self.create(cx, &dir, &name, &new).await?;
-        self.init_acls(&dentry, acls).await
+        self.init_acls(&dentry, acls).await.map_err(Into::into)
     }
 
     pub async fn symlink(
@@ -797,9 +822,9 @@ impl Vfs {
         target: &[u8],
         start: &Path,
         path: &[u8],
-    ) -> FsResult<()> {
+    ) -> PathResult<()> {
         if target.is_empty() {
-            return Err(Errno::ENOENT);
+            return Err(Errno::ENOENT.into());
         }
         let (dir, name, _lock) = self.prepare_create(cx, start, path, false).await?;
         let (attrs, _) = self
@@ -811,7 +836,10 @@ impl Vfs {
         };
         // Symlinks are always 0777; the umask does not apply.
         let new = NewNode { mode: 0o777, ..new };
-        self.create(cx, &dir, &name, &new).await.map(drop)
+        self.create(cx, &dir, &name, &new)
+            .await
+            .map(drop)
+            .map_err(Into::into)
     }
 
     /// `linkat`: `old` is resolved with `old_flags`.
@@ -823,14 +851,14 @@ impl Vfs {
         old_flags: LookupFlags,
         new_start: &Path,
         new: &[u8],
-    ) -> FsResult<()> {
+    ) -> PathResult<()> {
         let source = self.lookup(cx, old_start, old, old_flags).await?;
         let (dir, name, _lock) = self.prepare_create(cx, new_start, new, false).await?;
         if !Arc::ptr_eq(&source.mnt, &dir.mnt) {
-            return Err(Errno::EXDEV);
+            return Err(Errno::EXDEV.into());
         }
         if dir.mnt.is_read_only() {
-            return Err(Errno::EROFS);
+            return Err(Errno::EROFS.into());
         }
         if let Some(security) = cx.security() {
             security.path_link(&source, &dir)?;
@@ -840,15 +868,15 @@ impl Vfs {
         let attr = source.dentry.node().getattr().await?;
         // A link to an append-only or immutable file cannot be made.
         if append_only(&source.dentry) || immutable(&source.dentry) {
-            return Err(Errno::EPERM);
+            return Err(Errno::EPERM.into());
         }
         if source.dentry.file_type() == FileType::Directory {
-            return Err(Errno::EPERM);
+            return Err(Errno::EPERM.into());
         }
         // A removed file cannot get a name back, except an O_TMPFILE one (`I_LINKABLE`).
         let inode = source.dentry.inode();
         if attr.nlink == 0 && !inode.is_linkable() {
-            return Err(Errno::ENOENT);
+            return Err(Errno::ENOENT.into());
         }
         dir.dentry.node().link(&name, source.dentry.node()).await?;
         inode.set_linkable(false);
@@ -940,19 +968,27 @@ impl Vfs {
         cx: &Ctx<'_>,
         start: &Path,
         path: &[u8],
-    ) -> FsResult<(Path, Last, bool)> {
-        let mut walk = Walk::new(self, cx, start, path, LookupFlags::default())?;
+    ) -> PathResult<(Path, Last, bool)> {
+        let mut walk = Walk::with_purpose(
+            self,
+            cx,
+            start,
+            path,
+            LookupFlags::default(),
+            WalkPurpose::Parent,
+        )?;
         let last = walk.walk_parent().await?;
         Ok((walk.path.clone(), last, walk.flags.directory))
     }
 
-    pub async fn unlink(&self, cx: &Ctx<'_>, start: &Path, path: &[u8]) -> FsResult<()> {
+    pub async fn unlink(&self, cx: &Ctx<'_>, start: &Path, path: &[u8]) -> PathResult<()> {
         let (dir, last, trailing_slash) = self.parent_of(cx, start, path).await?;
+        dir.dentry.node().namespace_mutation()?;
         let Last::Normal(name) = last else {
-            return Err(Errno::EISDIR);
+            return Err(Errno::EISDIR.into());
         };
         if dir.mnt.is_read_only() {
-            return Err(Errno::EROFS);
+            return Err(Errno::EROFS.into());
         }
         let _lock = dir.dentry.inode().lock().await;
         let victim = lookup_one(&dir, &name).await?;
@@ -961,14 +997,15 @@ impl Vfs {
                 Errno::EISDIR
             } else {
                 Errno::ENOTDIR
-            });
+            }
+            .into());
         }
         if let Some(security) = cx.security() {
             security.path_remove(&dir, &victim.dentry)?;
         }
         self.may_delete(cx, &dir, &victim, false).await?;
         if self.is_local_mountpoint(&victim) {
-            return Err(Errno::EBUSY);
+            return Err(Errno::EBUSY.into());
         }
         dir.dentry.node().unlink(&name).await?;
         victim.dentry.detach();
@@ -989,16 +1026,17 @@ impl Vfs {
         Ok(())
     }
 
-    pub async fn rmdir(&self, cx: &Ctx<'_>, start: &Path, path: &[u8]) -> FsResult<()> {
+    pub async fn rmdir(&self, cx: &Ctx<'_>, start: &Path, path: &[u8]) -> PathResult<()> {
         let (dir, last, _) = self.parent_of(cx, start, path).await?;
+        dir.dentry.node().namespace_mutation()?;
         let name = match last {
             Last::Normal(name) => name,
-            Last::DotDot => return Err(Errno::ENOTEMPTY),
-            Last::Dot => return Err(Errno::EINVAL),
-            Last::Root | Last::Bind => return Err(Errno::EBUSY),
+            Last::DotDot => return Err(Errno::ENOTEMPTY.into()),
+            Last::Dot => return Err(Errno::EINVAL.into()),
+            Last::Root | Last::Bind => return Err(Errno::EBUSY.into()),
         };
         if dir.mnt.is_read_only() {
-            return Err(Errno::EROFS);
+            return Err(Errno::EROFS.into());
         }
         let _lock = dir.dentry.inode().lock().await;
         let victim = lookup_one(&dir, &name).await?;
@@ -1008,7 +1046,7 @@ impl Vfs {
         }
         self.may_delete(cx, &dir, &victim, true).await?;
         if self.is_local_mountpoint(&victim) {
-            return Err(Errno::EBUSY);
+            return Err(Errno::EBUSY.into());
         }
         dir.dentry.node().rmdir(&name).await?;
         victim.dentry.inode().set_dead();
@@ -1033,27 +1071,30 @@ impl Vfs {
         new_start: &Path,
         new: &[u8],
         mode: RenameMode,
-    ) -> FsResult<()> {
+    ) -> PathResult<()> {
         if mode == RenameMode::Whiteout && !cx.cred.capable_init(Cap::Mknod) {
-            return Err(Errno::EPERM);
+            return Err(Errno::EPERM.into());
         }
         let (old_dir, old_last, old_slash) = self.parent_of(cx, old_start, old).await?;
         let (new_dir, new_last, new_slash) = self.parent_of(cx, new_start, new).await?;
+        old_dir.dentry.node().namespace_mutation()?;
+        new_dir.dentry.node().namespace_mutation()?;
         if !Arc::ptr_eq(&old_dir.mnt, &new_dir.mnt) {
-            return Err(Errno::EXDEV);
+            return Err(Errno::EXDEV.into());
         }
         let Last::Normal(old_name) = old_last else {
-            return Err(Errno::EBUSY);
+            return Err(Errno::EBUSY.into());
         };
         let Last::Normal(new_name) = new_last else {
             return Err(if mode == RenameMode::NoReplace {
                 Errno::EEXIST
             } else {
                 Errno::EBUSY
-            });
+            }
+            .into());
         };
         if old_dir.mnt.is_read_only() {
-            return Err(Errno::EROFS);
+            return Err(Errno::EROFS.into());
         }
         let sb = old_dir.dentry.sb().clone();
         let cross_dir = !Arc::ptr_eq(old_dir.dentry.inode(), new_dir.dentry.inode());
@@ -1069,16 +1110,16 @@ impl Vfs {
         let target = match lookup_one(&new_dir, &new_name).await {
             Ok(target) if mode == RenameMode::NoReplace => {
                 drop(target);
-                return Err(Errno::EEXIST);
+                return Err(Errno::EEXIST.into());
             }
             Ok(target) => Some(target),
-            Err(Errno::ENOENT) if mode != RenameMode::Exchange => None,
-            Err(errno) => return Err(errno),
+            Err(PathError::Errno(Errno::ENOENT)) if mode != RenameMode::Exchange => None,
+            Err(errno) => return Err(errno.into()),
         };
         if cross_dir {
             // `lock_rename`'s trap: the child of one parent that is an ancestor of the other.
             if source.dentry.is_ancestor_of(&new_dir.dentry) {
-                return Err(Errno::EINVAL);
+                return Err(Errno::EINVAL.into());
             }
             if let Some(target) = &target
                 && target.dentry.is_ancestor_of(&old_dir.dentry)
@@ -1087,7 +1128,8 @@ impl Vfs {
                     Errno::EINVAL
                 } else {
                     Errno::ENOTEMPTY
-                });
+                }
+                .into());
             }
         }
         if mode == RenameMode::Exchange
@@ -1095,10 +1137,10 @@ impl Vfs {
             && !target.dentry.is_dir()
             && new_slash
         {
-            return Err(Errno::ENOTDIR);
+            return Err(Errno::ENOTDIR.into());
         }
         if !source.dentry.is_dir() && (old_slash || (mode != RenameMode::Exchange && new_slash)) {
-            return Err(Errno::ENOTDIR);
+            return Err(Errno::ENOTDIR.into());
         }
 
         if let Some(security) = cx.security() {
@@ -1141,7 +1183,7 @@ impl Vfs {
         if self.is_local_mountpoint(&source)
             || target.as_ref().is_some_and(|t| self.is_local_mountpoint(t))
         {
-            return Err(Errno::EBUSY);
+            return Err(Errno::EBUSY.into());
         }
         // A directory being replaced is locked like rmdir's victim, so nothing is created in it.
         let replaced_dir = match &target {
@@ -1191,14 +1233,14 @@ impl Vfs {
         start: &Path,
         path: &[u8],
         empty: bool,
-    ) -> FsResult<Vec<u8>> {
+    ) -> PathResult<Vec<u8>> {
         let flags = LookupFlags {
             empty,
             ..LookupFlags::nofollow()
         };
         let link = self.lookup(cx, start, path, flags).await?;
         if link.dentry.file_type() != FileType::Symlink {
-            return Err(Errno::EINVAL);
+            return Err(Errno::EINVAL.into());
         }
         // A magic link reads as where its object is (`proc_pid_readlink`).
         Ok(match link.dentry.node().get_link(cx).await? {
@@ -1626,15 +1668,15 @@ impl Vfs {
     }
 
     /// Creates each missing directory along `path`, as `mkdir -p` (for the embedder).
-    pub async fn mkdir_all(&self, cx: &Ctx<'_>, path: &[u8]) -> FsResult<()> {
+    pub async fn mkdir_all(&self, cx: &Ctx<'_>, path: &[u8]) -> PathResult<()> {
         let root = cx.root.clone();
         let mut prefix = Vec::new();
         for comp in path.split(|&b| b == b'/').filter(|c| !c.is_empty()) {
             prefix.push(b'/');
             prefix.extend_from_slice(comp);
             match self.mkdir(cx, &root, &prefix, 0o755).await {
-                Ok(()) | Err(Errno::EEXIST) => {}
-                Err(errno) => return Err(errno),
+                Ok(()) | Err(PathError::Errno(Errno::EEXIST)) => {}
+                Err(errno) => return Err(errno.into()),
             }
         }
         Ok(())

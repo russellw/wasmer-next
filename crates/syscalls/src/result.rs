@@ -6,6 +6,10 @@ use crate::memory::Fault;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SysErr {
     Errno(Errno),
+    /// Lookup reached a namespace root without a matching directory capability.
+    NamespaceBoundary,
+    /// A structural change to the namespace's own bindings was refused.
+    NamespaceMutation,
     /// Guest execution unwound. Its original engine error belongs to the import that
     /// supplied the borrowed capability; this marker must never become an errno or restart.
     GuestUnwind,

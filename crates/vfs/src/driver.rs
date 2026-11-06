@@ -130,6 +130,13 @@ pub enum Link {
     Jump(Path),
 }
 
+/// A synthetic namespace root's binding decision for one parsed component.
+pub enum NamespaceComponent {
+    Ordinary,
+    Boundary,
+    Fallback(Arc<crate::Dentry>),
+}
+
 /// A filesystem object (Linux's `inode` plus its `inode_operations`).
 ///
 /// Directory methods default to `ENOTDIR` and are only called on directories; names are single
@@ -142,6 +149,18 @@ pub enum Link {
 /// changed. Explicit changes come through `setattr`.
 #[async_trait(?Send)]
 pub trait Node: Send + Sync + Any {
+    fn namespace_component(&self, _name: &[u8]) -> NamespaceComponent {
+        NamespaceComponent::Ordinary
+    }
+
+    fn namespace_root_fallback(&self) -> Option<Arc<crate::Dentry>> {
+        None
+    }
+
+    fn namespace_mutation(&self) -> crate::PathResult<()> {
+        Ok(())
+    }
+
     /// The inode number: stable for the object's lifetime and unique within the filesystem, and
     /// the object's identity. The VFS keeps one inode per number (its lock, its file locks, its
     /// directory entry), so two `Node`s with one number must be the same object, and a number

@@ -124,6 +124,10 @@ impl File {
             .await
     }
 
+    pub(crate) fn belongs_to(&self, vfs: &Arc<Vfs>) -> bool {
+        Arc::ptr_eq(&self.vfs, vfs)
+    }
+
     pub fn limits_file_size(&self) -> bool {
         self.file_type() == FileType::Regular && self.path.dentry.sb().fs.limits_file_size()
     }

@@ -1056,6 +1056,8 @@ fn event_result<T: Into<i64>>(result: SysResult<T>) -> i64 {
     match result {
         Ok(n) => n.into(),
         Err(SysErr::Errno(errno)) => -i64::from(errno.0),
+        Err(SysErr::NamespaceBoundary) => -i64::from(Errno::ENOENT.0),
+        Err(SysErr::NamespaceMutation) => -i64::from(Errno::EACCES.0),
         Err(_) => -i64::from(Errno::EINTR.0),
     }
 }

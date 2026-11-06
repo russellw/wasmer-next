@@ -226,7 +226,12 @@ impl Vfs {
     }
 
     /// `graft_tree`: attaches the new tree at `mount` on `at`.
-    fn graft_tree(&self, state: &mut TreeState, mount: &Arc<Mount>, at: &Path) -> FsResult<()> {
+    pub(crate) fn graft_tree(
+        &self,
+        state: &mut TreeState,
+        mount: &Arc<Mount>,
+        at: &Path,
+    ) -> FsResult<()> {
         if at.dentry.is_dir() != mount.root.is_dir() {
             return Err(Errno::ENOTDIR);
         }
@@ -306,7 +311,7 @@ impl Vfs {
     /// `recursive`), attached nowhere. The source must be bindable, and a mount of the caller's
     /// namespace or of a detached tree it may use, not an object without a name, or an object of
     /// a filesystem whose objects bind (`may_copy_tree`).
-    fn copy_for_loopback(
+    pub(crate) fn copy_for_loopback(
         &self,
         state: &mut TreeState,
         ns: &MntNs,

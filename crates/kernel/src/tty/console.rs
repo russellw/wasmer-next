@@ -292,7 +292,11 @@ impl Kernel {
         let mut prepared: [Option<Arc<OpenFile>>; 3] = [None, None, None];
         let mut unattached = None;
         for (descriptors, output) in routes {
-            let file = self.vfs.open(&env.cx(), &env.fs.root, &node, &how).await?;
+            let file = self
+                .vfs
+                .open(&env.cx(), &env.fs.root, &node, &how)
+                .await
+                .map_err(|error| error.errno())?;
             let mut backing = self
                 .attach(&caller, file, OpenFlags::O_RDWR)
                 .await
@@ -320,6 +324,7 @@ impl Kernel {
                 prepared[fd] = Some(file.clone());
             }
         }
+
         let pid = self.process(task).pid;
         let replaced: Vec<_> = {
             let files = self.files(task);

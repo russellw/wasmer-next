@@ -491,7 +491,8 @@ impl Kernel {
         let file = self
             .vfs
             .open(&env.cx(), &dir, name.as_bytes(), &how)
-            .await?;
+            .await
+            .map_err(|error| env.error(error))?;
         let theirs = self.ptys.slave(&**file.node());
         if !theirs.is_some_and(|slave| {
             pty.side(Side::Slave)

@@ -4,6 +4,53 @@ use wasixv2_abi::{Errno, FileMode};
 
 pub type FsResult<T> = Result<T, Errno>;
 
+/// A pathname failure whose namespace provenance must survive ABI translation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PathError {
+    Errno(Errno),
+    NamespaceBoundary,
+    NamespaceMutation,
+}
+
+impl From<Errno> for PathError {
+    fn from(errno: Errno) -> Self {
+        Self::Errno(errno)
+    }
+}
+
+impl PathError {
+    /// Deliberate projection for an errno-only configuration or Linux boundary.
+    pub fn errno(self) -> Errno {
+        match self {
+            Self::Errno(errno) => errno,
+            Self::NamespaceBoundary => Errno::ENOENT,
+            Self::NamespaceMutation => Errno::EACCES,
+        }
+    }
+}
+
+impl PartialEq<Errno> for PathError {
+    fn eq(&self, errno: &Errno) -> bool {
+        matches!(self, Self::Errno(actual) if actual == errno)
+    }
+}
+
+impl std::fmt::Display for PathError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Errno(errno) => write!(f, "filesystem error {}", errno.0),
+            Self::NamespaceBoundary => {
+                f.write_str("namespace lookup is outside granted directories")
+            }
+            Self::NamespaceMutation => f.write_str("namespace bindings cannot be changed"),
+        }
+    }
+}
+
+impl std::error::Error for PathError {}
+
+pub type PathResult<T> = Result<T, PathError>;
+
 /// The type of a filesystem object, fixed when it is created.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FileType {

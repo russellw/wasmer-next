@@ -5,6 +5,7 @@
 //! observe about paths and permissions is decided here, following Linux's `fs/` code; the kernel
 //! decodes syscall arguments and calls [`Vfs`].
 
+mod bootstrap;
 mod cred;
 mod dentry;
 mod driver;
@@ -31,12 +32,16 @@ use std::sync::{
     atomic::{AtomicU32, Ordering},
 };
 
+pub use bootstrap::{BootstrapNamespace, NamespaceDirectory};
 pub use cred::{
     Cap, Cred, InitialUserNs, MAY_EXEC, MAY_READ, MAY_WRITE, Protection, UserNs,
     generic_permission, generic_permission_acl, initial_user_ns, same_user_ns,
 };
 pub use dentry::Dentry;
-pub use driver::{AppendOutcome, Filesystem, Handle, Link, MAX_DIR_COOKIE, Node, SharedContents};
+pub use driver::{
+    AppendOutcome, Filesystem, Handle, Link, MAX_DIR_COOKIE, NamespaceComponent, Node,
+    SharedContents,
+};
 pub use export::{HandleKind, MAX_HANDLE_SZ};
 pub use file::{DIR_POS_EOD, File, FileWriteGuard};
 pub use fileattr::{
@@ -228,7 +233,10 @@ impl Vfs {
             task: 0,
             leases: None,
         };
-        let source = self.lookup(&cx, &root, from, LookupFlags::follow()).await?;
+        let source = self
+            .lookup(&cx, &root, from, LookupFlags::follow())
+            .await
+            .map_err(PathError::errno)?;
         let target = self.embedder_target(at, create).await?;
         let bind = MountOp::Bind {
             source,
@@ -252,9 +260,11 @@ impl Vfs {
             leases: None,
         };
         if create {
-            self.mkdir_all(&cx, at).await?;
+            self.mkdir_all(&cx, at).await.map_err(PathError::errno)?;
         }
-        self.lookup(&cx, &root, at, LookupFlags::follow()).await
+        self.lookup(&cx, &root, at, LookupFlags::follow())
+            .await
+            .map_err(PathError::errno)
     }
 
     /// Detaches the topmost mount on `at` (resolved with full privileges), whoever uses it.

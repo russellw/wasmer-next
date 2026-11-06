@@ -2,6 +2,7 @@
 //! decides every path and permission question.
 
 mod attr;
+pub(crate) mod bootstrap;
 pub(crate) mod dnotify;
 pub(crate) mod fanotify;
 mod fhandle;
@@ -19,6 +20,15 @@ mod statmount;
 
 pub(crate) use fifo::FifoFile;
 pub(crate) use io::{At, read_iovecs};
+
+pub(crate) fn path_error(error: wasixv2_vfs::PathError) -> wasixv2_syscalls::SysErr {
+    use wasixv2_vfs::PathError;
+    match error {
+        PathError::Errno(errno) => errno.into(),
+        PathError::NamespaceBoundary => wasixv2_syscalls::SysErr::NamespaceBoundary,
+        PathError::NamespaceMutation => wasixv2_syscalls::SysErr::NamespaceMutation,
+    }
+}
 
 use std::{
     cell::Cell,
@@ -42,7 +52,8 @@ use wasixv2_syscalls::{
     Caller, CstrError, Errno, Fd, SysErr, SysResult, TaskId, UserMemory, read_cstr, read_value,
 };
 use wasixv2_vfs::{
-    Clock, Cred, Ctx, FsResult, LeaseWait, LookupFlags, MODE_PERM, PATH_MAX, Path, Timestamp,
+    Clock, Cred, Ctx, FsResult, LeaseWait, LookupFlags, MODE_PERM, PATH_MAX, Path, PathError,
+    Timestamp,
 };
 use wasixv2_wait::{Interrupted, interruptible};
 
@@ -256,10 +267,14 @@ impl Env {
 
     /// The error of a VFS call made with [`Env::cx`]: a restart when a signal ended its wait
     /// for leases.
-    pub(crate) fn error(&self, errno: Errno) -> SysErr {
+    pub(crate) fn error(&self, error: impl Into<PathError>) -> SysErr {
+        let error = error.into();
+        if !matches!(error, PathError::Errno(_)) {
+            return path_error(error);
+        }
         match self.leases.interrupted.get() {
             true => SysErr::Restart,
-            false => errno.into(),
+            false => path_error(error),
         }
     }
 }
@@ -328,10 +343,10 @@ impl Kernel {
         path: &[u8],
         flags: AtFlags,
         follow_default: bool,
-    ) -> Result<Path, Errno> {
+    ) -> SysResult<Path> {
         let empty = flags.contains(AtFlags::AT_EMPTY_PATH);
         if path.is_empty() && empty {
-            return self.start_or_fd(caller, env, dfd);
+            return self.start_or_fd(caller, env, dfd).map_err(Into::into);
         }
         let start = self.start(caller, env, dfd, path)?;
         let lookup = LookupFlags {
@@ -339,7 +354,10 @@ impl Kernel {
             empty,
             ..LookupFlags::default()
         };
-        self.vfs.lookup(&env.cx(), &start, path, lookup).await
+        self.vfs
+            .lookup(&env.cx(), &start, path, lookup)
+            .await
+            .map_err(|error| env.error(error))
     }
 
     /// `dfd` itself, for an empty path or a walk rooted there: the working directory for
@@ -365,7 +383,8 @@ impl Kernel {
         let dir = self
             .vfs
             .lookup(&env.cx(), &env.fs.cwd, path, lookup)
-            .await?;
+            .await
+            .map_err(|error| error.errno())?;
         self.vfs
             .permission(&env.cx(), &dir, wasixv2_vfs::MAY_EXEC | 0x40)
             .await?;

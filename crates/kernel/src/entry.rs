@@ -233,6 +233,8 @@ impl Kernel {
         let raw = match &ret {
             Ok(ret) => ret.to_raw(),
             Err(SysErr::Errno(errno)) => -i64::from(errno.0),
+            Err(SysErr::NamespaceBoundary) => -i64::from(Errno::ENOENT.0),
+            Err(SysErr::NamespaceMutation) => -i64::from(Errno::EACCES.0),
             // The `-ERESTART*` codes a tracer sees for an interrupted call.
             Err(SysErr::Restart) => -512,
             Err(SysErr::RestartNoIntr) => -513,

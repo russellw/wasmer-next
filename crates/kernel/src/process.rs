@@ -1814,6 +1814,8 @@ impl Kernel {
             .await
             .map_err(|err| match err {
                 SysErr::Errno(errno) => errno,
+                SysErr::NamespaceBoundary => Errno::ENOENT,
+                SysErr::NamespaceMutation => Errno::EACCES,
                 // Nothing waits here for a signal to interrupt.
                 _ => Errno::EINTR,
             })?;

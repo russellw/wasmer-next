@@ -190,9 +190,14 @@ async fn create_tty_node(
     };
     let dir = vfs
         .lookup(&cx, &root, at, wasixv2_vfs::LookupFlags::follow())
-        .await?;
+        .await
+        .map_err(|error| error.errno())?;
     let mode = FileType::CharDevice.mode_bits() | TTY_MODE;
-    match vfs.mknod(&cx, &dir, name.as_bytes(), mode, device).await {
+    match vfs
+        .mknod(&cx, &dir, name.as_bytes(), mode, device)
+        .await
+        .map_err(|error| error.errno())
+    {
         Ok(()) | Err(Errno::EEXIST) => {}
         Err(errno) => return Err(errno),
     }
@@ -203,7 +208,8 @@ async fn create_tty_node(
             name.as_bytes(),
             wasixv2_vfs::LookupFlags::default(),
         )
-        .await?;
+        .await
+        .map_err(|error| error.errno())?;
     vfs.chown(&cx, &node, Some(owner.0), Some(owner.1)).await
 }
 
@@ -219,10 +225,15 @@ async fn create_nodes(vfs: &Vfs, at: &[u8]) -> FsResult<()> {
     };
     let dir = vfs
         .lookup(&cx, &root, at, wasixv2_vfs::LookupFlags::follow())
-        .await?;
+        .await
+        .map_err(|error| error.errno())?;
     for (name, device, mode) in NODES {
         let mode = FileType::CharDevice.mode_bits() | mode;
-        match vfs.mknod(&cx, &dir, name.as_bytes(), mode, device).await {
+        match vfs
+            .mknod(&cx, &dir, name.as_bytes(), mode, device)
+            .await
+            .map_err(|error| error.errno())
+        {
             Ok(()) | Err(Errno::EEXIST) => {}
             Err(errno) => return Err(errno),
         }

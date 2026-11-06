@@ -523,7 +523,11 @@ impl Kernel {
                 ..LookupFlags::default()
             },
         };
-        let file = self.vfs.open(&env.cx(), path, b"", &how).await?;
+        let file = self
+            .vfs
+            .open(&env.cx(), path, b"", &how)
+            .await
+            .map_err(|error| env.error(error))?;
         Ok(OpenFile::new(Backing::Inode(file), OpenFlags::O_PATH))
     }
 }

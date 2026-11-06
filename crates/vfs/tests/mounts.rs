@@ -72,6 +72,7 @@ impl View {
             path.as_bytes(),
             LookupFlags::follow(),
         ))
+        .map_err(wasixv2_vfs::PathError::errno)
     }
 
     fn mkdir(&self, path: &str) {
@@ -79,6 +80,7 @@ impl View {
             self.vfs
                 .mkdir(&self.cx(), &self.root, path.as_bytes(), 0o755),
         )
+        .map_err(wasixv2_vfs::PathError::errno)
         .unwrap();
     }
 
@@ -88,7 +90,9 @@ impl View {
             mode: 0o644,
             lookup: LookupFlags::follow(),
         };
-        block_on(self.vfs.open(&self.cx(), &self.root, path.as_bytes(), &how)).unwrap()
+        block_on(self.vfs.open(&self.cx(), &self.root, path.as_bytes(), &how))
+            .map_err(wasixv2_vfs::PathError::errno)
+            .unwrap()
     }
 
     fn exists(&self, path: &str) -> bool {
@@ -202,7 +206,9 @@ fn umount_is_busy_while_used_or_covered_unless_detached() {
     assert_eq!(v.mount_count(), 1);
     // What was held still works, detached: `..` stays at its root.
     let cx = v.cx();
-    let up = block_on(v.vfs.lookup(&cx, &held, b"..", LookupFlags::follow())).unwrap();
+    let up = block_on(v.vfs.lookup(&cx, &held, b"..", LookupFlags::follow()))
+        .map_err(wasixv2_vfs::PathError::errno)
+        .unwrap();
     assert_eq!(up, held);
 }
 
@@ -476,14 +482,16 @@ fn removing_a_mountpoint_in_one_namespace_is_busy_there_and_detaches_elsewhere()
     w.mount_tmpfs("/d");
     let cx = v.cx();
     // Not a mountpoint in v's namespace: the directory goes, and w's mount with it.
-    block_on(v.vfs.rmdir(&cx, &v.root, b"/d")).unwrap();
+    block_on(v.vfs.rmdir(&cx, &v.root, b"/d"))
+        .map_err(wasixv2_vfs::PathError::errno)
+        .unwrap();
     assert_eq!(w.mount_count(), 1);
 
     v.mkdir("/e");
     v.mount_tmpfs("/e");
     let cx = v.cx();
     assert_eq!(
-        block_on(v.vfs.rmdir(&cx, &v.root, b"/e")),
+        block_on(v.vfs.rmdir(&cx, &v.root, b"/e")).map_err(wasixv2_vfs::PathError::errno),
         Err(Errno::EBUSY)
     );
 }
@@ -598,6 +606,7 @@ impl View {
             self.vfs
                 .lookup(&cx, &file.path, name.as_bytes(), LookupFlags::follow()),
         )
+        .map_err(wasixv2_vfs::PathError::errno)
     }
 }
 
@@ -765,7 +774,8 @@ fn files_open_for_writing_keep_their_mount_and_filesystem_writable() {
         lookup: LookupFlags::follow(),
     };
     let cx = v.cx();
-    let opened = block_on(v.vfs.open(&cx, &v.root, b"/b/f", &how));
+    let opened =
+        block_on(v.vfs.open(&cx, &v.root, b"/b/f", &how)).map_err(wasixv2_vfs::PathError::errno);
     assert_eq!(opened.err(), Some(Errno::EROFS));
 }
 

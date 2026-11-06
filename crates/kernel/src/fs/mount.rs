@@ -466,7 +466,8 @@ impl Kernel {
         let target = self
             .vfs
             .lookup(&env.cx(), &env.fs.cwd, &dir, LookupFlags::follow())
-            .await?;
+            .await
+            .map_err(|error| env.error(error))?;
         let request = MountRequest {
             dev_name,
             fstype,
@@ -484,7 +485,7 @@ impl Kernel {
         env: &Env,
         target: &Path,
         request: MountRequest,
-    ) -> Result<(), Errno> {
+    ) -> SysResult<()> {
         let MountRequest {
             dev_name,
             fstype,
@@ -495,7 +496,7 @@ impl Kernel {
             flags &= !MsFlags::MS_MGC_MSK.0;
         }
         if flags & MsFlags::MS_NOUSER.0 != 0 {
-            return Err(Errno::EINVAL);
+            return Err(Errno::EINVAL.into());
         }
         self.may_mount(env)?;
         let ns = self.ns(caller).mnt.tree.clone();
@@ -505,17 +506,21 @@ impl Kernel {
             let flags = mount_flags(flags, Some(target));
             return self
                 .vfs
-                .do_mount(&ns, target, MountOp::Reconfigure { flags });
+                .do_mount(&ns, target, MountOp::Reconfigure { flags })
+                .map_err(Into::into);
         }
         if has(MsFlags::MS_REMOUNT) {
-            return self.remount(env, &ns, target, flags, &data);
+            return self
+                .remount(env, &ns, target, flags, &data)
+                .map_err(Into::into);
         }
         if has(MsFlags::MS_BIND) {
             let source = self.old_path(env, dev_name).await?;
             let recursive = has(MsFlags::MS_REC);
             return self
                 .vfs
-                .do_mount(&ns, target, MountOp::Bind { source, recursive });
+                .do_mount(&ns, target, MountOp::Bind { source, recursive })
+                .map_err(Into::into);
         }
         let propagation = MsFlags::MS_SHARED.0
             | MsFlags::MS_PRIVATE.0
@@ -525,23 +530,28 @@ impl Kernel {
             let kind = propagation_type(flags).ok_or(Errno::EINVAL)?;
             let recursive = has(MsFlags::MS_REC);
             let op = MountOp::Propagation { kind, recursive };
-            return self.vfs.do_mount(&ns, target, op);
+            return self.vfs.do_mount(&ns, target, op).map_err(Into::into);
         }
         if has(MsFlags::MS_MOVE) {
             let source = self.old_path(env, dev_name).await?;
-            return self.vfs.do_mount(&ns, target, MountOp::Move { source });
+            return self
+                .vfs
+                .do_mount(&ns, target, MountOp::Move { source })
+                .map_err(Into::into);
         }
         self.new_mount(env, &ns, target, fstype, dev_name, flags, &data)
             .await
+            .map_err(Into::into)
     }
 
     /// The source of a bind or move: a non-empty path, resolved from the working directory
     /// (`kern_path` with `LOOKUP_FOLLOW`).
-    async fn old_path(&self, env: &Env, name: Option<Vec<u8>>) -> Result<Path, Errno> {
+    async fn old_path(&self, env: &Env, name: Option<Vec<u8>>) -> SysResult<Path> {
         let name = name.filter(|name| !name.is_empty()).ok_or(Errno::EINVAL)?;
         self.vfs
             .lookup(&env.cx(), &env.fs.cwd, &name, LookupFlags::follow())
             .await
+            .map_err(|error| env.error(error))
     }
 
     /// `do_new_mount`: an instance of the type `fstype` (`ENODEV` if there is none such)
@@ -664,7 +674,8 @@ impl Kernel {
         let path = self
             .vfs
             .lookup(&env.cx(), &env.fs.cwd, &name, lookup)
-            .await?;
+            .await
+            .map_err(|error| env.error(error))?;
         // `can_umount`.
         self.may_mount(&env)?;
         let flags = UmountFlags {
@@ -702,8 +713,16 @@ impl Kernel {
             ..LookupFlags::default()
         };
         let cx = env.cx();
-        let new = self.vfs.lookup(&cx, &env.fs.cwd, &new_root, lookup).await?;
-        let old = self.vfs.lookup(&cx, &env.fs.cwd, &put_old, lookup).await?;
+        let new = self
+            .vfs
+            .lookup(&cx, &env.fs.cwd, &new_root, lookup)
+            .await
+            .map_err(|error| env.error(error))?;
+        let old = self
+            .vfs
+            .lookup(&cx, &env.fs.cwd, &put_old, lookup)
+            .await
+            .map_err(|error| env.error(error))?;
         self.may_mount(&env)?;
         let ns = self.ns(caller).mnt.tree.clone();
         let root = env.fs.root.clone();
@@ -1000,13 +1019,13 @@ impl Kernel {
         name: Cstr,
         empty: bool,
         follow: bool,
-    ) -> Result<Path, Errno> {
+    ) -> SysResult<Path> {
         let name = match empty && name.is_null() {
             true => Vec::new(),
             false => read_path_empty(caller, name, empty).await?,
         };
         if name.is_empty() && dfd.0 >= 0 {
-            return self.fd_path(caller, dfd);
+            return self.fd_path(caller, dfd).map_err(Into::into);
         }
         let mut at = AtFlags(0);
         if empty {

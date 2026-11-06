@@ -17,6 +17,201 @@ use wasixv2_vfs::{
 
 const CWD: Fd = Fd(-100);
 
+fn bootstrap_config() -> ProcessConfig {
+    ProcessConfig {
+        args: vec!["embedding".into()],
+        env: Vec::new(),
+        stdio: Stdio::from_fns(|_| {}, |_| {}),
+    }
+}
+
+fn bootstrap_directory(
+    kernel: &Kernel,
+    path: &[u8],
+    name: Option<&[u8]>,
+    tag: u64,
+) -> DirectoryBootstrap {
+    let root = kernel.vfs().root();
+    let cred = wasixv2_vfs::Cred::root();
+    let cx = wasixv2_vfs::Ctx {
+        cred: &cred,
+        root: &root,
+        umask: 0,
+        task: 0,
+        leases: None,
+    };
+    let path = block_on(
+        kernel
+            .vfs()
+            .lookup(&cx, &root, path, wasixv2_vfs::LookupFlags::follow()),
+    )
+    .unwrap();
+    DirectoryBootstrap {
+        source: kernel
+            .vfs()
+            .open_tree(kernel.vfs().namespace(), &path, true)
+            .unwrap(),
+        lookup_name: name.map(<[u8]>::to_vec),
+        attachment: Some(wasixv2_syscalls::DescriptorAttachment::new(tag)),
+    }
+}
+
+#[test]
+fn namespace_bootstrap_installs_exact_bindings_before_exposure_and_keeps_processes_isolated() {
+    let (kernel, original, memory) = machine();
+    let ordinary = T::new(&kernel, original, &memory);
+    ordinary.mkdir("/a");
+    ordinary.mkdir("/b");
+    ordinary.create("/a/left", b"A");
+    ordinary.create("/b/right", b"B");
+    ordinary.create("/outside", b"outside");
+    let first = block_on(kernel.spawn_with_namespace(
+        bootstrap_config(),
+        NamespaceBootstrap {
+            directories: vec![
+                bootstrap_directory(&kernel, b"/a", None, 40),
+                bootstrap_directory(&kernel, b"/b", Some(b"named"), 50),
+            ],
+            root_attachment: Some(wasixv2_syscalls::DescriptorAttachment::new(30u64)),
+            root_fallback: None,
+        },
+    ))
+    .unwrap();
+    assert_eq!(first.descriptors, [Fd(3), Fd(4), Fd(5)]);
+    for (fd, tag) in [(Fd(3), 30u64), (Fd(4), 40), (Fd(5), 50)] {
+        assert_eq!(
+            first
+                .binding
+                .get(fd)
+                .unwrap()
+                .attachment
+                .as_ref()
+                .unwrap()
+                .downcast_ref::<u64>(),
+            Some(&tag)
+        );
+        assert_eq!(descriptor_value(&kernel, first.task, fd), Some(tag));
+    }
+    let t = T::new(&kernel, first.task, &memory);
+    for path in ["outside", "/proc", "/dev", "/tmp", "/a", "/0", "/#0"] {
+        assert_eq!(
+            t.open_at(Fd(3), path, OpenFlags::O_RDONLY),
+            Err(SysErr::NamespaceBoundary)
+        );
+    }
+    let left = t.open_at(Fd(4), "left", OpenFlags::O_RDONLY).unwrap();
+    assert_eq!(t.read(left, 1).unwrap(), b"A");
+    assert_eq!(
+        t.open_at(Fd(4), "missing", OpenFlags::O_RDONLY),
+        Err(Errno::ENOENT.into())
+    );
+    let other = t
+        .open_at(Fd(4), "../named/right", OpenFlags::O_RDONLY)
+        .unwrap();
+    assert_eq!(t.read(other, 1).unwrap(), b"B");
+    assert_eq!(
+        t.open_at(Fd(4), "../outside", OpenFlags::O_RDONLY),
+        Err(SysErr::NamespaceBoundary)
+    );
+    let parent = t.path("new");
+    assert_eq!(
+        block_on(kernel.mkdirat(&t.caller, Fd(3), parent, 0o755)),
+        Err(SysErr::NamespaceMutation)
+    );
+    let intermediate = t.path("outside/new");
+    assert_eq!(
+        block_on(kernel.mkdirat(&t.caller, Fd(3), intermediate, 0o755)),
+        Err(SysErr::NamespaceBoundary)
+    );
+    let second = block_on(kernel.spawn_with_namespace(
+        bootstrap_config(),
+        NamespaceBootstrap {
+            directories: vec![bootstrap_directory(&kernel, b"/b", Some(b"different"), 60)],
+            root_attachment: None,
+            root_fallback: None,
+        },
+    ))
+    .unwrap();
+    assert_eq!(
+        T::new(&kernel, second.task, &memory).open("/named/right", OpenFlags::O_RDONLY),
+        Err(SysErr::NamespaceBoundary)
+    );
+    assert!(t.open("/named/right", OpenFlags::O_RDONLY).is_ok());
+    assert!(ordinary.open("/outside", OpenFlags::O_RDONLY).is_ok());
+    let pinned = Caller::new(first.task, &memory).with_descriptors(&first.binding);
+    t.close(Fd(4));
+    assert_eq!(
+        t.open_at(Fd(5), ".", OpenFlags::O_RDONLY | OpenFlags::O_DIRECTORY)
+            .unwrap(),
+        Fd(4)
+    );
+    assert_eq!(
+        block_on(kernel.close(&pinned, Fd(4))),
+        Err(Errno::EBADF.into())
+    );
+    assert_eq!(
+        first
+            .binding
+            .get(Fd(4))
+            .unwrap()
+            .attachment
+            .as_ref()
+            .unwrap()
+            .downcast_ref::<u64>(),
+        Some(&40)
+    );
+}
+
+#[test]
+fn namespace_bootstrap_permission_failure_releases_unpublished_namespace_files_and_attachments() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Probe(Arc<AtomicUsize>);
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let (kernel, _, _) = machine();
+    let before = kernel.state.read_or_recover().tasks.len();
+    let drops = Arc::new(AtomicUsize::new(0));
+    let fs = Arc::new(MemFs::new(
+        Arc::new(HostClock(kernel.host.clone())),
+        0,
+        0,
+        0,
+    ));
+    let weak = Arc::downgrade(&fs);
+    let source = kernel.vfs().create_mount(
+        fs.clone(),
+        b"denied".to_vec(),
+        Default::default(),
+        false,
+        kernel.vfs().namespace().owner().clone(),
+    );
+    drop(fs);
+    let result = block_on(kernel.spawn_with_namespace(
+        bootstrap_config(),
+        NamespaceBootstrap {
+            directories: vec![DirectoryBootstrap {
+                source,
+                lookup_name: None,
+                attachment: None,
+            }],
+            root_attachment: Some(wasixv2_syscalls::DescriptorAttachment::new(Probe(
+                drops.clone(),
+            ))),
+            root_fallback: None,
+        },
+    ));
+    assert_eq!(result.err(), Some(Errno::EACCES));
+    assert_eq!(kernel.state.read_or_recover().tasks.len(), before);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    assert!(
+        weak.upgrade().is_none(),
+        "failed startup retained its source filesystem"
+    );
+}
+
 fn descriptor_value(kernel: &Kernel, task: TaskId, fd: Fd) -> Option<u64> {
     let set = kernel.snapshot_descriptors(task, &[fd]).unwrap();
     set.get(fd)?

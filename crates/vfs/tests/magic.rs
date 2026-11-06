@@ -163,7 +163,9 @@ impl World {
             target,
         };
         let cx = world.cx();
-        block_on(world.vfs.mkdir(&cx, &world.root, b"/dir", 0o755)).unwrap();
+        block_on(world.vfs.mkdir(&cx, &world.root, b"/dir", 0o755))
+            .map_err(wasixv2_vfs::PathError::errno)
+            .unwrap();
         world
     }
 
@@ -188,10 +190,12 @@ impl World {
             lookup: LookupFlags::follow(),
         };
         block_on(self.vfs.open(&self.cx(), &self.root, path, &how))
+            .map_err(wasixv2_vfs::PathError::errno)
     }
 
     fn lookup(&self, path: &[u8], flags: LookupFlags) -> Result<Path, Errno> {
         block_on(self.vfs.lookup(&self.cx(), &self.root, path, flags))
+            .map_err(wasixv2_vfs::PathError::errno)
     }
 }
 
@@ -204,16 +208,20 @@ fn a_trailing_jump_is_its_object_even_without_a_name() {
     w.jump_to(&file.path);
 
     assert!(w.lookup(b"/m/jump", LookupFlags::follow()).unwrap() == file.path);
-    block_on(w.vfs.unlink(&w.cx(), &w.root, b"/dir/f")).unwrap();
+    block_on(w.vfs.unlink(&w.cx(), &w.root, b"/dir/f"))
+        .map_err(wasixv2_vfs::PathError::errno)
+        .unwrap();
     let reopened = w.open(b"/m/jump", OpenFlags::O_RDWR).unwrap();
     assert!(reopened.path == file.path);
     // O_CREAT opens what the link reaches (`LAST_BIND`); no name can be made there.
     let created = w.open(b"/m/jump", OpenFlags::O_CREAT | OpenFlags::O_RDWR);
     assert!(created.is_ok());
-    let mkdir = block_on(w.vfs.mkdir(&w.cx(), &w.root, b"/m/jump", 0o755));
+    let mkdir = block_on(w.vfs.mkdir(&w.cx(), &w.root, b"/m/jump", 0o755))
+        .map_err(wasixv2_vfs::PathError::errno);
     assert_eq!(mkdir, Err(Errno::EEXIST));
     // readlink shows where the object is.
-    let body = block_on(w.vfs.readlink(&w.cx(), &w.root, b"/m/jump", false));
+    let body = block_on(w.vfs.readlink(&w.cx(), &w.root, b"/m/jump", false))
+        .map_err(wasixv2_vfs::PathError::errno);
     assert_eq!(body, Ok(b"/dir/f (deleted)".to_vec()));
     // Not following, the link is itself.
     let link = w.lookup(b"/m/jump", LookupFlags::nofollow()).unwrap();
@@ -238,7 +246,9 @@ fn resolve_flags_refuse_jumps() {
     let w = World::new();
     w.jump_to(&w.lookup(b"/dir", LookupFlags::follow()).unwrap());
     let refused = |start: &Path, path: &[u8], flags: LookupFlags| {
-        block_on(w.vfs.lookup(&w.cx(), start, path, flags)).err()
+        block_on(w.vfs.lookup(&w.cx(), start, path, flags))
+            .map_err(wasixv2_vfs::PathError::errno)
+            .err()
     };
 
     let no_magiclinks = LookupFlags {

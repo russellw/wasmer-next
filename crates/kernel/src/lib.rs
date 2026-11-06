@@ -154,6 +154,8 @@ pub struct ProcessConfig {
     pub stdio: Stdio,
 }
 
+pub use fs::bootstrap::{BootstrappedProcess, DirectoryBootstrap, NamespaceBootstrap};
+
 pub struct Kernel {
     descriptor_owner: Arc<()>,
     /// The machine's clocks: [`Kernel::time`] as a host, whose wall clock is the machine's.
@@ -723,6 +725,21 @@ impl Kernel {
         parent: u32,
         kernel_init: bool,
     ) -> Result<TaskId, Errno> {
+        self.new_process_as_prepared(credentials, args, env, files, parent, kernel_init, None)
+            .map(|(task, _)| task)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_process_as_prepared(
+        &self,
+        credentials: &Credentials,
+        args: Vec<String>,
+        env: Vec<String>,
+        files: FdTable,
+        parent: u32,
+        kernel_init: bool,
+        prepared: Option<fs::bootstrap::PreparedNamespace>,
+    ) -> Result<(TaskId, Option<wasixv2_syscalls::DescriptorSet>), Errno> {
         let cred = cred::Cred::new(credentials, self.init_user_ns.clone());
         let pid_ns = self.init_ns.pid_for_children.clone();
         let mut state = self.state.lock_or_recover();
@@ -761,6 +778,20 @@ impl Kernel {
             .cgroups
             .fork(self.cgroups.root().clone(), cpu.clone(), false)
             .expect("the root cgroup takes every task");
+        let files = Arc::new(Mutex::new(files));
+        let (fs, ns, binding) = match prepared {
+            Some(prepared) => {
+                let binding = descriptors::capture(
+                    &self.descriptor_owner,
+                    id,
+                    &files,
+                    &files.lock_or_recover(),
+                    &prepared.descriptors,
+                );
+                (prepared.fs, prepared.ns, Some(binding))
+            }
+            None => (FsContext::new(self.vfs.root()), self.init_ns.clone(), None),
+        };
         let task = Task {
             cred: Arc::new(cred),
             css,
@@ -773,9 +804,9 @@ impl Kernel {
             io: None,
             process,
             mm: Arc::default(),
-            files: Arc::new(Mutex::new(files)),
-            fs: Arc::new(Mutex::new(FsContext::new(self.vfs.root()))),
-            ns: Some(self.init_ns.clone()),
+            files,
+            fs: Arc::new(Mutex::new(fs)),
+            ns: Some(ns),
             work: work::Work::new(flag.clone()),
             restart: None,
             session_keyring_work: None,
@@ -796,7 +827,7 @@ impl Kernel {
         drop(state);
         // ---- proc ----
         self.procs.add(process, parent, Signal::SIGCHLD.0, false);
-        Ok(id)
+        Ok((id, binding))
     }
 
     /// Whether `process` is the kernel's init, which outlives everything the kernel runs.

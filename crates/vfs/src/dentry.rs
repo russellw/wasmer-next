@@ -41,6 +41,11 @@ struct Inner {
 }
 
 impl Dentry {
+    /// A trusted namespace mount anchor with ancestry but no lookup/cache name.
+    pub(crate) fn private_child(self: &Arc<Self>, node: Arc<dyn Node>) -> Arc<Self> {
+        Self::new(self.sb().iget(node), Vec::new(), Some(self.clone()))
+    }
+
     /// The root dentry of a filesystem.
     pub(crate) fn root(sb: &Arc<Superblock>, node: Arc<dyn Node>) -> Arc<Self> {
         Self::new(sb.iget(node), b"/".to_vec(), None)

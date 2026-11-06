@@ -1306,6 +1306,8 @@ pub(crate) fn cqe_res(result: SysResult<i32>) -> i32 {
     match result {
         Ok(res) => res,
         Err(SysErr::Errno(errno)) => -errno.0,
+        Err(SysErr::NamespaceBoundary) => -Errno::ENOENT.0,
+        Err(SysErr::NamespaceMutation) => -Errno::EACCES.0,
         Err(_) => -Errno::EINTR.0,
     }
 }

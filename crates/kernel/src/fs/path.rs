@@ -20,7 +20,10 @@ impl Kernel {
         let path = read_path(caller.memory(), pathname).await?;
         let env = self.env(caller);
         let start = self.start(caller, &env, dfd, &path)?;
-        self.vfs.mkdir(&env.cx(), &start, &path, mode).await?;
+        self.vfs
+            .mkdir(&env.cx(), &start, &path, mode)
+            .await
+            .map_err(|error| env.error(error))?;
         Ok(0)
     }
 
@@ -37,7 +40,8 @@ impl Kernel {
         let start = self.start(caller, &env, dfd, &path)?;
         self.vfs
             .mknod(&env.cx(), &start, &path, mode, Device::from_dev_t(dev))
-            .await?;
+            .await
+            .map_err(|error| env.error(error))?;
         Ok(0)
     }
 
@@ -55,9 +59,15 @@ impl Kernel {
         let env = self.env(caller);
         let start = self.start(caller, &env, dfd, &path)?;
         if flags.contains(AtFlags::AT_REMOVEDIR) {
-            self.vfs.rmdir(&env.cx(), &start, &path).await?;
+            self.vfs
+                .rmdir(&env.cx(), &start, &path)
+                .await
+                .map_err(|error| env.error(error))?;
         } else {
-            self.vfs.unlink(&env.cx(), &start, &path).await?;
+            self.vfs
+                .unlink(&env.cx(), &start, &path)
+                .await
+                .map_err(|error| env.error(error))?;
         }
         Ok(0)
     }
@@ -73,7 +83,10 @@ impl Kernel {
         let path = read_path(caller.memory(), newname).await?;
         let env = self.env(caller);
         let start = self.start(caller, &env, newdfd, &path)?;
-        self.vfs.symlink(&env.cx(), &target, &start, &path).await?;
+        self.vfs
+            .symlink(&env.cx(), &target, &start, &path)
+            .await
+            .map_err(|error| env.error(error))?;
         Ok(0)
     }
 
@@ -106,7 +119,8 @@ impl Kernel {
         };
         self.vfs
             .link(&env.cx(), &old_start, &old, old_flags, &new_start, &new)
-            .await?;
+            .await
+            .map_err(|error| env.error(error))?;
         Ok(0)
     }
 
@@ -146,7 +160,8 @@ impl Kernel {
         let new_start = self.start(caller, &env, newdfd, &new)?;
         self.vfs
             .rename(&env.cx(), &old_start, &old, &new_start, &new, mode)
-            .await?;
+            .await
+            .map_err(|error| env.error(error))?;
         Ok(0)
     }
 
@@ -175,8 +190,10 @@ impl Kernel {
             .await
             .map_err(|errno| match errno {
                 // An empty path that does not name a symlink.
-                Errno::EINVAL if path.is_empty() => Errno::ENOENT,
-                errno => errno,
+                wasixv2_vfs::PathError::Errno(Errno::EINVAL) if path.is_empty() => {
+                    Errno::ENOENT.into()
+                }
+                error => env.error(error),
             })?;
         let n = target.len().min(bufsiz as usize);
         UserSliceMut::new(buf.addr(), n as u32)
@@ -194,7 +211,11 @@ impl Kernel {
             directory: true,
             ..LookupFlags::default()
         };
-        let dir = self.vfs.lookup(&env.cx(), &start, &path, lookup).await?;
+        let dir = self
+            .vfs
+            .lookup(&env.cx(), &start, &path, lookup)
+            .await
+            .map_err(|error| env.error(error))?;
         self.vfs.permission(&env.cx(), &dir, MAY_EXEC).await?;
         self.with_task(caller.task(), |task| task.fs.lock_or_recover().cwd = dir);
         Ok(0)
@@ -223,7 +244,8 @@ impl Kernel {
         let dir = self
             .vfs
             .lookup(&env.cx(), &env.fs.cwd, &path, lookup)
-            .await?;
+            .await
+            .map_err(|error| env.error(error))?;
         self.vfs.permission(&env.cx(), &dir, MAY_EXEC).await?;
         if !env.cred.capable(Cap::SysChroot) {
             return Err(Errno::EPERM.into());
@@ -299,7 +321,8 @@ impl Kernel {
         let target = self
             .vfs
             .lookup(&env.cx(), &start, &path, LookupFlags::follow())
-            .await?;
+            .await
+            .map_err(|error| env.error(error))?;
         self.vfs
             .truncate_checked(&env.cx(), &target, length as u64, |old_size| {
                 if target.dentry.sb().fs.limits_file_size() {

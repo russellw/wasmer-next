@@ -57,6 +57,7 @@ impl World {
             },
         };
         block_on(self.vfs.open(&self.cx(), &self.root, path, &how))
+            .map_err(wasixv2_vfs::PathError::errno)
     }
 
     fn create(&self, path: &[u8]) -> File {
@@ -66,15 +67,322 @@ impl World {
 
     fn mkdir(&self, path: &[u8]) -> Result<(), Errno> {
         block_on(self.vfs.mkdir(&self.cx(), &self.root, path, 0o755))
+            .map_err(wasixv2_vfs::PathError::errno)
     }
 
     fn symlink(&self, target: &[u8], path: &[u8]) {
-        block_on(self.vfs.symlink(&self.cx(), target, &self.root, path)).unwrap();
+        block_on(self.vfs.symlink(&self.cx(), target, &self.root, path))
+            .map_err(wasixv2_vfs::PathError::errno)
+            .unwrap();
     }
 
     fn lookup(&self, path: &[u8], flags: LookupFlags) -> Result<Path, Errno> {
         block_on(self.vfs.lookup(&self.cx(), &self.root, path, flags))
+            .map_err(wasixv2_vfs::PathError::errno)
     }
+}
+
+fn namespace(
+    world: &World,
+    grants: &[(&[u8], Option<&[u8]>)],
+    fallback: Option<usize>,
+) -> Result<wasixv2_vfs::BootstrapNamespace, Errno> {
+    let directories = grants
+        .iter()
+        .map(|(path, name)| {
+            let path = world.lookup(path, LookupFlags::follow()).unwrap();
+            wasixv2_vfs::NamespaceDirectory {
+                source: world
+                    .vfs
+                    .open_tree(world.vfs.namespace(), &path, true)
+                    .unwrap(),
+                lookup_name: name.map(<[u8]>::to_vec),
+            }
+        })
+        .collect::<Vec<_>>();
+    world.vfs.bootstrap_namespace(
+        world.vfs.namespace(),
+        world.vfs.namespace().owner().clone(),
+        &directories,
+        fallback,
+    )
+}
+
+#[test]
+fn bootstrap_namespace_uses_real_mount_ancestry_and_unreachable_private_anchors() {
+    use wasixv2_vfs::PathError;
+    let world = World::new();
+    world.mkdir(b"/left").unwrap();
+    world.mkdir(b"/right").unwrap();
+    world.mkdir(b"/left/nested").unwrap();
+    world.create(b"/outside");
+    world.create(b"/left/a");
+    world.create(b"/right/b");
+    world.symlink(b"../../outside", b"/left/escape");
+    world.symlink(b"/outside", b"/left/absolute");
+    let flags = MountFlags {
+        read_only: true,
+        noexec: true,
+        ..MountFlags::default()
+    };
+    block_on(world.vfs.mount(
+        b"/left/nested",
+        Arc::new(MemFs::new(Arc::new(Epoch), 0o755, 1, 1)),
+        flags,
+        false,
+    ))
+    .unwrap();
+    let boot = namespace(
+        &world,
+        &[(b"/left", None), (b"/right", Some(b"named"))],
+        None,
+    )
+    .unwrap();
+    let cx = Ctx {
+        root: &boot.root,
+        ..world.cx()
+    };
+    let lookup = |start: &Path, path: &[u8]| {
+        block_on(world.vfs.lookup(&cx, start, path, LookupFlags::follow()))
+    };
+    assert_eq!(lookup(&boot.directories[0], b"..").unwrap(), boot.root);
+    assert_eq!(lookup(&boot.directories[1], b"..").unwrap(), boot.root);
+    assert_eq!(
+        lookup(&boot.directories[0], b"../named").unwrap(),
+        boot.directories[1]
+    );
+    for path in [
+        b"outside".as_slice(),
+        b"proc",
+        b"dev",
+        b"tmp",
+        b"0",
+        b"#0",
+        b"left",
+    ] {
+        assert_eq!(
+            lookup(&boot.root, path).err(),
+            Some(PathError::NamespaceBoundary)
+        );
+    }
+    for path in [b"../outside".as_slice(), b"escape", b"absolute"] {
+        assert_eq!(
+            lookup(&boot.directories[0], path).err(),
+            Some(PathError::NamespaceBoundary)
+        );
+    }
+    assert_eq!(
+        lookup(&boot.directories[0], b"missing").err(),
+        Some(PathError::Errno(Errno::ENOENT))
+    );
+    let nested = lookup(&boot.directories[0], b"nested").unwrap();
+    assert!(nested.mnt.flags().read_only && nested.mnt.is_noexec());
+    assert_eq!(lookup(&nested, b"../..").unwrap(), boot.root);
+    let initial = world.lookup(b"/left", LookupFlags::follow()).unwrap();
+    assert!(!Arc::ptr_eq(&initial.mnt, &boot.directories[0].mnt));
+    let second = namespace(&world, &[(b"/right", Some(b"other"))], None).unwrap();
+    let second_cx = Ctx {
+        root: &second.root,
+        ..world.cx()
+    };
+    assert_eq!(
+        block_on(
+            world
+                .vfs
+                .lookup(&second_cx, &second.root, b"named", LookupFlags::follow())
+        )
+        .err(),
+        Some(PathError::NamespaceBoundary)
+    );
+    assert!(lookup(&boot.root, b"named/b").is_ok());
+    assert!(world.lookup(b"/outside", LookupFlags::follow()).is_ok());
+}
+
+#[test]
+fn bootstrap_namespace_fallback_keeps_full_and_parent_goals_distinct() {
+    use wasixv2_vfs::PathError;
+    let world = World::new();
+    world.mkdir(b"/left").unwrap();
+    world.mkdir(b"/right").unwrap();
+    world.mkdir(b"/left/named").unwrap();
+    world.create(b"/left/file");
+    world.create(b"/right/right");
+    world.symlink(b"/", b"/left/slash");
+    world.symlink(b"/.", b"/left/dot");
+    world.symlink(b"/..", b"/left/parent");
+    world.symlink(b"..", b"/left/relative");
+    let boot = namespace(
+        &world,
+        &[(b"/left", None), (b"/right", Some(b"named"))],
+        Some(0),
+    )
+    .unwrap();
+    let cx = Ctx {
+        root: &boot.root,
+        ..world.cx()
+    };
+    let lookup = |path: &[u8]| {
+        block_on(
+            world
+                .vfs
+                .lookup(&cx, &boot.root, path, LookupFlags::follow()),
+        )
+    };
+    for path in [b"/".as_slice(), b"//", b"/slash", b"/dot"] {
+        assert_eq!(lookup(path).unwrap(), boot.directories[0]);
+    }
+    for path in [b".".as_slice(), b"/.", b"/..", b"/parent", b"/relative"] {
+        assert_eq!(lookup(path).unwrap(), boot.root);
+    }
+    assert_eq!(lookup(b"/named").unwrap(), boot.directories[1]);
+    assert_eq!(
+        lookup(b"missing").err(),
+        Some(PathError::Errno(Errno::ENOENT))
+    );
+    assert_eq!(
+        block_on(world.vfs.mkdir(&cx, &boot.root, b"new", 0o755)),
+        Err(PathError::NamespaceMutation)
+    );
+    assert_eq!(
+        block_on(world.vfs.mkdir(&cx, &boot.root, b"/./new", 0o755)),
+        Err(PathError::NamespaceMutation)
+    );
+    block_on(world.vfs.mkdir(&cx, &boot.root, b"/new", 0o755)).unwrap();
+    assert!(world.lookup(b"/left/new", LookupFlags::follow()).is_ok());
+    assert_eq!(
+        block_on(world.vfs.unlink(&cx, &boot.root, b"file")),
+        Err(PathError::NamespaceMutation)
+    );
+    block_on(world.vfs.rename(
+        &cx,
+        &boot.root,
+        b"/file",
+        &boot.root,
+        b"/moved",
+        RenameMode::Replace,
+    ))
+    .unwrap();
+    block_on(world.vfs.unlink(&cx, &boot.root, b"/moved")).unwrap();
+    block_on(world.vfs.rmdir(&cx, &boot.root, b"/new")).unwrap();
+    let how = OpenHow {
+        flags: OpenFlags::O_CREAT | OpenFlags::O_RDWR,
+        mode: 0o644,
+        lookup: LookupFlags::follow(),
+    };
+    assert_eq!(
+        block_on(world.vfs.open(&cx, &boot.root, b"relative-new", &how)).err(),
+        Some(PathError::NamespaceMutation)
+    );
+    block_on(world.vfs.open(&cx, &boot.root, b"/absolute-new", &how)).unwrap();
+    let mut copied_root = boot.root.clone();
+    let copied = world.vfs.copy_mnt_ns(
+        &boot.namespace,
+        boot.namespace.owner().clone(),
+        &mut [&mut copied_root],
+    );
+    let copied_cx = Ctx {
+        root: &copied_root,
+        ..world.cx()
+    };
+    let fallback = block_on(world.vfs.lookup(
+        &copied_cx,
+        &copied_root,
+        b"/",
+        LookupFlags::follow(),
+    ))
+    .unwrap();
+    assert!(copied.contains(&fallback.mnt));
+    assert!(!Arc::ptr_eq(&fallback.mnt, &boot.directories[0].mnt));
+    assert!(Arc::ptr_eq(
+        &fallback.mnt.parent().unwrap().mnt,
+        &copied_root.mnt
+    ));
+    assert!(
+        world
+            .lookup(b"/left/absolute-new", LookupFlags::follow())
+            .is_ok()
+    );
+}
+
+#[test]
+fn bootstrap_namespace_classifies_lookup_and_every_structural_mutation_separately() {
+    use wasixv2_vfs::PathError;
+    let world = World::new();
+    world.mkdir(b"/grant").unwrap();
+    world.create(b"/grant/file");
+    let boot = namespace(&world, &[(b"/grant", Some(b"grant"))], None).unwrap();
+    let cx = Ctx {
+        root: &boot.root,
+        ..world.cx()
+    };
+    let mutation = Err(PathError::NamespaceMutation);
+    assert_eq!(
+        block_on(world.vfs.mkdir(&cx, &boot.root, b"new", 0o755)),
+        mutation
+    );
+    assert_eq!(
+        block_on(world.vfs.rmdir(&cx, &boot.root, b"grant")),
+        mutation
+    );
+    assert_eq!(
+        block_on(world.vfs.unlink(&cx, &boot.root, b"grant")),
+        mutation
+    );
+    assert_eq!(
+        block_on(world.vfs.symlink(&cx, b"grant/file", &boot.root, b"new")),
+        mutation
+    );
+    assert_eq!(
+        block_on(world.vfs.link(
+            &cx,
+            &boot.root,
+            b"grant/file",
+            LookupFlags::follow(),
+            &boot.root,
+            b"new"
+        )),
+        mutation
+    );
+    assert_eq!(
+        block_on(world.vfs.rename(
+            &cx,
+            &boot.root,
+            b"grant",
+            &boot.root,
+            b"new",
+            RenameMode::Replace
+        )),
+        mutation
+    );
+    assert_eq!(
+        block_on(world.vfs.mkdir(&cx, &boot.root, b"outside/new", 0o755)),
+        Err(PathError::NamespaceBoundary)
+    );
+    assert_eq!(
+        block_on(
+            world
+                .vfs
+                .mkdir(&cx, &boot.root, b"grant/missing/new", 0o755)
+        ),
+        Err(PathError::Errno(Errno::ENOENT))
+    );
+    assert_eq!(
+        namespace(
+            &world,
+            &[(b"/grant", Some(b"same")), (b"/grant", Some(b"same"))],
+            None
+        )
+        .err(),
+        Some(Errno::EEXIST)
+    );
+    assert_eq!(
+        namespace(&world, &[(b"/grant", Some(b"slash/name"))], None).err(),
+        Some(Errno::EINVAL)
+    );
+    assert_eq!(
+        namespace(&world, &[(b"/grant", None)], Some(1)).err(),
+        Some(Errno::EINVAL)
+    );
 }
 
 #[test]
@@ -96,11 +404,11 @@ fn trailing_slashes_demand_directories() {
         Some(Errno::EISDIR)
     );
     assert_eq!(
-        block_on(w.vfs.unlink(&w.cx(), &w.root, b"/f/")),
+        block_on(w.vfs.unlink(&w.cx(), &w.root, b"/f/")).map_err(wasixv2_vfs::PathError::errno),
         Err(Errno::ENOTDIR)
     );
     assert_eq!(
-        block_on(w.vfs.rmdir(&w.cx(), &w.root, b"/d/.")),
+        block_on(w.vfs.rmdir(&w.cx(), &w.root, b"/d/.")).map_err(wasixv2_vfs::PathError::errno),
         Err(Errno::EINVAL)
     );
 }
@@ -159,7 +467,7 @@ fn resolve_beneath_and_in_root_scope_the_walk() {
             in_root: !beneath,
             ..LookupFlags::default()
         };
-        block_on(w.vfs.lookup(&w.cx(), &jail, path, flags))
+        block_on(w.vfs.lookup(&w.cx(), &jail, path, flags)).map_err(wasixv2_vfs::PathError::errno)
     };
 
     assert!(scoped(b"sub/..", true).is_ok());
@@ -175,7 +483,8 @@ fn resolve_beneath_and_in_root_scope_the_walk() {
         in_root: true,
         ..LookupFlags::default()
     };
-    let from_file = block_on(w.vfs.lookup(&w.cx(), &file, b"/", in_root));
+    let from_file = block_on(w.vfs.lookup(&w.cx(), &file, b"/", in_root))
+        .map_err(wasixv2_vfs::PathError::errno);
     assert_eq!(from_file.err(), Some(Errno::ENOTDIR));
 }
 
@@ -204,7 +513,7 @@ fn permissions_apply_to_an_unprivileged_user() {
         Err(Errno::EPERM)
     );
     assert_eq!(
-        block_on(w.vfs.mkdir(&cx, &w.root, b"/x", 0o777)),
+        block_on(w.vfs.mkdir(&cx, &w.root, b"/x", 0o777)).map_err(wasixv2_vfs::PathError::errno),
         Err(Errno::EACCES)
     );
 }
@@ -219,6 +528,7 @@ fn rename_rules_follow_linux() {
     w.create(b"/f");
     let rename = |from: &[u8], to: &[u8], mode| {
         block_on(w.vfs.rename(&w.cx(), &w.root, from, &w.root, to, mode))
+            .map_err(wasixv2_vfs::PathError::errno)
     };
 
     assert_eq!(
@@ -259,7 +569,9 @@ fn unlinked_files_stay_readable_through_open_descriptors() {
     let file = w.create(b"/f");
     block_on(file.write_at(b"still here", 0)).unwrap();
 
-    block_on(w.vfs.unlink(&w.cx(), &w.root, b"/f")).unwrap();
+    block_on(w.vfs.unlink(&w.cx(), &w.root, b"/f"))
+        .map_err(wasixv2_vfs::PathError::errno)
+        .unwrap();
     let mut buf = [0; 10];
     let n = block_on(file.read_at(&mut buf, 0)).unwrap();
 
@@ -286,7 +598,7 @@ fn mounts_cover_their_mountpoint_and_dotdot_climbs_out() {
     let m = w.lookup(b"/m", LookupFlags::follow()).unwrap();
     assert_eq!(w.vfs.d_path(&m, &w.root), b"/m");
     assert_eq!(
-        block_on(w.vfs.rmdir(&w.cx(), &w.root, b"/m")),
+        block_on(w.vfs.rmdir(&w.cx(), &w.root, b"/m")).map_err(wasixv2_vfs::PathError::errno),
         Err(Errno::EBUSY)
     );
     // Hard links cannot cross mounts.
@@ -298,7 +610,8 @@ fn mounts_cover_their_mountpoint_and_dotdot_climbs_out() {
             LookupFlags::default(),
             &w.root,
             b"/v"
-        )),
+        ))
+        .map_err(wasixv2_vfs::PathError::errno),
         Err(Errno::EXDEV)
     );
 }
@@ -315,6 +628,7 @@ fn hard_links_share_one_inode() {
         &w.root,
         b"/b",
     ))
+    .map_err(wasixv2_vfs::PathError::errno)
     .unwrap();
 
     let a = w.lookup(b"/a", LookupFlags::default()).unwrap();
@@ -332,18 +646,23 @@ fn only_tmpfiles_can_be_linked_back_from_nothing() {
             ..LookupFlags::default()
         };
         block_on(w.vfs.link(&w.cx(), &file.path, b"", flags, &w.root, to))
+            .map_err(wasixv2_vfs::PathError::errno)
     };
 
     // A deleted file stays deleted (`I_LINKABLE` is not set).
     let deleted = w.create(b"/f");
-    block_on(w.vfs.unlink(&w.cx(), &w.root, b"/f")).unwrap();
+    block_on(w.vfs.unlink(&w.cx(), &w.root, b"/f"))
+        .map_err(wasixv2_vfs::PathError::errno)
+        .unwrap();
     assert_eq!(link_fd(&deleted, b"/back"), Err(Errno::ENOENT));
 
     // An O_TMPFILE file gets a name once; O_EXCL makes it unlinkable.
     let tmp = OpenFlags::__O_TMPFILE | OpenFlags::O_DIRECTORY | OpenFlags::O_RDWR;
     let file = w.open(b"/", tmp, true).unwrap();
     assert_eq!(link_fd(&file, b"/named"), Ok(()));
-    block_on(w.vfs.unlink(&w.cx(), &w.root, b"/named")).unwrap();
+    block_on(w.vfs.unlink(&w.cx(), &w.root, b"/named"))
+        .map_err(wasixv2_vfs::PathError::errno)
+        .unwrap();
     assert_eq!(link_fd(&file, b"/again"), Err(Errno::ENOENT));
     let excl = w.open(b"/", tmp | OpenFlags::O_EXCL, true).unwrap();
     assert_eq!(link_fd(&excl, b"/excl"), Err(Errno::ENOENT));
@@ -358,7 +677,9 @@ fn nothing_is_created_in_a_removed_or_replaced_directory() {
     let gone = w.lookup(b"/gone", LookupFlags::default()).unwrap();
     let replaced = w.lookup(b"/dst", LookupFlags::default()).unwrap();
 
-    block_on(w.vfs.rmdir(&w.cx(), &w.root, b"/gone")).unwrap();
+    block_on(w.vfs.rmdir(&w.cx(), &w.root, b"/gone"))
+        .map_err(wasixv2_vfs::PathError::errno)
+        .unwrap();
     block_on(w.vfs.rename(
         &w.cx(),
         &w.root,
@@ -367,11 +688,12 @@ fn nothing_is_created_in_a_removed_or_replaced_directory() {
         b"/dst",
         RenameMode::Replace,
     ))
+    .map_err(wasixv2_vfs::PathError::errno)
     .unwrap();
 
     for dir in [&gone, &replaced] {
         assert_eq!(
-            block_on(w.vfs.mkdir(&w.cx(), dir, b"x", 0o755)),
+            block_on(w.vfs.mkdir(&w.cx(), dir, b"x", 0o755)).map_err(wasixv2_vfs::PathError::errno),
             Err(Errno::ENOENT)
         );
         assert!(w.vfs.d_path(dir, &w.root).ends_with(b" (deleted)"));
@@ -413,11 +735,15 @@ fn exchanged_directories_both_stay_live() {
         b"/b",
         RenameMode::Exchange,
     ))
+    .map_err(wasixv2_vfs::PathError::errno)
     .unwrap();
 
     // `getcwd` in the moved directory, and creating in it, work as on Linux.
     assert_eq!(w.vfs.d_path(&cwd, &w.root), b"/b");
-    assert_eq!(block_on(w.vfs.mkdir(&w.cx(), &cwd, b"x", 0o755)), Ok(()));
+    assert_eq!(
+        block_on(w.vfs.mkdir(&w.cx(), &cwd, b"x", 0o755)).map_err(wasixv2_vfs::PathError::errno),
+        Ok(())
+    );
     let other = w.lookup(b"/a", LookupFlags::default()).unwrap();
     assert_eq!(w.vfs.d_path(&other, &w.root), b"/a");
     assert!(w.lookup(b"/b/x", LookupFlags::default()).is_ok());
@@ -459,6 +785,7 @@ fn fifos_open_for_writing_on_read_only_mounts() {
         0o010_644,
         wasixv2_vfs::Device::default(),
     ))
+    .map_err(wasixv2_vfs::PathError::errno)
     .unwrap();
     w.mkdir(b"/ro").unwrap();
     let read_only = MountFlags {
@@ -622,10 +949,14 @@ fn a_rename_during_a_scoped_walk_makes_dotdot_fail_with_eagain() {
         b"/elsewhere/a",
         RenameMode::Replace,
     ))
+    .map_err(wasixv2_vfs::PathError::errno)
     .unwrap();
     open.store(true, Ordering::SeqCst);
 
-    assert!(matches!(poll(), Poll::Ready(Err(Errno::EAGAIN))));
+    assert!(matches!(
+        poll(),
+        Poll::Ready(Err(wasixv2_vfs::PathError::Errno(Errno::EAGAIN)))
+    ));
 }
 
 /// include/linux/fs.h get_write_access/deny_write_access: positive writers and negative

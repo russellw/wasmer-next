@@ -274,7 +274,10 @@ impl BinfmtMisc {
             true => fs.root.clone(),
             false => fs.cwd.clone(),
         };
-        let target = vfs.lookup(&cx, &start, path, LookupFlags::follow()).await?;
+        let target = vfs
+            .lookup(&cx, &start, path, LookupFlags::follow())
+            .await
+            .map_err(|error| error.errno())?;
         if target.dentry.file_type() != FileType::Regular || target.mnt.is_noexec() {
             return Err(Errno::EACCES);
         }
