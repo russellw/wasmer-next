@@ -14,7 +14,7 @@ use wasixv2_wasix1::{
     StartupInput,
     imports::{self, Module as Namespace},
 };
-use wasmer_api::{AsStoreAsync, AsStoreMut, Imports, Instance, Module, StoreAsync, StoreMut};
+use wasmer_api::{AsStoreAsync, AsStoreMut, Imports, Instance, Module, StoreMut};
 use wasmer_wasix::{WasiError, WasiStateCreationError, WasiVersion, get_wasi_version};
 
 #[derive(Default)]
@@ -69,8 +69,7 @@ impl Capture {
 pub(in crate::wasm_c_api) struct NativeWasi {
     process: Option<EmbeddingProcess>,
     env: HostEnvironment<MachineSyscalls>,
-    store: StoreAsync,
-    owner: wasmer_api::sys::NativeCleanupOwner,
+    retire: Option<Box<dyn FnOnce()>>,
     stdout: Option<Arc<Capture>>,
     stderr: Option<Arc<Capture>>,
 }
@@ -155,13 +154,22 @@ impl NativeWasi {
             Ok::<_, anyhow::Error>((process, environment))
         })??;
         let asynchronous = store.async_store()?;
-        let owner = wasmer_api::sys::native_cleanup_owner(&asynchronous)
-            .ok_or_else(|| anyhow::anyhow!("native cleanup owner is missing"))?;
+        let local =
+            wasixv2_exec::local_cleanup_runner(&asynchronous, environment.loader_cleanup().clone())
+                .ok_or_else(|| anyhow::anyhow!("native loader cleanup runner is missing"))?;
+        let scope = Arc::downgrade(environment.loader_cleanup());
+        store.register_cleanup_fence(Box::new(move || {
+            scope.upgrade().is_none_or(|scope| !scope.is_open())
+        }))?;
+        let retiring_env = environment.clone();
+        let retire = store.cleanup_retirement(Box::pin(local.run(async move {
+            let mut guard = asynchronous.write_lock().await;
+            retiring_env.deactivate(&mut guard.as_store_mut());
+        })))?;
         Ok(Self {
             process: Some(process),
             env: environment,
-            store: asynchronous,
-            owner,
+            retire: Some(retire),
             stdout,
             stderr,
         })
@@ -229,12 +237,9 @@ impl NativeWasi {
             return;
         };
         process.close();
-        let store = self.store.store();
-        let env = self.env.clone();
-        self.owner.retain(Box::pin(async move {
-            let mut guard = store.write_lock().await;
-            env.deactivate(&mut guard.as_store_mut());
-        }));
+        if let Some(retire) = self.retire.take() {
+            retire();
+        }
     }
 }
 impl Drop for NativeWasi {

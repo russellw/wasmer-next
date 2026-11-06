@@ -13,6 +13,7 @@ pub struct HostEnvironment<S: 'static> {
     env: FunctionEnv<ExecEnv<S>>,
     store_id: wasmer_types::StoreId,
     initialized: Arc<std::sync::atomic::AtomicBool>,
+    cleanup: Arc<LoaderCleanup>,
 }
 
 impl<S: 'static> Clone for HostEnvironment<S> {
@@ -21,6 +22,7 @@ impl<S: 'static> Clone for HostEnvironment<S> {
             env: self.env.clone(),
             store_id: self.store_id,
             initialized: self.initialized.clone(),
+            cleanup: self.cleanup.clone(),
         }
     }
 }
@@ -34,16 +36,30 @@ impl<S: Syscalls + Control + Send + Sync + 'static> HostEnvironment<S> {
         abis: Arc<Abis<S>>,
     ) -> Self {
         let cleanup = LoaderCleanup::new(host.clone());
-        let env = environment(store, syscalls, task, host, abis, cleanup, Arc::default());
+        let env = environment(
+            store,
+            syscalls,
+            task,
+            host,
+            abis,
+            cleanup.clone(),
+            Arc::default(),
+        );
         Self {
             env,
             store_id: store.objects_mut().id(),
             initialized: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cleanup,
         }
     }
 
     pub fn environment(&self) -> &FunctionEnv<ExecEnv<S>> {
         &self.env
+    }
+
+    /// The same loader scope used by this environment and its future images.
+    pub fn loader_cleanup(&self) -> &Arc<LoaderCleanup> {
+        &self.cleanup
     }
 
     /// Makes actual imported memory available before engine start without changing

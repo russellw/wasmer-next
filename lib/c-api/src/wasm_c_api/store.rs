@@ -28,6 +28,7 @@ struct ManagedStore {
     generation: Option<wasmer_api::sys::NativeInvocationScope>,
     owner: wasmer_api::sys::NativeCleanupOwner,
     driver: RefCell<Option<Rc<Driver>>>,
+    cleanup_fences: RefCell<Vec<Box<dyn Fn() -> bool>>>,
 }
 
 #[cfg(feature = "sys")]
@@ -56,6 +57,7 @@ impl StoreRef {
                         generation: Some(generation),
                         owner,
                         driver: RefCell::new(None),
+                        cleanup_fences: RefCell::default(),
                     }),
                 }),
             });
@@ -234,6 +236,40 @@ impl StoreRef {
         }
     }
 
+    #[cfg(feature = "sys")]
+    pub(crate) fn register_cleanup_fence(
+        &self,
+        fence: Box<dyn Fn() -> bool>,
+    ) -> Result<(), RuntimeError> {
+        match &self.inner.mode {
+            StoreMode::Native(native) => {
+                native.cleanup_fences.borrow_mut().push(fence);
+                Ok(())
+            }
+            StoreMode::Plain(_) => Err(RuntimeError::new("Store has no native cleanup owner")),
+        }
+    }
+
+    #[cfg(feature = "sys")]
+    pub(crate) fn cleanup_retirement(
+        &self,
+        mut future: std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>,
+    ) -> Result<Box<dyn FnOnce()>, RuntimeError> {
+        use std::future::Future;
+        let StoreMode::Native(native) = &self.inner.mode else {
+            return Err(RuntimeError::new("Store has no native cleanup owner"));
+        };
+        let driver = native.driver()?;
+        let owner = native.owner.clone();
+        Ok(Box::new(move || {
+            owner.retain(Box::pin(std::future::poll_fn(move |cx| {
+                let _runtime = driver.runtime.enter();
+                let _local = driver.local.enter();
+                future.as_mut().poll(cx)
+            })));
+        }))
+    }
+
     pub fn downgrade(&self) -> WeakStoreRef {
         WeakStoreRef {
             inner: Rc::downgrade(&self.inner),
@@ -296,28 +332,100 @@ impl Drop for ManagedStore {
         };
         let store = self.store.take();
         let driver = self.driver.get_mut().take();
+        let fences = std::mem::take(self.cleanup_fences.get_mut());
+        let owner = self.owner.clone();
         generation.close();
         self.owner.retain(Box::pin(async move {
             generation.close_and_wait_for_cleanup().await;
-            drop(store);
-            if let Some(driver) = driver {
-                // Public operations retain StoreRef until their driver has returned,
-                // so physical settlement leaves only this private owner.
-                let mut driver = Rc::try_unwrap(driver)
-                    .ok()
-                    .expect("native driver survived its Store owner");
-                std::future::poll_fn(|cx| {
-                    use std::future::Future;
-                    let _enter = driver.runtime.enter();
-                    std::pin::Pin::new(&mut driver.local).poll(cx)
-                })
-                .await;
-                let runtime = driver.runtime;
-                // Runtime destruction may block and is illegal inside a foreign Tokio
-                // callback. Only the drained, Send runtime moves; Store/LocalSet stay local.
-                let _ = std::thread::spawn(move || drop(runtime)).join();
-            }
+            let final_owner = owner.clone();
+            owner.after_pump(Box::new(move || {
+                retire_store(store, driver, fences, final_owner);
+            }));
         }));
+    }
+}
+
+#[cfg(feature = "sys")]
+fn retire_store(
+    store: Option<wasmer_api::StoreAsync>,
+    driver: Option<Rc<Driver>>,
+    fences: Vec<Box<dyn Fn() -> bool>>,
+    owner: wasmer_api::sys::NativeCleanupOwner,
+) {
+    use std::{
+        future::Future,
+        sync::{Arc, Condvar, Mutex},
+        task::{Context, Wake, Waker},
+    };
+    #[derive(Default)]
+    struct WakeSignal(Mutex<bool>, Condvar);
+    impl Wake for WakeSignal {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            *self.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+            self.1.notify_one();
+        }
+    }
+    struct ClearWake(wasmer_api::sys::NativeCleanupOwner);
+    impl Drop for ClearWake {
+        fn drop(&mut self) {
+            self.0.clear_idle_waker();
+        }
+    }
+    let _clear = ClearWake(owner.clone());
+    let signal = Arc::new(WakeSignal::default());
+    let waker = Waker::from(signal.clone());
+    let mut cx = Context::from_waker(&waker);
+    let mut drain = |driver: Option<&Driver>, require_fences: bool| {
+        loop {
+            *signal.0.lock().unwrap_or_else(|e| e.into_inner()) = false;
+            let runtime = driver.as_ref().map(|driver| driver.runtime.clone());
+            let _enter = runtime.as_ref().map(|runtime| runtime.enter());
+            if let Some(driver) = driver {
+                let local = driver.local.run_until(std::future::pending::<()>());
+                let _ = std::pin::pin!(local).as_mut().poll(&mut cx);
+            }
+            let _local = driver.map(|driver| driver.local.enter());
+            // Unlike notify's fallback, this poll installs our real thread-safe
+            // wake signal in every retained continuation. Pump before waiting.
+            if owner.poll_idle(&mut cx).is_ready()
+                && (!require_fences || fences.iter().all(|closed| closed()))
+            {
+                break;
+            }
+            let mut ready = signal.0.lock().unwrap_or_else(|e| e.into_inner());
+            while !*ready {
+                ready = signal.1.wait(ready).unwrap_or_else(|e| e.into_inner());
+            }
+        }
+    };
+    drain(driver.as_deref(), true);
+    let runtime = driver.map(|driver| {
+        // Cleanup continuations may retain the driver until their fences settle.
+        // Public calls retain StoreRef, so no other execution survives this point.
+        let driver = Rc::try_unwrap(driver)
+            .ok()
+            .expect("native driver survived its Store owner");
+        let Driver { runtime, local, .. } = driver;
+        {
+            let _enter = runtime.enter();
+            // Loader/native obligations have settled. Cancel unrelated local work,
+            // including tasks that would otherwise stay pending forever.
+            drop(local);
+        }
+        runtime
+    });
+    drain(None, false);
+    drop(store);
+    drain(None, false);
+    drop(drain);
+    drop(_clear);
+    // Runtime destruction can block and is illegal in a foreign Tokio callback.
+    // Only the Send runtime moves; all Store/LocalSet custody stayed on this thread.
+    if let Some(runtime) = runtime {
+        let _ = std::thread::spawn(move || drop(runtime)).join();
     }
 }
 
@@ -374,6 +482,90 @@ mod tests {
         module::wasm_module_t,
         value::{wasm_val_t, wasm_val_vec_t},
     };
+
+    #[test]
+    fn final_store_retirement_cancels_unrelated_pending_local_work() {
+        struct Dropped(Rc<std::cell::Cell<bool>>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+        let store = StoreRef::new(Store::default()).unwrap();
+        let weak = store.downgrade();
+        let dropped = Rc::new(std::cell::Cell::new(false));
+        let guard = Dropped(dropped.clone());
+        store
+            .run_host(async move {
+                tokio::task::spawn_local(async move {
+                    let _guard = guard;
+                    for _ in 0..256 {
+                        tokio::task::yield_now().await;
+                    }
+                    std::future::pending::<()>().await;
+                });
+            })
+            .unwrap();
+        drop(store);
+        assert!(weak.upgrade().is_none());
+        assert!(dropped.get(), "unrelated pending work must be cancelled");
+    }
+
+    #[test]
+    fn final_store_retirement_pumps_owner_continuations_needed_by_managed_local_work() {
+        let store = StoreRef::new(Store::default()).unwrap();
+        let StoreMode::Native(native) = &store.inner.mode else {
+            panic!("native test requires the sys backend");
+        };
+        let owner = native.owner.clone();
+        let gate = Rc::new(std::cell::Cell::new(false));
+        let waiter = Rc::new(RefCell::new(None::<std::task::Waker>));
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let owner_gate = gate.clone();
+        let owner_waiter = waiter.clone();
+        owner.retain(Box::pin(async move {
+            std::future::poll_fn(|cx| {
+                if owner_gate.get() {
+                    std::task::Poll::Ready(())
+                } else {
+                    *owner_waiter.borrow_mut() = Some(cx.waker().clone());
+                    std::task::Poll::Pending
+                }
+            })
+            .await;
+            send.send(()).unwrap();
+        }));
+        let completed = Rc::new(std::cell::Cell::new(false));
+        let fence = completed.clone();
+        store
+            .register_cleanup_fence(Box::new(move || fence.get()))
+            .unwrap();
+        let task_completed = completed.clone();
+        store
+            .run_host(async move {
+                tokio::task::spawn_local(async move {
+                    // Exceed a LocalSet poll's budget: progress must come from its
+                    // real wake signal, not a later unrelated native call.
+                    for _ in 0..256 {
+                        tokio::task::yield_now().await;
+                    }
+                    gate.set(true);
+                    let wake = waiter.borrow_mut().take();
+                    if let Some(wake) = wake {
+                        wake.wake();
+                    }
+                    receive.await.unwrap();
+                    task_completed.set(true);
+                });
+            })
+            .unwrap();
+        drop(store);
+        assert!(
+            completed.get(),
+            "managed work must finish before cancellation"
+        );
+        assert!(owner.is_idle());
+    }
 
     #[test]
     fn entered_runtime_calls_fail_without_panicking_and_leave_the_store_usable() {
