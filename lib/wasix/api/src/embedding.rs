@@ -97,6 +97,17 @@ impl EmbeddingProcess {
         self.wasix1.as_ref()
     }
 
+    /// Disarms registration after an external executor has settled terminal cleanup.
+    /// This does not fault or release the task again. The executor must settle all
+    /// guest invocations and own the task's release before calling this method.
+    pub fn released(&mut self) {
+        if let Some(registration) = self.registration.take() {
+            registration.released();
+        }
+        #[cfg(feature = "wasix1")]
+        drop(self.wasix1.take());
+    }
+
     /// Retires this process once. Settle its guest invocations before calling.
     pub fn close(&mut self) {
         drop(self.registration.take());
@@ -156,6 +167,34 @@ mod tests {
             machine.syscalls.inner.kill(second_task, Signal::SIGCONT),
             Err(Errno::ESRCH)
         );
+        assert!(machine.running.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn released_embedding_registration_leaves_external_task_and_sibling_untouched() {
+        let machine = Arc::new(Machine::new());
+        let mut external = machine.start_embedding(config()).await.unwrap();
+        let sibling = machine.start_embedding(config()).await.unwrap();
+        let task = external.task();
+        let sibling_task = sibling.task();
+
+        // No guest has entered. Keep the executor-owned kernel task observable
+        // until its final cleanup to prove disarming performs no termination.
+        external.released();
+        external.released();
+        #[cfg(feature = "wasix1")]
+        assert!(external.wasix1().is_none());
+        drop(external);
+        assert_eq!(machine.syscalls.inner.kill(task, Signal::SIGCONT), Ok(()));
+        assert_eq!(
+            machine.syscalls.inner.kill(sibling_task, Signal::SIGCONT),
+            Ok(())
+        );
+        assert_eq!(*machine.running.lock().unwrap(), vec![sibling_task]);
+
+        // The external executor, rather than the retired registration, releases it.
+        crate::abandon(&machine.syscalls.inner, task);
+        drop(sibling);
         assert!(machine.running.lock().unwrap().is_empty());
     }
 
