@@ -2740,7 +2740,7 @@ mod tests {
                     assert(exports.size == (profile == 0 ? 11 : profile == 1 ? 7 : 8));
                     wasm_memory_t* memory = wasm_extern_as_memory(exports.data[0]);
                     assert(memory && wasm_memory_data_size(memory) >= 256);
-                    uint8_t* bytes = wasm_memory_data(memory);
+                    uint8_t* bytes = (uint8_t*)wasm_memory_data(memory);
                     wasm_func_t* spawn = wasm_extern_as_func(exports.data[1]);
                     wasm_func_t* join = wasm_extern_as_func(exports.data[2]);
                     wasm_func_t* pid = wasm_extern_as_func(exports.data[3]);
