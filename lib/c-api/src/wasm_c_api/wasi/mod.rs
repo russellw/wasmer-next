@@ -1662,4 +1662,512 @@ mod tests {
             }
         }).success();
     }
+
+    #[allow(
+        unexpected_cfgs,
+        reason = "tools like cargo-llvm-coverage pass --cfg coverage"
+    )]
+    #[cfg(unix)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    #[test]
+    fn test_wasi_legacy_root_mapping_and_path_resolution_contract() {
+        let output = (assert_c! {
+            #include "tests/wasmer.h"
+            #include <stdint.h>
+            #include <stdio.h>
+            #include <stdlib.h>
+            #include <string.h>
+            #include <sys/stat.h>
+            #include <unistd.h>
+
+            static uint32_t read_u32(const uint8_t* data, size_t offset) {
+                return (uint32_t)data[offset] |
+                    ((uint32_t)data[offset + 1] << 8) |
+                    ((uint32_t)data[offset + 2] << 16) |
+                    ((uint32_t)data[offset + 3] << 24);
+            }
+
+            static uint64_t read_u64(const uint8_t* data, size_t offset) {
+                return (uint64_t)read_u32(data, offset) |
+                    ((uint64_t)read_u32(data, offset + 4) << 32);
+            }
+
+            static void write_byte(const char* path, char value) {
+                FILE* file = fopen(path, "wb");
+                assert(file);
+                assert(fputc(value, file) == value);
+                assert(fclose(file) == 0);
+            }
+
+            static void assert_preopen_name(
+                const uint8_t* data,
+                uint32_t fd,
+                uint32_t status,
+                const char* expected
+            ) {
+                size_t record = 4000 + (size_t)(fd - 3) * 80;
+                assert(read_u32(data, record) == status);
+                if (status != 0) {
+                    return;
+                }
+                size_t expected_len = strlen(expected);
+                assert(read_u32(data, record + 4) == 0);
+                assert(read_u32(data, record + 8) == expected_len);
+                assert(memcmp(data + record + 12, expected, expected_len) == 0);
+            }
+
+            static void assert_open_record(
+                const uint8_t* data,
+                uint32_t index,
+                uint32_t status,
+                uint64_t inode
+            ) {
+                size_t record = 10000 + (size_t)index * 32;
+                assert(read_u32(data, record) == status);
+                if (status == 0) {
+                    assert(read_u32(data, record + 4) == 0);
+                    assert(read_u64(data, record + 8) == inode);
+                }
+            }
+
+            static void assert_read_record(
+                const uint8_t* data,
+                uint32_t index,
+                uint32_t open_status,
+                char value
+            ) {
+                size_t record = 12000 + (size_t)index * 32;
+                assert(read_u32(data, record) == open_status);
+                if (open_status == 0) {
+                    assert(read_u32(data, record + 4) == 0);
+                    assert(read_u32(data, record + 16) == 0);
+                    assert(read_u32(data, record + 20) == 1);
+                    assert(data[record + 24] == (uint8_t)value);
+                }
+            }
+
+            static void run_probe(
+                wasm_store_t* store,
+                wasm_module_t* module,
+                wasi_config_t* config,
+                int map_root_alias,
+                const char* root_path
+            ) {
+                wasi_env_t* wasi_env = wasi_env_new(store, config);
+                assert(wasi_env);
+
+                wasm_extern_vec_t imports = WASM_EMPTY_VEC;
+                assert(wasi_get_imports(store, wasi_env, module, &imports));
+                wasm_instance_t* instance = wasm_instance_new(
+                    store, module, &imports, NULL
+                );
+                assert(instance);
+                assert(wasi_env_initialize_instance(wasi_env, store, instance));
+
+                wasm_extern_vec_t exports = WASM_EMPTY_VEC;
+                wasm_instance_exports(instance, &exports);
+                assert(exports.size == 2);
+                assert(wasm_extern_kind(exports.data[0]) == WASM_EXTERN_MEMORY);
+                wasm_memory_t* memory = wasm_extern_as_memory(exports.data[0]);
+                assert(memory);
+                uint8_t* data = (uint8_t*)wasm_memory_data(memory);
+                assert(data);
+
+                char root_marker[512];
+                char root_named_marker[512];
+                char missing_path[512];
+                char relative_root_marker[512];
+                char relative_named_marker[512];
+                const char* root_leaf = strrchr(root_path, '/');
+                assert(root_leaf);
+                root_leaf++;
+                assert(snprintf(root_marker, sizeof(root_marker), "%s/marker", root_path) > 0);
+                assert(snprintf(
+                    root_named_marker,
+                    sizeof(root_named_marker),
+                    "%s/named/marker",
+                    root_path
+                ) > 0);
+                assert(snprintf(
+                    missing_path,
+                    sizeof(missing_path),
+                    "%s/missing-for-root-contract",
+                    root_path
+                ) > 0);
+                assert(snprintf(
+                    relative_root_marker,
+                    sizeof(relative_root_marker),
+                    "tmp/%s/marker",
+                    root_leaf
+                ) > 0);
+                assert(snprintf(
+                    relative_named_marker,
+                    sizeof(relative_named_marker),
+                    "tmp/%s/named/marker",
+                    root_leaf
+                ) > 0);
+
+                const char* dynamic_paths[] = {
+                    root_marker,
+                    root_named_marker,
+                    missing_path,
+                    relative_root_marker,
+                    relative_named_marker,
+                };
+                const size_t dynamic_offsets[] = { 3000, 3200, 3400, 3600, 3800 };
+                const size_t dynamic_lengths[] = { 3500, 3504, 3508, 3512, 3516 };
+                for (size_t i = 0; i < sizeof(dynamic_offsets) / sizeof(dynamic_offsets[0]); ++i) {
+                    size_t length = strlen(dynamic_paths[i]);
+                    assert(length < 180);
+                    memcpy(data + dynamic_offsets[i], dynamic_paths[i], length);
+                    data[dynamic_offsets[i] + length] = 0;
+                    data[dynamic_lengths[i]] = (uint8_t)length;
+                    data[dynamic_lengths[i] + 1] = (uint8_t)(length >> 8);
+                    data[dynamic_lengths[i] + 2] = (uint8_t)(length >> 16);
+                    data[dynamic_lengths[i] + 3] = (uint8_t)(length >> 24);
+                }
+                data[3520] = (uint8_t)(map_root_alias != 0);
+
+                wasm_func_t* start = wasi_get_start_function(instance);
+                assert(start);
+                wasm_val_vec_t arguments = WASM_EMPTY_VEC;
+                wasm_val_vec_t results = WASM_EMPTY_VEC;
+                assert(wasm_func_call(start, &arguments, &results) == NULL);
+
+                fprintf(stderr, "root-probe mode=%s\n", map_root_alias ? "mapdir-root" : "preopen-root");
+                for (uint32_t fd = 3; fd <= 6; ++fd) {
+                    size_t record = 4000 + (size_t)(fd - 3) * 80;
+                    uint32_t status = read_u32(data, record);
+                    uint32_t name_len = read_u32(data, record + 8);
+                    fprintf(stderr, "prestat fd=%u status=%u name=%.*s len=%u\n",
+                        fd, status, (int)name_len, data + record + 12, name_len);
+                }
+                size_t root_ino = read_u64(data, 4808);
+                size_t map_ino = read_u64(data, 4840);
+                size_t named_ino = read_u64(data, 4872);
+                fprintf(stderr, "fd-inodes root=%llu fd4=%llu fd5=%llu\n",
+                    (unsigned long long)root_ino,
+                    (unsigned long long)map_ino,
+                    (unsigned long long)named_ino);
+                uint32_t listing_error = read_u32(data, 4700);
+                uint32_t listing_size = read_u32(data, 4704);
+                assert(listing_error == 0);
+                fprintf(stderr, "root-listing bytes=%u\n", listing_size);
+                size_t cursor = 20000;
+                size_t end = 20000 + listing_size;
+                char previous[256] = {0};
+                char listed_names[2][256] = {{0}};
+                size_t entries = 0;
+                while (cursor < end) {
+                    uint32_t name_len = read_u32(data, cursor + 16);
+                    assert(cursor + 24 + name_len <= end);
+                    char name[256];
+                    assert(name_len < sizeof(name));
+                    memcpy(name, data + cursor + 24, name_len);
+                    name[name_len] = 0;
+                    if (entries != 0) {
+                        assert(strcmp(previous, name) < 0);
+                    }
+                    fprintf(stderr, "root-entry[%zu]=%s\n", entries, name);
+                    assert(entries < 2);
+                    strcpy(listed_names[entries], name);
+                    strcpy(previous, name);
+                    entries++;
+                    cursor += 24 + name_len;
+                }
+                assert(cursor == end);
+                assert(entries == 2);
+                assert(strcmp(listed_names[0], map_root_alias ? "/" : "//") == 0);
+                assert(strcmp(listed_names[1], "/named") == 0);
+
+                static const char* open_names[] = {
+                    "/", "//", "///", "/.", "/..", ".", "fd4/..", "fd4/.",
+                    "/named", "sub/abs-root", "sub/abs-dot", "sub/abs-parent",
+                    "sub/rel-dot", "sub/rel-parent", "fd5/sub", "missing",
+                };
+                for (uint32_t i = 0; i < 16; ++i) {
+                    size_t record = 10000 + (size_t)i * 32;
+                    fprintf(stderr, "open[%u]=%s errno=%u stat_errno=%u ino=%llu type=%u\n",
+                        i,
+                        open_names[i],
+                        read_u32(data, record),
+                        read_u32(data, record + 4),
+                        (unsigned long long)read_u64(data, record + 8),
+                        data[record + 16]);
+                }
+                static const char* read_names[] = {
+                    "fallback-R", "fallback-named-F", "/named/marker", "fd4/marker",
+                    "fd4/named/marker", "fd4/tmp-R", "fd4/tmp-F",
+                    "sub/rel-dot/marker", "sub/rel-parent/marker",
+                };
+                for (uint32_t i = 0; i < 9; ++i) {
+                    size_t record = 12000 + (size_t)i * 32;
+                    fprintf(stderr, "read[%u]=%s errno=%u stat_errno=%u ino=%llu read_errno=%u count=%u byte=%c\n",
+                        i,
+                        read_names[i],
+                        read_u32(data, record),
+                        read_u32(data, record + 4),
+                        (unsigned long long)read_u64(data, record + 8),
+                        read_u32(data, record + 16),
+                        read_u32(data, record + 20),
+                        data[record + 24] ? data[record + 24] : '-');
+                }
+
+                assert_preopen_name(data, 3, 0, "/");
+                assert_preopen_name(data, 4, 0, map_root_alias ? "" : "/");
+                assert_preopen_name(data, 5, 0, "named");
+                assert_preopen_name(data, 6, 8, "");
+
+                uint64_t virtual_root = read_u64(data, 4808);
+                uint64_t root_grant = read_u64(data, 4840);
+                uint64_t named_grant = read_u64(data, 4872);
+                if (map_root_alias) {
+                    assert_open_record(data, 0, 0, virtual_root);
+                    assert_open_record(data, 1, 0, virtual_root);
+                    assert_open_record(data, 2, 0, virtual_root);
+                    assert_open_record(data, 3, 0, virtual_root);
+                    assert_open_record(data, 4, 0, virtual_root);
+                    assert_open_record(data, 5, 0, virtual_root);
+                    assert_open_record(data, 6, 0, virtual_root);
+                    assert_open_record(data, 7, 0, root_grant);
+                    assert_open_record(data, 8, 0, named_grant);
+                    assert_open_record(data, 9, 0, virtual_root);
+                    assert_open_record(data, 10, 0, virtual_root);
+                    assert_open_record(data, 11, 0, virtual_root);
+                    assert_open_record(data, 12, 76, 0);
+                    assert_open_record(data, 13, 76, 0);
+                    assert_open_record(data, 15, 76, 0);
+                    assert_read_record(data, 0, 76, 0);
+                    assert_read_record(data, 1, 76, 0);
+                    assert_read_record(data, 2, 0, 'N');
+                    assert_read_record(data, 3, 0, 'R');
+                    assert_read_record(data, 4, 0, 'F');
+                    assert_read_record(data, 7, 76, 0);
+                    assert_read_record(data, 8, 76, 0);
+                } else {
+                    assert_open_record(data, 0, 0, root_grant);
+                    assert_open_record(data, 1, 0, root_grant);
+                    assert_open_record(data, 2, 0, root_grant);
+                    assert_open_record(data, 3, 0, virtual_root);
+                    assert_open_record(data, 4, 0, virtual_root);
+                    assert_open_record(data, 5, 0, virtual_root);
+                    assert_open_record(data, 6, 0, virtual_root);
+                    assert_open_record(data, 7, 0, root_grant);
+                    assert_open_record(data, 8, 0, named_grant);
+                    assert_open_record(data, 9, 0, root_grant);
+                    assert_open_record(data, 10, 0, root_grant);
+                    assert_open_record(data, 11, 0, virtual_root);
+                    assert_open_record(data, 12, 0, read_u64(data, 10456));
+                    assert_open_record(data, 13, 0, named_grant);
+                    assert_open_record(data, 14, 0, read_u64(data, 10456));
+                    assert_open_record(data, 15, 44, 0);
+                    assert_read_record(data, 0, 0, 'R');
+                    assert_read_record(data, 1, 0, 'F');
+                    assert_read_record(data, 2, 0, 'N');
+                    assert_read_record(data, 5, 0, 'R');
+                    assert_read_record(data, 6, 0, 'F');
+                    assert_read_record(data, 7, 0, 'S');
+                    assert_read_record(data, 8, 0, 'N');
+                }
+
+                wasm_func_delete(start);
+                wasm_instance_delete(instance);
+                wasm_extern_vec_delete(&imports);
+                wasm_extern_vec_delete(&exports);
+                wasi_env_delete(wasi_env);
+            }
+
+            int main() {
+                wasm_engine_t* engine = wasm_engine_new();
+                wasm_store_t* store = wasm_store_new(engine);
+                wasm_byte_vec_t wat;
+                wasmer_byte_vec_new_from_string(
+                    &wat,
+                    "(module\n"
+                    " (import \"wasi_snapshot_preview1\" \"fd_prestat_get\" (func $prestat_get (param i32 i32) (result i32)))\n"
+                    " (import \"wasi_snapshot_preview1\" \"fd_prestat_dir_name\" (func $prestat_name (param i32 i32 i32) (result i32)))\n"
+                    " (import \"wasi_snapshot_preview1\" \"fd_readdir\" (func $readdir (param i32 i32 i32 i64 i32) (result i32)))\n"
+                    " (import \"wasi_snapshot_preview1\" \"path_open\" (func $path_open (param i32 i32 i32 i32 i32 i64 i64 i32 i32) (result i32)))\n"
+                    " (import \"wasi_snapshot_preview1\" \"fd_filestat_get\" (func $filestat (param i32 i32) (result i32)))\n"
+                    " (import \"wasi_snapshot_preview1\" \"fd_read\" (func $read (param i32 i32 i32 i32) (result i32)))\n"
+                    " (import \"wasi_snapshot_preview1\" \"fd_close\" (func $close (param i32) (result i32)))\n"
+                    " (memory (export \"memory\") 1)\n"
+                    " (data (i32.const 800) \"/\")\n"
+                    " (data (i32.const 804) \"//\")\n"
+                    " (data (i32.const 808) \"///\")\n"
+                    " (data (i32.const 812) \"/.\")\n"
+                    " (data (i32.const 816) \"/..\")\n"
+                    " (data (i32.const 820) \".\")\n"
+                    " (data (i32.const 824) \"..\")\n"
+                    " (data (i32.const 832) \"/named\")\n"
+                    " (data (i32.const 840) \"/named/marker\")\n"
+                    " (data (i32.const 856) \"named/marker\")\n"
+                    " (data (i32.const 872) \"marker\")\n"
+                    " (data (i32.const 888) \"sub/abs-root\")\n"
+                    " (data (i32.const 904) \"sub/abs-dot\")\n"
+                    " (data (i32.const 920) \"sub/abs-parent\")\n"
+                    " (data (i32.const 936) \"sub/rel-dot\")\n"
+                    " (data (i32.const 952) \"sub/rel-parent\")\n"
+                    " (data (i32.const 968) \"sub\")\n"
+                    " (data (i32.const 976) \"sub/rel-dot/marker\")\n"
+                    " (data (i32.const 1000) \"sub/rel-parent/marker\")\n"
+                    " (func $record_fd (param $fd i32) (param $out i32) (local $err i32)\n"
+                    "  local.get $fd i32.const 5000 call $filestat local.set $err\n"
+                    "  local.get $out local.get $err i32.store\n"
+                    "  local.get $out i32.const 8 i32.add i32.const 5000 i64.load offset=8 i64.store)\n"
+                    " (func $record_pre (param $fd i32) (param $out i32) (local $err i32)\n"
+                    "  local.get $fd i32.const 5000 call $prestat_get local.set $err\n"
+                    "  local.get $out local.get $err i32.store\n"
+                    "  local.get $err if else\n"
+                    "   local.get $out i32.const 8 i32.add i32.const 5000 i32.load offset=4 i32.store\n"
+                    "   local.get $fd local.get $out i32.const 12 i32.add i32.const 64 call $prestat_name\n"
+                    "   local.set $err\n"
+                    "   local.get $out i32.const 4 i32.add local.get $err i32.store\n"
+                    "  end)\n"
+                    " (func $record_open (param $dir i32) (param $lookup i32) (param $path i32) (param $len i32) (param $oflags i32) (param $out i32) (local $err i32) (local $fd i32)\n"
+                    "  local.get $dir local.get $lookup local.get $path local.get $len local.get $oflags\n"
+                    "  i64.const 2097154 i64.const 0 i32.const 0 i32.const 5300 call $path_open local.set $err\n"
+                    "  local.get $out local.get $err i32.store\n"
+                    "  local.get $err if else\n"
+                    "   i32.const 5300 i32.load local.tee $fd i32.const 5400 call $filestat local.set $err\n"
+                    "   local.get $out i32.const 4 i32.add local.get $err i32.store\n"
+                    "   local.get $out i32.const 8 i32.add i32.const 5400 i64.load offset=8 i64.store\n"
+                    "   local.get $out i32.const 16 i32.add i32.const 5400 i32.load8_u offset=16 i32.store8\n"
+                    "   local.get $fd call $close drop\n"
+                    "  end)\n"
+                    " (func $record_read (param $dir i32) (param $lookup i32) (param $path i32) (param $len i32) (param $out i32) (local $err i32) (local $fd i32)\n"
+                    "  local.get $dir local.get $lookup local.get $path local.get $len i32.const 0\n"
+                    "  i64.const 2097154 i64.const 0 i32.const 0 i32.const 5300 call $path_open local.set $err\n"
+                    "  local.get $out local.get $err i32.store\n"
+                    "  local.get $err if else\n"
+                    "   i32.const 5300 i32.load local.tee $fd i32.const 5400 call $filestat local.set $err\n"
+                    "   local.get $out i32.const 4 i32.add local.get $err i32.store\n"
+                    "   local.get $out i32.const 8 i32.add i32.const 5400 i64.load offset=8 i64.store\n"
+                    "   i32.const 7000 i32.const 7100 i32.store\n"
+                    "   i32.const 7004 i32.const 1 i32.store\n"
+                    "   i32.const 7100 i32.const 0 i32.store8\n"
+                    "   i32.const 7200 i32.const 0 i32.store\n"
+                    "   local.get $fd i32.const 7000 i32.const 1 i32.const 7200 call $read local.set $err\n"
+                    "   local.get $out i32.const 16 i32.add local.get $err i32.store\n"
+                    "   local.get $out i32.const 20 i32.add i32.const 7200 i32.load i32.store\n"
+                    "   local.get $out i32.const 24 i32.add i32.const 7100 i32.load8_u i32.store8\n"
+                    "   local.get $fd call $close drop\n"
+                    "  end)\n"
+                    " (func (export \"_start\")\n"
+                    "  i32.const 3 i32.const 4800 call $record_fd\n"
+                    "  i32.const 4 i32.const 4832 call $record_fd\n"
+                    "  i32.const 5 i32.const 4864 call $record_fd\n"
+                    "  i32.const 3 i32.const 4000 call $record_pre\n"
+                    "  i32.const 4 i32.const 4080 call $record_pre\n"
+                    "  i32.const 5 i32.const 4160 call $record_pre\n"
+                    "  i32.const 6 i32.const 4240 call $record_pre\n"
+                    "  i32.const 3 i32.const 20000 i32.const 2048 i64.const 0 i32.const 4704 call $readdir\n"
+                    "  i32.const 4700 i32.store\n"
+                    "  i32.const 3 i32.const 0 i32.const 800 i32.const 1 i32.const 2 i32.const 10000 call $record_open\n"
+                    "  i32.const 3 i32.const 0 i32.const 804 i32.const 2 i32.const 2 i32.const 10032 call $record_open\n"
+                    "  i32.const 3 i32.const 0 i32.const 808 i32.const 3 i32.const 2 i32.const 10064 call $record_open\n"
+                    "  i32.const 3 i32.const 0 i32.const 812 i32.const 2 i32.const 2 i32.const 10096 call $record_open\n"
+                    "  i32.const 3 i32.const 0 i32.const 816 i32.const 3 i32.const 2 i32.const 10128 call $record_open\n"
+                    "  i32.const 3 i32.const 0 i32.const 820 i32.const 1 i32.const 2 i32.const 10160 call $record_open\n"
+                    "  i32.const 4 i32.const 0 i32.const 824 i32.const 2 i32.const 2 i32.const 10192 call $record_open\n"
+                    "  i32.const 4 i32.const 0 i32.const 820 i32.const 1 i32.const 2 i32.const 10224 call $record_open\n"
+                    "  i32.const 3 i32.const 0 i32.const 832 i32.const 6 i32.const 2 i32.const 10256 call $record_open\n"
+                    "  i32.const 5 i32.const 1 i32.const 888 i32.const 12 i32.const 2 i32.const 10288 call $record_open\n"
+                    "  i32.const 5 i32.const 1 i32.const 904 i32.const 11 i32.const 2 i32.const 10320 call $record_open\n"
+                    "  i32.const 5 i32.const 1 i32.const 920 i32.const 14 i32.const 2 i32.const 10352 call $record_open\n"
+                    "  i32.const 5 i32.const 1 i32.const 936 i32.const 11 i32.const 2 i32.const 10384 call $record_open\n"
+                    "  i32.const 5 i32.const 1 i32.const 952 i32.const 14 i32.const 2 i32.const 10416 call $record_open\n"
+                    "  i32.const 5 i32.const 0 i32.const 968 i32.const 3 i32.const 2 i32.const 10448 call $record_open\n"
+                    "  i32.const 3 i32.const 0 i32.const 3400 i32.const 3508 i32.load i32.const 0 i32.const 10480 call $record_open\n"
+                    "  i32.const 3 i32.const 0 i32.const 3000 i32.const 3500 i32.load i32.const 12000 call $record_read\n"
+                    "  i32.const 3 i32.const 0 i32.const 3200 i32.const 3504 i32.load i32.const 12032 call $record_read\n"
+                    "  i32.const 3 i32.const 0 i32.const 840 i32.const 13 i32.const 12064 call $record_read\n"
+                    "  i32.const 4 i32.const 0 i32.const 872 i32.const 6 i32.const 12096 call $record_read\n"
+                    "  i32.const 4 i32.const 0 i32.const 856 i32.const 12 i32.const 12128 call $record_read\n"
+                    "  i32.const 4 i32.const 0 i32.const 3600 i32.const 3512 i32.load i32.const 12160 call $record_read\n"
+                    "  i32.const 4 i32.const 0 i32.const 3800 i32.const 3516 i32.load i32.const 12192 call $record_read\n"
+                    "  i32.const 5 i32.const 1 i32.const 976 i32.const 18 i32.const 12224 call $record_read\n"
+                    "  i32.const 5 i32.const 1 i32.const 1000 i32.const 21 i32.const 12256 call $record_read))\n"
+                );
+                wasm_byte_vec_t wasm;
+                wat2wasm(&wat, &wasm);
+                wasm_module_t* module = wasm_module_new(store, &wasm);
+                assert(module);
+
+                char root_template[] = "/tmp/wasmer-capi-root-contract-XXXXXX";
+                char grant_template[] = "/tmp/wasmer-capi-named-grant-XXXXXX";
+                char* root_path = mkdtemp(root_template);
+                char* grant_path = mkdtemp(grant_template);
+                assert(root_path && grant_path);
+                char path[512];
+                assert(snprintf(path, sizeof(path), "%s/named", root_path) > 0);
+                assert(mkdir(path, 0700) == 0);
+                char root_marker[512], fallback_named_marker[512], grant_marker[512];
+                assert(snprintf(root_marker, sizeof(root_marker), "%s/marker", root_path) > 0);
+                assert(snprintf(fallback_named_marker, sizeof(fallback_named_marker), "%s/named/marker", root_path) > 0);
+                assert(snprintf(grant_marker, sizeof(grant_marker), "%s/marker", grant_path) > 0);
+                write_byte(root_marker, 'R');
+                write_byte(fallback_named_marker, 'F');
+                write_byte(grant_marker, 'N');
+                assert(snprintf(path, sizeof(path), "%s/sub", grant_path) > 0);
+                assert(mkdir(path, 0700) == 0);
+                char sub_marker[512];
+                assert(snprintf(sub_marker, sizeof(sub_marker), "%s/sub/marker", grant_path) > 0);
+                write_byte(sub_marker, 'S');
+                char link_path[512];
+                assert(snprintf(link_path, sizeof(link_path), "%s/sub/abs-root", grant_path) > 0);
+                assert(symlink("/", link_path) == 0);
+                assert(snprintf(link_path, sizeof(link_path), "%s/sub/abs-dot", grant_path) > 0);
+                assert(symlink("/.", link_path) == 0);
+                assert(snprintf(link_path, sizeof(link_path), "%s/sub/abs-parent", grant_path) > 0);
+                assert(symlink("/..", link_path) == 0);
+                assert(snprintf(link_path, sizeof(link_path), "%s/sub/rel-dot", grant_path) > 0);
+                assert(symlink(".", link_path) == 0);
+                assert(snprintf(link_path, sizeof(link_path), "%s/sub/rel-parent", grant_path) > 0);
+                assert(symlink("..", link_path) == 0);
+
+                wasi_config_t* map_root_config = wasi_config_new("map-root");
+                assert(map_root_config);
+                assert(wasi_config_mapdir(map_root_config, "/", root_path));
+                assert(wasi_config_mapdir(map_root_config, "named", grant_path));
+                run_probe(store, module, map_root_config, 1, root_path);
+
+                wasi_config_t* preopen_root_config = wasi_config_new("preopen-root");
+                assert(preopen_root_config);
+                assert(wasi_config_preopen_dir(preopen_root_config, "/"));
+                assert(wasi_config_mapdir(preopen_root_config, "named", grant_path));
+                run_probe(store, module, preopen_root_config, 0, root_path);
+
+                wasm_module_delete(module);
+                wasm_byte_vec_delete(&wasm);
+                wasm_byte_vec_delete(&wat);
+                wasm_store_delete(store);
+                wasm_engine_delete(engine);
+
+                assert(unlink(root_marker) == 0);
+                assert(unlink(fallback_named_marker) == 0);
+                assert(snprintf(path, sizeof(path), "%s/named", root_path) > 0);
+                assert(rmdir(path) == 0);
+                assert(rmdir(root_path) == 0);
+                assert(unlink(grant_marker) == 0);
+                assert(unlink(sub_marker) == 0);
+                assert(snprintf(link_path, sizeof(link_path), "%s/sub/abs-root", grant_path) > 0);
+                assert(unlink(link_path) == 0);
+                assert(snprintf(link_path, sizeof(link_path), "%s/sub/abs-dot", grant_path) > 0);
+                assert(unlink(link_path) == 0);
+                assert(snprintf(link_path, sizeof(link_path), "%s/sub/abs-parent", grant_path) > 0);
+                assert(unlink(link_path) == 0);
+                assert(snprintf(link_path, sizeof(link_path), "%s/sub/rel-dot", grant_path) > 0);
+                assert(unlink(link_path) == 0);
+                assert(snprintf(link_path, sizeof(link_path), "%s/sub/rel-parent", grant_path) > 0);
+                assert(unlink(link_path) == 0);
+                assert(snprintf(path, sizeof(path), "%s/sub", grant_path) > 0);
+                assert(rmdir(path) == 0);
+                assert(rmdir(grant_path) == 0);
+                return 0;
+            }
+        })
+        .success();
+        eprintln!("{}", String::from_utf8_lossy(&output.get_output().stderr));
+    }
 }
