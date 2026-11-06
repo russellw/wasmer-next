@@ -782,13 +782,15 @@ impl Backend for Adapter {
         Backend::publish(&*self.0, host, backlog, sink)
     }
 }
-fn pair() -> (
+type NetworkPair = (
     Arc<Broker>,
     Arc<Net>,
     Arc<Provider>,
     Arc<Net>,
     Arc<Provider>,
-) {
+);
+
+fn pair() -> NetworkPair {
     let broker = Arc::new(Broker::default());
     let left = Provider::new(1, broker.clone());
     let right = Provider::new(2, broker.clone());

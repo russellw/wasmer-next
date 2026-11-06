@@ -743,6 +743,10 @@ impl Net {
         })
     }
 
+    pub(crate) fn external_route_candidate(&self, dst: SocketAddr) -> NetResult<bool> {
+        self.state().ifaces.external_route_candidate(dst.ip())
+    }
+
     /// Where traffic to `dst` (canonical) goes, given the socket's bound address.
     pub(crate) fn path(&self, dst: SocketAddr, bound: Option<IpAddr>) -> NetResult<Path> {
         let hop = self.hop(&self.state(), dst, bound)?;
@@ -1177,6 +1181,14 @@ impl Drop for UdpPublished {
 
 /// Where one UDP datagram goes (see [`Net::udp_route`]).
 pub(crate) enum UdpRoute {
+    /// Candidate owned by an already-admitted external resource. It carries literal
+    /// physical hints, never a fabricated namespace route or effective interface.
+    External { from: SocketAddr, interface: u32 },
+    /// Canonically validated multicast, offered only to an opted-in external endpoint.
+    Multicast { from: SocketAddr, interface: u32 },
+    /// Permission/size-validated limited broadcast, offered only to that same capability.
+    Broadcast,
+
     /// Inside the namespace, from `from`, to the socket bound for it if any.
     Local {
         from: SocketAddr,

@@ -80,13 +80,24 @@ impl BindAdmission for Admission {
             return Err(Errno::ECANCELED);
         }
         let bound = state.bound.as_ref().ok_or(Errno::EAGAIN)?;
-        let result_now = bound
-            .local_addr()
-            .and_then(|local| (self.commit)(local, bound.clone()));
-        if result_now != Err(Errno::EAGAIN) {
-            state.result = Some(result_now);
-        }
+        let local = match bound.local_addr() {
+            Err(Errno::EAGAIN) => return Err(Errno::EAGAIN),
+            result => result,
+        };
+        // A ready resource is committed once. Setter errors, including EAGAIN, are final;
+        // repeating an already accepted membership join would violate provider custody.
+        let result_now = local.and_then(|local| (self.commit)(local, bound.clone()));
+        state.result = Some(result_now);
         result_now
+    }
+
+    fn complete_result(&self) -> Option<Result<(), Errno>> {
+        let result = self.complete();
+        if result == Err(Errno::EAGAIN) {
+            self.state.lock().unwrap().result
+        } else {
+            Some(result)
+        }
     }
 }
 
@@ -98,6 +109,9 @@ impl Pollable for Subscription {
 impl BindAdmission for Subscription {
     fn complete(&self) -> Result<(), Errno> {
         self.0.complete()
+    }
+    fn complete_result(&self) -> Option<Result<(), Errno>> {
+        self.0.complete_result()
     }
 }
 

@@ -35,6 +35,11 @@ use crate::{
     resolver::{Resolver, ResolverConfig},
 };
 
+mod native;
+pub use native::{
+    NativeBoundTcp, NativeClose, NativeDatagram, NativeListener, NativeReceiveLease, NativeStream,
+};
+
 const WAKER: Token = Token(0);
 /// `SIOCATMARK` (`sockatmark`), which the libc crate has only for Apple's systems.
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -73,6 +78,8 @@ struct Shared {
     listeners: Mutex<Vec<Arc<ListenerShared>>>,
     next: AtomicUsize,
     stop: AtomicBool,
+    native: Mutex<native::Control>,
+    native_finished: AtomicBool,
 }
 
 impl Shared {
@@ -131,6 +138,8 @@ impl HostBackend {
             listeners: Mutex::new(Vec::new()),
             next: AtomicUsize::new(1),
             stop: AtomicBool::new(false),
+            native: Mutex::default(),
+            native_finished: AtomicBool::new(false),
         });
         let thread = thread::Builder::new()
             .name("wasixv2-vnet-host".into())
@@ -221,7 +230,7 @@ fn tcp(sock: TcpStream) -> socket2::Socket {
 
 impl Drop for HostBackend {
     fn drop(&mut self) {
-        self.shared.stop.store(true, Ordering::Release);
+        native::stop(&self.shared);
         let _ = self.shared.waker.wake();
         if let Some(t) = self.thread.take() {
             let _ = t.join();
@@ -235,13 +244,24 @@ fn run(mut poll: Poll, shared: Arc<Shared>) {
     // Streams the guest closed with bytes still unsent, by token.
     let mut orphans: HashMap<Token, Arc<StreamShared>> = HashMap::new();
     let mut timeout = None;
+    let mut native_error = Errno::ENETDOWN;
     while !shared.stop.load(Ordering::Acquire) {
-        if let Err(e) = poll.poll(&mut events, timeout) {
+        native::drain(&shared, &mut orphans);
+        let continued = native::receive_pending(&shared, &mut buf, &mut orphans);
+        native::drain(&shared, &mut orphans);
+        let poll_timeout = if continued {
+            Some(Duration::ZERO)
+        } else {
+            timeout
+        };
+        if let Err(e) = poll.poll(&mut events, poll_timeout) {
             if e.kind() == io::ErrorKind::Interrupted {
                 continue;
             }
             tracing::error!(error = %e, "vnet-host reactor failed");
-            return;
+            native_error = errno_from_io(&e);
+            native::stop(&shared);
+            break;
         }
         let mut pump = |s: &Arc<StreamShared>, buf: &mut [u8]| {
             if s.pump(&shared, buf) {
@@ -254,13 +274,18 @@ fn run(mut poll: Poll, shared: Arc<Shared>) {
             }
             match shared.entry(ev.token()) {
                 Some(Entry::Stream(s)) => {
-                    {
+                    let writable = {
                         let mut st = s.state();
                         st.host_readable |=
                             ev.is_readable() || ev.is_read_closed() || ev.is_error();
+                        let was = st.host_writable;
                         st.host_writable |= ev.is_writable() || ev.is_error();
-                    }
+                        s._retirement.is_some() && !was && st.host_writable
+                    };
                     pump(&s, &mut buf);
+                    if writable {
+                        s.wq.wake(PollMask::OUT | PollMask::WRNORM);
+                    }
                 }
                 Some(Entry::Listener(l)) => l.accept_all(),
                 Some(Entry::Datagram(d)) => {
@@ -296,6 +321,7 @@ fn run(mut poll: Poll, shared: Arc<Shared>) {
         });
         timeout = next.map(|deadline| deadline.saturating_duration_since(now));
     }
+    native::shutdown(&shared, &mut orphans, native_error);
 }
 
 // ---- streams ----
@@ -395,6 +421,8 @@ struct StreamShared {
     dirty: AtomicBool,
     st: Mutex<StreamState>,
     backend: Weak<Shared>,
+    // Must remain last: the fd and every other field drop before the close acknowledgement.
+    _retirement: Option<native::Retirement>,
 }
 
 impl StreamShared {
@@ -408,6 +436,10 @@ impl StreamShared {
         let mut st = self.state();
         if st.gone {
             return false;
+        }
+        if st.released && self._retirement.is_some() {
+            drop(st);
+            return native::closing(self, shared, Instant::now()).is_some();
         }
         if st.released && !st.connected {
             // `tcp_close` in `SYN_SENT` (or after a failed attempt): nothing to deliver.
@@ -575,6 +607,10 @@ impl StreamShared {
         if st.gone {
             return None;
         }
+        if st.released && self._retirement.is_some() {
+            drop(st);
+            return native::closing(self, shared, now);
+        }
         let deadline = st.orphan_deadline?;
         if deadline > now {
             return Some(deadline);
@@ -621,13 +657,52 @@ impl HostStream {
         connected: bool,
         wq: WaitQueue,
     ) -> io::Result<Arc<Self>> {
+        Self::register_inner(backend, sock, peer, connected, wq, None)
+    }
+
+    fn register_inner(
+        backend: &Arc<Shared>,
+        sock: impl Into<socket2::Socket>,
+        peer: SocketAddr,
+        connected: bool,
+        wq: WaitQueue,
+        retirement: Option<native::Retirement>,
+    ) -> io::Result<Arc<Self>> {
         let sock = sock.into();
-        let family = sock.local_addr()?.family();
+        let family = match sock.local_addr() {
+            Ok(addr) => addr.family(),
+            Err(error) => {
+                if retirement.is_some() {
+                    let _ = sock.set_linger(Some(Duration::ZERO));
+                }
+                drop(sock);
+                drop(retirement);
+                return Err(error);
+            }
+        };
         let urgent = family == libc::AF_INET as _ || family == libc::AF_INET6 as _;
-        if urgent {
-            sock.set_out_of_band_inline(true)?;
+        if urgent && let Err(error) = sock.set_out_of_band_inline(true) {
+            if retirement.is_some() {
+                let _ = sock.set_linger(Some(Duration::ZERO));
+            }
+            drop(sock);
+            drop(retirement);
+            return Err(error);
         }
         let token = backend.token();
+        let native_linger = if retirement.is_some() {
+            match sock.linger() {
+                Ok(linger) => linger,
+                Err(error) => {
+                    let _ = sock.set_linger(Some(Duration::ZERO));
+                    drop(sock);
+                    drop(retirement);
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
         let shared = Arc::new(StreamShared {
             urgent,
             sock,
@@ -637,9 +712,12 @@ impl HostStream {
             dirty: AtomicBool::new(false),
             st: Mutex::new(StreamState {
                 connected,
+                linger: native_linger,
+                abort: native_linger.is_some_and(|t| t.is_zero()),
                 ..StreamState::default()
             }),
             backend: Arc::downgrade(backend),
+            _retirement: retirement,
         });
         backend
             .entries
@@ -652,6 +730,9 @@ impl HostStream {
             token,
             Interest::READABLE | Interest::WRITABLE,
         ) {
+            if shared._retirement.is_some() {
+                let _ = shared.sock.set_linger(Some(Duration::ZERO));
+            }
             backend.remove(token);
             return Err(e);
         }
@@ -681,6 +762,9 @@ impl HostStream {
 impl Drop for HostStream {
     fn drop(&mut self) {
         let mut st = self.0.state();
+        if st.gone {
+            return;
+        }
         st.released = true;
         st.tx_ready = st.tx.len();
         st.abort |= !st.rx.is_empty();
@@ -720,7 +804,12 @@ impl Pollable for HostStream {
         if st.rx.readable(1, st.oobinline) {
             m |= PollMask::IN | PollMask::RDNORM;
         }
-        if snd_shut || st.tx.len() < STREAM_BUF {
+        let writable = if self.0._retirement.is_some() {
+            st.host_writable
+        } else {
+            st.tx.len() < STREAM_BUF
+        };
+        if snd_shut || writable {
             m |= PollMask::OUT | PollMask::WRNORM;
         }
         if st.rx.urgent() {
@@ -942,11 +1031,14 @@ struct ListenerShared {
     pending: AtomicBool,
     /// Registrations on the guest listeners' room queues while their accept queues are full.
     room: Mutex<Vec<WaitRegistration>>,
+    // Last field: actual listener descriptor destruction precedes completion.
+    _retirement: Option<native::Retirement>,
 }
 
 enum ListenerSink {
     Inet(Arc<dyn InboundSink>),
     Vsock(Arc<dyn VsockInboundSink>),
+    Native(Arc<native::NativeAccept>),
 }
 
 impl ListenerSink {
@@ -954,6 +1046,7 @@ impl ListenerSink {
         match self {
             Self::Inet(s) => s.poll_room(table),
             Self::Vsock(s) => s.poll_room(table),
+            Self::Native(s) => s.poll_room(table),
         }
     }
 
@@ -965,6 +1058,7 @@ impl ListenerSink {
     ) -> bool {
         match self {
             Self::Inet(s) => s.incoming(stream, wq),
+            Self::Native(_) => unreachable!("native accepts retain the raw socket"),
             Self::Vsock(s) => {
                 #[cfg(any(target_os = "linux", target_os = "android"))]
                 if peer.family() == libc::AF_VSOCK as _ {
@@ -1005,6 +1099,15 @@ impl ListenerShared {
                     // The queue of the guest socket-to-be, which adopts it.
                     if let Err(e) = sock.set_nonblocking(true) {
                         tracing::warn!(error = %e, "setting accepted socket nonblocking");
+                        if matches!(self.sink, ListenerSink::Native(_)) {
+                            let _ = sock.set_linger(Some(Duration::ZERO));
+                        }
+                        continue;
+                    }
+                    if let ListenerSink::Native(sink) = &self.sink {
+                        if let Some(peer) = peer.as_socket() {
+                            sink.incoming(sock, peer);
+                        }
                         continue;
                     }
                     let wq = WaitQueue::new();
@@ -1057,8 +1160,17 @@ impl WaitEntry for RoomKick {
         let Some(backend) = listener.backend.upgrade() else {
             return false;
         };
+        // Pair the final live check with retirement's removal from this same work list.
+        // A native close cannot acquire a new driver reference after its purge.
+        let mut pending = backend.listeners.lock().unwrap();
+        if backend.stop.load(Ordering::Acquire)
+            || matches!(&listener.sink,ListenerSink::Native(sink) if sink.closed())
+        {
+            return false;
+        }
         if !listener.pending.swap(true, Ordering::AcqRel) {
-            backend.listeners.lock().unwrap().push(listener);
+            pending.push(listener);
+            drop(pending);
             let _ = backend.waker.wake();
         }
         true
@@ -1124,7 +1236,12 @@ const RECVERR: [(i32, i32); 2] = [
 ];
 
 struct DgramState {
-    queue: VecDeque<(Vec<u8>, SocketAddr)>,
+    receiver: Option<native::ReceiveSlot>,
+    queue: VecDeque<(
+        Vec<u8>,
+        SocketAddr,
+        Option<wasixv2_vnet::endpoint::DatagramInfo>,
+    )>,
     /// Bytes of datagrams and of queued errors' payloads.
     queued: usize,
     /// `sk_err` of the host socket: what an ICMP error to a connected peer left, or with
@@ -1147,6 +1264,7 @@ struct DgramState {
 impl DgramState {
     fn new(attached: bool) -> Self {
         Self {
+            receiver: None,
             queue: VecDeque::new(),
             queued: 0,
             err: None,
@@ -1173,6 +1291,8 @@ struct DgramShared {
     wq: Mutex<WaitQueue>,
     st: Mutex<DgramState>,
     backend: Weak<Shared>,
+    // Last field: actual datagram descriptor destruction precedes completion.
+    retirement: Option<native::Retirement>,
 }
 
 impl DgramShared {
@@ -1206,10 +1326,18 @@ impl DgramShared {
     }
 
     fn receive_all(&self, buf: &mut [u8]) {
-        let mut wake = self.receive_datagrams(buf);
+        if self.retirement.as_ref().is_some_and(|r| r.0.requested()) {
+            return;
+        }
+        let (mut wake, mut more) = self.receive_datagrams(buf);
         #[cfg(any(target_os = "linux", target_os = "android"))]
         if self.state().recverr.contains(&true) {
-            wake |= self.receive_errors(buf);
+            let (errors, pending) = self.receive_errors(buf);
+            wake |= errors;
+            more |= pending;
+        }
+        if more && let Some(shared) = self.backend.upgrade() {
+            native::schedule_read(&shared, self.token);
         }
         if !wake.is_empty() {
             self.wake(wake);
@@ -1219,36 +1347,58 @@ impl DgramShared {
     /// Reads the host socket's error queue into the endpoint's, which holds as much as its
     /// receive buffer (`sock_queue_err_skb`).
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    fn receive_errors(&self, buf: &mut [u8]) -> PollMask {
+    fn receive_errors(&self, buf: &mut [u8]) -> (PollMask, bool) {
         let mut wake = PollMask::empty();
+        let mut attempts = 0;
         loop {
+            if self.retirement.is_some() && attempts == native::RX_BUDGET {
+                return (wake, true);
+            }
+            attempts += usize::from(self.retirement.is_some());
             match errqueue::recv(&self.sock, buf) {
                 Ok(Some(e)) => {
                     let mut st = self.state();
-                    if st.attached && st.queued <= DGRAM_BUF {
+                    if st.attached
+                        && st.queued <= DGRAM_BUF
+                        && (self.retirement.is_none() || st.errqueue.len() < DGRAM_BUF / 64)
+                    {
                         st.queued += e.payload.len();
                         st.errqueue.push_back(e);
                         wake |= PollMask::ERR;
                     }
                 }
-                Ok(None) => return wake,
+                Ok(None) => return (wake, false),
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e) => {
                     tracing::warn!(error = %e, "reading a host datagram socket's error queue");
-                    return wake;
+                    return (wake, false);
                 }
             }
         }
     }
 
-    fn receive_datagrams(&self, buf: &mut [u8]) -> PollMask {
+    fn receive_datagrams(&self, buf: &mut [u8]) -> (PollMask, bool) {
+        if self.retirement.is_some() {
+            return native::receive_selected(self, buf);
+        }
         let mut wake = PollMask::empty();
         // An error is reported once and then cleared (`sock_error`); one that comes straight
         // back is not a peer's report, and retrying it would starve every other socket.
         let mut failed = false;
+        let mut attempts = 0;
         loop {
-            match self.sock.recv_from(buf) {
-                Ok((n, from)) => {
+            if self.retirement.is_some() && attempts == native::RX_BUDGET {
+                return (wake, true);
+            }
+            attempts += usize::from(self.retirement.is_some());
+            let received = if self.retirement.is_some() {
+                native::receive_packet(&self.sock, buf)
+                    .map(|(n, info)| (n, info.source, Some(info)))
+            } else {
+                self.sock.recv_from(buf).map(|(n, from)| (n, from, None))
+            };
+            match received {
+                Ok((n, from, destination)) => {
                     failed = false;
                     let start = match self.strip_ip_header {
                         true => usize::from(buf.first().map_or(0, |b| b & 0x0f) * 4).min(n),
@@ -1256,9 +1406,13 @@ impl DgramShared {
                     };
                     let mut st = self.state();
                     // Like a full SO_RCVBUF, or no socket at all: dropped.
-                    if st.attached && st.queued <= DGRAM_BUF {
+                    if st.attached
+                        && st.queued <= DGRAM_BUF
+                        && (self.retirement.is_none() || st.queue.len() < DGRAM_BUF / 64)
+                    {
                         st.queued += n - start;
-                        st.queue.push_back((buf[start..n].to_vec(), from));
+                        st.queue
+                            .push_back((buf[start..n].to_vec(), from, destination));
                         wake |= PollMask::IN | PollMask::RDNORM;
                     }
                 }
@@ -1280,7 +1434,7 @@ impl DgramShared {
                 }
             }
         }
-        wake
+        (wake, false)
     }
 }
 
@@ -1336,7 +1490,7 @@ impl BackendDatagram for HostDatagram {
 
     fn recv_from(&self, buf: &mut [u8], peek: bool) -> Result<(usize, usize, SocketAddr), Errno> {
         let mut st = self.0.state();
-        let (data, from) = st.queue.front().ok_or(Errno::EAGAIN)?;
+        let (data, from, _) = st.queue.front().ok_or(Errno::EAGAIN)?;
         let (from, full) = (*from, data.len());
         let n = buf.len().min(full);
         buf[..n].copy_from_slice(&data[..n]);
@@ -1591,32 +1745,42 @@ impl HostBackend {
         sink: ListenerSink,
         addr: SocketAddr,
     ) -> io::Result<HostPublication> {
-        let token = self.shared.token();
+        Self::register_listener_inner(&self.shared, sock, sink, addr, None)
+    }
+
+    fn register_listener_inner(
+        backend: &Arc<Shared>,
+        sock: socket2::Socket,
+        sink: ListenerSink,
+        addr: SocketAddr,
+        retirement: Option<native::Retirement>,
+    ) -> io::Result<HostPublication> {
+        let token = backend.token();
         let shared = Arc::new(ListenerShared {
             sock,
             token,
             sink,
-            backend: Arc::downgrade(&self.shared),
+            backend: Arc::downgrade(backend),
             pending: AtomicBool::new(false),
             room: Mutex::new(Vec::new()),
+            _retirement: retirement,
         });
-        self.shared
+        backend
             .entries
             .lock()
             .unwrap()
             .insert(token, Entry::Listener(shared.clone()));
         let fd = shared.sock.as_raw_fd();
-        if let Err(e) = self
-            .shared
+        if let Err(e) = backend
             .registry
             .register(&mut SourceFd(&fd), token, Interest::READABLE)
         {
-            self.shared.remove(token);
+            backend.remove(token);
             return Err(e);
         }
         Ok(HostPublication {
             shared,
-            backend: Arc::downgrade(&self.shared),
+            backend: Arc::downgrade(backend),
             addr,
         })
     }
@@ -1642,8 +1806,25 @@ impl HostBackend {
         wq: Option<WaitQueue>,
         strip_ip_header: bool,
     ) -> io::Result<Arc<HostDatagram>> {
-        let v6 = sock.local_addr()?.is_ipv6();
-        let token = self.shared.token();
+        Self::register_datagram_inner(&self.shared, sock, wq, strip_ip_header, None)
+    }
+
+    fn register_datagram_inner(
+        backend: &Arc<Shared>,
+        sock: UdpSocket,
+        wq: Option<WaitQueue>,
+        strip_ip_header: bool,
+        retirement: Option<native::Retirement>,
+    ) -> io::Result<Arc<HostDatagram>> {
+        let v6 = match sock.local_addr() {
+            Ok(addr) => addr.is_ipv6(),
+            Err(error) => {
+                drop(sock);
+                drop(retirement);
+                return Err(error);
+            }
+        };
+        let token = backend.token();
         let published = wq.is_none();
         let shared = Arc::new(DgramShared {
             sock,
@@ -1653,21 +1834,22 @@ impl HostBackend {
             strip_ip_header,
             wq: Mutex::new(wq.unwrap_or_default()),
             st: Mutex::new(DgramState::new(!published)),
-            backend: Arc::downgrade(&self.shared),
+            backend: Arc::downgrade(backend),
+            retirement,
         });
-        self.shared
+        backend
             .entries
             .lock()
             .unwrap()
             .insert(token, Entry::Datagram(shared.clone()));
         let fd = shared.sock.as_raw_fd();
         // Writable too: a send that met `EAGAIN` waits for the host to take datagrams again.
-        if let Err(e) = self.shared.registry.register(
+        if let Err(e) = backend.registry.register(
             &mut SourceFd(&fd),
             token,
             Interest::READABLE | Interest::WRITABLE,
         ) {
-            self.shared.remove(token);
+            backend.remove(token);
             return Err(e);
         }
         Ok(Arc::new(HostDatagram(shared)))
@@ -1940,6 +2122,7 @@ mod tests {
                 ..DgramState::new(true)
             }),
             backend: Weak::new(),
+            retirement: None,
         };
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {

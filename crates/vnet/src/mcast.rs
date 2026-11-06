@@ -15,7 +15,7 @@ use std::{
     mem::offset_of,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     sync::{
-        Arc,
+        Arc, Weak,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -86,6 +86,22 @@ const IGMP_MAX_MEMBERSHIPS: usize = 20;
 const AF_INET: u16 = 2;
 const AF_INET6: u16 = 10;
 
+/// Admission on one actual external resource, without owning that resource or inventing an
+/// effective physical interface for a zero/address-selected request.
+#[derive(Clone)]
+struct ProviderMembership(Weak<dyn crate::endpoint::EndpointBound>);
+impl std::fmt::Debug for ProviderMembership {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ProviderMembership(..)")
+    }
+}
+impl PartialEq for ProviderMembership {
+    fn eq(&self, other: &Self) -> bool {
+        Weak::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for ProviderMembership {}
+
 /// One membership of a socket (`struct ip_mc_socklist`, `struct ipv6_mc_socklist`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Membership {
@@ -94,6 +110,12 @@ struct Membership {
     ifindex: u32,
     /// IPv4's `imr_address`, which a leave by address matches.
     address: Ipv4Addr,
+    /// The literal interface request, before namespace route selection.
+    requested_index: u32,
+    /// Whether this record holds a namespace interface reference, separate from its literal
+    /// physical request. An external request need not name a synthetic namespace interface.
+    namespace_ref: bool,
+    provider: Option<ProviderMembership>,
     /// Names the membership's filter on the interface.
     id: u64,
     /// `sfmode`: `MCAST_INCLUDE`, else `MCAST_EXCLUDE`.
@@ -109,6 +131,9 @@ impl Membership {
             group,
             ifindex,
             address,
+            requested_index: ifindex,
+            namespace_ref: true,
+            provider: None,
             id: NEXT.fetch_add(1, Ordering::Relaxed),
             include,
             sources: None,
@@ -167,6 +192,8 @@ pub(crate) struct Mcast {
     pub all4: bool,
     /// `IP_MULTICAST_IF`: `mc_index` and `mc_addr`.
     pub index4: u32,
+    /// Literal index before namespace address-to-interface resolution, for physical replay.
+    pub requested_index4: u32,
     pub addr4: Ipv4Addr,
     /// `mcast_hops`, `IPV6_MULTICAST_HOPS`.
     pub hops6: u8,
@@ -184,6 +211,7 @@ impl Default for Mcast {
             loop4: true,
             all4: true,
             index4: 0,
+            requested_index4: 0,
             addr4: Ipv4Addr::UNSPECIFIED,
             hops6: 1,
             loop6: true,
@@ -261,7 +289,270 @@ fn u32_at(value: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(value[at..at + 4].try_into().expect("4 bytes"))
 }
 
+/// A validated selected-provider change. Preparation only reads interface state.
+/// Committing a join can still fail if its interface disappeared during provider work.
+pub(crate) struct PreparedMcast {
+    next: Mcast,
+    change: Option<(bool, Membership)>,
+}
+impl PreparedMcast {
+    pub(crate) fn state(&self) -> &Mcast {
+        &self.next
+    }
+
+    pub(crate) fn admit_provider(&mut self, bound: &Arc<dyn crate::endpoint::EndpointBound>) {
+        if let Some((true, member)) = &self.change
+            && let Some(record) = self
+                .next
+                .groups
+                .iter_mut()
+                .find(|record| record.id == member.id)
+        {
+            record.provider = Some(ProviderMembership(Arc::downgrade(bound)));
+        }
+    }
+
+    pub(crate) fn commit(self, net: &Net) -> NetResult<Mcast> {
+        if let Some((join, member)) = &self.change {
+            if !member.namespace_ref {
+                return Ok(self.next);
+            }
+            net.update_interfaces(|ifs| {
+                if *join {
+                    ifs.join_group(member.ifindex, member.filter())?;
+                } else {
+                    ifs.leave_group(member.ifindex, member.group, member.id);
+                }
+                Ok::<(), Errno>(())
+            })?;
+        }
+        Ok(self.next)
+    }
+}
+
 impl Mcast {
+    pub(crate) fn prepare_selected(
+        &self,
+        net: &Net,
+        kind: SocketKind,
+        bound_dev: u32,
+        level: i32,
+        name: i32,
+        value: &[u8],
+    ) -> NetResult<PreparedMcast> {
+        let mut next = self.clone();
+        let mut change = None;
+        match (level, name) {
+            (SOL_IP, n)
+                if n == IpOption::IP_ADD_MEMBERSHIP.0 || n == IpOption::IP_DROP_MEMBERSHIP.0 =>
+            {
+                if kind == SocketKind::Stream {
+                    return Err(Errno::EPROTO);
+                }
+                if value.len() < IP_MREQ_LEN {
+                    return Err(Errno::EINVAL);
+                }
+                let index = if value.len() >= IP_MREQN_LEN {
+                    u32_at(value, IMR_IFINDEX)
+                } else {
+                    0
+                };
+                let (group, address) = (v4_at(value, 0), v4_at(value, IMR_ADDRESS));
+                if n == IpOption::IP_ADD_MEMBERSHIP.0 {
+                    let member = self.prepare_physical_join4(group, address, index)?;
+                    next.groups.push(member.clone());
+                    change = Some((true, member));
+                } else {
+                    let at = self.physical_leave(group.into(), address, index)?;
+                    change = Some((false, next.groups.remove(at)));
+                }
+            }
+            (SOL_IPV6, n)
+                if n == Ipv6Option::IPV6_ADD_MEMBERSHIP.0
+                    || n == Ipv6Option::IPV6_DROP_MEMBERSHIP.0 =>
+            {
+                if value.len() < IPV6_MREQ_LEN {
+                    return Err(Errno::EINVAL);
+                }
+                if kind == SocketKind::Stream {
+                    return Err(Errno::EPROTO);
+                }
+                let (group, index) = (v6_at(value, 0), u32_at(value, IPV6MR_IFINDEX));
+                if n == Ipv6Option::IPV6_ADD_MEMBERSHIP.0 {
+                    let member = self.prepare_physical_join6(group, index)?;
+                    next.groups.push(member.clone());
+                    change = Some((true, member));
+                } else {
+                    let at = self.physical_leave(group.into(), Ipv4Addr::UNSPECIFIED, index)?;
+                    change = Some((false, next.groups.remove(at)));
+                }
+            }
+            // Preserve the literal physical interface hint. Availability is authoritative
+            // only after this same selected resource accepts the option.
+            (SOL_IP, n) if n == IpOption::IP_MULTICAST_IF.0 => {
+                if value.len() < 4 {
+                    return Err(Errno::EINVAL);
+                }
+                let (address, index) = match value.len() {
+                    IP_MREQN_LEN.. => (v4_at(value, IMR_ADDRESS), u32_at(value, IMR_IFINDEX)),
+                    IP_MREQ_LEN.. => (v4_at(value, IMR_ADDRESS), 0),
+                    _ => (v4_at(value, 0), 0),
+                };
+                if bound_dev != 0 && index != 0 && index != bound_dev {
+                    return Err(Errno::EINVAL);
+                }
+                next.addr4 = address;
+                next.index4 = index;
+                next.requested_index4 = index;
+            }
+            (SOL_IPV6, n) if n == Ipv6Option::IPV6_MULTICAST_IF.0 => {
+                if kind == SocketKind::Stream {
+                    return Err(Errno::ENOPROTOOPT);
+                }
+                if value.len() < 4 {
+                    return Err(Errno::EINVAL);
+                }
+                let index = u32_at(value, 0);
+                if bound_dev != 0 && index != 0 && index != bound_dev {
+                    return Err(Errno::EINVAL);
+                }
+                next.oif6 = index;
+            }
+            // These setters only change scalar fields; they never join/leave an interface.
+            (SOL_IP, n)
+                if n == IpOption::IP_MULTICAST_TTL.0 || n == IpOption::IP_MULTICAST_LOOP.0 =>
+            {
+                next.set(net, kind, bound_dev, level, name, value)?;
+            }
+            (SOL_IPV6, n)
+                if n == Ipv6Option::IPV6_MULTICAST_HOPS.0
+                    || n == Ipv6Option::IPV6_MULTICAST_LOOP.0 =>
+            {
+                next.set(net, kind, bound_dev, level, name, value)?;
+            }
+            _ => return Err(Errno::EOPNOTSUPP),
+        }
+        Ok(PreparedMcast { next, change })
+    }
+
+    fn prepare_physical_join4(
+        &self,
+        group: Ipv4Addr,
+        address: Ipv4Addr,
+        index: u32,
+    ) -> NetResult<Membership> {
+        if !group.is_multicast() {
+            return Err(Errno::EINVAL);
+        }
+        let group = IpAddr::V4(group);
+        if self
+            .groups
+            .iter()
+            .any(|m| m.group == group && m.requested_index == index && m.address == address)
+        {
+            return Err(Errno::EADDRINUSE);
+        }
+        if self.groups.iter().filter(|m| m.group.is_ipv4()).count() >= IGMP_MAX_MEMBERSHIPS {
+            return Err(Errno::ENOBUFS);
+        }
+        let mut member = Membership::new(group, index, address, false);
+        // Physical indices/addresses are never namespace interface identities.
+        member.namespace_ref = false;
+        member.requested_index = index;
+        Ok(member)
+    }
+
+    fn prepare_physical_join6(&self, group: Ipv6Addr, index: u32) -> NetResult<Membership> {
+        if !group.is_multicast() {
+            return Err(Errno::EINVAL);
+        }
+        let group = IpAddr::V6(group);
+        if self
+            .groups
+            .iter()
+            .any(|m| m.group == group && m.requested_index == index)
+        {
+            return Err(Errno::EADDRINUSE);
+        }
+        let mut member = Membership::new(group, index, Ipv4Addr::UNSPECIFIED, false);
+        member.namespace_ref = false;
+        member.requested_index = index;
+        Ok(member)
+    }
+
+    fn physical_leave(&self, group: IpAddr, address: Ipv4Addr, index: u32) -> NetResult<usize> {
+        if !group.is_multicast() {
+            return Err(Errno::EINVAL);
+        }
+        let matches =
+            |m: &Membership| m.group == group && m.requested_index == index && m.address == address;
+        self.groups
+            .iter()
+            .position(matches)
+            .or_else(|| {
+                let mut group_members = self
+                    .groups
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, m)| m.group == group);
+                let (at, _) = group_members.next()?;
+                group_members.next().is_none().then_some(at)
+            })
+            .ok_or(Errno::EADDRNOTAVAIL)
+    }
+
+    pub(crate) fn admit_provider(&mut self, bound: &Arc<dyn crate::endpoint::EndpointBound>) {
+        for member in &mut self.groups {
+            member.provider = Some(ProviderMembership(Arc::downgrade(bound)));
+        }
+    }
+
+    /// A zero/address-selected interface is not a wildcard policy. Admission requires a
+    /// matching physical membership on this SAME live resource, whose provider enforces
+    /// the physical choice. Source filtering and literal nonzero interface hints still apply.
+    pub(crate) fn allows_selected(
+        &self,
+        group: IpAddr,
+        source: IpAddr,
+        interface: u32,
+        bound: &Arc<dyn crate::endpoint::EndpointBound>,
+    ) -> bool {
+        self.groups.iter().any(|member| {
+            member.group == group
+                && member.allows(source)
+                && (member.requested_index == 0 || member.requested_index == interface)
+                && member
+                    .provider
+                    .as_ref()
+                    .and_then(|admission| admission.0.upgrade())
+                    .is_some_and(|resource| Arc::ptr_eq(&resource, bound))
+        })
+    }
+
+    /// Current memberships as fresh-bind operations, preserving the original interface hint.
+    pub(crate) fn backend_memberships(&self) -> NetResult<Vec<(i32, i32, Vec<u8>)>> {
+        let mut out = Vec::new();
+        for member in &self.groups {
+            if member.include || member.sources.is_some() {
+                return Err(Errno::EOPNOTSUPP);
+            }
+            match member.group {
+                IpAddr::V4(group) => {
+                    let mut bytes = group.octets().to_vec();
+                    bytes.extend(member.address.octets());
+                    bytes.extend(member.requested_index.to_le_bytes());
+                    out.push((SOL_IP, IpOption::IP_ADD_MEMBERSHIP.0, bytes));
+                }
+                IpAddr::V6(group) => {
+                    let mut bytes = group.octets().to_vec();
+                    bytes.extend(member.requested_index.to_le_bytes());
+                    out.push((SOL_IPV6, Ipv6Option::IPV6_ADD_MEMBERSHIP.0, bytes));
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// `setsockopt` of a multicast option (see [`handles`]) on a socket of type `kind` in
     /// `net`. `bound_dev` is `SO_BINDTODEVICE`'s interface, 0 for none.
     pub(crate) fn set(
@@ -738,9 +1029,11 @@ impl Mcast {
         };
         if index == 0 && address.is_unspecified() {
             self.index4 = 0;
+            self.requested_index4 = 0;
             self.addr4 = Ipv4Addr::UNSPECIFIED;
             return Ok(());
         }
+        let requested_index = index;
         {
             let st = net.state();
             let found = match index {
@@ -753,6 +1046,7 @@ impl Mcast {
             return Err(Errno::EINVAL);
         }
         self.index4 = index;
+        self.requested_index4 = requested_index;
         self.addr4 = address;
         Ok(())
     }
@@ -761,6 +1055,34 @@ impl Mcast {
     /// (`ip_mc_find_dev`).
     /// `include` is the mode of a source-specific join (`ip_mc_join_group_ssm`); a plain one
     /// excludes nothing.
+    fn prepare_join4(
+        &self,
+        ifs: &Interfaces,
+        group: Ipv4Addr,
+        address: Ipv4Addr,
+        ifindex: u32,
+        include: bool,
+    ) -> NetResult<Membership> {
+        if !group.is_multicast() {
+            return Err(Errno::EINVAL);
+        }
+        let group_ip = IpAddr::V4(group);
+        let index = find_dev4(ifs, group, address, ifindex).ok_or(Errno::ENODEV)?;
+        if self
+            .groups
+            .iter()
+            .any(|m| m.group == group_ip && m.ifindex == index)
+        {
+            return Err(Errno::EADDRINUSE);
+        }
+        if self.groups.iter().filter(|m| m.group.is_ipv4()).count() >= IGMP_MAX_MEMBERSHIPS {
+            return Err(Errno::ENOBUFS);
+        }
+        let mut membership = Membership::new(group_ip, index, address, include);
+        membership.requested_index = ifindex;
+        Ok(membership)
+    }
+
     fn join4(
         &mut self,
         net: &Net,
@@ -769,28 +1091,41 @@ impl Mcast {
         ifindex: u32,
         include: bool,
     ) -> NetResult<()> {
-        if !group.is_multicast() {
-            return Err(Errno::EINVAL);
-        }
-        let group_ip = IpAddr::V4(group);
         net.update_interfaces(|ifs| {
-            let index = find_dev4(ifs, group, address, ifindex).ok_or(Errno::ENODEV)?;
-            if self
-                .groups
-                .iter()
-                .any(|m| m.group == group_ip && m.ifindex == index)
-            {
-                return Err(Errno::EADDRINUSE);
-            }
-            let count = self.groups.iter().filter(|m| m.group.is_ipv4()).count();
-            if count >= IGMP_MAX_MEMBERSHIPS {
-                return Err(Errno::ENOBUFS);
-            }
-            let m = Membership::new(group_ip, index, address, include);
-            ifs.join_group(index, m.filter())?;
+            let m = self.prepare_join4(ifs, group, address, ifindex, include)?;
+            ifs.join_group(m.ifindex, m.filter())?;
             self.groups.push(m);
             Ok(())
         })
+    }
+
+    fn prepare_leave4(
+        &self,
+        ifs: &Interfaces,
+        group: Ipv4Addr,
+        address: Ipv4Addr,
+        ifindex: u32,
+    ) -> NetResult<usize> {
+        let group_ip = IpAddr::V4(group);
+        let found = match (ifindex, address.is_unspecified()) {
+            (0, false) => ifs.link_with_addr(address.into()),
+            (0, true) => ifs.route(group_ip).ok().map(|d| d.oif),
+            (i, _) => ifs.link(i).map(|l| l.index),
+        };
+        if ifindex == 0 && address.is_unspecified() && found.is_none() {
+            return Err(Errno::ENODEV);
+        }
+        self.groups
+            .iter()
+            .position(|m| {
+                m.group == group_ip
+                    && match (ifindex, address.is_unspecified()) {
+                        (0, true) => true,
+                        (0, false) => m.address == address,
+                        (i, _) => m.ifindex == i,
+                    }
+            })
+            .ok_or(Errno::EADDRNOTAVAIL)
     }
 
     /// `ip_mc_leave_group`: by index if given, else by the address it was made with.
@@ -801,33 +1136,43 @@ impl Mcast {
         address: Ipv4Addr,
         ifindex: u32,
     ) -> NetResult<()> {
-        let group_ip = IpAddr::V4(group);
         net.update_interfaces(|ifs| {
-            let found = match (ifindex, address.is_unspecified()) {
-                (0, false) => ifs.link_with_addr(address.into()),
-                (0, true) => ifs.route(group_ip).ok().map(|d| d.oif),
-                (i, _) => ifs.link(i).map(|l| l.index),
-            };
-            if ifindex == 0 && address.is_unspecified() && found.is_none() {
-                return Err(Errno::ENODEV);
+            let at = self.prepare_leave4(ifs, group, address, ifindex)?;
+            let m = self.groups.remove(at);
+            if m.namespace_ref {
+                ifs.leave_group(m.ifindex, m.group, m.id);
             }
-            let at = self.groups.iter().position(|m| {
-                m.group == group_ip
-                    && match (ifindex, address.is_unspecified()) {
-                        (0, true) => true,
-                        (0, false) => m.address == address,
-                        (i, _) => m.ifindex == i,
-                    }
-            });
-            let m = self.groups.remove(at.ok_or(Errno::EADDRNOTAVAIL)?);
-            ifs.leave_group(m.ifindex, group_ip, m.id);
             Ok(())
         })
     }
 
-    /// `ipv6_sock_mc_join`: the interface by index, else the route to the group; `include`
-    /// as for [`Mcast::join4`].
+    fn prepare_join6(
+        &self,
+        ifs: &Interfaces,
+        group: Ipv6Addr,
+        ifindex: u32,
+        include: bool,
+    ) -> NetResult<Membership> {
+        if !group.is_multicast() {
+            return Err(Errno::EINVAL);
+        }
+        let group_ip = IpAddr::V6(group);
+        if self
+            .groups
+            .iter()
+            .any(|m| m.group == group_ip && (ifindex == 0 || m.ifindex == ifindex))
+        {
+            return Err(Errno::EADDRINUSE);
+        }
+        let index = find_dev6(ifs, ifindex).ok_or(Errno::ENODEV)?;
+        let mut m = Membership::new(group_ip, index, Ipv4Addr::UNSPECIFIED, include);
+        m.requested_index = ifindex;
+        Ok(m)
+    }
+
+    /// `ipv6_sock_mc_join`: the interface by index, else the route to the group.
     fn join6(&mut self, net: &Net, group: Ipv6Addr, ifindex: u32, include: bool) -> NetResult<()> {
+        // Keep IPv6's duplicate check before taking the interface state, as before.
         if !group.is_multicast() {
             return Err(Errno::EINVAL);
         }
@@ -840,27 +1185,29 @@ impl Mcast {
             return Err(Errno::EADDRINUSE);
         }
         net.update_interfaces(|ifs| {
-            let index = find_dev6(ifs, ifindex).ok_or(Errno::ENODEV)?;
-            let m = Membership::new(group_ip, index, Ipv4Addr::UNSPECIFIED, include);
-            ifs.join_group(index, m.filter())?;
+            let m = self.prepare_join6(ifs, group, ifindex, include)?;
+            ifs.join_group(m.ifindex, m.filter())?;
             self.groups.push(m);
             Ok(())
         })
     }
 
-    /// `ipv6_sock_mc_drop`.
-    fn leave6(&mut self, net: &Net, group: Ipv6Addr, ifindex: u32) -> NetResult<()> {
+    fn prepare_leave6(&self, group: Ipv6Addr, ifindex: u32) -> NetResult<usize> {
         if !group.is_multicast() {
             return Err(Errno::EINVAL);
         }
         let group_ip = IpAddr::V6(group);
-        let at = self
-            .groups
+        self.groups
             .iter()
             .position(|m| m.group == group_ip && (ifindex == 0 || m.ifindex == ifindex))
-            .ok_or(Errno::EADDRNOTAVAIL)?;
+            .ok_or(Errno::EADDRNOTAVAIL)
+    }
+
+    /// `ipv6_sock_mc_drop`.
+    fn leave6(&mut self, net: &Net, group: Ipv6Addr, ifindex: u32) -> NetResult<()> {
+        let at = self.prepare_leave6(group, ifindex)?;
         let m = self.groups.remove(at);
-        net.update_interfaces(|ifs| ifs.leave_group(m.ifindex, group_ip, m.id));
+        net.update_interfaces(|ifs| ifs.leave_group(m.ifindex, m.group, m.id));
         Ok(())
     }
 
@@ -879,7 +1226,9 @@ impl Mcast {
         net.update_interfaces(|ifs| {
             self.groups.retain(|m| {
                 if m.group.is_ipv6() {
-                    ifs.leave_group(m.ifindex, m.group, m.id);
+                    if m.namespace_ref {
+                        ifs.leave_group(m.ifindex, m.group, m.id);
+                    }
                     false
                 } else {
                     true
@@ -895,7 +1244,9 @@ impl Mcast {
         let groups = std::mem::take(&mut self.groups);
         net.update_interfaces(|ifs| {
             for m in groups {
-                ifs.leave_group(m.ifindex, m.group, m.id);
+                if m.namespace_ref {
+                    ifs.leave_group(m.ifindex, m.group, m.id);
+                }
             }
         });
     }
@@ -1040,6 +1391,19 @@ impl Mcast {
             IpAddr::V4(_) => (self.ttl, self.loop4),
             IpAddr::V6(_) => (self.hops6, self.loop6),
         }
+    }
+
+    /// The original selected physical hint, never a namespace-resolved interface index.
+    pub(crate) fn physical_interface(&self, group: IpAddr) -> (u32, Option<IpAddr>) {
+        let (_, address) = self.interface(group);
+        (
+            if group.is_ipv4() {
+                self.requested_index4
+            } else {
+                self.oif6
+            },
+            address,
+        )
     }
 
     /// `IP_MULTICAST_IF`/`IPV6_MULTICAST_IF` for a datagram to `group`: the interface (0 for

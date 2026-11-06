@@ -3,7 +3,7 @@
 
 use std::{
     borrow::Cow,
-    collections::VecDeque,
+    collections::{BTreeSet, VecDeque},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
         Arc, Mutex, MutexGuard, Weak,
@@ -21,12 +21,12 @@ use crate::{
     Accepted, BackendDatagram, Control, Domain, NetResult, PortEntry, Publication, QueuedError,
     RecvMsg, SendMsg, Shutdown, Socket, SocketKind,
     addr::{canonical, canonical_ip, present, sockaddr_bytes, unbound},
-    bpf::{Arrival, PACKET_HOST, PACKET_LOOPBACK, PACKET_MULTICAST, SockFilter},
+    bpf::{Arrival, PACKET_BROADCAST, PACKET_HOST, PACKET_LOOPBACK, PACKET_MULTICAST, SockFilter},
     cmsg::{self, SendCtl},
     endpoint::{
         AttemptGate, DatagramDelivery, EndpointBindPurpose, EndpointBindRequest, EndpointBound,
-        EndpointChoice, EndpointDatagramTx, EndpointKind, EndpointQuery, EndpointSource,
-        EndpointSourceId, EndpointTarget, UdpTxConfig,
+        EndpointChoice, EndpointDatagramTx, EndpointKind, EndpointMember, EndpointQuery,
+        EndpointSource, EndpointSourceId, EndpointTarget, UdpTxConfig,
         runtime::{Namespace, SocketEndpoint},
     },
     icmp::{Back, IPPROTO_UDP, IPV4_HDR, IPV6_HDR, Quoted, UDP_HDR, udp_datagram},
@@ -77,6 +77,50 @@ struct PreparedFlow<'a> {
     scope: u32,
     ctl: SendCtl,
     data: Cow<'a, [u8]>,
+}
+
+/// Namespace paths and an admitted physical resource are distinct routing authorities.
+enum ConnectRoute {
+    Namespace(Path),
+    External { source: IpAddr },
+}
+impl ConnectRoute {
+    fn source(&self) -> IpAddr {
+        match self {
+            Self::Namespace(path) => path.src(),
+            Self::External { source } => *source,
+        }
+    }
+    fn same(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Namespace(Path::Dns { src: a }), Self::Namespace(Path::Dns { src: b })) => {
+                a == b
+            }
+            (
+                Self::Namespace(Path::Nowhere {
+                    src: a,
+                    unresolved: x,
+                }),
+                Self::Namespace(Path::Nowhere {
+                    src: b,
+                    unresolved: y,
+                }),
+            ) => a == b && x == y,
+            (
+                Self::Namespace(Path::Local {
+                    src: a,
+                    net: Some(x),
+                }),
+                Self::Namespace(Path::Local {
+                    src: b,
+                    net: Some(y),
+                }),
+            ) => a == b && Arc::ptr_eq(x, y),
+            (Self::Namespace(a), Self::Namespace(b)) => a.endpoint_same(b),
+            (Self::External { source: a }, Self::External { source: b }) => a == b,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -135,6 +179,10 @@ struct Inner {
     endpoint_connection: Option<EndpointConnection>,
     endpoint_blocked: Option<WriteFocus>,
     endpoint_write_revision: u64,
+    /// Replay keys only: values and memberships remain in canonical SockOpts/Mcast.
+    endpoint_option_keys: BTreeSet<(i32, i32)>,
+    /// Socket-wide; unlike a TX revision it is never reset by connect/disconnect.
+    endpoint_option_version: u64,
 }
 
 fn policy_destination(g: &Inner, msg: &SendMsg<'_>) -> Option<SocketAddr> {
@@ -158,6 +206,8 @@ pub struct UdpSocket {
     wq: WaitQueue,
     me: Weak<UdpSocket>,
     inner: Mutex<Inner>,
+    /// Serializes bounded selected-provider controls, not socket/network state or async waits.
+    endpoint_control: Mutex<()>,
     /// The auto-publication of the bound port, for as long as the socket lives.
     auto_publication: Mutex<Option<Box<dyn Publication>>>,
 }
@@ -202,9 +252,265 @@ impl UdpSocket {
                 endpoint_connection: None,
                 endpoint_blocked: None,
                 endpoint_write_revision: 0,
+                endpoint_option_keys: BTreeSet::new(),
+                endpoint_option_version: 0,
             }),
+            endpoint_control: Mutex::new(()),
             auto_publication: Mutex::new(None),
         })
+    }
+
+    fn selected_option(level: i32, name: i32) -> bool {
+        (level == SocketLevel::SOL_SOCKET.0
+            && [SocketOption::SO_BROADCAST.0, SocketOption::SO_DONTROUTE.0].contains(&name))
+            || (level == SocketLevel::SOL_IP.0
+                && [
+                    IpOption::IP_TTL.0,
+                    IpOption::IP_MULTICAST_TTL.0,
+                    IpOption::IP_MULTICAST_IF.0,
+                    IpOption::IP_MULTICAST_LOOP.0,
+                    IpOption::IP_ADD_MEMBERSHIP.0,
+                    IpOption::IP_DROP_MEMBERSHIP.0,
+                ]
+                .contains(&name))
+            || (level == SocketLevel::SOL_IPV6.0
+                && [
+                    Ipv6Option::IPV6_UNICAST_HOPS.0,
+                    Ipv6Option::IPV6_MULTICAST_HOPS.0,
+                    Ipv6Option::IPV6_MULTICAST_IF.0,
+                    Ipv6Option::IPV6_MULTICAST_LOOP.0,
+                    Ipv6Option::IPV6_ADD_MEMBERSHIP.0,
+                    Ipv6Option::IPV6_DROP_MEMBERSHIP.0,
+                ]
+                .contains(&name))
+    }
+
+    fn selected_membership(level: i32, name: i32) -> bool {
+        (level == SocketLevel::SOL_IP.0
+            && [
+                IpOption::IP_ADD_MEMBERSHIP.0,
+                IpOption::IP_DROP_MEMBERSHIP.0,
+            ]
+            .contains(&name))
+            || (level == SocketLevel::SOL_IPV6.0
+                && [
+                    Ipv6Option::IPV6_ADD_MEMBERSHIP.0,
+                    Ipv6Option::IPV6_DROP_MEMBERSHIP.0,
+                ]
+                .contains(&name))
+    }
+
+    fn selected_option_value(&self, opts: &SockOpts, level: i32, name: i32) -> NetResult<Vec<u8>> {
+        if level == SocketLevel::SOL_IP.0 && name == IpOption::IP_MULTICAST_IF.0 {
+            let mut request = vec![0; 4];
+            request.extend_from_slice(&opts.mc.addr4.octets());
+            request.extend_from_slice(&opts.mc.requested_index4.to_le_bytes());
+            return Ok(request);
+        }
+        let mut bytes = [0u8; 4];
+        let n = if crate::mcast::handles(level, name) {
+            opts.get_mcast(&self.net, level, name, &mut bytes)?
+        } else {
+            opts.get(level, name, &mut bytes)?
+        };
+        Ok(bytes[..n].to_vec())
+    }
+
+    fn selected_option_snapshot(&self, g: &Inner) -> NetResult<Vec<(i32, i32, Vec<u8>)>> {
+        let mut options = Vec::new();
+        for &(level, name) in &g.endpoint_option_keys {
+            options.push((
+                level,
+                name,
+                self.selected_option_value(&g.opts, level, name)?,
+            ));
+        }
+        options.extend(g.opts.mc.backend_memberships()?);
+        Ok(options)
+    }
+
+    fn set_selected_option(&self, level: i32, name: i32, value: &[u8]) -> NetResult<()> {
+        // No state guard escapes into provider work. This gate serializes only bounded
+        // nonreentrant controls; pending bind futures release it and reacquire at commit.
+        let _control = self.endpoint_control.lock().unwrap();
+        {
+            let mut g = self.lock();
+            if g.endpoint_bound.is_none() {
+                let next_version = g
+                    .endpoint_option_version
+                    .checked_add(1)
+                    .ok_or(Errno::EOVERFLOW)?;
+                if crate::mcast::handles(level, name) {
+                    g.opts.set_mcast(&self.net, level, name, value)?;
+                } else {
+                    let bound = g.local.is_some();
+                    g.opts.set(level, name, value, bound)?;
+                }
+                if !Self::selected_membership(level, name) {
+                    g.endpoint_option_keys.insert((level, name));
+                }
+                g.endpoint_option_version = next_version;
+                return Ok(());
+            }
+        }
+        let (next, prepared, bound, version) = {
+            let g = self.lock();
+            let mut next = g.opts.clone();
+            let prepared = if crate::mcast::handles(level, name) {
+                let prepared = next.prepare_selected_mcast(&self.net, level, name, value)?;
+                next.mc = prepared.state().clone();
+                Some(prepared)
+            } else {
+                next.set(level, name, value, g.local.is_some())?;
+                None
+            };
+            (
+                next,
+                prepared,
+                g.endpoint_bound.clone(),
+                g.endpoint_option_version,
+            )
+        };
+        let next_version = version.checked_add(1).ok_or(Errno::EOVERFLOW)?;
+        let provider_value = if Self::selected_membership(level, name) {
+            value.to_vec()
+        } else {
+            self.selected_option_value(&next, level, name)?
+        };
+        if let Some(bound) = &bound {
+            bound.set_option(level, name, &provider_value)?;
+        }
+        let mut g = self.lock();
+        // Source ids may change independently of the actual bound resource. The control
+        // gate protects both renewals and this socket-wide version, avoiding stale-token close.
+        let same = match (&bound, &g.endpoint_bound) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        if !same || version != g.endpoint_option_version {
+            return Err(Errno::ECANCELED);
+        }
+        if let Some(mut prepared) = prepared {
+            if let Some(bound) = &bound {
+                prepared.admit_provider(bound);
+            }
+            match prepared.commit(&self.net) {
+                Ok(mc) => g.opts.mc = mc,
+                Err(error) => {
+                    if bound.is_some() {
+                        self.retire_selected_binding(&mut g);
+                    }
+                    return Err(error);
+                }
+            }
+        } else {
+            let bound_now = g.local.is_some();
+            if let Err(error) = g.opts.set(level, name, &provider_value, bound_now) {
+                if bound.is_some() {
+                    self.retire_selected_binding(&mut g);
+                }
+                return Err(error);
+            }
+        }
+        g.endpoint_option_version = next_version;
+        if !Self::selected_membership(level, name) {
+            g.endpoint_option_keys.insert((level, name));
+        }
+        Ok(())
+    }
+
+    fn retire_selected_binding(&self, g: &mut Inner) {
+        if let Some(local) = g.local.take() {
+            self.net.state().udp.unbind(self.id, local.port());
+        }
+        g.endpoint_bound = None;
+        g.peer = None;
+        g.policy_peer = None;
+        g.requested_bind = None;
+        g.saddr = None;
+        g.addr_locked = false;
+        g.port_locked = false;
+        g.backend = None;
+        let _ = self.release_publication(g);
+        if let Some(ns) = self.net.endpoints() {
+            self.endpoint_reset(g, &ns);
+        }
+        self.wq.wake(PollMask::ERR | PollMask::HUP);
+    }
+
+    /// Changes only the captured external resource. Renew authority before a physical
+    /// mutation so no old TX claim can configure the resource while its association changes.
+    /// The caller holds the bounded control gate, but no state lock crosses provider calls.
+    fn associate_bound<'a>(
+        &'a self,
+        mut g: MutexGuard<'a, Inner>,
+        ns: &Namespace,
+        peer: Option<SocketAddr>,
+        selected_source: Option<EndpointSourceId>,
+    ) -> (MutexGuard<'a, Inner>, NetResult<()>) {
+        let Some(bound) = g.endpoint_bound.clone().filter(|_| ns.external) else {
+            return (g, Ok(()));
+        };
+        let old_connection = g.endpoint_connection.clone();
+        drop(g);
+        let before_local = bound.local_addr();
+        let before_peer = bound.datagram_peer_addr();
+        g = self.lock();
+        self.endpoint_reset(&mut g, ns);
+        if let Some(source) = selected_source {
+            self.endpoint.replace_source(ns, source);
+        }
+        let source = self.endpoint.source();
+        drop(g);
+        let result = bound.connect_datagram(source, peer);
+        let after_local = bound.local_addr();
+        let after_peer = bound.datagram_peer_addr();
+        g = self.lock();
+        let result = match result {
+            None => Ok(()),
+            Some(Err(error)) => {
+                let unchanged = matches!((&before_local, &after_local), (Ok(a), Ok(b)) if a == b)
+                    && matches!((&before_peer, &after_peer), (Some(Ok(a)), Some(Ok(b))) if a == b);
+                if unchanged {
+                    g.endpoint_connection = old_connection;
+                    if let Some(local) = g.local {
+                        self.endpoint_join(&g, local);
+                    }
+                } else {
+                    self.retire_selected_binding(&mut g);
+                }
+                return (g, Err(error));
+            }
+            Some(Ok(())) => after_local.and_then(|actual| {
+                let actual = canonical(actual);
+                let previous = g.local.ok_or(Errno::ECANCELED)?;
+                if actual.port() == 0 || actual.is_ipv4() != previous.is_ipv4() {
+                    return Err(Errno::EPROTO);
+                }
+                if let Some(requested) = g.requested_bind {
+                    let requested = canonical(requested);
+                    if (requested.port() != 0 && requested.port() != actual.port())
+                        || (!requested.ip().is_unspecified() && requested.ip() != actual.ip())
+                    {
+                        return Err(Errno::EPROTO);
+                    }
+                }
+                self.net.state().udp.replace_bound(
+                    self.id,
+                    previous.port(),
+                    self.spec(&g.opts, actual.ip()),
+                    actual.port(),
+                    self.me.clone(),
+                )?;
+                g.local = Some(actual);
+                Ok(())
+            }),
+        };
+        if result.is_err() {
+            self.retire_selected_binding(&mut g);
+        }
+        (g, result)
     }
 
     fn provider_bind(
@@ -216,6 +522,7 @@ impl UdpSocket {
         let Some(namespace) = self.net.endpoints() else {
             return Ok(None);
         };
+        let external = namespace.external;
         let original_bind = if explicit {
             Some(requested)
         } else {
@@ -225,6 +532,7 @@ impl UdpSocket {
         if explicit {
             self.net.admit(requested, crate::PolicyDirection::Inbound)?;
         }
+        let _control = self.endpoint_control.lock().unwrap();
         let (request, admission) = {
             let mut g = self.lock();
             if !explicit {
@@ -242,7 +550,11 @@ impl UdpSocket {
             let request_explicit = original_bind.is_some();
             let addr = canonical(requested);
             let freebind = g.opts.flag(0, wasixv2_abi::IpOption::IP_FREEBIND.0);
-            self.net.check_bind(addr, privileged, freebind)?;
+            if !external {
+                self.net.check_bind(addr, privileged, freebind)?;
+            }
+            // External capability alone does not select an address authority. Its pure
+            // choice below precedes the selected security check and any provider work.
             if matches!(requested, SocketAddr::V6(v6) if v6.ip().to_ipv4_mapped().is_some())
                 && g.opts.v6only
             {
@@ -271,11 +583,33 @@ impl UdpSocket {
                 self.wq.clone(),
                 move |actual, bound| {
                     let socket = commit.upgrade().ok_or(Errno::ECANCELED)?;
+                    let _control = socket.endpoint_control.lock().unwrap();
                     let actual = crate::endpoint::bind::validate(request, actual)?;
+                    let options = {
+                        let g = socket.lock();
+                        if g.bind_pending != Some(source_id)
+                            || socket.endpoint.source() != source_id
+                        {
+                            return Err(Errno::ECANCELED);
+                        }
+                        if (g.opts.v6only, g.opts.reuseaddr, g.opts.reuseport)
+                            != (request.v6only, request.reuse_addr, request.reuse_port)
+                        {
+                            return Err(Errno::ECANCELED);
+                        }
+                        if external {
+                            socket.selected_option_snapshot(&g)?
+                        } else {
+                            Vec::new()
+                        }
+                    };
+                    for (level, name, value) in options {
+                        bound.set_option(level, name, &value)?;
+                    }
                     socket.net.check_bind(
                         actual,
                         privileged,
-                        freebind || requested.ip().is_unspecified(),
+                        freebind || external || requested.ip().is_unspecified(),
                     )?;
                     let mut g = socket.lock();
                     if g.bind_pending != Some(source_id) || socket.endpoint.source() != source_id {
@@ -295,12 +629,16 @@ impl UdpSocket {
                         request.explicit && !canonical(requested).ip().is_unspecified();
                     g.bind_pending = None;
                     g.bind_admission = Weak::new();
+                    if external {
+                        g.opts.mc.admit_provider(&bound);
+                    }
                     g.endpoint_bound = Some(bound);
                     socket.claim_publication(&mut g, None);
                     socket.endpoint_join(&g, actual);
                     let group = socket.endpoint.group();
                     let namespace = socket.net.endpoints();
                     drop(g);
+                    drop(_control);
                     if let (Some(namespace), Some(group)) = (namespace, group) {
                         namespace.refresh(&group);
                     }
@@ -322,8 +660,36 @@ impl UdpSocket {
             g.bind_admission = Arc::downgrade(&admission);
             (request, admission)
         };
-        // The synchronous factory must not block; the lease represents all pending work.
-        let result = namespace.provider.bind(request, self.wq.clone());
+        // Factories may reenter the socket; only the later bounded resource controls are
+        // nonreentrant. Never retain even the control gate during a foreign factory.
+        drop(_control);
+        let result = (|| {
+            if external && !namespace.provider.select_bind(&request)? {
+                // Pure namespace selection accepts no physical work. The ordinary bind
+                // path below repeats all namespace address/route validation.
+                return Ok(None);
+            }
+            if explicit || matches!(request.purpose, EndpointBindPurpose::Listen { .. }) {
+                self.net.admit(requested, crate::PolicyDirection::Inbound)?;
+            }
+            {
+                let _control = self.endpoint_control.lock().unwrap();
+                let g = self.lock();
+                if g.bind_pending != Some(request.source_id)
+                    || self.endpoint.source() != request.source_id
+                    || (g.opts.v6only, g.opts.reuseaddr, g.opts.reuseport)
+                        != (request.v6only, request.reuse_addr, request.reuse_port)
+                {
+                    return Err(Errno::ECANCELED);
+                }
+                self.net.check_bind(
+                    canonical(requested),
+                    privileged,
+                    g.opts.flag(0, wasixv2_abi::IpOption::IP_FREEBIND.0) || external,
+                )?;
+            }
+            namespace.provider.bind(request, self.wq.clone())
+        })();
         admission.install(result.clone());
         match result {
             Ok(Some(_)) => Ok(Some(admission.subscribe())),
@@ -392,11 +758,14 @@ impl UdpSocket {
             ns.join_udp(
                 &self.endpoint,
                 self.me.clone(),
-                local,
+                EndpointMember {
+                    source_id: self.endpoint.source(),
+                    local,
+                    requested_bind: g.requested_bind,
+                    binding: g.endpoint_bound.clone(),
+                },
                 self.domain(),
                 g.opts.v6only,
-                g.requested_bind,
-                g.endpoint_bound.clone(),
             );
         }
     }
@@ -423,6 +792,28 @@ impl UdpSocket {
     }
     fn endpoint_same_route(previous: &UdpRoute, current: &UdpRoute) -> bool {
         match (previous, current) {
+            (
+                UdpRoute::External {
+                    from: a,
+                    interface: ai,
+                },
+                UdpRoute::External {
+                    from: b,
+                    interface: bi,
+                },
+            ) => a == b && ai == bi,
+            (UdpRoute::Broadcast, UdpRoute::Broadcast) => true,
+            (
+                UdpRoute::Multicast {
+                    from: a,
+                    interface: ai,
+                },
+                UdpRoute::Multicast {
+                    from: b,
+                    interface: bi,
+                },
+            ) => a == b && ai == bi,
+
             (
                 UdpRoute::Local {
                     from: a,
@@ -565,24 +956,68 @@ impl UdpSocket {
         }
     }
 
-    pub(crate) fn deliver_endpoint(
+    fn multicast_takes(
+        &self,
+        g: &Inner,
+        destination: SocketAddr,
+        from: SocketAddr,
+        interface: u32,
+        external: bool,
+    ) -> bool {
+        let Some(local) = g.local else {
+            return false;
+        };
+        let device = self.net.device_index(&g.opts.bind_device);
+        let membership = if external {
+            g.endpoint_bound.as_ref().is_some_and(|bound| {
+                g.opts
+                    .mc
+                    .allows_selected(destination.ip(), from.ip(), interface, bound)
+            })
+        } else {
+            g.opts.mc.allows(destination.ip(), from.ip(), interface)
+        };
+        serves(local, g.opts.v6only, canonical(destination))
+            && g.peer.is_none_or(|peer| canonical(peer) == canonical(from))
+            && (device == 0 || device == interface)
+            && membership
+    }
+
+    pub(crate) fn deliver_endpoint_packet(
         &self,
         source: EndpointSourceId,
         gate: &AttemptGate,
         data: &[u8],
-        from: SocketAddr,
-        destination: SocketAddr,
+        info: crate::endpoint::DatagramInfo,
     ) -> DatagramDelivery {
+        let from = info.source;
+        let destination = info.destination;
         let at = Arrival {
             src: from.ip(),
             dst: destination.ip(),
             ttl: 64,
             traffic_class: 0,
-            iif: crate::iface::LOOPBACK_INDEX,
-            pkttype: PACKET_HOST,
+            iif: info.interface,
+            pkttype: if destination.ip().is_multicast() {
+                PACKET_MULTICAST
+            } else if matches!(info.destination.ip(), IpAddr::V4(ip) if ip.is_broadcast()) {
+                PACKET_BROADCAST
+            } else {
+                PACKET_HOST
+            },
         };
+        let external = self.net.endpoints().is_some_and(|ns| ns.external);
         let (filter, port) = {
             let g = self.lock();
+            if destination.ip().is_multicast()
+                && !self.multicast_takes(&g, destination, from, info.interface, external)
+            {
+                return DatagramDelivery::Dropped;
+            }
+            let device = self.net.device_index(&g.opts.bind_device);
+            if device != 0 && device != info.interface {
+                return DatagramDelivery::Dropped;
+            }
             (g.opts.filter.clone(), g.local.map_or(0, |a| a.port()))
         };
         let Some(data) = self.filtered(&filter, data, from, port, &at) else {
@@ -592,7 +1027,16 @@ impl UdpSocket {
         if self.endpoint.source() != source {
             return DatagramDelivery::Retired;
         }
-        if g.peer.is_some_and(|peer| peer != from) || g.queued > g.opts.rcvbuf {
+        if g.peer
+            .is_some_and(|peer| canonical(peer) != canonical(from))
+            || g.queued > g.opts.rcvbuf
+            || (destination.ip().is_multicast()
+                && !self.multicast_takes(&g, destination, from, info.interface, external))
+            || {
+                let device = self.net.device_index(&g.opts.bind_device);
+                device != 0 && device != info.interface
+            }
+        {
             return DatagramDelivery::Dropped;
         }
         let result = self
@@ -1109,6 +1553,27 @@ impl UdpSocket {
         Ok(path)
     }
 
+    fn connect_route(
+        &self,
+        g: &Inner,
+        addr: SocketAddr,
+        admission: crate::net::Admission,
+    ) -> NetResult<ConnectRoute> {
+        let namespace = self.connect_path(g, addr, admission);
+        if admission == crate::net::Admission::Allowed
+            && g.endpoint_bound.is_some()
+            && self.net.endpoints().is_some_and(|ns| ns.external)
+            && self.net.external_route_candidate(canonical(addr))?
+            && (addr.ip().is_multicast()
+                || matches!(namespace, Err(Errno::ENETUNREACH | Errno::EADDRNOTAVAIL)))
+        {
+            return Ok(ConnectRoute::External {
+                source: g.local.map_or(self.any(), |local| local.ip()),
+            });
+        }
+        namespace.map(ConnectRoute::Namespace)
+    }
+
     fn send_dns_source(
         &self,
         g: &Inner,
@@ -1236,11 +1701,44 @@ impl UdpSocket {
         Ok(true)
     }
 
+    fn check_payload(
+        &self,
+        g: &mut Inner,
+        dst: SocketAddr,
+        scope: u32,
+        ctl: &SendCtl,
+        len: usize,
+        mtu: Option<u32>,
+    ) -> NetResult<()> {
+        let max = if dst.is_ipv4() {
+            MAX_V4_PAYLOAD
+        } else {
+            MAX_V6_PAYLOAD
+        };
+        if len > max {
+            return Err(Errno::EMSGSIZE);
+        }
+        if let Some(size) = ctl.gso_size {
+            cmsg::check_segments(len, size)?;
+        } else {
+            let oif = self.flow_oif(g, Some(dst), scope, ctl);
+            Self::check_mtu(g, dst.ip(), oif, mtu, len + UDP_HDR, ctl.dontfrag)?;
+        }
+        if let Some(error) = Self::take_err(g) {
+            return Err(error);
+        }
+        if g.wr_shut {
+            return Err(Errno::EPIPE);
+        }
+        Ok(())
+    }
+
     fn check_unicast(
         &self,
         g: &mut Inner,
         flow: &PreparedFlow<'_>,
         dns_source: Option<IpAddr>,
+        physical: bool,
     ) -> NetResult<UdpRoute> {
         let PreparedFlow {
             local,
@@ -1254,31 +1752,60 @@ impl UdpSocket {
             Some(src) => UdpRoute::Dns {
                 from: SocketAddr::new(src, local.port()),
             },
-            None => self.net.udp_route(local, dst, &ctl)?,
+            None => match self.net.udp_route(local, dst, ctl) {
+                Ok(route) => route,
+                Err(Errno::ENETUNREACH | Errno::EADDRNOTAVAIL)
+                    if physical && self.net.external_route_candidate(dst)? =>
+                {
+                    return self.external_route(g, local, dst, scope, ctl, data.len());
+                }
+                Err(error) => return Err(error),
+            },
         };
-        let max = if dst.is_ipv4() {
-            MAX_V4_PAYLOAD
-        } else {
-            MAX_V6_PAYLOAD
-        };
-        if data.len() > max {
-            return Err(Errno::EMSGSIZE);
-        }
-        if let Some(size) = ctl.gso_size {
-            cmsg::check_segments(data.len(), size)?;
-        } else {
-            let mtu = self.net.mtu_to(dst.ip());
-            let oif = self.flow_oif(g, Some(dst), scope, &ctl);
-            let len = data.len() + UDP_HDR;
-            Self::check_mtu(g, dst.ip(), oif, mtu, len, ctl.dontfrag)?;
-        }
-        if let Some(e) = Self::take_err(g) {
-            return Err(e);
-        }
-        if g.wr_shut {
-            return Err(Errno::EPIPE);
-        }
+        self.check_payload(g, dst, scope, ctl, data.len(), self.net.mtu_to(dst.ip()))?;
         Ok(route)
+    }
+
+    fn external_route(
+        &self,
+        g: &mut Inner,
+        local: SocketAddr,
+        dst: SocketAddr,
+        scope: u32,
+        ctl: &SendCtl,
+        len: usize,
+    ) -> NetResult<UdpRoute> {
+        if !self.net.external_route_candidate(dst)? {
+            return Err(Errno::EAGAIN);
+        }
+        self.check_broadcast(g, dst, len)?;
+        // Per-packet physical interface overrides have no old provider operation. Socket
+        // multicast interface selection is applied to the same resource by setsockopt.
+        if ctl.oif != 0 {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        self.check_payload(g, dst, scope, ctl, len, None)?;
+        let (interface, mc_source) = if dst.ip().is_multicast() {
+            g.opts.mc.physical_interface(dst.ip())
+        } else {
+            (0, None)
+        };
+        let bound = (!local.ip().is_unspecified()).then_some(local.ip());
+        let source = ctl
+            .src
+            .map(canonical_ip)
+            .or(bound)
+            .or(mc_source)
+            .unwrap_or(local.ip());
+        if source.is_ipv4() != dst.is_ipv4()
+            || bound.is_some_and(|bound| !source.is_unspecified() && source != bound)
+        {
+            return Err(Errno::EINVAL);
+        }
+        Ok(UdpRoute::External {
+            from: SocketAddr::new(source, local.port()),
+            interface,
+        })
     }
 
     fn check_multicast(
@@ -1290,28 +1817,47 @@ impl UdpSocket {
         len: usize,
     ) -> NetResult<McRoute> {
         let route = self.mc_route(g, dst, scope, Some(ctl))?;
-        let max = match dst.is_ipv4() {
-            true => MAX_V4_PAYLOAD,
-            false => MAX_V6_PAYLOAD,
-        };
-        if len > max {
-            return Err(Errno::EMSGSIZE);
-        }
-        if let Some(size) = ctl.gso_size {
-            cmsg::check_segments(len, size)?;
-        } else {
-            let mtu = self.net.link_mtu(route.oif);
-            let oif = self.flow_oif(g, Some(dst), scope, ctl);
-            let len = len + UDP_HDR;
-            Self::check_mtu(g, dst.ip(), oif, mtu, len, ctl.dontfrag)?;
-        }
-        if let Some(e) = Self::take_err(g) {
-            return Err(e);
-        }
-        if g.wr_shut {
-            return Err(Errno::EPIPE);
-        }
+        self.check_payload(g, dst, scope, ctl, len, self.net.link_mtu(route.oif))?;
         Ok(route)
+    }
+
+    fn revalidate_endpoint_route(
+        &self,
+        g: &mut Inner,
+        route: &UdpRoute,
+        flow: &PreparedFlow<'_>,
+        physical: bool,
+    ) -> NetResult<UdpRoute> {
+        let PreparedFlow {
+            local,
+            dst,
+            scope,
+            ctl,
+            data,
+        } = flow;
+        let (local, dst, scope, len) = (*local, *dst, *scope, data.len());
+        match route {
+            UdpRoute::External { .. } => self.external_route(g, local, dst, scope, ctl, len),
+            UdpRoute::Broadcast => {
+                if !self.check_broadcast(g, dst, len)? {
+                    return Err(Errno::EAGAIN);
+                }
+                if physical {
+                    // The admitted resource owns its physical route/MTU. Apply the same
+                    // selected validation and literal-hint limits as external multicast.
+                    self.external_route(g, local, dst, scope, ctl, len)?;
+                }
+                Ok(UdpRoute::Broadcast)
+            }
+            UdpRoute::Multicast { .. } => {
+                let route = self.check_multicast(g, dst, scope, ctl, len)?;
+                Ok(UdpRoute::Multicast {
+                    from: SocketAddr::new(route.src, local.port()),
+                    interface: route.oif,
+                })
+            }
+            _ => self.net.udp_route(local, dst, ctl),
+        }
     }
 
     fn send_locked<'a>(
@@ -1342,7 +1888,9 @@ impl UdpSocket {
             ..msg
         };
         let cork = g.cork || msg.flags.contains(MsgFlags::MSG_MORE);
-        if self.check_broadcast(&g, dst, msg.data.len())? {
+        let broadcast = self.check_broadcast(&g, dst, msg.data.len())?;
+        let external = self.net.endpoints().is_some_and(|ns| ns.external);
+        if broadcast && (!external || g.endpoint_bound.is_none()) {
             if cork {
                 g.pending = Some(Pending {
                     policy_dst: policy_dst.unwrap_or(dst),
@@ -1356,11 +1904,30 @@ impl UdpSocket {
             }
             return Ok(msg.data.len());
         }
-        if dst.ip().is_multicast() {
+        if dst.ip().is_multicast() && !external {
             return self.send_multicast(g, local, dst, scope, &ctl, msg, policy_dst);
         }
-        let route = self.check_unicast(&mut g, &flow, dns_source)?;
-        if cork {
+        let mut route = if external
+            && g.endpoint_bound.is_some()
+            && dst.ip().is_multicast()
+            && self.net.external_route_candidate(dst)?
+        {
+            self.external_route(&mut g, local, dst, scope, &ctl, msg.data.len())?
+        } else if broadcast {
+            // Pure selection decides ownership before provider-only pending-error,
+            // shutdown/GSO/MTU validation. Namespace broadcast retains its old fast path.
+            UdpRoute::Broadcast
+        } else if dst.ip().is_multicast() {
+            let route = self.check_multicast(&mut g, dst, scope, &ctl, msg.data.len())?;
+            UdpRoute::Multicast {
+                from: SocketAddr::new(route.src, local.port()),
+                interface: route.oif,
+            }
+        } else {
+            let physical = external && g.endpoint_bound.is_some() && dns_source.is_none();
+            self.check_unicast(&mut g, &flow, dns_source, physical)?
+        };
+        if cork && !broadcast {
             g.pending = Some(Pending {
                 policy_dst: policy_dst.unwrap_or(dst),
                 data: msg.data.to_vec(),
@@ -1379,9 +1946,15 @@ impl UdpSocket {
             let local_binding = g.local;
             let connected = g.endpoint_connection.clone();
             let eligible = matches!(&route,UdpRoute::Local {at,..} if Arc::ptr_eq(at,&self.net))
-                || (ns.external && matches!(&route, UdpRoute::Backend { .. }));
+                || (ns.external
+                    && matches!(&route, UdpRoute::Backend { .. } | UdpRoute::External { .. }))
+                || (ns.external
+                    && matches!(&route, UdpRoute::Multicast { .. } | UdpRoute::Broadcast)
+                    && self.net.external_route_candidate(dst).unwrap_or(false));
             let effective = match &route {
-                UdpRoute::Local { from, .. } => *from,
+                UdpRoute::Local { from, .. }
+                | UdpRoute::Multicast { from, .. }
+                | UdpRoute::External { from, .. } => *from,
                 _ => local,
             };
             let group = self.endpoint.group();
@@ -1414,23 +1987,59 @@ impl UdpSocket {
             } else {
                 EndpointChoice::Namespace
             };
+            let current_admission = self
+                .net
+                .admit(policy_dst.unwrap_or(dst), crate::PolicyDirection::Outbound)?;
+            if current_admission != admission {
+                return Err(Errno::EPERM);
+            }
             g = self.lock();
             if source != self.endpoint.source() || g.local != local_binding {
                 return Err(Errno::ECANCELED);
             }
+            if matches!(choice, EndpointChoice::Namespace)
+                && matches!(route, UdpRoute::External { .. })
+            {
+                // Namespace ownership retains its actual validation and errors. No physical
+                // operation was accepted by pure selection, so there is no provider fallback.
+                route = if dst.ip().is_multicast() {
+                    let route = self.check_multicast(&mut g, dst, scope, &ctl, msg.data.len())?;
+                    UdpRoute::Multicast {
+                        from: SocketAddr::new(route.src, local.port()),
+                        interface: route.oif,
+                    }
+                } else {
+                    self.check_unicast(&mut g, &flow, dns_source, false)?
+                };
+            }
+            let physical = matches!(choice, EndpointChoice::Provider(_));
             // Publication refresh and pure selection may reenter this socket or change its
             // route. Both choices must pass current validation before any dispatch accepts
             // data. The cork has already been gathered: a stale snapshot fails unaccepted
             // rather than recursively appending or replaying the message.
-            if let Some(error) = Self::take_err(&mut g) {
-                return Err(error);
+            if !broadcast || physical {
+                if let Some(error) = Self::take_err(&mut g) {
+                    return Err(error);
+                }
+                if g.wr_shut {
+                    return Err(Errno::EPIPE);
+                }
             }
-            if g.wr_shut {
-                return Err(Errno::EPIPE);
-            }
-            let current_route = self.net.udp_route(local, dst, &ctl)?;
+            let current_route = self.revalidate_endpoint_route(&mut g, &route, &flow, physical)?;
             if !Self::endpoint_same_route(&route, &current_route) {
                 return Err(Errno::EAGAIN);
+            }
+            if cork {
+                g.pending = Some(Pending {
+                    policy_dst: policy_dst.unwrap_or(dst),
+                    data: msg.data.to_vec(),
+                    local,
+                    dst,
+                    scope,
+                    ctl,
+                    now: msg.now,
+                });
+                return Ok(msg.data.len());
             }
             if let EndpointChoice::Provider(target) = choice {
                 g.endpoint_blocked = None;
@@ -1452,6 +2061,12 @@ impl UdpSocket {
                         return result;
                     }
                 };
+                let current_admission = self
+                    .net
+                    .admit(policy_dst.unwrap_or(dst), crate::PolicyDirection::Outbound)?;
+                if current_admission != admission {
+                    return Err(Errno::EPERM);
+                }
                 let current = {
                     let mut g = self.lock();
                     if source != self.endpoint.source() {
@@ -1463,7 +2078,8 @@ impl UdpSocket {
                     if g.wr_shut {
                         return Err(Errno::EPIPE);
                     }
-                    let current_route = self.net.udp_route(local, dst, &ctl)?;
+                    let current_route =
+                        self.revalidate_endpoint_route(&mut g, &route, &flow, true)?;
                     if !Self::endpoint_same_route(&route, &current_route) {
                         return Err(Errno::EAGAIN);
                     }
@@ -1471,7 +2087,14 @@ impl UdpSocket {
                 };
                 let segment = ctl.gso_size.unwrap_or(usize::MAX).max(1);
                 let send = |bytes: &[u8]| {
-                    let n = tx.send_to(current, &target, effective, dst, bytes)?;
+                    let physical_destination = match dst {
+                        SocketAddr::V6(mut address) => {
+                            address.set_scope_id(scope);
+                            SocketAddr::V6(address)
+                        }
+                        address => address,
+                    };
+                    let n = tx.send_to(current, &target, effective, physical_destination, bytes)?;
                     if n == bytes.len() {
                         Ok(n)
                     } else {
@@ -1510,6 +2133,11 @@ impl UdpSocket {
         let ttl = ctl.ttl.unwrap_or_else(|| g.opts.unicast_ttl(self.domain()));
         let traffic_class = Self::traffic_class(&g, &ctl, dst.ip());
         match route {
+            UdpRoute::External { .. } => Err(Errno::ECANCELED),
+            UdpRoute::Broadcast => Ok(msg.data.len()),
+            UdpRoute::Multicast { .. } => {
+                self.send_multicast(g, local, dst, scope, &ctl, msg, policy_dst)
+            }
             UdpRoute::Local {
                 from,
                 to,
@@ -1741,16 +2369,8 @@ impl UdpSocket {
     /// the group or a wildcard of its family, connected to nobody else, on no other device,
     /// and allows the group (`ip_mc_sf_allow`, `inet6_mc_check`).
     fn deliver_multicast(&self, dst: SocketAddr, from: SocketAddr, at: &Arrival, data: &[u8]) {
-        let iif = at.iif;
         let g = self.lock();
-        let Some(local) = g.local else {
-            return;
-        };
-        let dev = self.net.device_index(&g.opts.bind_device);
-        let takes = serves(local, g.opts.v6only, dst)
-            && g.peer.is_none_or(|p| p == from)
-            && (dev == 0 || dev == iif)
-            && g.opts.mc.allows(dst.ip(), from.ip(), iif);
+        let takes = self.multicast_takes(&g, dst, from, at.iif, false);
         drop(g);
         if takes {
             self.deliver(data, from, at);
@@ -1899,6 +2519,10 @@ impl Socket for UdpSocket {
     fn bind(&self, addr: SocketAddr, privileged: bool) -> NetResult<()> {
         let requested = addr;
         self.net.admit(addr, crate::PolicyDirection::Inbound)?;
+        let control = self
+            .net
+            .endpoints()
+            .map(|_| self.endpoint_control.lock().unwrap());
         let mapped = matches!(addr, SocketAddr::V6(v6) if v6.ip().to_ipv4_mapped().is_some());
         let addr = canonical(addr);
         let mut g = self.lock();
@@ -1934,6 +2558,7 @@ impl Socket for UdpSocket {
         let group = self.endpoint.group();
         let ns = self.net.endpoints();
         drop(g);
+        drop(control);
         if let (Some(ns), Some(group)) = (ns, group) {
             ns.refresh(&group);
         }
@@ -1957,6 +2582,25 @@ impl Socket for UdpSocket {
         if self.net.endpoints().is_none() || self.lock().local.is_some() {
             return Ok(None);
         }
+        let physical = if let Some(namespace) = self.net.endpoints().filter(|ns| ns.external) {
+            let request = {
+                let g = self.lock();
+                EndpointBindRequest {
+                    source_id: self.endpoint.source(),
+                    kind: EndpointKind::Datagram,
+                    requested: g.requested_bind.unwrap_or(SocketAddr::new(self.any(), 0)),
+                    explicit: g.requested_bind.is_some(),
+                    purpose: EndpointBindPurpose::Bind,
+                    domain: self.domain(),
+                    v6only: g.opts.v6only,
+                    reuse_addr: g.opts.reuseaddr,
+                    reuse_port: g.opts.reuseport,
+                }
+            };
+            namespace.provider.select_bind(&request)?
+        } else {
+            false
+        };
         // Shared preparation validates without accepting bytes or consuming the live cork.
         match operation {
             crate::endpoint::EndpointAutobind::Listen(_) => return Ok(None),
@@ -1971,7 +2615,18 @@ impl Socket for UdpSocket {
                 {
                     return Err(Errno::ENETUNREACH);
                 }
-                self.connect_path(&g, destination, admission)?;
+                if physical {
+                    self.check_broadcast(&g, canonical(destination), 0)?;
+                }
+                match self.connect_path(&g, destination, admission) {
+                    Ok(_) => {}
+                    Err(error)
+                        if physical
+                            && admission == crate::net::Admission::Allowed
+                            && (destination.ip().is_multicast()
+                                || matches!(error, Errno::ENETUNREACH | Errno::EADDRNOTAVAIL)) => {}
+                    Err(error) => return Err(error),
+                }
             }
             crate::endpoint::EndpointAutobind::Send(msg) => {
                 let (mut g, destination, admission) = self.send_policy(msg)?;
@@ -1979,12 +2634,24 @@ impl Socket for UdpSocket {
                 self.send_head(&g, msg)?;
                 let local = SocketAddr::new(g.saddr.unwrap_or(self.any()), 0);
                 let flow = self.prepare_flow(&g, msg, local, g.pending.clone())?;
-                if self.check_broadcast(&g, flow.dst, flow.data.len())? {
+                if physical
+                    && flow.dst.ip().is_multicast()
+                    && self.net.external_route_candidate(flow.dst).unwrap_or(false)
+                {
+                    self.external_route(
+                        &mut g,
+                        local,
+                        flow.dst,
+                        flow.scope,
+                        &flow.ctl,
+                        flow.data.len(),
+                    )?;
+                } else if self.check_broadcast(&g, flow.dst, flow.data.len())? {
                     // Broadcast's existing path intentionally skips pending socket errors.
                 } else if flow.dst.ip().is_multicast() {
                     self.check_multicast(&mut g, flow.dst, flow.scope, &flow.ctl, flow.data.len())?;
                 } else {
-                    self.check_unicast(&mut g, &flow, dns_source)?;
+                    self.check_unicast(&mut g, &flow, dns_source, physical)?;
                 }
             }
         }
@@ -2003,22 +2670,37 @@ impl Socket for UdpSocket {
     /// source address if bound to the wildcard.
     fn connect(&self, addr: SocketAddr) -> NetResult<()> {
         let admission = self.net.admit(addr, crate::PolicyDirection::Outbound)?;
+        let mut control = self
+            .net
+            .endpoints()
+            .map(|_| self.endpoint_control.lock().unwrap());
         let dst = canonical(addr);
         let mut g = self.lock();
-        let path = self.connect_path(&g, addr, admission)?;
+        let mut path = self.connect_route(&g, addr, admission)?;
         let mut selected = None;
         let namespace = self.net.endpoints();
         let mut next_source = None;
         if let Some(ns) = &namespace {
+            if ns.external {
+                self.check_broadcast(&g, dst, 0)?;
+            }
             let candidate = EndpointSourceId(self.net.next_id());
             next_source = Some(candidate);
-            if matches!(path, Path::Local { net: None, .. })
-                || (ns.external && matches!(path, Path::Backend { .. }))
+            if matches!(path, ConnectRoute::Namespace(Path::Local { net: None, .. }))
+                || (ns.external
+                    && (matches!(
+                        path,
+                        ConnectRoute::Namespace(Path::Backend { .. })
+                            | ConnectRoute::External { .. }
+                    ) || ((dst.ip().is_multicast()
+                        || matches!(dst.ip(), IpAddr::V4(ip) if ip.is_broadcast()))
+                        && self.net.external_route_candidate(dst).unwrap_or(false))))
             {
                 let previous = self.endpoint.source();
+                let option_version = g.endpoint_option_version;
                 let bound = g.local;
                 let saddr = g.saddr;
-                let effective = SocketAddr::new(path.src(), bound.map_or(0, |a| a.port()));
+                let effective = SocketAddr::new(path.source(), bound.map_or(0, |a| a.port()));
                 let query = EndpointQuery {
                     kind: EndpointKind::Datagram,
                     source_id: candidate,
@@ -2030,21 +2712,85 @@ impl Socket for UdpSocket {
                     local_binding: ns.hint(EndpointKind::Datagram, dst, effective),
                 };
                 drop(g);
+                drop(control.take());
                 let choice = ns.provider.select(&query)?;
+                control = Some(self.endpoint_control.lock().unwrap());
                 g = self.lock();
-                if previous != self.endpoint.source() || bound != g.local || saddr != g.saddr {
+                if previous != self.endpoint.source()
+                    || bound != g.local
+                    || saddr != g.saddr
+                    || option_version != g.endpoint_option_version
+                {
                     return Err(Errno::ECANCELED);
                 }
-                let current = self.net.path(dst, g.local.map(|l| l.ip()).or(g.saddr))?;
-                if !current.endpoint_same(&path) {
+                let current = self.connect_route(&g, addr, admission)?;
+                if !current.same(&path) {
                     return Err(Errno::EAGAIN);
                 }
                 if let EndpointChoice::Provider(target) = choice {
                     selected = Some(target);
+                } else if matches!(path, ConnectRoute::External { .. }) {
+                    path = ConnectRoute::Namespace(self.connect_path(&g, addr, admission)?);
                 }
             }
         }
-        let src = path.src();
+        if namespace.is_some() {
+            let witness = (
+                self.endpoint.source(),
+                g.local,
+                g.saddr,
+                g.endpoint_option_version,
+            );
+            // Pure provider selection may reenter policy configuration. No physical operation
+            // is accepted until the caller's current authorization is checked again.
+            drop(g);
+            drop(control.take());
+            let current_admission = self.net.admit(addr, crate::PolicyDirection::Outbound)?;
+            control = namespace
+                .as_ref()
+                .map(|_| self.endpoint_control.lock().unwrap());
+            g = self.lock();
+            if current_admission != admission {
+                return Err(Errno::EPERM);
+            }
+            if witness
+                != (
+                    self.endpoint.source(),
+                    g.local,
+                    g.saddr,
+                    g.endpoint_option_version,
+                )
+            {
+                return Err(Errno::ECANCELED);
+            }
+            let current_route = if selected.is_some() {
+                self.connect_route(&g, addr, admission)?
+            } else {
+                ConnectRoute::Namespace(self.connect_path(&g, addr, admission)?)
+            };
+            if !current_route.same(&path) {
+                return Err(Errno::EAGAIN);
+            }
+        }
+        if let Some(ns) = &namespace {
+            let (current, result) =
+                self.associate_bound(g, ns, selected.as_ref().map(|_| addr), next_source);
+            g = current;
+            if let Err(error) = result {
+                let group = self.endpoint.group();
+                drop(g);
+                drop(control);
+                if let Some(group) = group {
+                    ns.refresh(&group);
+                }
+                return Err(error);
+            }
+            // A physical mutation already renewed authority before calling the provider.
+            if ns.external && g.endpoint_bound.is_some() {
+                next_source = Some(self.endpoint.source());
+            }
+        }
+        let src = path.source();
         let local = self.autobind(&mut g)?;
         if local.ip().is_unspecified() && g.endpoint_bound.is_none() {
             self.net.state().udp.rehash(self.id, local.port(), src);
@@ -2055,39 +2801,46 @@ impl Socket for UdpSocket {
             .udp
             .set_remote(self.id, local.port(), Some(dst));
         if let (Some(ns), Some(source)) = (&namespace, next_source) {
-            self.endpoint_reset(&mut g, ns);
-            self.endpoint.replace_source(ns, source);
+            if self.endpoint.source() != source {
+                self.endpoint_reset(&mut g, ns);
+                self.endpoint.replace_source(ns, source);
+            }
             let bound = g.local.unwrap();
             self.endpoint_join(&g, bound);
         }
         let provider_selected = selected.is_some();
         let endpoint_connection = if let Some(target) = selected {
             EndpointConnection::Peer(target)
-        } else if matches!(path, Path::Backend { .. }) {
+        } else if matches!(path, ConnectRoute::Namespace(Path::Backend { .. })) {
             EndpointConnection::Host
         } else {
             EndpointConnection::Local
         };
         match path {
-            Path::Backend { .. } if provider_selected => {
+            ConnectRoute::External { .. } | ConnectRoute::Namespace(Path::Backend { .. })
+                if provider_selected =>
+            {
                 g.backend = None;
                 if let Some((_, ep)) = &g.published {
                     let _ = ep.attach(None);
                 }
             }
             // The host endpoint filters by the peer and reports its ICMP errors.
-            Path::Backend { host_dst, .. } => {
+            ConnectRoute::Namespace(Path::Backend { host_dst, .. }) => {
                 self.backend_endpoint(&mut g)?.connect(Some(host_dst))?
             }
             // The association moved inside the namespace, to a link of its own, or to the DNS
             // server, whose answers are delivered as local datagrams: nothing the backend
             // receives is for us now.
-            Path::Local { .. } | Path::Dns { .. } | Path::Nowhere { .. } => {
+            ConnectRoute::Namespace(
+                Path::Local { .. } | Path::Dns { .. } | Path::Nowhere { .. },
+            ) => {
                 g.backend = None;
                 if let Some((_, ep)) = &g.published {
                     let _ = ep.attach(None);
                 }
             }
+            ConnectRoute::External { .. } => return Err(Errno::ECANCELED),
         }
         g.peer = Some(dst);
         g.policy_peer = Some(addr);
@@ -2096,6 +2849,7 @@ impl Socket for UdpSocket {
         }
         let group = self.endpoint.group();
         drop(g);
+        drop(control);
         if let (Some(ns), Some(group)) = (namespace, group) {
             ns.refresh(&group);
         }
@@ -2104,7 +2858,27 @@ impl Socket for UdpSocket {
 
     /// `udp_disconnect`.
     fn disconnect(&self) -> NetResult<()> {
+        let control = self
+            .net
+            .endpoints()
+            .map(|_| self.endpoint_control.lock().unwrap());
         let mut g = self.lock();
+        let namespace = self.net.endpoints();
+        let mut renewed = false;
+        if let Some(ns) = &namespace {
+            renewed = ns.external && g.endpoint_bound.is_some();
+            let (current, result) = self.associate_bound(g, ns, None, None);
+            g = current;
+            if let Err(error) = result {
+                let group = self.endpoint.group();
+                drop(g);
+                drop(control);
+                if let Some(group) = group {
+                    ns.refresh(&group);
+                }
+                return Err(error);
+            }
+        }
         g.peer = None;
         g.policy_peer = None;
         if let Some(b) = &g.backend {
@@ -2133,15 +2907,17 @@ impl Socket for UdpSocket {
         if g.published.is_some() && g.backend.is_none() {
             self.activate_publication(&mut g);
         }
-        let namespace = self.net.endpoints();
         if let Some(ns) = &namespace {
-            self.endpoint_reset(&mut g, ns);
+            if !renewed {
+                self.endpoint_reset(&mut g, ns);
+            }
             if let Some(local) = g.local {
                 self.endpoint_join(&g, local);
             }
         }
         let group = self.endpoint.group();
         drop(g);
+        drop(control);
         if let (Some(ns), Some(group)) = (namespace, group) {
             ns.refresh(&group);
         }
@@ -2220,7 +2996,20 @@ impl Socket for UdpSocket {
     }
 
     fn local_addr(&self) -> NetResult<SocketAddr> {
+        let _control = self
+            .net
+            .endpoints()
+            .map(|_| self.endpoint_control.lock().unwrap());
         let g = self.lock();
+        if let Some(bound) = g
+            .endpoint_bound
+            .clone()
+            .filter(|_| self.net.endpoints().is_some_and(|ns| ns.external))
+        {
+            drop(g);
+            let actual = bound.local_addr()?;
+            return Ok(present(self.domain(), actual));
+        }
         Ok(g.local
             .or(g.saddr.map(|ip| SocketAddr::new(ip, 0)))
             .map_or(unbound(self.domain()), |a| present(self.domain(), a)))
@@ -2246,6 +3035,14 @@ impl Socket for UdpSocket {
     }
 
     fn set_option(&self, level: i32, name: i32, value: &[u8]) -> NetResult<()> {
+        if self.net.endpoints().is_some_and(|ns| ns.external) && Self::selected_option(level, name)
+        {
+            return self.set_selected_option(level, name, value);
+        }
+        let _control = self
+            .net
+            .endpoints()
+            .map(|_| self.endpoint_control.lock().unwrap());
         let mut g = self.lock();
         if (level, name) == (17, 1 /* UDP_CORK */) {
             g.cork = crate::opts::read_int(value)? != 0;
@@ -2255,6 +3052,7 @@ impl Socket for UdpSocket {
                 let now = pending.now;
                 // udp_lib_setsockopt ignores push errors; the cork is still cleared.
                 drop(g);
+                drop(_control);
                 let _ = self.send(SendMsg {
                     data: &[],
                     to: None,
@@ -2293,6 +3091,7 @@ impl Socket for UdpSocket {
             }
             let group = self.endpoint.group();
             drop(g);
+            drop(_control);
             if let (Some(ns), Some(group)) = (ns, group) {
                 ns.refresh(&group);
             }
@@ -2338,6 +3137,7 @@ impl Socket for UdpSocket {
             None
         };
         drop(g);
+        drop(_control);
         if let Some((tx, config)) = configuration {
             tx.configure(config);
         }

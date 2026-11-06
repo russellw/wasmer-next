@@ -589,6 +589,15 @@ pub trait Network: Send + Sync {
 pub trait BindAdmission: Pollable {
     /// EAGAIN while pending; repeated successful completion reserves the address only once.
     fn complete(&self) -> Result<(), Errno>;
+
+    /// Distinguishes pending readiness from a completed operation returning EAGAIN.
+    /// Existing admissions keep the original EAGAIN-is-pending convention by default.
+    fn complete_result(&self) -> Option<Result<(), Errno>> {
+        match self.complete() {
+            Err(Errno::EAGAIN) => None,
+            result => Some(result),
+        }
+    }
 }
 
 pub trait Socket: Pollable {

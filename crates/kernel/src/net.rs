@@ -418,9 +418,9 @@ impl Kernel {
             wait.wait(
                 WaitOn::Object(&*admission),
                 PollMask::WRITABLE | PollMask::ERR,
-                || admission.complete(),
+                || admission.complete_result().ok_or(Errno::EAGAIN),
             )
-            .await?;
+            .await??;
         } else {
             sock.socket.bind(addr, privileged)?;
         }
@@ -445,9 +445,9 @@ impl Kernel {
             wait.wait(
                 WaitOn::Object(&*admission),
                 PollMask::WRITABLE | PollMask::ERR,
-                || admission.complete(),
+                || admission.complete_result().ok_or(Errno::EAGAIN),
             )
-            .await?;
+            .await??;
         }
         Ok(())
     }

@@ -50,6 +50,16 @@ pub(crate) struct Group {
     control: Mutex<Control>,
 }
 impl Group {
+    pub(super) fn report_member(&self, source: EndpointSourceId, report: impl FnOnce()) {
+        let members = self.members.lock().unwrap();
+        if self.live.load(Ordering::Acquire)
+            && members.values().any(|member| member.source == source)
+        {
+            // report only touches the private AttemptGate; it cannot run foreign provider code.
+            report();
+        }
+    }
+
     fn spec(
         &self,
         attempt: PublicationAttemptId,
@@ -128,10 +138,13 @@ impl SocketEndpoint {
     }
     pub(crate) fn replace_source(&self, namespace: &Namespace, source: EndpointSourceId) {
         let mut membership = self.group.lock().unwrap();
-        self.source.store(source.0, Ordering::Release);
         if let Some(group) = membership.take() {
             namespace.leave(&group, self.id);
         }
+        // Final ingress commit holds this same membership fence. Publish the new source
+        // only after old group removal, so a member-conditioned status cannot race between
+        // source retirement and removal and mark a replacement registration Ready.
+        self.source.store(source.0, Ordering::Release);
     }
     /// Member epoch validation and queue commit share this local fence with retirement.
     pub(crate) fn commit<T>(
@@ -240,49 +253,47 @@ impl Namespace {
         &self,
         endpoint: &SocketEndpoint,
         socket: Weak<TcpSocket>,
-        local: SocketAddr,
+        member: EndpointMember,
         domain: Domain,
         v6only: bool,
         backlog: u32,
-        requested_bind: Option<SocketAddr>,
-        binding: Option<Arc<dyn EndpointBound>>,
     ) -> Arc<Group> {
+        debug_assert_eq!(member.source_id, endpoint.source());
         self.join(
             endpoint,
             Key {
                 kind: EndpointKind::Stream,
-                local,
+                local: member.local,
                 domain,
                 v6only,
             },
             SocketRef::Tcp(socket),
             backlog,
-            requested_bind,
-            binding,
+            member.requested_bind,
+            member.binding,
         )
     }
     pub(crate) fn join_udp(
         &self,
         endpoint: &SocketEndpoint,
         socket: Weak<UdpSocket>,
-        local: SocketAddr,
+        member: EndpointMember,
         domain: Domain,
         v6only: bool,
-        requested_bind: Option<SocketAddr>,
-        binding: Option<Arc<dyn EndpointBound>>,
     ) -> Arc<Group> {
+        debug_assert_eq!(member.source_id, endpoint.source());
         self.join(
             endpoint,
             Key {
                 kind: EndpointKind::Datagram,
-                local,
+                local: member.local,
                 domain,
                 v6only,
             },
             SocketRef::Udp(socket),
             0,
-            requested_bind,
-            binding,
+            member.requested_bind,
+            member.binding,
         )
     }
     fn leave(&self, group: &Arc<Group>, id: u64) {
@@ -342,6 +353,7 @@ impl Namespace {
             } else {
                 let id = PublicationAttemptId(self.next_id());
                 let (gate, reporter) = AttemptGate::new();
+                let reporter = reporter.for_group(Arc::downgrade(group));
                 let revision = control.revision;
                 control.publishing = true;
                 control.attempt = Some(Attempt {
@@ -487,6 +499,7 @@ struct Ingress {
     attempt: PublicationAttemptId,
 }
 impl Ingress {
+    #[cfg(test)]
     fn tcp_members(
         &self,
         namespace: &Namespace,
@@ -494,10 +507,25 @@ impl Ingress {
         source: SocketAddr,
         destination: SocketAddr,
     ) -> Vec<(Weak<TcpSocket>, EndpointSourceId)> {
+        self.tcp_members_for(namespace, group, source, destination, None)
+    }
+
+    fn tcp_members_for(
+        &self,
+        namespace: &Namespace,
+        group: &Group,
+        source: SocketAddr,
+        destination: SocketAddr,
+        physical: Option<EndpointSourceId>,
+    ) -> Vec<(Weak<TcpSocket>, EndpointSourceId)> {
         let Some(net) = namespace.net.upgrade() else {
             return Vec::new();
         };
-        let members = group.members();
+        let members = group
+            .members()
+            .into_iter()
+            .filter(|member| physical.is_none_or(|source| member.source == source))
+            .collect::<Vec<_>>();
         let selected = net.state().tcp.lookup(
             canonical(destination),
             Some(canonical(source)),
@@ -531,9 +559,10 @@ impl Ingress {
         Some((namespace, group))
     }
 }
-impl EndpointStreamIngress for Ingress {
-    fn poll_room_to(
+impl Ingress {
+    fn room_for(
         &self,
+        physical: Option<EndpointSourceId>,
         source: SocketAddr,
         destination: SocketAddr,
         table: Option<&mut PollTable<'_>>,
@@ -546,7 +575,8 @@ impl EndpointStreamIngress for Ingress {
             return room;
         }
         let mut room = Room::Gone;
-        for (weak, epoch) in self.tcp_members(&namespace, &group, source, destination) {
+        for (weak, epoch) in self.tcp_members_for(&namespace, &group, source, destination, physical)
+        {
             if let Some(socket) = weak.upgrade() {
                 match socket.endpoint_room(epoch, source, destination, table.as_deref_mut()) {
                     Room::Ready => return Room::Ready,
@@ -557,8 +587,9 @@ impl EndpointStreamIngress for Ingress {
         }
         room
     }
-    fn incoming_to(
+    fn incoming_for(
         &self,
+        physical: Option<EndpointSourceId>,
         source: SocketAddr,
         destination: SocketAddr,
         stream: Arc<dyn BackendStream>,
@@ -570,7 +601,7 @@ impl EndpointStreamIngress for Ingress {
         if canonical(stream.peer_addr()) != canonical(source) || self.gate.room(None).is_some() {
             return false;
         }
-        let mut members = self.tcp_members(&namespace, &group, source, destination);
+        let mut members = self.tcp_members_for(&namespace, &group, source, destination, physical);
         if !members.is_empty() {
             let count = members.len();
             members.rotate_left(source.port() as usize % count);
@@ -595,7 +626,92 @@ impl EndpointStreamIngress for Ingress {
         false
     }
 }
+impl EndpointStreamIngress for Ingress {
+    fn poll_room_to(
+        &self,
+        source: SocketAddr,
+        destination: SocketAddr,
+        table: Option<&mut PollTable<'_>>,
+    ) -> Room {
+        self.room_for(None, source, destination, table)
+    }
+    fn poll_room_member_to(
+        &self,
+        member: EndpointSourceId,
+        source: SocketAddr,
+        destination: SocketAddr,
+        table: Option<&mut PollTable<'_>>,
+    ) -> Room {
+        self.room_for(Some(member), source, destination, table)
+    }
+    fn incoming_to(
+        &self,
+        source: SocketAddr,
+        destination: SocketAddr,
+        stream: Arc<dyn BackendStream>,
+        wq: WaitQueue,
+    ) -> bool {
+        self.incoming_for(None, source, destination, stream, wq)
+    }
+    fn incoming_member_to(
+        &self,
+        member: EndpointSourceId,
+        source: SocketAddr,
+        destination: SocketAddr,
+        stream: Arc<dyn BackendStream>,
+        wq: WaitQueue,
+    ) -> bool {
+        self.incoming_for(Some(member), source, destination, stream, wq)
+    }
+}
 impl EndpointDatagramIngress for Ingress {
+    fn incoming_member_packet(
+        &self,
+        group_id: EndpointGroupId,
+        attempt_id: PublicationAttemptId,
+        physical: EndpointSourceId,
+        info: super::DatagramInfo,
+        bytes: &[u8],
+    ) -> DatagramDelivery {
+        let Some((namespace, group)) = self.capture(info.destination) else {
+            return DatagramDelivery::Retired;
+        };
+        if group.id != group_id || self.attempt != attempt_id {
+            return DatagramDelivery::Retired;
+        }
+        match self.gate.room(None) {
+            Some(Room::Full) => return DatagramDelivery::Dropped,
+            Some(_) => return DatagramDelivery::Retired,
+            None => {}
+        }
+        let Some(net) = namespace.net.upgrade() else {
+            return DatagramDelivery::Retired;
+        };
+        let Some(member) = group
+            .members()
+            .into_iter()
+            .find(|member| member.source == physical)
+        else {
+            return DatagramDelivery::Retired;
+        };
+        let SocketRef::Udp(weak) = member.socket else {
+            return DatagramDelivery::Retired;
+        };
+        // Validate the actual captured member is still registered for this destination/peer.
+        let eligible = net.state().udp.lookup(
+            canonical(info.destination),
+            Some(canonical(info.source)),
+            |candidate, _| Weak::ptr_eq(candidate, &weak),
+        );
+        if eligible.is_empty() {
+            return DatagramDelivery::Unreachable;
+        }
+        weak.upgrade()
+            .map_or(DatagramDelivery::Unreachable, |socket| {
+                socket.deliver_endpoint_packet(physical, &self.gate, bytes, info)
+            })
+    }
+
     fn incoming(
         &self,
         group_id: EndpointGroupId,
@@ -604,6 +720,27 @@ impl EndpointDatagramIngress for Ingress {
         destination: SocketAddr,
         bytes: &[u8],
     ) -> DatagramDelivery {
+        self.incoming_packet(
+            group_id,
+            attempt_id,
+            super::DatagramInfo {
+                source,
+                destination,
+                interface: crate::iface::LOOPBACK_INDEX,
+            },
+            bytes,
+        )
+    }
+
+    fn incoming_packet(
+        &self,
+        group_id: EndpointGroupId,
+        attempt_id: PublicationAttemptId,
+        info: super::DatagramInfo,
+        bytes: &[u8],
+    ) -> DatagramDelivery {
+        let source = info.source;
+        let destination = info.destination;
         let Some((namespace, group)) = self.capture(destination) else {
             return DatagramDelivery::Retired;
         };
@@ -643,7 +780,7 @@ impl EndpointDatagramIngress for Ingress {
             .unwrap();
         weak.upgrade()
             .map_or(DatagramDelivery::Unreachable, |socket| {
-                socket.deliver_endpoint(member.source, &self.gate, bytes, from, destination)
+                socket.deliver_endpoint_packet(member.source, &self.gate, bytes, info)
             })
     }
 }

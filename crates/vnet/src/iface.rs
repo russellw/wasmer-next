@@ -1634,6 +1634,30 @@ impl Interfaces {
                 via: Via::Local,
             });
         }
+        let r = self.route_entry(dst)?.ok_or(Errno::ENETUNREACH)?;
+        let src = r
+            .prefsrc
+            .or_else(|| self.select_source(r, dst))
+            .ok_or(Errno::EADDRNOTAVAIL)?;
+        let link = self.link(r.oif).expect("checked above");
+        let via = match &link.kind {
+            LinkKind::Loopback => Via::Local,
+            LinkKind::Uplink => Via::Uplink,
+            LinkKind::Veth(end) if link.carrier() => Via::Veth(end.clone()),
+            LinkKind::Veth(_) => Via::Nowhere { unresolved: true },
+            LinkKind::Dummy => Via::Nowhere { unresolved: false },
+        };
+        Ok(RouteDecision {
+            oif: r.oif,
+            src,
+            local: false,
+            route: Some(r.clone()),
+            via,
+        })
+    }
+
+    /// One winning route/error decision shared with optional physical route selection.
+    fn route_entry(&self, dst: IpAddr) -> NetResult<Option<&Route>> {
         for table in [RT_TABLE_MAIN, RT_TABLE_DEFAULT] {
             let mut best: Option<&Route> = None;
             for r in self.routes.iter().filter(|r| {
@@ -1657,27 +1681,24 @@ impl Interfaces {
                 Some(e) => return Err(e),
                 None => {}
             }
-            let src = r
-                .prefsrc
-                .or_else(|| self.select_source(r, dst))
-                .ok_or(Errno::EADDRNOTAVAIL)?;
-            let link = self.link(r.oif).expect("checked above");
-            let via = match &link.kind {
-                LinkKind::Loopback => Via::Local,
-                LinkKind::Uplink => Via::Uplink,
-                LinkKind::Veth(end) if link.carrier() => Via::Veth(end.clone()),
-                LinkKind::Veth(_) => Via::Nowhere { unresolved: true },
-                LinkKind::Dummy => Via::Nowhere { unresolved: false },
-            };
-            return Ok(RouteDecision {
-                oif: r.oif,
-                src,
-                local: false,
-                route: Some(r.clone()),
-                via,
-            });
+            return Ok(Some(r));
         }
-        Err(Errno::ENETUNREACH)
+        Ok(None)
+    }
+
+    /// Selects an ownership candidate without inventing a source or namespace route.
+    /// Private/veth/local routes retain authority even when source selection would fail.
+    pub(crate) fn external_route_candidate(&self, dst: IpAddr) -> NetResult<bool> {
+        if self.local_link(dst).is_some() {
+            return Ok(false);
+        }
+        match self.route_entry(dst) {
+            Ok(Some(route)) => Ok(self
+                .link(route.oif)
+                .is_some_and(|link| matches!(link.kind, LinkKind::Uplink))),
+            Ok(None) => Ok(true),
+            Err(error) => Err(error),
+        }
     }
 
     /// The source address for `dst` through route `r`: `inet_select_addr` for IPv4 (a primary

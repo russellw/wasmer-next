@@ -103,6 +103,33 @@ pub struct EndpointBindRequest {
 /// retain weak publication authority so dropping the last lease closes late results.
 pub trait EndpointBound: Pollable + Any {
     fn local_addr(&self) -> Result<SocketAddr, Errno>;
+
+    /// Applies an option to this exact admitted resource. Bounded and nonreentrant like
+    /// transport data methods: never enter ANY WLK namespace, socket or ingress. The caller
+    /// holds no network/socket state lock, but may serialize control operations separately.
+    fn set_option(&self, level: i32, name: i32, value: &[u8]) -> Result<(), Errno> {
+        let _ = (level, name, value);
+        Err(Errno::EOPNOTSUPP)
+    }
+
+    /// Optional physical UDP association on this same resource, before canonical commit.
+    /// `None` preserves existing providers; a selected result/error is authoritative.
+    /// The same bounded nonreentrant contract as `set_option` applies.
+    fn connect_datagram(
+        &self,
+        source: EndpointSourceId,
+        peer: Option<SocketAddr>,
+    ) -> Option<Result<(), Errno>> {
+        let _ = (source, peer);
+        None
+    }
+
+    /// Physical UDP peer on this resource. `None` means unsupported; `Some(Ok(None))`
+    /// means disconnected. This distinction lets a failed association retain its old
+    /// canonical state only when the provider proves that no physical state changed.
+    fn datagram_peer_addr(&self) -> Option<Result<Option<SocketAddr>, Errno>> {
+        None
+    }
 }
 
 #[derive(Clone)]
@@ -250,7 +277,10 @@ pub enum PublicationState {
 /// this attempt's gate before exposing failure and waking waiters. A stale reporter cannot
 /// change a replacement attempt; a failed/retired attempt cannot become Ready again.
 #[derive(Clone)]
-pub struct PublicationReporter(Arc<dyn PublicationReport>);
+pub struct PublicationReporter(
+    Arc<dyn PublicationReport>,
+    Option<std::sync::Weak<runtime::Group>>,
+);
 
 // The socket layer supplies this local gate/state implementation. Providers cannot replace it.
 trait PublicationReport: Pollable {
@@ -260,6 +290,24 @@ trait PublicationReport: Pollable {
 }
 
 impl PublicationReporter {
+    pub(crate) fn for_group(self, group: std::sync::Weak<runtime::Group>) -> Self {
+        Self(self.0, Some(group))
+    }
+
+    /// A physical member may report only while that exact source remains in this group.
+    /// The private core gate, not foreign provider code, is updated under membership custody.
+    pub fn ready_member(&self, source: EndpointSourceId) {
+        if let Some(group) = self.1.as_ref().and_then(|group| group.upgrade()) {
+            group.report_member(source, || self.0.ready());
+        }
+    }
+
+    pub fn failed_member(&self, source: EndpointSourceId, error: Errno) {
+        if let Some(group) = self.1.as_ref().and_then(|group| group.upgrade()) {
+            group.report_member(source, || self.0.failed(error));
+        }
+    }
+
     pub fn state(&self) -> PublicationState {
         self.0.state()
     }
@@ -313,6 +361,29 @@ pub trait EndpointLease: Pollable {
 /// It captures BOTH group and attempt identity. Lookup filters to current captured-group
 /// members, then validates the selected member/listen epoch and attempt again at enqueue.
 pub trait EndpointStreamIngress: Send + Sync {
+    fn poll_room_member_to(
+        &self,
+        member: EndpointSourceId,
+        source: SocketAddr,
+        destination: SocketAddr,
+        table: Option<&mut PollTable<'_>>,
+    ) -> Room {
+        let _ = member;
+        self.poll_room_to(source, destination, table)
+    }
+
+    fn incoming_member_to(
+        &self,
+        member: EndpointSourceId,
+        source: SocketAddr,
+        destination: SocketAddr,
+        stream: Arc<dyn BackendStream>,
+        wq: WaitQueue,
+    ) -> bool {
+        let _ = member;
+        self.incoming_to(source, destination, stream, wq)
+    }
+
     /// Provisional gates register on their local gate WaitQueue before returning Full;
     /// commit/Ready wakes that queue without requiring any backlog change. Retirement/Err
     /// wakes it and returns Gone. Active gates use the normal member backlog queues too.
@@ -346,11 +417,53 @@ pub enum DatagramDelivery {
     Retired,
 }
 
+/// Actual provider packet metadata, without translating addresses or interface identifiers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DatagramInfo {
+    pub source: SocketAddr,
+    pub destination: SocketAddr,
+    pub interface: u32,
+}
+
+/// One captured receive consumer, invoked by the provider's existing driver outside all
+/// transport locks. `ready` follows the successful bounded empty-queue cutover on that
+/// driver; it is not a wire-arrival timestamp or an acknowledgement of peer consumption.
+pub trait DatagramReceiver: Send + Sync {
+    fn ready(&self);
+    fn failed(&self, error: Errno);
+    fn received(&self, info: DatagramInfo, bytes: &[u8]) -> DatagramDelivery;
+}
+
 /// Sole receive authority for provider-peer datagrams and replies, including implicit
 /// autobinds. The driver releases transport locks before calling this namespace ingress.
 /// Its captured group/attempt and current member/source epochs gate admission AND commit.
 /// Unrestricted global wildcard lookup must not retarget a different group.
 pub trait EndpointDatagramIngress: Send + Sync {
+    /// One OS/provider receive belongs only to the captured physical member. Providers with
+    /// separate reuse sockets must not hash/fan out each socket's copy over the whole group.
+    fn incoming_member_packet(
+        &self,
+        group: EndpointGroupId,
+        attempt: PublicationAttemptId,
+        member: EndpointSourceId,
+        info: DatagramInfo,
+        bytes: &[u8],
+    ) -> DatagramDelivery {
+        let _ = member;
+        self.incoming_packet(group, attempt, info, bytes)
+    }
+
+    /// External providers retain the actual receive interface and scoped destination.
+    fn incoming_packet(
+        &self,
+        group_id: EndpointGroupId,
+        attempt_id: PublicationAttemptId,
+        info: DatagramInfo,
+        bytes: &[u8],
+    ) -> DatagramDelivery {
+        self.incoming(group_id, attempt_id, info.source, info.destination, bytes)
+    }
+
     fn incoming(
         &self,
         group_id: EndpointGroupId,
@@ -418,6 +531,14 @@ pub trait EndpointProvider: Send + Sync {
     /// DNS, veth, and another namespace's routes remain outside this optional capability.
     fn select_external(&self) -> bool {
         false
+    }
+    /// Pure bind ownership selection, consulted only with `select_external`. A selected
+    /// provider validates physical address/interface availability on the admitted resource;
+    /// namespace security, family and port reservation checks still precede its factory.
+    /// False retains namespace address validation and accepts no provider work.
+    fn select_bind(&self, request: &EndpointBindRequest) -> Result<bool, Errno> {
+        let _ = request;
+        Ok(false)
     }
     /// None accepts no work or callback custody and preserves ordinary namespace binding.
     fn bind(
@@ -503,7 +624,7 @@ impl AttemptGate {
             state: std::sync::Mutex::new(AttemptState::default()),
             wait: WaitQueue::new(),
         });
-        (gate.clone(), PublicationReporter(gate))
+        (gate.clone(), PublicationReporter(gate, None))
     }
 
     /// A successful factory result is committed to this still-current attempt. A provider
@@ -693,3 +814,6 @@ mod tests;
 
 #[cfg(test)]
 mod bind_tests;
+
+#[cfg(test)]
+mod selected_tests;
