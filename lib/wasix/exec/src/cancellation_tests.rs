@@ -45,6 +45,8 @@ struct Proof {
     start: Mutex<Option<mpsc::Receiver<()>>>,
     drop_worker: Mutex<Option<oneshot::Receiver<()>>>,
     authority: Mutex<Option<WeakCancellation>>,
+    publications: std::sync::atomic::AtomicUsize,
+    hold_publication: Mutex<Option<mpsc::Receiver<()>>>,
     reject: bool,
     complete: Mutex<Option<oneshot::Receiver<()>>>,
     sibling_done: Mutex<Option<oneshot::Sender<()>>>,
@@ -92,6 +94,15 @@ impl Executor for ProofHost {
         let proof = self.0.clone();
         if proof.reject {
             return Err(std::io::ErrorKind::Unsupported.into());
+        }
+        if proof
+            .publications
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            == 2
+            && let Some(gate) = proof.hold_publication.lock().unwrap().take()
+        {
+            proof.event("publication-held");
+            gate.recv().unwrap();
         }
         let gate = proof.start.lock().unwrap().take();
         let drop_worker = proof.drop_worker.lock().unwrap().take();
@@ -452,6 +463,8 @@ fn dropped_waiter(image: bool, retain_frame: bool) {
         start: Mutex::new(None),
         drop_worker: Mutex::new(None),
         authority: Mutex::new(None),
+        publications: std::sync::atomic::AtomicUsize::new(0),
+        hold_publication: Mutex::new(None),
         reject: false,
         complete: Mutex::new(None),
         sibling_done: Mutex::new(None),
@@ -613,6 +626,8 @@ fn lifecycle_proof(reject: bool) -> (Arc<Proof>, mpsc::Receiver<Event>) {
             start: Mutex::new(None),
             drop_worker: Mutex::new(None),
             authority: Mutex::new(None),
+            publications: std::sync::atomic::AtomicUsize::new(0),
+            hold_publication: Mutex::new(None),
             reject,
             complete: Mutex::new(None),
             sibling_done: Mutex::new(None),
@@ -1009,74 +1024,107 @@ fn published_child_takeover_survives_dropping_its_old_worker() {
     {
         return;
     }
-    let (proof, observed) = lifecycle_proof(false);
-    let (drop_tx, drop_rx) = oneshot::channel();
-    *proof.drop_worker.lock().unwrap() = Some(drop_rx);
-    let (complete_tx, complete_rx) = oneshot::channel();
-    *proof.complete.lock().unwrap() = Some(complete_rx);
-    let image = wat::parse_str(
-        r#"(module
+    for overlap in [false, true] {
+        TERMINAL_WAITS.store(0, std::sync::atomic::Ordering::Release);
+        let (proof, observed) = lifecycle_proof(false);
+        let (publication_tx, publication_rx) = mpsc::channel();
+        if overlap {
+            *proof.hold_publication.lock().unwrap() = Some(publication_rx);
+        }
+        let (drop_tx, drop_rx) = oneshot::channel();
+        *proof.drop_worker.lock().unwrap() = Some(drop_rx);
+        let (complete_tx, complete_rx) = oneshot::channel();
+        *proof.complete.lock().unwrap() = Some(complete_rx);
+        let image = wat::parse_str(
+            r#"(module
         (import "custom" "complete" (func $complete))
         (import "wasixv2" "exit_group" (func $exit (param i32)))
         (memory (export "memory") 1)
         (func (export "_start") call $complete i32.const 37 call $exit unreachable))"#,
-    )
-    .unwrap();
-    let mut abis = Abis::wasixv2();
-    abis.push_instantiation_hook(Arc::new(LifecycleHook {
-        proof: proof.clone(),
-        image,
-    }));
-    let spawner = process::spawner(
-        Store::default().engine().clone(),
-        Arc::new(PendingControl(proof.clone())),
-        Arc::new(ProofHost(proof)),
-        Arc::new(abis),
-    );
-    spawner.spawn_owned(
-        TaskId(1),
-        Image::copied(shared_module(true)),
-        crate::spawn_custody::Publication::test_child(TaskId(1)),
-    );
-    let mut events = Vec::new();
-    until(&observed, &mut events, "complete-pending");
-    if !events.iter().any(|event| event.0 == "old-pending") {
-        until(&observed, &mut events, "old-pending");
-    }
-    // A real guest on the sibling Store has already published the replacement.
-    // Discard the original worker itself, rather than its outer Rust waiter.
-    drop_tx.send(()).unwrap();
-    until(&observed, &mut events, "old-drained");
-    assert!(
-        events
+        )
+        .unwrap();
+        let mut abis = Abis::wasixv2();
+        abis.push_instantiation_hook(Arc::new(LifecycleHook {
+            proof: proof.clone(),
+            image,
+        }));
+        let spawner = process::spawner(
+            Store::default().engine().clone(),
+            Arc::new(PendingControl(proof.clone())),
+            Arc::new(ProofHost(proof.clone())),
+            Arc::new(abis),
+        );
+        spawner.spawn_owned(
+            TaskId(1),
+            Image::copied(shared_module(true)),
+            crate::spawn_custody::Publication::test_child(TaskId(1)),
+        );
+        let mut events = Vec::new();
+        if overlap {
+            until(&observed, &mut events, "publication-held");
+            if !events.iter().any(|event| event.0 == "old-pending") {
+                until(&observed, &mut events, "old-pending");
+            }
+            proof
+                .authority
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .upgrade()
+                .unwrap()
+                .request();
+            until(&observed, &mut events, "old-drained");
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while TERMINAL_WAITS.load(std::sync::atomic::Ordering::Acquire) == 0 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "drained owner must await the sibling's reservation"
+                );
+                std::thread::yield_now();
+            }
+            publication_tx.send(()).unwrap();
+            until(&observed, &mut events, "complete-pending");
+        } else {
+            until(&observed, &mut events, "complete-pending");
+            if !events.iter().any(|event| event.0 == "old-pending") {
+                until(&observed, &mut events, "old-pending");
+            }
+            // Once transfer commits, even the original worker itself can be dropped.
+            drop_tx.send(()).unwrap();
+            until(&observed, &mut events, "old-drained");
+        }
+        assert!(
+            events
+                .iter()
+                .all(|event| event.0 != "fault" && event.0 != "release")
+        );
+        complete_tx.send(()).unwrap();
+        while events
             .iter()
-            .all(|event| event.0 != "fault" && event.0 != "release")
-    );
-    complete_tx.send(()).unwrap();
-    while events
-        .iter()
-        .filter(|event| event.0 == "worker-done")
-        .count()
-        < 3
-    {
-        until(&observed, &mut events, "worker-done");
-    }
-    assert!(events.iter().all(|event| event.0 != "fault"));
-    assert_eq!(
-        events.iter().filter(|event| event.0 == "release").count(),
-        1
-    );
-    let replacement = events
-        .iter()
-        .find(|event| event.0 == "complete-pending")
-        .unwrap()
-        .1;
-    assert!(
-        events
+            .filter(|event| event.0 == "worker-done")
+            .count()
+            < 3
+        {
+            until(&observed, &mut events, "worker-done");
+        }
+        assert!(events.iter().all(|event| event.0 != "fault"));
+        assert_eq!(
+            events.iter().filter(|event| event.0 == "release").count(),
+            1
+        );
+        let replacement = events
             .iter()
-            .filter(|event| event.0 == "release")
-            .all(|event| event.1 == replacement)
-    );
+            .find(|event| event.0 == "complete-pending")
+            .unwrap()
+            .1;
+        assert!(
+            events
+                .iter()
+                .filter(|event| event.0 == "release")
+                .all(|event| event.1 == replacement)
+        );
+    }
 }
 
 #[test]

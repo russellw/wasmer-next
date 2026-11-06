@@ -22,6 +22,9 @@ use crate::{Abis, ExecError, ThreadEntry, cleanup::RunCleanup, thread};
 #[path = "cancellation_tests.rs"]
 mod tests;
 
+#[cfg(all(test, feature = "sys", not(target_arch = "wasm32")))]
+static TERMINAL_WAITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 #[derive(Clone)]
 pub(crate) struct Cancellation(Arc<Mutex<State>>);
 #[derive(Clone)]
@@ -128,8 +131,8 @@ impl Cancellation {
             wake.wake();
         }
     }
-    /// Called only after this owner's physical roots and cleanup have drained.
-    /// A synchronous takeover reservation has committed or unwound before then.
+    /// Only a never-entered factory can retire synchronously: it has no bound
+    /// image or sibling that could hold a takeover reservation.
     #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
     pub(crate) fn claim_terminal(&self) -> bool {
         let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
@@ -150,11 +153,13 @@ impl Cancellation {
             .selected
     }
     #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
-    async fn terminal_owner(&self) -> Option<Arc<process::Handoff>> {
+    pub(crate) async fn terminal_owner(&self) -> Option<Arc<process::Handoff>> {
         poll_fn(|cx| {
             let next = cx.waker().clone();
             let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
             if state.phase == Phase::Transferring {
+                #[cfg(test)]
+                TERMINAL_WAITS.fetch_add(1, std::sync::atomic::Ordering::Release);
                 let old = state.waker.replace(next);
                 drop(state);
                 drop(old);

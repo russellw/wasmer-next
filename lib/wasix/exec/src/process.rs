@@ -330,6 +330,8 @@ where
                 None => cleanup,
             };
             let scope = cleanup.clone();
+            #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+            let terminal_authority = cleanup.cancellation().cloned();
             Box::pin(async move {
                 let profile = match profile {
                     Ok(profile) => profile,
@@ -416,8 +418,17 @@ where
                     .as_ref()
                     .is_some_and(|terminal| terminal.load(std::sync::atomic::Ordering::Acquire))
                 {
-                    // Startup::drop claimed this image after the runner drained; a
-                    // transferred image never reaches this terminal release path.
+                    #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+                    if terminal_authority
+                        .as_ref()
+                        .expect("published child authority")
+                        .terminal_owner()
+                        .await
+                        .is_some()
+                    {
+                        return;
+                    }
+                    terminal_syscalls.fault(task, Signal::SIGSEGV.0);
                     finish_task(&*terminal_syscalls, task).await;
                 }
             }) as wasixv2_host::LocalFuture<'static, ()>

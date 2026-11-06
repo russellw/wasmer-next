@@ -197,22 +197,22 @@ impl Publication {
             #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
             authority: authority.clone(),
             cleanup: Some(Box::new(move || {
+                // An entered worker resolves a possibly concurrent sibling takeover
+                // on its driven async path after physical retirement.
+                if entered.load(Ordering::Acquire) {
+                    terminal.store(true, Ordering::Release);
+                    return;
+                }
                 #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
                 if !authority.claim_terminal() {
                     return;
                 }
-                let running = entered.load(Ordering::Acquire);
-                // The driven worker awaits group_wait after its final physical drain.
-                // Only a never-entered factory can release synchronously here.
-                terminal.store(running, Ordering::Release);
                 let unwinding = std::thread::panicking();
                 let fault = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     syscalls.fault(task, Signal::SIGSEGV.0);
                 }));
                 let release = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    if !running {
-                        syscalls.release(task);
-                    }
+                    syscalls.release(task);
                 }));
                 for result in [fault, release] {
                     if let Err(panic) = result {
