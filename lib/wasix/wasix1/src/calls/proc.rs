@@ -515,11 +515,25 @@ async fn in_vfork_child<S: 'static>(env: &Env<S>) -> Result<bool, RuntimeError> 
     with_instance(env, |instance| instance.is_vfork_child(task)).await
 }
 
+/// Whether control returns to a guest vfork continuation or stays inside `spawn`.
+#[derive(Clone, Copy)]
+enum VforkContinuation {
+    Guest,
+    Spawn,
+}
+
 /// Starts a vfork child of the calling task: the instance runs as the child afterwards.
 /// Returns the parent's compat state, or the errno of a failed `clone`.
 async fn vfork<S: Syscalls + Control + 'static>(
     env: &Env<S>,
+    continuation: VforkContinuation,
 ) -> Result<Result<Parent, i32>, RuntimeError> {
+    let fork_allowed = match continuation {
+        VforkContinuation::Guest => wasixv2_exec::process_fork_allowed(env).await,
+        // Spawn never copies or returns through a guest child activation. File actions
+        // and exec stay in this import; the parent resumes the same retained invocation.
+        VforkContinuation::Spawn => true,
+    };
     let mut parent = None;
     let done = shim::call(env, async |frame| {
         parent = Some(Parent {
@@ -529,9 +543,7 @@ async fn vfork<S: Syscalls + Control + 'static>(
         frame
             .syscalls
             .clone(
-                &frame
-                    .caller()
-                    .with_process_fork_allowed(wasixv2_exec::process_fork_allowed(env).await),
+                &frame.caller().with_process_fork_allowed(fork_allowed),
                 VFORK,
                 0,
                 S32Ptr::NULL,
@@ -580,7 +592,7 @@ pub(crate) async fn proc_fork_env<S: Syscalls + Control + 'static>(
     if in_vfork_child(&env).await? {
         return Ok(i32::from(Errno::NOTSUP.0));
     }
-    let parent = match vfork(&env).await? {
+    let parent = match vfork(&env, VforkContinuation::Guest).await? {
         Ok(parent) => parent,
         Err(errno) => return Ok(errno),
     };
@@ -633,7 +645,7 @@ pub(crate) async fn proc_fork<S: Syscalls + Control + 'static>(
         Some(Resumed::Restored(child)) => return write_pid(child as u32).await,
         // The vfork point is saved: become the child.
         Some(Resumed::Saved(point)) => {
-            let parent = match vfork(&env).await? {
+            let parent = match vfork(&env, VforkContinuation::Guest).await? {
                 Ok(parent) => parent,
                 Err(errno) => return Ok(errno),
             };
@@ -851,7 +863,7 @@ async fn spawn<S: Syscalls + Control + 'static>(
         return Ok(i32::from(errno.0));
     }
     let request = request.expect("decoded above");
-    let parent = match vfork(env).await? {
+    let parent = match vfork(env, VforkContinuation::Spawn).await? {
         Ok(parent) => parent,
         Err(errno) => return Ok(errno),
     };

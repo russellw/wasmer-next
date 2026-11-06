@@ -777,6 +777,56 @@ fn spawn() {
     assert_eq!(std::fs::read(programs.0.join("out.txt")).unwrap(), b"child");
 }
 
+/// Spawn retains the parent's context; neither its child nor a failed exec can
+/// turn a guest fork/vfork into a supported operation in that context.
+#[test]
+fn spawn_from_a_nonmain_context_preserves_guest_fork_restrictions() {
+    let programs = Programs::new("context-spawn", &[("child.wasm", CHILD)]);
+    let wat = SPAWN
+        .replace(
+            r#"  (memory (export "memory") 1)"#,
+            r#"
+  (import "wasix_32v1" "context_create" (func $create (param i32 i32) (result i32)))
+  (import "wasix_32v1" "context_switch" (func $switch (param i64) (result i32)))
+  (import "wasix_32v1" "context_destroy" (func $destroy (param i64) (result i32)))
+  (import "wasix_32v1" "proc_fork" (func $fork (param i32 i32) (result i32)))
+  (import "wasix_32v1" "proc_fork_env" (func $vfork (param i32) (result i32)))
+  (memory (export "memory") 1)
+  (table 2 funcref)
+  (elem (i32.const 1) $context)
+  (func $check_fork
+    (if (i32.ne (call $fork (i32.const 1) (i32.const 300)) (i32.const 58))
+      (then (call $exit (i32.const 81))))
+    (if (i32.ne (call $vfork (i32.const 300)) (i32.const 58))
+      (then (call $exit (i32.const 82)))))
+  (func (export "_start")
+    (if (call $create (i32.const 400) (i32.const 1)) (then (call $exit (i32.const 83))))
+    (if (call $switch (i64.load (i32.const 400))) (then (call $exit (i32.const 84))))
+    (if (call $destroy (i64.load (i32.const 400))) (then (call $exit (i32.const 85))))
+    (call $exit (i32.const 0)))
+"#,
+        )
+        .replace(
+            "  (func (export \"_start\")\n    (if (call $spawn",
+            r#"  (func $context (local $kept i64)
+    (local.set $kept (i64.const 0x123456789abcdef))
+    (call $check_fork)
+    (if (call $spawn"#,
+        )
+        .replace(
+            "    (call $exit (i32.const 0))))",
+            r#"    (call $check_fork)
+    (if (i64.ne (local.get $kept) (i64.const 0x123456789abcdef))
+      (then (call $exit (i32.const 86))))
+    (if (call $switch (i64.const 0)) (then (call $exit (i32.const 87))))
+    unreachable))"#,
+        );
+    let (status, stdout) = run(&wat, Some(&programs.0));
+    assert_eq!(status, 0);
+    assert_eq!(stdout, b"childchild");
+    assert_eq!(std::fs::read(programs.0.join("out.txt")).unwrap(), b"child");
+}
+
 /// The Rust-style legacy call has three independent pipes and drops every empty CR/LF
 /// argument. The child observes the requested cwd and inherited environment, echoes its
 /// stdin to stdout/stderr, then exits with 7.
