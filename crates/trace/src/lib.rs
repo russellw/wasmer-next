@@ -8,6 +8,21 @@ use wasixv2_syscalls::{Caller, Layer, SysResult, Syscall, SyscallRet, Syscalls, 
 pub struct Trace;
 
 impl<S: Syscalls> Layer<S> for Trace {
+    fn lookup_host<'a>(
+        &'a self,
+        caller: &'a Caller<'_>,
+        name: &'a str,
+        port: Option<u16>,
+        next: &'a S,
+    ) -> Option<wasixv2_syscalls::LocalFuture<'a, SysResult<Vec<std::net::IpAddr>>>> {
+        let future = next.lookup_host(caller, name, port)?;
+        Some(Box::pin(async move {
+            let result = future.await;
+            tracing::trace!(task = caller.task().0, name, ?port, ?result, "host lookup");
+            result
+        }))
+    }
+
     fn call<'a>(
         &'a self,
         caller: &'a Caller<'_>,
@@ -137,5 +152,91 @@ mod tests {
             result,
             MaybeFuture::Ready(Ok(SyscallRet::Getpid(19)))
         ));
+    }
+    struct HostLookup;
+    impl Syscalls for HostLookup {
+        fn lookup_host<'a>(
+            &'a self,
+            _: &'a Caller<'_>,
+            name: &'a str,
+            port: Option<u16>,
+        ) -> Option<LocalFuture<'a, SysResult<Vec<std::net::IpAddr>>>> {
+            Some(Box::pin(async move {
+                assert_eq!(name, "Original.Name.");
+                assert_eq!(port, Some(443));
+                Err(Errno::EACCES.into())
+            }))
+        }
+    }
+    struct UnknownLayer;
+    impl<S: Syscalls> Layer<S> for UnknownLayer {
+        fn call<'a>(
+            &'a self,
+            _: &'a Caller<'_>,
+            _: Syscall,
+            _: &'a S,
+        ) -> MaybeFuture<'a, SysResult<SyscallRet>> {
+            panic!("host hooks are not guest syscall values")
+        }
+    }
+    struct Events(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+    impl tracing::Subscriber for Events {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Fields(String);
+            impl tracing::field::Visit for Fields {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    use std::fmt::Write;
+                    write!(&mut self.0, "{}={value:?};", field.name()).unwrap();
+                }
+            }
+            let mut fields = Fields(String::new());
+            event.record(&mut fields);
+            self.0.lock().unwrap().push(fields.0);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+    #[test]
+    fn host_hook_requires_layer_opt_in_and_trace_delegates_exact_error_with_event() {
+        let caller = Caller::new(TaskId(7), &NoMemory);
+        let denied = Layered::new(UnknownLayer, HostLookup);
+        assert!(
+            denied
+                .lookup_host(&caller, "Original.Name.", Some(443))
+                .is_none()
+        );
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        tracing::subscriber::with_default(Events(events.clone()), || {
+            let stack = Layered::new(Trace, HostLookup);
+            assert_eq!(
+                block_on(
+                    stack
+                        .lookup_host(&caller, "Original.Name.", Some(443))
+                        .unwrap()
+                ),
+                Err(SysErr::Errno(Errno::EACCES))
+            );
+        });
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        for value in ["host lookup", "Original.Name.", "443", "EACCES"] {
+            assert!(
+                events[0].contains(value),
+                "missing {value} in {}",
+                events[0]
+            );
+        }
     }
 }

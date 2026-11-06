@@ -2779,6 +2779,66 @@ fn landlock_autobind(landlock: &crate::landlock::Domain, sock: &SocketFile) -> R
     }
 }
 
+// Host-only resolver admission. This never borrows guest memory into a backend callback.
+impl Kernel {
+    pub(crate) async fn host_lookup(
+        &self,
+        caller: &Caller<'_>,
+        net: Arc<NetNs>,
+        network: Arc<dyn wasixv2_vnet::Network>,
+        name: &str,
+        port: Option<u16>,
+    ) -> SysResult<Vec<std::net::IpAddr>> {
+        use std::sync::Mutex;
+        use wasixv2_vnet::{Answer, Found, Lookup, LookupContext, LookupError};
+        use wasixv2_wait::{Interrupt, WaitQueue, wait_event};
+        let interrupt = self.interrupt(caller);
+        // No operation has been admitted yet: let canonical return-to-guest handling
+        // deliver STOP/KILL/task work and decide whether it may restart this import.
+        if interrupt.pending() {
+            return Err(SysErr::Restart);
+        }
+        struct Wait {
+            result: Mutex<Option<Result<Found, LookupError>>>,
+            queue: WaitQueue,
+        }
+        let wait = Arc::new(Wait {
+            result: Mutex::new(None),
+            queue: WaitQueue::new(),
+        });
+        let completed = wait.clone();
+        network.lookup_contextual(
+            Lookup::Name(name.to_owned()),
+            LookupContext { port },
+            Box::new(move |result| {
+                // An admitted operation owns its initiating realm until actual completion,
+                // even if the subscriber was interrupted or changed namespaces meanwhile.
+                let _namespace = net;
+                *completed.result.lock().unwrap() = Some(result);
+                completed.queue.wake(PollMask::IN);
+            }),
+        );
+        // Interruption retires only this waiter. An admitted provider owns its result until
+        // callback completion, just like provider_ioctl; no Restart may replay the lookup.
+        let result = wait_event(
+            &wait.queue,
+            || wait.result.lock().unwrap().take(),
+            &*interrupt,
+        )
+        .await
+        .map_err(|_| Errno::EINTR)?;
+        match result {
+            Ok(Found {
+                answer: Answer::Addrs { addrs, .. },
+                ..
+            }) => Ok(addrs),
+            Ok(_) | Err(LookupError::Failed) => Err(Errno::EIO.into()),
+            Err(LookupError::NotFound { .. }) => Err(Errno::ENOENT.into()),
+            Err(LookupError::Provider(error)) => Err(error.into()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

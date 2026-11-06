@@ -352,6 +352,18 @@ pub enum NewLinkKind {
 
 /// A network namespace: what the kernel's `socket` and the network pseudo files use.
 pub trait Network: Send + Sync {
+    /// Immutable opt-in for host-only contextual name lookup. No I/O or admission here.
+    fn supports_contextual_lookup(&self) -> bool {
+        false
+    }
+
+    /// Resolves a host name through the explicitly selected namespace backend.
+    /// Once selected, errors are authoritative; callers must not replay through wire DNS.
+    fn lookup_contextual(&self, lookup: Lookup, context: LookupContext, done: LookupDone) {
+        let _ = (lookup, context);
+        done(Err(LookupError::Failed));
+    }
+
     /// Controls of the configured transport in this exact namespace; absent by default.
     fn provider(&self) -> Option<Arc<dyn crate::provider::Provider>> {
         None
@@ -740,6 +752,17 @@ pub trait NetworkPolicy: std::fmt::Debug + Send + Sync {
 /// Implementations do their I/O off the guest's thread. A backend object wakes the guest
 /// socket's original wait queue, including when the object was created after registration.
 pub trait Backend: Send + Sync {
+    /// Immutable, side-effect-free opt-in for contextual host lookup; ordinary DNS is unchanged.
+    fn supports_contextual_lookup(&self) -> bool {
+        false
+    }
+
+    /// Optional host lookup, preserving the original name and caller's service-port hint.
+    fn lookup_contextual(&self, lookup: Lookup, context: LookupContext, done: LookupDone) {
+        let _ = (lookup, context);
+        done(Err(LookupError::Failed));
+    }
+
     /// Optional controls for this same transport, never a different network session.
     fn provider(&self) -> Option<Arc<dyn crate::provider::Provider>> {
         None
@@ -856,6 +879,12 @@ pub enum Lookup {
     Forward(Vec<u8>),
 }
 
+/// Context supplied only by an explicitly admitted host-side lookup.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LookupContext {
+    pub port: Option<u16>,
+}
+
 /// What a [`Lookup`] found, and for how many seconds that holds (the TTL of the records made
 /// of it).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -886,6 +915,8 @@ pub enum LookupError {
     NotFound { ttl: u32 },
     /// The host could not tell (`SERVFAIL`).
     Failed,
+    /// Exact error from an explicitly selected contextual provider.
+    Provider(Errno),
 }
 
 /// Receives the result of a [`Backend::lookup`].
