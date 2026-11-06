@@ -87,6 +87,7 @@ impl Drop for Pending {
 struct Prepared<S: 'static> {
     root: Arc<Root>,
     base: Arc<dyn Abi<S>>,
+    prepared_base: Option<Box<dyn PreparedImage<S>>>,
     imports: Imports,
     forwarders: Vec<BoundModule>,
     tls: Vec<u32>,
@@ -113,7 +114,7 @@ impl<S: Syscalls + Control + Send + Sync + 'static> PreparedImage<S> for Prepare
             root: self.root.clone(),
             base: self.base.clone(),
         };
-        let bound = image.bind_store(instance, store, task, role)?;
+        let bound = image.bind_store(instance, store, task, role, self.prepared_base.take())?;
         {
             let mut local = lock(&bound.local);
             local.forwarders.append(&mut self.forwarders);
@@ -131,17 +132,48 @@ impl<S: Syscalls + Control + Send + Sync + 'static> PreparedImage<S> for Prepare
 }
 
 impl<S: Syscalls + Control + Send + Sync + 'static> Image<S> {
-    pub(super) async fn prepare_startup(&self, cx: &Preparation<'_, S>) -> PreparedResult<S> {
+    pub(super) async fn prepare_image(&self, cx: &Preparation<'_, S>) -> PreparedResult<S> {
+        let base = self.base.prepare(cx).await?;
+        let mut imports = cx.with_store(|data, _| data.abi_imports().clone()).await;
+        if let Some(base) = &base {
+            imports.extend(base.imports());
+        }
+        let startup = self.prepare_startup(cx, &imports).await?;
+        if base.is_none() && startup.is_none() {
+            return Ok(None);
+        }
+        let mut prepared = startup.unwrap_or_else(|| Prepared {
+            root: self.root.clone(),
+            base: self.base.clone(),
+            prepared_base: None,
+            imports: Imports::new(),
+            forwarders: Vec::new(),
+            tls: vec![0],
+            bound: None,
+        });
+        if let Some(base) = &base {
+            let mut overlay = base.imports().clone();
+            overlay.extend(&prepared.imports);
+            prepared.imports = overlay;
+        }
+        prepared.prepared_base = base;
+        Ok(Some(Box::new(prepared)))
+    }
+
+    async fn prepare_startup(
+        &self,
+        cx: &Preparation<'_, S>,
+        base: &Imports,
+    ) -> std::result::Result<Option<Prepared<S>>, ExecError> {
         if let Some(error) = self.root.error.get() {
             return Err(load_error(error));
         }
-        let (syscalls, task, cleanup, base) = cx
+        let (syscalls, task, cleanup) = cx
             .with_store(|data, _| {
                 (
                     data.syscalls().clone(),
                     data.task(),
                     data.loader_cleanup().cloned(),
-                    data.abi_imports().clone(),
                 )
             })
             .await;
@@ -276,14 +308,13 @@ impl<S: Syscalls + Control + Send + Sync + 'static> Image<S> {
             .map_err(load_error)?;
         let graph = Arc::new(graph);
         let (imports, forwarders) = cx
-            .with_store(|_, store| {
-                main_imports(&self.root.forward_code, store, &base, &graph, &tls)
-            })
+            .with_store(|_, store| main_imports(&self.root.forward_code, store, base, &graph, &tls))
             .await
             .map_err(load_error)?;
-        Ok(Some(Box::new(Prepared::<S> {
+        Ok(Some(Prepared::<S> {
             root: self.root.clone(),
             base: self.base.clone(),
+            prepared_base: None,
             imports,
             forwarders,
             tls,
@@ -293,7 +324,7 @@ impl<S: Syscalls + Control + Send + Sync + 'static> Image<S> {
                 env: cx.environment().clone(),
                 process,
             }),
-        })))
+        }))
     }
 }
 

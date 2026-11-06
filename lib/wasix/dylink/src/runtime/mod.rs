@@ -22,7 +22,8 @@ use std::{
 };
 use wasixv2_abi::{Cstr, DlFlags, DlHandle, DlHandlePtr, Uptr, UptrPtr};
 use wasixv2_exec::{
-    Abi, AbiInstance, Entry, EntryReturn, ExecEnv, ExecError, Role, Sigreturn, VforkResume, Wasixv2,
+    Abi, AbiInstance, Entry, EntryReturn, ExecEnv, ExecError, PreparedImage, Role, Sigreturn,
+    VforkResume, Wasixv2,
 };
 use wasixv2_syscalls::{
     Caller, Control, Errno, LoaderAdmission, LoaderGate, LoaderPhase, LoaderReservation,
@@ -663,7 +664,7 @@ impl<S: Syscalls + Control + Send + Sync + 'static> Abi<S> for Image<S> {
         &'a self,
         cx: &'a wasixv2_exec::Preparation<'a, S>,
     ) -> LocalFuture<'a, startup::PreparedResult<S>> {
-        Box::pin(self.prepare_startup(cx))
+        Box::pin(self.prepare_image(cx))
     }
     fn bind(
         &self,
@@ -672,7 +673,7 @@ impl<S: Syscalls + Control + Send + Sync + 'static> Abi<S> for Image<S> {
         task: TaskId,
         role: Role,
     ) -> std::result::Result<Arc<dyn AbiInstance<S>>, ExecError> {
-        self.bind_store(instance, store, task, role)
+        self.bind_store(instance, store, task, role, None)
             .map(|image| image as Arc<dyn AbiInstance<S>>)
     }
     fn image_layout(
@@ -718,13 +719,17 @@ impl<S: Syscalls + Control + Send + Sync + 'static> Image<S> {
         store: &mut Store,
         task: TaskId,
         role: Role,
+        prepared: Option<Box<dyn PreparedImage<S>>>,
     ) -> std::result::Result<Arc<StoreImage<S>>, ExecError> {
         if let Some(error) = self.root.error.get() {
             return Err(ExecError::Load(wasixv2_exec::LoadError::other(failure(
                 error,
             ))));
         }
-        let inner = self.base.bind(instance, store, task, role)?;
+        let inner = match prepared {
+            Some(prepared) => prepared.bind(instance, store, task, role)?,
+            None => self.base.bind(instance, store, task, role)?,
+        };
         let memory = instance
             .exports
             .get_memory("__wasix_dylink_memory_0")?
