@@ -422,10 +422,10 @@ impl Sandbox {
             let completed = self.inner.close_result.clone();
             if let Err(error) = self.inner.client.inner.services.cleanup(async move {
                 let mut failure = None;
-                if let Some(network) = &inner.probe_network {
-                    if let Err(error) = network.close().await {
-                        failure.get_or_insert_with(|| error.to_string());
-                    }
+                if let Some(network) = &inner.probe_network
+                    && let Err(error) = network.close().await
+                {
+                    failure.get_or_insert_with(|| error.to_string());
                 }
                 // Registration and the admission count share a lock. Every provisional
                 // launch registers its owner before releasing its admission lease.

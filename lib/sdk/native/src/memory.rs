@@ -182,9 +182,7 @@ impl MemoryStorage {
         options: FileOpenOptions,
     ) -> FsResult<MemoryFile> {
         let write = options.write || options.append;
-        if (!options.read && !write)
-            || (!write && (options.create || options.create_new || options.truncate))
-        {
+        if !write && (!options.read || options.create || options.create_new || options.truncate) {
             return Err(FsError::InvalidInput("invalid file open options".into()));
         }
         let mut flags = match (options.read, write) {

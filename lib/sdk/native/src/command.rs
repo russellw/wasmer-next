@@ -513,17 +513,16 @@ impl Command {
             drop(run);
             supervisor.release_kernel();
             drop(machine);
-            if let Some(network) = network_scope {
-                if let Err(error) = network.close().await {
-                    if result.is_ok() {
-                        result = Err(error.to_string());
-                    }
-                }
+            if let Some(network) = network_scope
+                && let Err(error) = network.close().await
+                && result.is_ok()
+            {
+                result = Err(error.to_string());
             }
-            if let Err(error) = providers.close().await {
-                if result.is_ok() {
-                    result = Err(error.to_string());
-                }
+            if let Err(error) = providers.close().await
+                && result.is_ok()
+            {
+                result = Err(error.to_string());
             }
             drop(stdout);
             drop(stderr);

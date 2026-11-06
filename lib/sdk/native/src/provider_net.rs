@@ -823,10 +823,9 @@ impl Backend for ProviderNetwork {
             if let Some(result) = group
                 .wait_scoped(&cancellation, provider.bind_udp(any(domain), false, false))
                 .await
+                && let Some(output) = output.upgrade()
             {
-                if let Some(output) = output.upgrade() {
-                    output.ready(result);
-                }
+                output.ready(result);
             }
         })?;
         Ok(socket)
@@ -862,7 +861,8 @@ impl Backend for ProviderNetwork {
                     if listener.set_handler(cx.waker().into()).is_err(){return Poll::Ready(None);}
                     match listener.try_accept(){Ok(result)=>Poll::Ready(Some(result)),Err(NetworkError::WouldBlock)=>Poll::Pending,Err(_)=>Poll::Ready(None)}
                 });
-                tokio::select!{ result=accepted=>{let Some((socket,peer))=result else{break;};let queue=WaitQueue::default();let Ok(stream)=Stream::new(group.clone(),queue.clone(),peer)else{break;};stream.ready(Ok(socket));if group.register(stream.clone()).is_err(){break;}if stop.closed()||group.closed(){stream.close();break;}let _=sink.incoming(stream,queue);}, _=&mut canceled=>{}, _=&mut closing=>{} }
+                tokio::select!{ result=accepted=>{let Some((socket,peer))=result else{break;};let queue=WaitQueue::default();let Ok(stream)=Stream::new(group.clone(),queue.clone(),peer)else{break;};stream.ready(Ok(socket));if group.register(stream.clone()).is_err(){break;}
+                    if stop.closed()||group.closed(){stream.close();break;}let _=sink.incoming(stream,queue);}, _=&mut canceled=>{}, _=&mut closing=>{} }
             }
             listener.remove_handler();
         }).map_err(|e|io::Error::from_raw_os_error(e.0))?;

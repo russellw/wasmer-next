@@ -71,6 +71,8 @@ impl Drop for DropMark {
     }
 }
 
+type ResolveCall = (String, Option<u16>, Option<IpAddr>);
+
 struct FakeProvider {
     tcp: Mutex<Option<Box<dyn VirtualTcpSocket + Sync>>>,
     udp: Mutex<Option<Box<dyn VirtualUdpSocket + Sync>>>,
@@ -81,7 +83,7 @@ struct FakeProvider {
     tcp_calls: Mutex<Vec<(SocketAddr, SocketAddr)>>,
     udp_calls: Mutex<Vec<(SocketAddr, bool, bool)>>,
     listen_calls: Mutex<Vec<(SocketAddr, bool, bool, bool)>>,
-    resolve_calls: Mutex<Vec<(String, Option<u16>, Option<IpAddr>)>>,
+    resolve_calls: Mutex<Vec<ResolveCall>>,
 }
 
 impl std::fmt::Debug for FakeProvider {
