@@ -93,6 +93,23 @@ impl HostProcessState {
         }))
     }
 
+    /// Configures the environment's exact byte buffers and explicit preopens once.
+    pub fn set_startup_input(&self, input: crate::StartupInput) -> Result<(), wasixv2_abi::Errno> {
+        self.0.state.set_startup_input(input)
+    }
+
+    /// The process's import binding before the engine has produced an instance.
+    pub fn unattached<S: Send + Sync + 'static>(&self) -> Arc<dyn AbiInstance<S>> {
+        Arc::new(Wasix1Instance::from_exports(
+            self.0.procs.clone(),
+            self.0.commands.clone(),
+            self.0.http.clone(),
+            self.0.limits,
+            Exports::new(),
+            false,
+        ))
+    }
+
     /// Captures an actual instance's handles without requiring or running `_start`.
     /// The environment explicitly selects the returned binding; calling a function
     /// from an older instance does not select that instance again.
@@ -177,6 +194,24 @@ impl Wasix1Instance {
         store: &mut wasmer::StoreMut<'_>,
     ) -> Self {
         let exports = &instance.exports;
+        Self::from_exports(
+            procs,
+            commands,
+            http,
+            limits,
+            exports.clone(),
+            wasixv2_exec::TableMetadata::bind(instance, store).cacheable(),
+        )
+    }
+
+    fn from_exports(
+        procs: Arc<Procs>,
+        commands: Arc<RwLock<Commands>>,
+        http: Arc<crate::http::State>,
+        limits: crate::Limits,
+        exports: Exports,
+        table_cacheable: bool,
+    ) -> Self {
         let function = |name: &str| exports.get_function(name).ok().cloned();
         Self {
             http,
@@ -185,11 +220,11 @@ impl Wasix1Instance {
             procs,
             commands,
             image: Mutex::new(None),
-            exports: exports.clone(),
             initialize: None,
             entry: None,
-            table_cacheable: wasixv2_exec::TableMetadata::bind(instance, store).cacheable(),
+            table_cacheable,
             signal: Mutex::new(function(SIGNAL_CALLBACK)),
+            exports,
             blocked: AtomicBool::new(false),
             started: AtomicBool::new(false),
             vforks: Mutex::new(HashMap::new()),

@@ -175,7 +175,11 @@ unsafe fn wasi_get_unordered_imports_inner(
                 Some(Box::new(wasmer_named_extern_t {
                     module,
                     name,
-                    r#extern: Box::new(wasm_extern_t::new(store.clone(), extern_)),
+                    r#extern: {
+                        let mut value = Box::new(wasm_extern_t::new(store.clone(), extern_));
+                        wasi_env.inner.tag_import(&mut value);
+                        value
+                    },
                 }))
             })
             .collect::<Vec<_>>(),

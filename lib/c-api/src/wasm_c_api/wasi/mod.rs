@@ -2,6 +2,9 @@
 //!
 //! This API will be superseded by a standard WASI API when/if such a standard is created.
 
+#[cfg(feature = "sys")]
+mod native;
+
 pub use super::unstable::wasi::wasi_get_unordered_imports;
 use super::{
     externals::{wasm_extern_t, wasm_extern_vec_t, wasm_func_t, wasm_memory_t},
@@ -31,6 +34,7 @@ pub struct wasi_config_t {
     inherit_stdin: bool,
     builder: WasiEnvBuilder,
     runtime: Option<tokio::runtime::Runtime>,
+    preopens: Vec<(String, String)>,
 }
 
 #[unsafe(no_mangle)]
@@ -54,6 +58,7 @@ pub unsafe extern "C" fn wasi_config_new(
         inherit_stdin: true,
         builder: WasiEnv::builder(prog_name).fs(default_fs_backing()),
         runtime: Some(runtime),
+        preopens: Vec::new(),
     }))
 }
 
@@ -104,6 +109,10 @@ pub unsafe extern "C" fn wasi_config_preopen_dir(
         return false;
     }
 
+    config
+        .preopens
+        .push((dir_str.to_owned(), dir_str.to_owned()));
+
     true
 }
 
@@ -137,6 +146,11 @@ pub unsafe extern "C" fn wasi_config_mapdir(
         update_last_error(e);
         return false;
     }
+
+    config.preopens.push((
+        alias_str.trim_start_matches('/').to_owned(),
+        dir_str.to_owned(),
+    ));
 
     true
 }
@@ -174,8 +188,88 @@ pub extern "C" fn wasi_config_inherit_stdin(config: &mut wasi_config_t) {
 #[allow(non_camel_case_types)]
 pub struct wasi_env_t {
     /// cbindgen:ignore
-    pub(super) inner: WasiFunctionEnv,
+    pub(super) inner: WasiBackend,
     pub(super) store: StoreRef,
+}
+
+pub(super) enum WasiBackend {
+    Legacy(WasiFunctionEnv),
+    #[cfg(feature = "sys")]
+    Native(native::NativeWasi),
+}
+
+impl WasiBackend {
+    pub(super) fn import_object(
+        &self,
+        store: &mut wasmer_api::StoreMut<'_>,
+        module: &wasmer_api::Module,
+    ) -> anyhow::Result<wasmer_api::Imports> {
+        match self {
+            Self::Legacy(env) => Ok(env.import_object(store, module)?),
+            #[cfg(feature = "sys")]
+            Self::Native(env) => env.import_object(store, module),
+        }
+    }
+
+    fn build_memory(
+        &self,
+        store: &mut wasmer_api::StoreMut<'_>,
+        module: &wasmer_api::Module,
+    ) -> anyhow::Result<Option<wasmer_api::Memory>> {
+        let ty = module
+            .imports()
+            .memories()
+            .next()
+            .map(|memory| *memory.ty());
+        match self {
+            Self::Legacy(env) => {
+                let spawn = match ty {
+                    Some(ty) => wasmer_wasix::runtime::SpawnType::CreateMemoryOfType(ty),
+                    None => wasmer_wasix::runtime::SpawnType::CreateMemory,
+                };
+                let tasks = env.data(store).runtime.task_manager().clone();
+                Ok(tasks.build_memory(store, spawn)?)
+            }
+            #[cfg(feature = "sys")]
+            Self::Native(_) => Ok(Some(wasmer_api::Memory::new(
+                store,
+                ty.unwrap_or_else(|| wasmer_api::MemoryType::new(1u32, None, false)),
+            )?)),
+        }
+    }
+
+    pub(super) fn tag_import(&self, value: &mut wasm_extern_t) {
+        #[cfg(feature = "sys")]
+        if let Self::Native(native) = self {
+            if matches!(value.inner, wasmer_api::Extern::Function(_)) {
+                value.wasi_origin = Some(native.environment().clone());
+            }
+        }
+        #[cfg(not(feature = "sys"))]
+        let _ = value;
+    }
+
+    fn initialize(
+        &mut self,
+        store: &mut wasmer_api::StoreMut<'_>,
+        instance: wasmer_api::Instance,
+    ) -> anyhow::Result<()> {
+        match self {
+            Self::Legacy(env) => Ok(env.initialize(store, instance)?),
+            #[cfg(feature = "sys")]
+            Self::Native(env) => env.initialize(store, &instance),
+        }
+    }
+
+    fn on_exit(&mut self, store: &mut wasmer_api::StoreMut<'_>) {
+        match self {
+            Self::Legacy(env) => {
+                env.on_exit(store, None);
+            }
+            #[cfg(feature = "sys")]
+            Self::Native(env) => env.close(),
+        }
+    }
 }
 
 /// Create a new WASI environment.
@@ -187,6 +281,21 @@ pub unsafe extern "C" fn wasi_env_new(
     mut config: Box<wasi_config_t>,
 ) -> Option<Box<wasi_env_t>> {
     let store = &mut store?.inner;
+    #[cfg(feature = "sys")]
+    if store.is_native() {
+        let env = c_try!(native::NativeWasi::new(
+            store,
+            config.builder.get_args().to_vec(),
+            config.builder.get_env().to_vec(),
+            config.preopens.clone(),
+            !config.inherit_stdout,
+            !config.inherit_stderr,
+        ));
+        return Some(Box::new(wasi_env_t {
+            inner: WasiBackend::Native(env),
+            store: store.clone(),
+        }));
+    }
 
     let runtime = config.runtime.take();
 
@@ -217,7 +326,7 @@ pub unsafe extern "C" fn wasi_env_new(
     })));
 
     Some(Box::new(wasi_env_t {
-        inner: env,
+        inner: WasiBackend::Legacy(env),
         store: store.clone(),
     }))
 }
@@ -227,7 +336,7 @@ pub unsafe extern "C" fn wasi_env_new(
 pub extern "C" fn wasi_env_delete(state: Option<Box<wasi_env_t>>) {
     if let Some(mut env) = state {
         let store = env.store.clone();
-        c_try!(store.with_mut(|store| env.inner.on_exit(store, None)); otherwise ());
+        c_try!(store.with_mut(|store| env.inner.on_exit(store)); otherwise ());
     }
 }
 
@@ -249,7 +358,14 @@ pub unsafe extern "C" fn wasi_env_read_stdout(
 ) -> isize {
     let inner_buffer = unsafe { slice::from_raw_parts_mut(buffer as *mut _, buffer_len) };
 
-    let stdout = c_try!(env.store.with_mut(|store| env.inner.data(store).stdout()); otherwise -1);
+    #[cfg(feature = "sys")]
+    if let WasiBackend::Native(native) = &env.inner {
+        return native.read(false, inner_buffer);
+    }
+    let WasiBackend::Legacy(legacy) = &env.inner else {
+        unreachable!()
+    };
+    let stdout = c_try!(env.store.with_mut(|store| legacy.data(store).stdout()); otherwise -1);
 
     if let Ok(mut stdout) = stdout {
         if let Some(stdout) = stdout.as_mut() {
@@ -271,7 +387,14 @@ pub unsafe extern "C" fn wasi_env_read_stderr(
     buffer_len: usize,
 ) -> isize {
     let inner_buffer = unsafe { slice::from_raw_parts_mut(buffer as *mut _, buffer_len) };
-    let stderr = c_try!(env.store.with_mut(|store| env.inner.data(store).stderr()); otherwise -1);
+    #[cfg(feature = "sys")]
+    if let WasiBackend::Native(native) = &env.inner {
+        return native.read(true, inner_buffer);
+    }
+    let WasiBackend::Legacy(legacy) = &env.inner else {
+        unreachable!()
+    };
+    let stderr = c_try!(env.store.with_mut(|store| legacy.data(store).stderr()); otherwise -1);
     if let Ok(mut stderr) = stderr {
         if let Some(stderr) = stderr.as_mut() {
             read_inner(stderr, inner_buffer)
@@ -394,23 +517,25 @@ unsafe fn wasi_get_imports_inner(
             wasi_env.inner.import_object(store, &module.inner)
         })));
 
-    let shared_memory = module.inner.imports().memories().next().map(|a| *a.ty());
-
-    let spawn_type = match shared_memory {
-        Some(ty) => wasmer_wasix::runtime::SpawnType::CreateMemoryOfType(ty),
-        None => wasmer_wasix::runtime::SpawnType::CreateMemory,
-    };
-
-    let tasks =
-        c_try!(store.with_mut(|store| wasi_env.inner.data(store).runtime.task_manager().clone()));
-    let memory = c_try!(store.with_mut(|store| tasks.build_memory(store, spawn_type))).unwrap();
+    let memory =
+        c_try!(store.with_mut(|store| wasi_env.inner.build_memory(store, &module.inner))).unwrap();
 
     if let Some(memory) = memory {
         import_object.define("env", "memory", memory);
     }
 
     imports_set_buffer(store, &module.inner, import_object, imports)?;
-
+    let values = imports
+        .take()
+        .into_iter()
+        .map(|value| {
+            value.map(|mut value| {
+                wasi_env.inner.tag_import(&mut value);
+                value
+            })
+        })
+        .collect::<Vec<_>>();
+    imports.set_buffer(values);
     Some(())
 }
 
@@ -448,7 +573,7 @@ pub unsafe extern "C" fn wasi_env_initialize_instance(
     store: &mut wasm_store_t,
     instance: &mut wasm_instance_t,
 ) -> bool {
-    c_try!(store.inner.with_mut(|store| wasi_env.inner.initialize(store, instance.inner.clone()).unwrap()); otherwise false);
+    c_try!(c_try!(store.inner.with_mut(|store| wasi_env.inner.initialize(store, instance.inner.clone())); otherwise false); otherwise false);
     true
 }
 

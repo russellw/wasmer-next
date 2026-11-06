@@ -16,11 +16,18 @@ use wasmer_api::{Extern, ExternType, Function, Global, Memory, Table};
 pub struct wasm_extern_t {
     pub(crate) inner: Extern,
     pub(crate) store: StoreRef,
+    #[cfg(all(feature = "wasi", feature = "sys"))]
+    pub(crate) wasi_origin: Option<wasixv2_exec::HostEnvironment<wasixv2::MachineSyscalls>>,
 }
 
 impl wasm_extern_t {
     pub(crate) fn new(store: StoreRef, inner: Extern) -> Self {
-        Self { inner, store }
+        Self {
+            inner,
+            store,
+            #[cfg(all(feature = "wasi", feature = "sys"))]
+            wasi_origin: None,
+        }
     }
 
     pub(crate) fn global(&self) -> Global {

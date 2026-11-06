@@ -14,6 +14,7 @@ mod contexts;
 mod cooperative;
 mod cputime;
 mod dynamic;
+mod embedding;
 mod fork;
 mod function;
 mod generated;
@@ -24,6 +25,8 @@ mod memory_image;
 #[cfg(all(target_os = "linux", feature = "sys"))]
 mod pagemap;
 mod preempt;
+pub use embedding::HostEnvironment;
+
 mod preparation;
 mod process;
 mod signal;
@@ -923,21 +926,17 @@ where
         .map(|gate| Binding::new(&*abi, gate, task))
         .transpose()
         .map_err(|e| ExecError::Load(LoadError::Format(e)))?;
-    let spawner = process::spawner(
-        store.engine().clone(),
-        syscalls.clone(),
-        host.clone(),
-        abis.clone(),
-    );
     let handoff = Arc::new(process::Handoff::default());
     handoff.bind_cancellation(cleanup.cancellation());
-    let proc = process::ProcExports::new(spawner, handoff.clone());
-    let env = FunctionEnv::new(
-        &mut store,
-        ExecEnv::new(syscalls.clone(), task, proc, host.clone()),
+    let env = embedding::environment(
+        &mut store.as_store_mut(),
+        syscalls.clone(),
+        task,
+        host.clone(),
+        abis.clone(),
+        cleanup.shared().clone(),
+        handoff.clone(),
     );
-    env.as_mut(&mut store).cleanup = Some(cleanup.shared().clone());
-    abis.install_hooks(&mut store.as_store_mut(), &env);
     let mut imports = imports(&*abi, &mut store.as_store_mut(), &env, module);
     let size = fork.map(|image| image.memory.size());
     let imported = import_memory(&mut store.as_store_mut(), module, &mut imports, size)?;

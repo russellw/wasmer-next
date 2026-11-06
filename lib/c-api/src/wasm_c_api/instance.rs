@@ -55,6 +55,26 @@ pub unsafe extern "C" fn wasm_instance_new(
         .take(module_import_count)
         .collect::<Vec<Extern>>();
 
+    #[cfg(all(feature = "wasi", feature = "sys"))]
+    if let Some(memory) = externs.iter().find_map(|value| match value {
+        Extern::Memory(memory) => Some(memory),
+        _ => None,
+    }) {
+        for import in imports
+            .as_slice()
+            .iter()
+            .take(module_import_count)
+            .flatten()
+        {
+            if let Some(origin) = &import.wasi_origin {
+                c_try!(
+                    store
+                        .inner
+                        .with_mut(|store| origin.prebind_memory(store, memory))
+                );
+            }
+        }
+    }
     let instance = match c_try!(store.inner.instantiate(wasm_module, externs)) {
         Ok(instance) => instance,
 

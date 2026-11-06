@@ -202,6 +202,38 @@ impl StoreRef {
         }
     }
 
+    pub(crate) fn is_native(&self) -> bool {
+        match &self.inner.mode {
+            #[cfg(feature = "sys")]
+            StoreMode::Native(_) => true,
+            StoreMode::Plain(_) => false,
+        }
+    }
+
+    #[cfg(feature = "sys")]
+    pub(crate) fn async_store(&self) -> Result<wasmer_api::StoreAsync, RuntimeError> {
+        use wasmer_api::AsStoreAsync;
+        match &self.inner.mode {
+            StoreMode::Native(native) => Ok(native.store.as_ref().unwrap().store()),
+            StoreMode::Plain(_) => Err(RuntimeError::new(
+                "Store is not managed by the native driver",
+            )),
+        }
+    }
+
+    #[cfg(feature = "sys")]
+    pub(crate) fn run_host<R>(
+        &self,
+        future: impl std::future::Future<Output = R>,
+    ) -> Result<R, RuntimeError> {
+        match &self.inner.mode {
+            StoreMode::Native(native) => native.driver()?.run(future),
+            StoreMode::Plain(_) => Err(RuntimeError::new(
+                "Store is not managed by the native driver",
+            )),
+        }
+    }
+
     pub fn downgrade(&self) -> WeakStoreRef {
         WeakStoreRef {
             inner: Rc::downgrade(&self.inner),
