@@ -37,3 +37,13 @@ resolver/loader boundary checks and the temporary timestamp helper test pass
 using the original pinned fixtures. These results do
 not establish N-API execution, configured-provider guest loopback/pre-bind,
 separate terminal output routing, finite terminal EOF, or legacy-provider retirement.
+
+## Integrated native union
+
+The final union `d0b6c749f37` uses WLK `049156e0b7a`, preserving the
+Python fixes and root C API imports changes. All 29 default library and 33
+integration tests passed on that tuple. The N-API acceptance case passed eight
+original guest executions through public SDK commands. Finite console EOF,
+separate stdout/stderr, cached waits and per-run close/cancellation cases passed.
+Host/custom provider physical bind/loopback fidelity and retirement of the
+interim virtual-fs/net/io adapters remain required; this is not full SDK parity.
