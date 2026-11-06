@@ -1133,4 +1133,256 @@ mod tests {
         })
         .success();
     }
+
+    #[allow(
+        unexpected_cfgs,
+        reason = "tools like cargo-llvm-coverage pass --cfg coverage"
+    )]
+    #[cfg(unix)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    #[test]
+    fn test_wasi_legacy_virtual_root_and_preopen_descriptor_contract() {
+        (assert_c! {
+            #include "tests/wasmer.h"
+            #include <stdint.h>
+            #include <stdlib.h>
+            #include <sys/stat.h>
+            #include <unistd.h>
+
+            static uint32_t load_u32(const uint8_t* data, size_t offset) {
+                return (uint32_t)data[offset] |
+                    ((uint32_t)data[offset + 1] << 8) |
+                    ((uint32_t)data[offset + 2] << 16) |
+                    ((uint32_t)data[offset + 3] << 24);
+            }
+
+            static uint64_t load_u64(const uint8_t* data, size_t offset) {
+                return (uint64_t)load_u32(data, offset) |
+                    ((uint64_t)load_u32(data, offset + 4) << 32);
+            }
+
+            static void assert_guest_probe(
+                wasm_store_t* store,
+                wasm_module_t* module,
+                wasi_env_t* wasi_env,
+                int configured
+            ) {
+                wasm_extern_vec_t imports = WASM_EMPTY_VEC;
+                assert(wasi_get_imports(store, wasi_env, module, &imports));
+                wasm_instance_t* instance = wasm_instance_new(
+                    store, module, &imports, NULL
+                );
+                assert(instance);
+                assert(wasi_env_initialize_instance(wasi_env, store, instance));
+
+                wasm_func_t* start = wasi_get_start_function(instance);
+                assert(start);
+                wasm_val_vec_t arguments = WASM_EMPTY_VEC;
+                wasm_val_vec_t results = WASM_EMPTY_VEC;
+                assert(wasm_func_call(start, &arguments, &results) == NULL);
+
+                wasm_extern_vec_t exports = WASM_EMPTY_VEC;
+                wasm_instance_exports(instance, &exports);
+                assert(exports.size == 2);
+                assert(wasm_extern_kind(exports.data[0]) == WASM_EXTERN_MEMORY);
+                wasm_memory_t* memory = wasm_extern_as_memory(exports.data[0]);
+                assert(memory);
+                const uint8_t* data = (const uint8_t*)wasm_memory_data(memory);
+                assert(data);
+
+                /* fd 3 is the legacy virtual root, with its historical broad rights. */
+                assert(load_u32(data, 0) == 0);
+                assert(load_u32(data, 4) == 0);
+                assert(load_u32(data, 8) == 0);
+                assert(load_u32(data, 12) == 0);
+                assert(configured ? load_u32(data, 16) > 0 : load_u32(data, 16) == 0);
+                assert(load_u32(data, 120) == 1);
+                assert(data[320] == '/');
+                assert(load_u64(data, 72) == ((UINT64_C(1) << 39) - 1));
+                assert(load_u64(data, 80) == ((UINT64_C(1) << 39) - 1));
+
+                if (configured) {
+                    const char* first_alias = "same//path";
+                    const char* second_alias = "same/path";
+                    const uint64_t mapped_rights = (UINT64_C(1) << 29) - 1;
+
+                    /* The builder strips only leading slashes. These remain two names. */
+                    assert(load_u32(data, 20) == 0);
+                    assert(load_u32(data, 24) == 0);
+                    assert(load_u32(data, 28) == 0);
+                    assert(load_u32(data, 32) == 0);
+                    assert(load_u32(data, 36) == 0);
+                    assert(load_u32(data, 40) == 0);
+                    assert(load_u32(data, 124) == strlen(first_alias));
+                    assert(load_u32(data, 128) == strlen(second_alias));
+                    assert(memcmp(data + 336, first_alias, strlen(first_alias)) == 0);
+                    assert(memcmp(data + 352, second_alias, strlen(second_alias)) == 0);
+                    assert(load_u64(data, 88) == mapped_rights);
+                    assert(load_u64(data, 96) == mapped_rights);
+                    assert(load_u64(data, 104) == mapped_rights);
+                    assert(load_u64(data, 112) == mapped_rights);
+                    assert(load_u32(data, 56) == 0);
+                    assert(load_u32(data, 60) == 0);
+                    assert(data[64] == 'A');
+                    assert(data[65] == 'B');
+                } else {
+                    /* With no configured preopens, fd 4 and fd 5 do not exist. */
+                    assert(load_u32(data, 20) == 8);
+                    assert(load_u32(data, 24) == 8);
+                    assert(load_u32(data, 28) == 8);
+                    assert(load_u32(data, 32) == 8);
+                    assert(load_u32(data, 36) == 8);
+                    assert(load_u32(data, 40) == 8);
+                    assert(load_u32(data, 44) == 76);
+                    assert(load_u32(data, 48) == 76);
+                    assert(load_u32(data, 52) == 76);
+                    assert(load_u32(data, 56) == 8);
+                    assert(load_u32(data, 60) == 8);
+                }
+
+                wasm_extern_vec_delete(&exports);
+                wasm_func_delete(start);
+                wasm_instance_delete(instance);
+                wasm_extern_vec_delete(&imports);
+            }
+
+            int main() {
+                wasm_engine_t* engine = wasm_engine_new();
+                wasm_store_t* store = wasm_store_new(engine);
+
+                wasm_byte_vec_t wat;
+                wasmer_byte_vec_new_from_string(
+                    &wat,
+                    "(module\n"
+                    "  (import \"wasi_snapshot_preview1\" \"fd_prestat_get\" (func $prestat_get (param i32 i32) (result i32)))\n"
+                    "  (import \"wasi_snapshot_preview1\" \"fd_prestat_dir_name\" (func $prestat_name (param i32 i32 i32) (result i32)))\n"
+                    "  (import \"wasi_snapshot_preview1\" \"fd_fdstat_get\" (func $fdstat_get (param i32 i32) (result i32)))\n"
+                    "  (import \"wasi_snapshot_preview1\" \"fd_readdir\" (func $readdir (param i32 i32 i32 i64 i32) (result i32)))\n"
+                    "  (import \"wasi_snapshot_preview1\" \"path_open\" (func $path_open (param i32 i32 i32 i32 i32 i64 i64 i32 i32) (result i32)))\n"
+                    "  (import \"wasi_snapshot_preview1\" \"fd_read\" (func $fd_read (param i32 i32 i32 i32) (result i32)))\n"
+                    "  (import \"wasi_snapshot_preview1\" \"fd_close\" (func $fd_close (param i32) (result i32)))\n"
+                    "  (memory (export \"memory\") 1)\n"
+                    "  (data (i32.const 800) \"proc\")\n"
+                    "  (data (i32.const 810) \"dev\")\n"
+                    "  (data (i32.const 820) \"tmp\")\n"
+                    "  (data (i32.const 830) \"marker\")\n"
+                    "  (func $path_status (param $path i32) (param $len i32) (result i32)\n"
+                    "    (local $error i32)\n"
+                    "    i32.const 3 i32.const 0\n"
+                    "    local.get $path local.get $len\n"
+                    "    i32.const 0 i64.const 0 i64.const 0 i32.const 0\n"
+                    "    i32.const 560 call $path_open\n"
+                    "    local.tee $error\n"
+                    "    if (result i32)\n"
+                    "      local.get $error\n"
+                    "    else\n"
+                    "      i32.const 560 i32.load call $fd_close\n"
+                    "    end)\n"
+                    "  (func $read_marker (param $dir i32) (param $out i32) (result i32)\n"
+                    "    (local $error i32)\n"
+                    "    local.get $dir i32.const 0\n"
+                    "    i32.const 830 i32.const 6 i32.const 0\n"
+                    "    i64.const 2 i64.const 0 i32.const 0\n"
+                    "    i32.const 560 call $path_open\n"
+                    "    local.tee $error\n"
+                    "    if\n"
+                    "      local.get $error return\n"
+                    "    end\n"
+                    "    i32.const 496 i32.const 640 i32.store\n"
+                    "    i32.const 500 i32.const 1 i32.store\n"
+                    "    i32.const 564 i32.const 0 i32.store\n"
+                    "    i32.const 560 i32.load i32.const 496 i32.const 1 i32.const 564\n"
+                    "    call $fd_read local.tee $error\n"
+                    "    if\n"
+                    "      local.get $error return\n"
+                    "    end\n"
+                    "    local.get $out i32.const 640 i32.load8_u i32.store8\n"
+                    "    i32.const 560 i32.load call $fd_close)\n"
+                    "  (func (export \"_start\")\n"
+                    "    i32.const 0 i32.const 3 i32.const 256 call $prestat_get i32.store\n"
+                    "    i32.const 4 i32.const 3 i32.const 320 i32.const 64 call $prestat_name i32.store\n"
+                    "    i32.const 8 i32.const 3 i32.const 400 call $fdstat_get i32.store\n"
+                    "    i32.const 72 i32.const 400 i64.load offset=8 i64.store\n"
+                    "    i32.const 80 i32.const 400 i64.load offset=16 i64.store\n"
+                    "    i32.const 12 i32.const 3 i32.const 700 i32.const 256 i64.const 0 i32.const 544\n"
+                    "    call $readdir i32.store\n"
+                    "    i32.const 16 i32.const 544 i32.load i32.store\n"
+                    "    i32.const 120 i32.const 256 i32.load offset=4 i32.store\n"
+                    "    i32.const 20 i32.const 4 i32.const 272 call $prestat_get i32.store\n"
+                    "    i32.const 24 i32.const 4 i32.const 336 i32.const 64 call $prestat_name i32.store\n"
+                    "    i32.const 28 i32.const 4 i32.const 432 call $fdstat_get i32.store\n"
+                    "    i32.const 88 i32.const 432 i64.load offset=8 i64.store\n"
+                    "    i32.const 96 i32.const 432 i64.load offset=16 i64.store\n"
+                    "    i32.const 124 i32.const 272 i32.load offset=4 i32.store\n"
+                    "    i32.const 32 i32.const 5 i32.const 288 call $prestat_get i32.store\n"
+                    "    i32.const 36 i32.const 5 i32.const 352 i32.const 64 call $prestat_name i32.store\n"
+                    "    i32.const 40 i32.const 5 i32.const 464 call $fdstat_get i32.store\n"
+                    "    i32.const 104 i32.const 464 i64.load offset=8 i64.store\n"
+                    "    i32.const 112 i32.const 464 i64.load offset=16 i64.store\n"
+                    "    i32.const 128 i32.const 288 i32.load offset=4 i32.store\n"
+                    "    i32.const 44 i32.const 800 i32.const 4 call $path_status i32.store\n"
+                    "    i32.const 48 i32.const 810 i32.const 3 call $path_status i32.store\n"
+                    "    i32.const 52 i32.const 820 i32.const 3 call $path_status i32.store\n"
+                    "    i32.const 56 i32.const 4 i32.const 64 call $read_marker i32.store\n"
+                    "    i32.const 60 i32.const 5 i32.const 65 call $read_marker i32.store))"
+                );
+                wasm_byte_vec_t wasm;
+                wat2wasm(&wat, &wasm);
+                wasm_module_t* module = wasm_module_new(store, &wasm);
+                assert(module);
+
+                wasi_config_t* empty_config = wasi_config_new("empty");
+                wasi_env_t* empty_env = wasi_env_new(store, empty_config);
+                assert(empty_env);
+                assert_guest_probe(store, module, empty_env, 0);
+
+                char temp_root[] = "/tmp/wasmer-capi-preopens-XXXXXX";
+                char* root = mkdtemp(temp_root);
+                assert(root);
+                char dir_a[512], dir_b[512], file_a[512], file_b[512];
+                assert(snprintf(dir_a, sizeof(dir_a), "%s/a", root) > 0);
+                assert(snprintf(dir_b, sizeof(dir_b), "%s/b", root) > 0);
+                assert(mkdir(dir_a, 0700) == 0);
+                assert(mkdir(dir_b, 0700) == 0);
+                assert(snprintf(file_a, sizeof(file_a), "%s/marker", dir_a) > 0);
+                assert(snprintf(file_b, sizeof(file_b), "%s/marker", dir_b) > 0);
+                FILE* marker_a = fopen(file_a, "wb");
+                FILE* marker_b = fopen(file_b, "wb");
+                assert(marker_a && marker_b);
+                assert(fputc('A', marker_a) == 'A');
+                assert(fputc('B', marker_b) == 'B');
+                assert(fclose(marker_a) == 0);
+                assert(fclose(marker_b) == 0);
+
+                wasi_config_t* config = wasi_config_new("mapped");
+                /* Legacy normalization strips leading slashes only. */
+                assert(wasi_config_mapdir(config, "/same//path", dir_a));
+                assert(wasi_config_mapdir(config, "same/path", dir_b));
+                wasi_env_t* mapped_env = wasi_env_new(store, config);
+                assert(mapped_env);
+                assert_guest_probe(store, module, mapped_env, 1);
+
+                wasi_config_t* duplicate = wasi_config_new("duplicate");
+                assert(wasi_config_mapdir(duplicate, "duplicate", dir_a));
+                assert(wasi_config_mapdir(duplicate, "/duplicate", dir_b));
+                assert(wasi_env_new(store, duplicate) == NULL);
+
+                wasi_env_delete(mapped_env);
+                wasi_env_delete(empty_env);
+                wasm_module_delete(module);
+                wasm_byte_vec_delete(&wasm);
+                wasm_byte_vec_delete(&wat);
+                wasm_store_delete(store);
+                wasm_engine_delete(engine);
+
+                assert(unlink(file_a) == 0);
+                assert(unlink(file_b) == 0);
+                assert(rmdir(dir_a) == 0);
+                assert(rmdir(dir_b) == 0);
+                assert(rmdir(root) == 0);
+                return 0;
+            }
+        })
+        .success();
+    }
 }
