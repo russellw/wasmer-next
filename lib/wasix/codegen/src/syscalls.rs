@@ -80,6 +80,7 @@ impl Gen {
     fn trait_def(&mut self, methods: &[Method]) {
         self.out.push_str(TRAIT_DOCS);
         self.line("pub trait Syscalls {");
+        self.out.push_str(HOST_LOOKUP);
         for m in methods {
             self.line("");
             push_docs(&mut self.out, &m.f.docs);
@@ -255,6 +256,7 @@ impl Gen {
     fn layered(&mut self, methods: &[Method]) {
         self.line("");
         self.line("impl<L: Layer<S>, S: Syscalls> Syscalls for Layered<L, S> {");
+        self.out.push_str(LAYERED_HOST_LOOKUP);
         for m in methods {
             self.line("");
             if m.too_many_args() {
@@ -458,12 +460,51 @@ const TRAIT_DOCS: &str = r#"
 #[allow(unused_variables)]
 "#;
 
+const HOST_LOOKUP: &str = r#"
+    /// Optional host-only name lookup. `None` preserves the guest's ordinary DNS path.
+    /// This is not a guest syscall and must be explicitly admitted by each layer.
+    /// Construction may capture pure immutable namespace/capability metadata only;
+    /// provider admission, policy callbacks and lookup work begin when the future is polled.
+    fn lookup_host<'a>(
+        &'a self,
+        caller: &'a Caller<'_>,
+        name: &'a str,
+        port: Option<u16>,
+    ) -> Option<crate::LocalFuture<'a, SysResult<Vec<std::net::IpAddr>>>> {
+        None
+    }
+"#;
+
+const LAYERED_HOST_LOOKUP: &str = r#"
+    fn lookup_host<'a>(
+        &'a self,
+        caller: &'a Caller<'_>,
+        name: &'a str,
+        port: Option<u16>,
+    ) -> Option<crate::LocalFuture<'a, SysResult<Vec<std::net::IpAddr>>>> {
+        self.layer.lookup_host(caller, name, port, &self.inner)
+    }
+"#;
+
 const LAYER: &str = r#"
 /// A layer that sees every syscall as a [`Syscall`] value.
 ///
 /// A layer is written for the syscalls `S` it runs in front of: a generic one (a tracer) for
 /// every `S`, one that needs more of what it wraps (the kernel's syscall entry) for that type.
 pub trait Layer<S: Syscalls> {
+    /// Optional host lookup, disabled even when `next` supports it unless this layer opts in.
+    /// Construction is metadata-only; provider/policy work must remain in the returned future.
+    fn lookup_host<'a>(
+        &'a self,
+        caller: &'a Caller<'_>,
+        name: &'a str,
+        port: Option<u16>,
+        next: &'a S,
+    ) -> Option<crate::LocalFuture<'a, SysResult<Vec<std::net::IpAddr>>>> {
+        let _ = (caller, name, port, next);
+        None
+    }
+
     fn call<'a>(
         &'a self,
         caller: &'a Caller<'_>,
@@ -595,6 +636,16 @@ pub(crate) mod tests {
         ] {
             assert!(out.contains(want), "missing `{want}` in:\n{out}");
         }
+    }
+
+    #[test]
+    fn host_lookup_is_optional_layer_metadata_not_a_guest_syscall() {
+        let out = generate(&model("getpid: func() -> slong;"), "t.wit").unwrap();
+        assert_eq!(out.matches("fn lookup_host<'a>").count(), 3);
+        assert!(out.contains("self.layer.lookup_host(caller, name, port, &self.inner)"));
+        assert!(!out.contains("LookupHost"));
+        assert!(!out.contains("lookup-host"));
+        assert!(out.contains("impl<L, S: crate::Control> crate::Control for Layered<L, S>"));
     }
 
     #[test]

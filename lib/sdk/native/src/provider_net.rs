@@ -14,7 +14,7 @@ use virtual_net::{
 use wasixv2_abi::Errno;
 use wasixv2_vnet::{
     Answer, Backend, BackendDatagram, BackendStream, Domain, Found, InboundSink, Lookup,
-    LookupDone, LookupError, Publication, Room, Shutdown, StreamState,
+    LookupContext, LookupDone, LookupError, Publication, Room, Shutdown, StreamState,
 };
 use wasixv2_wait::{PollMask, PollTable, Pollable, WaitQueue};
 
@@ -241,6 +241,54 @@ pub(crate) struct ProviderNetwork {
     group: Arc<Group>,
 }
 impl ProviderNetwork {
+    fn resolve_lookup(
+        &self,
+        lookup: Lookup,
+        port: Option<u16>,
+        contextual: bool,
+        done: LookupDone,
+    ) {
+        let Lookup::Name(name) = lookup else {
+            done(Err(if contextual {
+                LookupError::Provider(Errno::EINVAL)
+            } else {
+                LookupError::Failed
+            }));
+            return;
+        };
+        let provider = self.provider.clone();
+        let completion = Arc::new(Mutex::new(Some(done)));
+        let output = completion.clone();
+        let group = self.group.clone();
+        if let Err(error) = self.group.spawn(async move {
+            let result = match group.wait(provider.resolve(&name, port, None)).await {
+                Some(Ok(addrs)) if !group.closed() => Ok(Found {
+                    answer: Answer::Addrs {
+                        canonical: name,
+                        addrs,
+                    },
+                    ttl: 0,
+                }),
+                Some(Err(error)) if contextual => Err(LookupError::Provider(errno(error))),
+                _ if contextual => Err(LookupError::Provider(Errno::ENETDOWN)),
+                _ => Err(LookupError::Failed),
+            };
+            let done = output.lock().unwrap().take();
+            if let Some(done) = done {
+                done(result);
+            }
+        }) {
+            let done = completion.lock().unwrap().take();
+            if let Some(done) = done {
+                done(Err(if contextual {
+                    LookupError::Provider(error)
+                } else {
+                    LookupError::Failed
+                }));
+            }
+        }
+    }
+
     pub(crate) fn new(provider: DynVirtualNetworking, services: Services) -> Arc<Self> {
         let group = Arc::new(Group {
             state: Mutex::default(),
@@ -868,40 +916,14 @@ impl Backend for ProviderNetwork {
         }).map_err(|e|io::Error::from_raw_os_error(e.0))?;
         Ok(Box::new(Published { host, cancellation }))
     }
+    fn supports_contextual_lookup(&self) -> bool {
+        true
+    }
+    fn lookup_contextual(&self, lookup: Lookup, context: LookupContext, done: LookupDone) {
+        self.resolve_lookup(lookup, context.port, true, done);
+    }
     fn lookup(&self, lookup: Lookup, done: LookupDone) {
-        let Lookup::Name(name) = lookup else {
-            done(Err(LookupError::Failed));
-            return;
-        };
-        let provider = self.provider.clone();
-        let completion = Arc::new(Mutex::new(Some(done)));
-        let output = completion.clone();
-        let group = self.group.clone();
-        if self
-            .group
-            .spawn(async move {
-                let result = match group.wait(provider.resolve(&name, None, None)).await {
-                    Some(Ok(addrs)) if !group.closed() => Ok(Found {
-                        answer: Answer::Addrs {
-                            canonical: name,
-                            addrs,
-                        },
-                        ttl: 0,
-                    }),
-                    _ => Err(LookupError::Failed),
-                };
-                let done = output.lock().unwrap().take();
-                if let Some(done) = done {
-                    done(result);
-                }
-            })
-            .is_err()
-        {
-            let done = completion.lock().unwrap().take();
-            if let Some(done) = done {
-                done(Err(LookupError::Failed));
-            }
-        }
+        self.resolve_lookup(lookup, None, false, done);
     }
 }
 #[cfg(test)]

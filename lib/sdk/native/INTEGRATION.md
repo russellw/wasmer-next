@@ -24,6 +24,14 @@ virtual-fs; the SDK dependency record is the only changed lock record.
 The public network_provider type still uses virtual-net and a live canonical
 network adapter, retaining virtual-io transitively. Their separate retirement is
 not implemented in this slice. No old WASIX Runtime/runner is reintroduced.
+Configured SDK providers receive the original lookup name and optional service
+port through the canonical namespace's opt-in host lookup. Each syscall layer must
+admit this path; unknown layers, tracing restrictions and seccomp retain ordinary
+wire DNS. Pending selected operations keep their initiating namespace and cannot
+be replayed through wire DNS after interruption or a policy/provider change.
+Exact selected-provider errors remain authoritative. This does not complete the
+physical endpoint or legacy network-crate retirement work described below.
+
 Compiled modules and their allocating feature engines share one cache owner.
 Plain runs reuse the client owner; N-API creates a separate owner and budget per
 run. Persistent artifact bytes use the existing versioned cache directories.

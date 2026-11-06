@@ -888,3 +888,293 @@ fn port_provider_absence_preserves_validation_and_authorization_order() {
     "#;
     assert_eq!(run_port(data, body), 0);
 }
+
+/// In-memory host opt-in used only to prove shim admission; it cannot open host transports.
+#[derive(Default)]
+struct HostDns {
+    admitted: std::sync::atomic::AtomicUsize,
+    domains: std::sync::atomic::AtomicUsize,
+    feedback: std::sync::atomic::AtomicUsize,
+}
+impl wasixv2_vnet::Backend for HostDns {
+    fn connect(
+        &self,
+        _: std::net::SocketAddr,
+        _: wasixv2_vnet::WaitQueue,
+    ) -> Result<Arc<dyn wasixv2_vnet::BackendStream>, wasixv2_abi::Errno> {
+        panic!("DNS admission fixture must never reach a host stream")
+    }
+    fn datagram(
+        &self,
+        _: wasixv2_vnet::Domain,
+        _: wasixv2_vnet::WaitQueue,
+    ) -> Result<Arc<dyn wasixv2_vnet::BackendDatagram>, wasixv2_abi::Errno> {
+        panic!("DNS admission fixture must never reach a host datagram")
+    }
+    fn publish(
+        &self,
+        _: std::net::SocketAddr,
+        _: u32,
+        _: Arc<dyn wasixv2_vnet::InboundSink>,
+    ) -> Result<Box<dyn wasixv2_vnet::Publication>, io::Error> {
+        panic!("DNS admission fixture must never publish a host endpoint")
+    }
+    fn supports_contextual_lookup(&self) -> bool {
+        true
+    }
+    fn lookup_contextual(
+        &self,
+        lookup: wasixv2_vnet::Lookup,
+        context: wasixv2_vnet::LookupContext,
+        done: wasixv2_vnet::LookupDone,
+    ) {
+        self.admitted
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(lookup, wasixv2_vnet::Lookup::Name("MiXeD.Invalid.".into()));
+        assert_eq!(context.port, Some(443));
+        done(Ok(wasixv2_vnet::Found {
+            answer: wasixv2_vnet::Answer::Addrs {
+                canonical: "MiXeD.Invalid.".into(),
+                addrs: vec!["192.0.2.9".parse().unwrap()],
+            },
+            ttl: 0,
+        }));
+    }
+}
+impl std::fmt::Debug for HostDns {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HostDns")
+    }
+}
+impl wasixv2_vnet::NetworkPolicy for HostDns {
+    fn allows_socket(&self, _: std::net::SocketAddr, _: wasixv2_vnet::PolicyDirection) -> bool {
+        true
+    }
+    fn allows_domain(&self, name: &str) -> bool {
+        self.domains
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(name, "MiXeD.Invalid");
+        true
+    }
+    fn resolved_domain(&self, _: &str, _: &[std::net::IpAddr]) {
+        self.feedback
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+fn host_dns_kernel<S>(
+    dns: Arc<HostDns>,
+) -> (
+    Arc<dyn wasixv2::Host>,
+    Arc<wasixv2_exec::Abis<S>>,
+    wasixv2_kernel::Kernel,
+)
+where
+    S: wasixv2_syscalls::Syscalls + wasixv2_syscalls::Control + Send + Sync + 'static,
+{
+    let host: Arc<dyn wasixv2::Host> = Arc::new(wasixv2::TokioHost::default());
+    let root = Arc::new(wasixv2_vfs_mem::MemFs::new(
+        Arc::new(wasixv2_kernel::HostClock(host.clone())),
+        0o777,
+        1,
+        1,
+    ));
+    let mut abis = wasixv2_exec::Abis::new();
+    abis.push(Arc::new(wasixv2_wasix1::Wasix1::new()));
+    let abis = Arc::new(abis);
+    let network = wasixv2_vnet::Net::new(
+        wasixv2_vnet::NetConfig {
+            policy: Some(dns.clone()),
+            ..wasixv2_vnet::NetConfig::host_default()
+        },
+        Some(dns),
+    );
+    let kernel = wasixv2_kernel::Kernel::new(host.clone(), root)
+        .with_binfmt(abis.clone())
+        .with_network(network);
+    (host, abis, kernel)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn resolve_default_none_layer_preserves_actual_wire_socket_denial() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use wasixv2_kernel::{Dispatch, Kernel, SyscallEntry};
+    use wasixv2_syscalls::{Caller, Layer, Layered, MaybeFuture, SysResult, Syscall, SyscallRet};
+    struct DenySocket(Arc<AtomicUsize>);
+    impl Layer<Kernel> for DenySocket {
+        // Deliberately no lookup_host override: this layer requires observable wire syscalls.
+        fn call<'a>(
+            &'a self,
+            caller: &'a Caller<'_>,
+            call: Syscall,
+            next: &'a Kernel,
+        ) -> MaybeFuture<'a, SysResult<SyscallRet>> {
+            if matches!(call, Syscall::Socket { .. }) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                MaybeFuture::Ready(Err(wasixv2_abi::Errno::EPERM.into()))
+            } else {
+                Dispatch.call(caller, call, next)
+            }
+        }
+    }
+    let dns = Arc::new(HostDns::default());
+    let denied = Arc::new(AtomicUsize::new(0));
+    let (host, abis, kernel) = host_dns_kernel(dns.clone());
+    let task = kernel
+        .spawn(ProcessConfig {
+            args: vec!["wire-denial".into()],
+            env: vec![],
+            stdio: Stdio::from_fns(|_| {}, |_| {}),
+        })
+        .unwrap();
+    let syscalls = Arc::new(Layered::new(
+        SyscallEntry(DenySocket(denied.clone())),
+        kernel,
+    ));
+    let wasm = guest(
+        r#"(data (i32.const 100) "MiXeD.Invalid.")"#,
+        r#"
+      (call $assert (i32.eq (call $resolve (i32.const 100) (i32.const 14) (i32.const 443) (i32.const 1000) (i32.const 1) (i32.const 8)) (i32.const 63)) (i32.const 1))"#,
+    );
+    let store = wasmer::Store::default();
+    let module = wasixv2_exec::load(store.engine(), &wasm).unwrap();
+    let status = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        wasixv2_exec::run_with_abis(store, &module, syscalls, task, host, abis),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(status, 0);
+    assert_eq!(
+        denied.load(Ordering::SeqCst),
+        1,
+        "the real wire Socket call passed through the denying layer"
+    );
+    assert_eq!(dns.admitted.load(Ordering::SeqCst), 0);
+    assert_eq!(dns.domains.load(Ordering::SeqCst), 0);
+    assert_eq!(dns.feedback.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn resolve_pending_signals_run_canonical_actions_before_host_admission() {
+    use futures::FutureExt;
+    use std::{
+        future::Future,
+        sync::atomic::{AtomicBool, Ordering},
+        task::Poll,
+    };
+    use wasixv2_kernel::{Dispatch, Kernel, SyscallEntry};
+    use wasixv2_syscalls::{
+        Caller, GroupStop, Layer, Layered, MaybeFuture, SysResult, Syscall, SyscallRet, Syscalls,
+    };
+    struct StopBeforeHost(Arc<AtomicBool>, wasixv2_abi::Signal);
+    impl Layer<Kernel> for StopBeforeHost {
+        fn call<'a>(
+            &'a self,
+            caller: &'a Caller<'_>,
+            call: Syscall,
+            next: &'a Kernel,
+        ) -> MaybeFuture<'a, SysResult<SyscallRet>> {
+            Dispatch.call(caller, call, next)
+        }
+        fn lookup_host<'a>(
+            &'a self,
+            caller: &'a Caller<'_>,
+            name: &'a str,
+            port: Option<u16>,
+            next: &'a Kernel,
+        ) -> Option<wasixv2_syscalls::LocalFuture<'a, SysResult<Vec<std::net::IpAddr>>>> {
+            let future = next.lookup_host(caller, name, port)?;
+            Some(Box::pin(async move {
+                // Inject the race after selection, before the Kernel future's first poll.
+                if !self.0.swap(true, Ordering::SeqCst) {
+                    next.kill(caller.task(), self.1).unwrap();
+                }
+                future.await
+            }))
+        }
+    }
+    for signal in [wasixv2_abi::Signal::SIGKILL, wasixv2_abi::Signal::SIGSTOP] {
+        let dns = Arc::new(HostDns::default());
+        let stopped = Arc::new(AtomicBool::new(false));
+        let (host, abis, kernel) = host_dns_kernel(dns.clone());
+        let task = kernel
+            .spawn(ProcessConfig {
+                args: vec!["stop-dns".into()],
+                env: vec![],
+                stdio: Stdio::from_fns(|_| {}, |_| {}),
+            })
+            .unwrap();
+        let syscalls = Arc::new(Layered::new(
+            SyscallEntry(StopBeforeHost(stopped.clone(), signal)),
+            kernel,
+        ));
+        let wasm = guest(
+            r#"(data (i32.const 100) "MiXeD.Invalid.")"#,
+            r#"
+      (call $ok (call $resolve (i32.const 100) (i32.const 14) (i32.const 443) (i32.const 1000) (i32.const 1) (i32.const 8)) (i32.const 1))
+      (call $assert (i32.eq (i32.load (i32.const 8)) (i32.const 1)) (i32.const 2))"#,
+        );
+        let store = wasmer::Store::default();
+        let module = wasixv2_exec::load(store.engine(), &wasm).unwrap();
+        let mut run = Box::pin(wasixv2_exec::run_with_abis(
+            store,
+            &module,
+            syscalls.clone(),
+            task,
+            host,
+            abis,
+        ));
+        if signal == wasixv2_abi::Signal::SIGKILL {
+            assert_eq!(
+                tokio::time::timeout(std::time::Duration::from_secs(5), run)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                137
+            );
+            assert!(stopped.load(Ordering::SeqCst));
+            assert_eq!(dns.admitted.load(Ordering::SeqCst), 0);
+            assert_eq!(dns.domains.load(Ordering::SeqCst), 0);
+            assert_eq!(dns.feedback.load(Ordering::SeqCst), 0);
+            continue;
+        }
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            std::future::poll_fn(|cx| {
+                assert!(
+                    run.as_mut().poll(cx).is_pending(),
+                    "the actual guest must wait for CONT"
+                );
+                if stopped.load(Ordering::SeqCst) {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(syscalls.stop_wait(task).now_or_never().is_none());
+        assert_eq!(dns.admitted.load(Ordering::SeqCst), 0);
+        assert_eq!(dns.domains.load(Ordering::SeqCst), 0);
+        syscalls
+            .inner
+            .kill(task, wasixv2_abi::Signal::SIGCONT)
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), run)
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            dns.admitted.load(Ordering::SeqCst),
+            1,
+            "only the safe rerun admits a provider lookup"
+        );
+        assert!(dns.domains.load(Ordering::SeqCst) > 0);
+        assert_eq!(dns.feedback.load(Ordering::SeqCst), 1);
+    }
+}

@@ -505,13 +505,13 @@ async fn lookup<S: Syscalls + Control + 'static>(
 }
 
 /// `resolve(host, host_len, port, addrs, naddrs, ro_naddrs)`: up to `naddrs` addresses of
-/// `host` as [`AddrIp`]s. The port is only a hint and unused.
+/// `host` as [`AddrIp`]s. Host backends may use the port hint; wire DNS ignores it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn resolve<S: Syscalls + Control + 'static>(
     env: Env<S>,
     host: i32,
     host_len: i32,
-    _port: i32,
+    port: i32,
     addrs: i32,
     naddrs: i32,
     ro_naddrs: i32,
@@ -525,7 +525,15 @@ pub(crate) async fn resolve<S: Syscalls + Control + 'static>(
         let Ok(name) = String::from_utf8(name) else {
             return shim::fail(Errno::INVAL);
         };
-        let found = lookup(frame, &name).await?;
+        let caller = frame.caller();
+        let port = match port as u16 {
+            0 => None,
+            port => Some(port),
+        };
+        let found = match frame.syscalls.lookup_host(&caller, &name, port) {
+            Some(lookup) => lookup.await?,
+            None => lookup(frame, &name).await?,
+        };
         let n = found.len().min(naddrs as u32 as usize);
         for (i, ip) in found.iter().take(n).enumerate() {
             let at = (addrs as u32).wrapping_add((i * AddrIp::SIZE) as u32);
