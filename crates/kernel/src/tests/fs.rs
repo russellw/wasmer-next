@@ -9,6 +9,12 @@ use super::ipc::{errno, get, machine, put};
 use super::*;
 use crate::sync::MutexExt;
 
+use std::any::Any;
+use wasixv2_vfs::{
+    AppendOutcome, Attr, Cred, FileType, Filesystem as VfsFilesystem, FsInfo, FsResult,
+    Handle as VfsHandle, NewNode, Node as VfsNode, OpenOptions, SetAttr, StatFs,
+};
+
 const CWD: Fd = Fd(-100);
 
 fn descriptor_value(kernel: &Kernel, task: TaskId, fd: Fd) -> Option<u64> {
@@ -18,6 +24,310 @@ fn descriptor_value(kernel: &Kernel, task: TaskId, fd: Fd) -> Option<u64> {
         .as_ref()?
         .downcast_ref::<u64>()
         .copied()
+}
+
+/// A legacy provider over tmpfs: data is real, while append reports no atomic offset and leaves
+/// cursor advancement to the kernel's existing open-file description.
+struct CursorProviderFs {
+    inner: MemFs,
+    audit: Arc<CursorProviderAudit>,
+}
+
+#[derive(Default)]
+struct CursorProviderAudit {
+    initial_positions: Mutex<Vec<(bool, u64)>>,
+    append_calls: Mutex<Vec<(u64, Vec<u8>, usize)>>,
+    ordinary_writes: Mutex<Vec<(u64, Vec<u8>)>>,
+}
+
+impl CursorProviderAudit {
+    fn clear(&self) {
+        self.initial_positions.lock().unwrap().clear();
+        self.append_calls.lock().unwrap().clear();
+        self.ordinary_writes.lock().unwrap().clear();
+    }
+}
+
+impl CursorProviderFs {
+    fn new(audit: Arc<CursorProviderAudit>) -> Self {
+        Self {
+            inner: MemFs::new(Arc::new(HostClock(Arc::new(TestHost))), 0o777, 0, 0),
+            audit,
+        }
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl VfsFilesystem for CursorProviderFs {
+    fn limits_file_size(&self) -> bool {
+        self.inner.limits_file_size()
+    }
+
+    fn info(&self) -> FsInfo {
+        self.inner.info()
+    }
+
+    fn root(&self) -> Arc<dyn VfsNode> {
+        Arc::new(CursorProviderNode {
+            inner: self.inner.root(),
+            audit: self.audit.clone(),
+        })
+    }
+
+    async fn statfs(&self) -> FsResult<StatFs> {
+        self.inner.statfs().await
+    }
+}
+
+struct CursorProviderNode {
+    inner: Arc<dyn VfsNode>,
+    audit: Arc<CursorProviderAudit>,
+}
+
+#[async_trait::async_trait(?Send)]
+impl VfsNode for CursorProviderNode {
+    fn ino(&self) -> u64 {
+        self.inner.ino()
+    }
+
+    fn file_type(&self) -> FileType {
+        self.inner.file_type()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    async fn getattr(&self) -> FsResult<Attr> {
+        self.inner.getattr().await
+    }
+
+    async fn setattr(&self, attr: &SetAttr) -> FsResult<Attr> {
+        self.inner.setattr(attr).await
+    }
+
+    async fn lookup(&self, name: &[u8]) -> FsResult<Arc<dyn VfsNode>> {
+        self.inner.lookup(name).await.map(|inner| {
+            Arc::new(Self {
+                inner,
+                audit: self.audit.clone(),
+            }) as Arc<dyn VfsNode>
+        })
+    }
+
+    async fn create(&self, name: &[u8], new: &NewNode<'_>) -> FsResult<Arc<dyn VfsNode>> {
+        self.inner.create(name, new).await.map(|inner| {
+            Arc::new(Self {
+                inner,
+                audit: self.audit.clone(),
+            }) as Arc<dyn VfsNode>
+        })
+    }
+
+    async fn open(&self, options: OpenOptions) -> FsResult<Box<dyn VfsHandle>> {
+        let initial_len = if options.append {
+            self.inner.getattr().await?.size
+        } else {
+            0
+        };
+        let inner = self.inner.open(options).await?;
+        Ok(Box::new(CursorProviderHandle {
+            inner,
+            initial_len,
+            audit: self.audit.clone(),
+        }))
+    }
+}
+
+struct CursorProviderHandle {
+    inner: Box<dyn VfsHandle>,
+    initial_len: u64,
+    audit: Arc<CursorProviderAudit>,
+}
+
+#[async_trait::async_trait(?Send)]
+impl VfsHandle for CursorProviderHandle {
+    fn initial_position(&self, append: bool) -> u64 {
+        let position = if append { self.initial_len } else { 0 };
+        self.audit
+            .initial_positions
+            .lock()
+            .unwrap()
+            .push((append, position));
+        position
+    }
+
+    async fn read_at(&self, buf: &mut [u8], offset: u64) -> FsResult<usize> {
+        self.inner.read_at(buf, offset).await
+    }
+
+    async fn write_at(&self, data: &[u8], offset: u64) -> FsResult<usize> {
+        self.inner.write_at(data, offset).await
+    }
+
+    async fn write_at_as(&self, data: &[u8], offset: u64, cred: &Cred) -> FsResult<usize> {
+        self.audit
+            .ordinary_writes
+            .lock()
+            .unwrap()
+            .push((offset, data.to_vec()));
+        self.inner.write_at_as(data, offset, cred).await
+    }
+
+    async fn append(&self, data: &[u8]) -> FsResult<(u64, usize)> {
+        self.inner.append(data).await
+    }
+
+    async fn append_as(&self, data: &[u8], cred: &Cred) -> FsResult<(u64, usize)> {
+        self.inner.append_as(data, cred).await
+    }
+
+    async fn append_at_cursor_as(
+        &self,
+        data: &[u8],
+        cursor: u64,
+        cred: &Cred,
+    ) -> FsResult<AppendOutcome> {
+        // Force a short vectored write across the two guest iovecs below.
+        let count = data.len().min(3);
+        let (_, written) = self.inner.append_as(&data[..count], cred).await?;
+        self.audit
+            .append_calls
+            .lock()
+            .unwrap()
+            .push((cursor, data.to_vec(), written));
+        Ok(AppendOutcome::OffsetUnknown { count: written })
+    }
+
+    async fn set_size(&self, size: u64) -> FsResult<()> {
+        self.inner.set_size(size).await
+    }
+}
+
+fn mount_cursor_provider(kernel: &Kernel, t: &T<'_>, audit: Arc<CursorProviderAudit>) {
+    block_on(kernel.vfs().mount(
+        b"/provider",
+        Arc::new(CursorProviderFs::new(audit.clone())),
+        wasixv2_vfs::MountFlags::default(),
+        true,
+    ))
+    .unwrap();
+    t.create("/provider/data", b"seed");
+    audit.clear();
+}
+
+#[test]
+fn provider_append_keeps_the_shared_cursor_and_explicit_append_does_not_move_it() {
+    let (kernel, task, memory) = machine();
+    let t = T::new(&kernel, task, &memory);
+    let audit = Arc::new(CursorProviderAudit::default());
+    mount_cursor_provider(&kernel, &t, audit.clone());
+
+    let fd = t
+        .open("/provider/data", OpenFlags::O_RDWR | OpenFlags::O_APPEND)
+        .unwrap();
+    assert!(t.read(fd, 8).unwrap().is_empty());
+    assert_eq!(
+        block_on(kernel.lseek(&t.caller, fd, 0, SeekWhence::SEEK_CUR)),
+        Ok(4),
+        "an append open starts at the provider's canonical initial length"
+    );
+    assert_eq!(*audit.initial_positions.lock().unwrap(), vec![(true, 4)]);
+
+    let duplicate = block_on(kernel.dup(&t.caller, fd)).unwrap();
+    put(&memory, 0x2400, b"ab");
+    put(&memory, 0x2500, b"cde");
+    let mut iovecs = Vec::new();
+    for (base, len) in [(0x2400u32, 2u32), (0x2500, 3)] {
+        iovecs.extend_from_slice(&base.to_le_bytes());
+        iovecs.extend_from_slice(&len.to_le_bytes());
+    }
+    put(&memory, 0x1800, &iovecs);
+    assert_eq!(
+        block_on(kernel.writev(&t.caller, fd, GuestPtr::new(0x1800), 2,)),
+        Ok(3),
+        "a short provider append ends this vectored write after its initialized prefix"
+    );
+    assert_eq!(t.write(duplicate, b"XY"), Ok(2));
+    assert_eq!(
+        block_on(kernel.lseek(&t.caller, fd, 0, SeekWhence::SEEK_CUR)),
+        Ok(9),
+        "dup shares the original append cursor"
+    );
+
+    assert_eq!(
+        block_on(kernel.lseek(&t.caller, fd, 1, SeekWhence::SEEK_SET)),
+        Ok(1)
+    );
+    put(&memory, 0x2600, b"!");
+    let mut append_iovec = Vec::new();
+    append_iovec.extend_from_slice(&0x2600u32.to_le_bytes());
+    append_iovec.extend_from_slice(&1u32.to_le_bytes());
+    put(&memory, 0x1800, &append_iovec);
+    assert_eq!(
+        block_on(kernel.pwritev2(
+            &t.caller,
+            fd,
+            GuestPtr::new(0x1800),
+            1,
+            0,
+            RwfFlags::RWF_APPEND,
+        )),
+        Ok(1)
+    );
+    assert_eq!(
+        t.read(duplicate, 3).unwrap(),
+        b"eed",
+        "explicit RWF_APPEND writes at EOF without moving the shared open position"
+    );
+
+    assert_eq!(
+        block_on(kernel.lseek(&t.caller, fd, 1, SeekWhence::SEEK_SET)),
+        Ok(1)
+    );
+    assert_eq!(t.write(fd, b"?"), Ok(1));
+    assert_eq!(
+        block_on(kernel.lseek(&t.caller, fd, 0, SeekWhence::SEEK_CUR)),
+        Ok(2),
+        "an unknown append offset advances the existing cursor, not a guessed EOF"
+    );
+    let count = block_on(kernel.pread64(&t.caller, fd, UserSliceMut::new(0x2800, 32), 0)).unwrap();
+    assert_eq!(get(&memory, 0x2800, count as usize), b"seedabcXY!?");
+    assert_eq!(
+        *audit.append_calls.lock().unwrap(),
+        vec![
+            (4, b"abcde".to_vec(), 3),
+            (7, b"XY".to_vec(), 2),
+            (0, b"!".to_vec(), 1),
+            (1, b"?".to_vec(), 1),
+        ],
+        "the provider sees the existing position and reports only its byte count"
+    );
+    assert!(audit.ordinary_writes.lock().unwrap().is_empty());
+}
+
+#[test]
+fn provider_nonappend_open_writes_from_zero_without_calling_append() {
+    let (kernel, task, memory) = machine();
+    let t = T::new(&kernel, task, &memory);
+    let audit = Arc::new(CursorProviderAudit::default());
+    mount_cursor_provider(&kernel, &t, audit.clone());
+
+    let fd = t.open("/provider/data", OpenFlags::O_RDWR).unwrap();
+    assert_eq!(t.write(fd, b"over"), Ok(4));
+    assert_eq!(
+        *audit.initial_positions.lock().unwrap(),
+        vec![(false, 0)],
+        "ordinary provider opens retain the POSIX zero position"
+    );
+    assert_eq!(
+        *audit.ordinary_writes.lock().unwrap(),
+        vec![(0, b"over".to_vec())]
+    );
+    assert!(audit.append_calls.lock().unwrap().is_empty());
+
+    let count = block_on(kernel.pread64(&t.caller, fd, UserSliceMut::new(0x2800, 8), 0)).unwrap();
+    assert_eq!(get(&memory, 0x2800, count as usize), b"over");
 }
 
 #[test]
