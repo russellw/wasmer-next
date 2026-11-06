@@ -191,7 +191,12 @@ fn check_env(env: Vec<Vec<u8>>) -> V1Result<Vec<Vec<u8>>> {
 
 /// `_prepare_wasi` updated the first matching inherited key in place and appended
 /// new keys; successive supplied duplicates update that same slot. Keep byte values.
-fn merge_exec_environment(mut inherited: Vec<Vec<u8>>, supplied: &[Vec<u8>]) -> Vec<Vec<u8>> {
+fn merge_exec_environment(inherited: Vec<Vec<u8>>, supplied: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    // Legacy _prepare_wasi normalizes every inherited entry even for Some(empty).
+    let mut inherited: Vec<_> = inherited
+        .into_iter()
+        .map(|entry| String::from_utf8_lossy(&entry).into_owned().into_bytes())
+        .collect();
     fn key(entry: &[u8]) -> Option<&[u8]> {
         entry
             .iter()
@@ -1334,7 +1339,7 @@ pub(crate) async fn proc_parent<S: Syscalls + Control + 'static>(
 #[cfg(test)]
 mod tests {
     #[test]
-    fn exec_environment_merges_in_order_updates_first_duplicate_and_keeps_raw_values() {
+    fn exec_environment_merges_in_order_and_normalizes_only_inherited_entries() {
         let inherited = vec![
             b"OLD=parent".to_vec(),
             b"DUP=first".to_vec(),
@@ -1354,14 +1359,20 @@ mod tests {
                 b"OLD=parent".to_vec(),
                 b"DUP=update".to_vec(),
                 b"DUP=second".to_vec(),
-                b"RAW=\xff".to_vec(),
+                b"RAW=\xef\xbf\xbd".to_vec(),
                 b"NEW=last=equals".to_vec(),
                 b"EMPTY=".to_vec(),
             ]
         );
+        let mut normalized = inherited.clone();
+        normalized[3] = b"RAW=\xef\xbf\xbd".to_vec();
         assert_eq!(
             super::merge_exec_environment(inherited.clone(), &[]),
-            inherited
+            normalized
+        );
+        assert_eq!(
+            inherited[3], b"RAW=\xff",
+            "startup bytes stay raw until explicit exec normalization"
         );
         assert!(matches!(
             super::check_env(vec![b"BARE".to_vec()]),

@@ -560,6 +560,18 @@ where
     finish(engine, first, syscalls, task, host, abis, cleanup).await
 }
 
+/// A default/noop ABI preserves its predecessor's compat custody. A successor
+/// that supplies ownership has already installed its new token before entry.
+fn keep_process_lease(
+    current: &mut Option<Box<dyn crate::ExecProcessLease>>,
+    successor: Option<Box<dyn crate::ExecProcessLease>>,
+) {
+    if let Some(successor) = successor {
+        let previous = current.replace(successor);
+        drop(previous);
+    }
+}
+
 /// Follows `task`'s process from the end of its first image's run through the images its
 /// `execve` calls load, until it exits; releases the task then. An image that cannot start kills
 /// the process with SIGSEGV.
@@ -583,7 +595,7 @@ where
             return Err(err);
         }
     };
-    let mut process_leases = Vec::new();
+    let mut process_lease = None;
     let status = loop {
         let mut image = match ended {
             // The task runs on in the instance that took over, which releases it.
@@ -605,9 +617,7 @@ where
             },
             Ended::Exec(image) => image,
         };
-        if let Some(lease) = image.lease.take() {
-            process_leases.push(lease);
-        }
+        keep_process_lease(&mut process_lease, image.lease.take());
         // `de_thread`: the old image is gone from every thread before the new one starts.
         let Some(waited) =
             crate::cancellation::execution(cleanup.cancellation(), syscalls.exec_wait(task)).await
@@ -875,6 +885,54 @@ pub(crate) async fn vfork_return<S: 'static>(
 
 #[cfg(test)]
 pub(super) mod tests {
+    #[test]
+    fn repeated_exec_retires_predecessor_leases_and_keeps_noop_abi_custody_bounded() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Counted {
+            live: Arc<AtomicUsize>,
+            retired: Arc<AtomicUsize>,
+        }
+        impl crate::ExecProcessLease for Counted {}
+        impl Drop for Counted {
+            fn drop(&mut self) {
+                self.live.fetch_sub(1, Ordering::SeqCst);
+                self.retired.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let live = Arc::new(AtomicUsize::new(0));
+        let retired = Arc::new(AtomicUsize::new(0));
+        let mut custody = None;
+        super::keep_process_lease(&mut custody, None);
+        for image in 0..1000 {
+            live.fetch_add(1, Ordering::SeqCst);
+            super::keep_process_lease(
+                &mut custody,
+                Some(Box::new(Counted {
+                    live: live.clone(),
+                    retired: retired.clone(),
+                })),
+            );
+            assert_eq!(
+                live.load(Ordering::SeqCst),
+                1,
+                "one predecessor after image {image}"
+            );
+            assert_eq!(retired.load(Ordering::SeqCst), image);
+            for _ in 0..3 {
+                super::keep_process_lease(&mut custody, None);
+            }
+            assert_eq!(
+                live.load(Ordering::SeqCst),
+                1,
+                "noop successors retain custody"
+            );
+            assert_eq!(retired.load(Ordering::SeqCst), image);
+        }
+        drop(custody);
+        assert_eq!(live.load(Ordering::SeqCst), 0);
+        assert_eq!(retired.load(Ordering::SeqCst), 1000);
+    }
+
     use std::{
         collections::{HashMap, VecDeque},
         ops::Range,
