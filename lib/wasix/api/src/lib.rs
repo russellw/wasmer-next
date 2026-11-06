@@ -3,6 +3,11 @@
 
 #![recursion_limit = "256"]
 
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+mod admitted;
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+pub use admitted::{Run, spawn, spawn_file};
+
 #[cfg(all(feature = "browser", target_arch = "wasm32"))]
 pub mod browser;
 
@@ -1354,14 +1359,50 @@ impl Running<'_> {
 
 impl Drop for Running<'_> {
     fn drop(&mut self) {
-        self.machine
-            .running
-            .lock()
-            .unwrap()
-            .retain(|task| *task != self.task);
-        if !self.released {
-            abandon(&self.machine.syscalls.inner, self.task);
+        finish_running(self.machine, self.task, self.released);
+    }
+}
+
+fn finish_running(machine: &Machine, task: TaskId, released: bool) {
+    machine.running.lock().unwrap().retain(|id| *id != task);
+    if !released {
+        abandon(&machine.syscalls.inner, task);
+    }
+}
+
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+impl Running<'_> {
+    fn into_owned(self, machine: Arc<Machine>) -> OwnedRunning {
+        assert!(std::ptr::eq(self.machine, machine.as_ref()));
+        // Transfer this admission's cleanup obligation to the factory. The
+        // borrowed guard owns no allocation or other independent resource.
+        let admission = std::mem::ManuallyDrop::new(self);
+        OwnedRunning {
+            machine,
+            task: admission.task,
+            released: admission.released,
         }
+    }
+}
+
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+struct OwnedRunning {
+    machine: Arc<Machine>,
+    task: TaskId,
+    released: bool,
+}
+
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+impl OwnedRunning {
+    fn released(mut self) {
+        self.released = true;
+    }
+}
+
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+impl Drop for OwnedRunning {
+    fn drop(&mut self) {
+        finish_running(&self.machine, self.task, self.released);
     }
 }
 

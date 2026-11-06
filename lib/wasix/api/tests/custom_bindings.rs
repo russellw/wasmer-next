@@ -254,6 +254,17 @@ async fn run_case_with_thread(
     thread: Option<ThreadProbe>,
     file: bool,
 ) -> (Result<i32, wasixv2::RunError>, Events) {
+    run_case_with_admission(name, main_binding, variant, thread, file, false).await
+}
+
+async fn run_case_with_admission(
+    name: &str,
+    main_binding: bool,
+    variant: Variant,
+    thread: Option<ThreadProbe>,
+    file: bool,
+    admitted: bool,
+) -> (Result<i32, wasixv2::RunError>, Events) {
     let programs = Programs(std::env::temp_dir().join(format!(
         "wasixv2-custom-binding-{name}-{}",
         std::process::id()
@@ -353,7 +364,21 @@ async fn run_case_with_thread(
         env: vec!["LD_LIBRARY_PATH=/prog".into()],
         stdio: Stdio::from_fns(|_| {}, |_| {}),
     };
-    let status = if file {
+    let status = if admitted {
+        let machine = Arc::new(machine);
+        let engine = wasmer::Engine::default();
+        let run = if file {
+            wasixv2::spawn_file(machine, engine, "/prog/main.wasm".into(), config).await
+        } else {
+            let module = wasixv2::load(&engine, &main).expect("valid admitted fixture");
+            wasixv2::spawn(machine, engine, module, config).await
+        }
+        .expect("admitted custom-binding process");
+        Ok(run
+            .wait()
+            .await
+            .expect("admitted custom-binding completion"))
+    } else if file {
         machine
             .run_file(&wasmer::Engine::default(), "/prog/main.wasm", config)
             .await
@@ -545,6 +570,52 @@ async fn side_only_bindings_construct_and_retire_on_their_owning_thread() {
                         .count()
                         >= 2
                 );
+                assert_eq!(events.last().unwrap().0, "cleanup");
+                for phase in ["prepare", "configure", "call", "deactivate", "cleanup"] {
+                    assert_eq!(events.iter().filter(|(seen, _)| *seen == phase).count(), 1);
+                }
+            }
+        })
+        .await;
+}
+
+/// The common owner must preserve the same side-only binding profile as the
+/// synchronous facade, including file exec and its loader cleanup fence.
+#[tokio::test]
+async fn admitted_side_bindings_keep_the_existing_owning_thread_lifecycle() {
+    if !owning_thread_subprocess("admitted_side_bindings_keep_the_existing_owning_thread_lifecycle")
+    {
+        return;
+    }
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            for (name, file) in [
+                ("admitted-owner-bytes", false),
+                ("admitted-owner-file", true),
+            ] {
+                let caller = std::thread::current().id();
+                let events: ThreadEvents = Arc::default();
+                let (status, _) = run_case_with_admission(
+                    name,
+                    false,
+                    Variant::Env,
+                    Some(ThreadProbe {
+                        events: events.clone(),
+                        barrier: None,
+                    }),
+                    file,
+                    true,
+                )
+                .await;
+                assert_eq!(status.unwrap(), 0);
+                let events = events.lock().unwrap();
+                let owner = events
+                    .iter()
+                    .find(|(phase, _)| *phase == "prepare")
+                    .unwrap()
+                    .1;
+                assert_ne!(owner, caller);
+                assert!(events.iter().all(|(_, thread)| *thread == owner));
                 assert_eq!(events.last().unwrap().0, "cleanup");
                 for phase in ["prepare", "configure", "call", "deactivate", "cleanup"] {
                     assert_eq!(events.iter().filter(|(seen, _)| *seen == phase).count(), 1);

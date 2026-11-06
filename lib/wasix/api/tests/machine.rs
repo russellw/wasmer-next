@@ -393,6 +393,39 @@ async fn a_dropped_run_kills_its_process() {
         .await;
 }
 
+/// Wait futures subscribe to an admitted owner; canceling one does not stop it.
+#[tokio::test]
+async fn admitted_wait_cancellation_preserves_the_owner_and_repeated_waits() {
+    let machine = Arc::new(Machine::new());
+    let stdout = Arc::new(Capture::default());
+    let engine = wasmer::Engine::default();
+    let module = wasixv2::load(&engine, &wat::parse_str(BLOCK_WAT).unwrap()).unwrap();
+    let run = wasixv2::spawn(
+        machine,
+        engine,
+        module,
+        wasixv2::ProcessConfig {
+            args: vec![],
+            env: vec![],
+            stdio: stdio(&stdout),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(run.id() > 0);
+    ready(&stdout).await;
+    {
+        let waiting = run.wait();
+        tokio::pin!(waiting);
+        assert!(futures_util::poll!(&mut waiting).is_pending());
+    }
+    run.signaller().signal(15).unwrap();
+    let (first, second) = futures_util::future::join(run.wait(), run.wait()).await;
+    assert_eq!(first.unwrap(), 143);
+    assert_eq!(second.unwrap(), 143);
+    assert_eq!(run.wait().await.unwrap(), 143);
+}
+
 /// Runs `wat` on `machine` and returns its exit status and stdout.
 async fn run_on(machine: &Machine, wat: &str) -> (i32, Vec<u8>) {
     let wasm = wat::parse_str(wat).expect("valid test module");

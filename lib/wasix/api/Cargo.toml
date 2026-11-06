@@ -75,6 +75,7 @@ js-sys.workspace = true
 resolved-packages = ["dep:wasmer-package", "dep:wasmer-config"]
 default = ["sys", "tokio", "host-network", "wasix1"]
 sys = [
+  "dep:wasixv2-wait",
   "wasmer/sys",
   "wasmer/headless",
   "wasixv2-exec/sys",
