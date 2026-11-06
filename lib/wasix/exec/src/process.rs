@@ -364,7 +364,7 @@ where
                         let guest = async move {
                             let cancellation = scope.cancellation().cloned();
                             if crate::cancellation::execution(cancellation.as_ref(), async move {
-                                run(scope).await
+                                Box::pin(run(scope)).await
                             })
                             .await
                             .is_some()
@@ -393,7 +393,7 @@ where
                                     let result =
                                         crate::catch_panic(crate::cancellation::execution(
                                             cancellation.as_ref(),
-                                            async move { run(scope).await },
+                                            async move { Box::pin(run(scope)).await },
                                         ))
                                         .await;
                                     if let Err(panic) = result {
