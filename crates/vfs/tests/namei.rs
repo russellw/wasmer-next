@@ -194,7 +194,9 @@ fn bootstrap_namespace_fallback_mutations_use_exact_relative_or_absolute_parents
     world.mkdir(b"/left/named").unwrap();
     world.mkdir(b"/left/directory").unwrap();
     world.mkdir(b"/right").unwrap();
-    world.create(b"/left/file");
+    let source = world.create(b"/left/file");
+    assert_eq!(block_on(source.write_at(b"retained", 0)), Ok(8));
+    let before = block_on(world.vfs.stat(&source.path)).unwrap();
     world.create(b"/right/marker");
     let boot = namespace(
         &world,
@@ -207,6 +209,28 @@ fn bootstrap_namespace_fallback_mutations_use_exact_relative_or_absolute_parents
         ..world.cx()
     };
     let mutation = Err(PathError::NamespaceMutation);
+    let how = OpenHow {
+        flags: OpenFlags::O_CREAT | OpenFlags::O_RDWR,
+        mode: 0o600,
+        lookup: LookupFlags::follow(),
+    };
+    let existing = block_on(world.vfs.open(&cx, &boot.root, b"file", &how)).unwrap();
+    assert_eq!(
+        (existing.path.dentry.sb().id, existing.node().ino()),
+        (source.path.dentry.sb().id, source.node().ino())
+    );
+    let mut bytes = [0; 8];
+    assert_eq!(block_on(existing.read_at(&mut bytes, 0)), Ok(8));
+    assert_eq!(&bytes, b"retained");
+    let after = block_on(world.vfs.stat(&source.path)).unwrap();
+    assert_eq!(
+        (after.mode, after.size, after.nlink),
+        (before.mode, before.size, before.nlink)
+    );
+    assert_eq!(
+        block_on(world.vfs.open(&cx, &boot.root, b"not-created", &how)).err(),
+        Some(PathError::NamespaceMutation)
+    );
     assert_eq!(
         block_on(world.vfs.link(
             &cx,
@@ -361,8 +385,21 @@ fn bootstrap_namespace_preserves_intermediate_lookup_provenance_for_every_mutati
                 PathError::Errno(Errno::ENOENT),
             ),
         ] {
+            let how = OpenHow {
+                flags: OpenFlags::O_CREAT | OpenFlags::O_RDWR,
+                mode: 0o644,
+                lookup: LookupFlags::follow(),
+            };
             let results = [
                 block_on(world.vfs.mkdir(&cx, &boot.root, path, 0o755)),
+                block_on(world.vfs.mknod(
+                    &cx,
+                    &boot.root,
+                    path,
+                    wasixv2_vfs::FileType::Regular.mode_bits() | 0o644,
+                    Default::default(),
+                )),
+                block_on(world.vfs.open(&cx, &boot.root, path, &how)).map(drop),
                 block_on(world.vfs.rmdir(&cx, &boot.root, path)),
                 block_on(world.vfs.unlink(&cx, &boot.root, path)),
                 block_on(world.vfs.symlink(&cx, b"target", &boot.root, path)),
