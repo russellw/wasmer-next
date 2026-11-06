@@ -437,6 +437,141 @@ async fn descriptor_compat_read_uses_its_authorized_pipe_after_a_layer_reuses_th
     );
 }
 
+/// The ABI authorizes a replaceable stdio target, then a suspended layer installs
+/// a named directory there. The kernel must reject the stale target under its install lock.
+#[tokio::test]
+async fn descriptor_renumber_does_not_overwrite_a_named_target_installed_while_pending() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use wasixv2_abi::{Errno, Fd, OpenFlags};
+    use wasixv2_kernel::{Dispatch, HostClock, Kernel, SyscallEntry};
+    use wasixv2_syscalls::{
+        Caller, DescriptorUpdate, Layer, Layered, MaybeFuture, SysResult, Syscall, SyscallRet,
+        Syscalls,
+    };
+    struct PauseDup(Arc<AtomicBool>);
+    impl Layer<Kernel> for PauseDup {
+        fn call<'a>(
+            &'a self,
+            caller: &'a Caller<'_>,
+            call: Syscall,
+            next: &'a Kernel,
+        ) -> MaybeFuture<'a, SysResult<SyscallRet>> {
+            MaybeFuture::Future(Box::pin(async move {
+                if let Syscall::Dup3 {
+                    oldfd: Fd(1),
+                    newfd: Fd(20),
+                    ..
+                } = call
+                    && !self.0.swap(true, Ordering::AcqRel)
+                {
+                    let original = caller.descriptors().unwrap();
+                    assert!(original.get(Fd(20)).unwrap().present);
+                    let plan = caller.descriptor_installations().unwrap();
+                    assert!(plan.result(0).is_none());
+                    // This is after the ABI's target-kind check, before kernel dup3.
+                    tokio::task::yield_now().await;
+                    let directory = next.snapshot_descriptors(caller.task(), &[Fd(3)]).unwrap();
+                    let named = wasixv2_wasix1::PreopenRights::ALL
+                        .named_attachment(b"protected")
+                        .unwrap();
+                    assert_eq!(
+                        next.replace_descriptor_attachment(
+                            caller.task(),
+                            &directory,
+                            Fd(3),
+                            Some(named.clone()),
+                        ),
+                        Ok(DescriptorUpdate::Replaced)
+                    );
+                    let unbound = Caller::new(caller.task(), caller.memory());
+                    assert_eq!(
+                        next.dup3(&unbound, Fd(3), Fd(20), OpenFlags(0)).await,
+                        Ok(Fd(20))
+                    );
+                    let result = Dispatch.call(caller, call, next).await;
+                    assert!(matches!(
+                        result,
+                        Err(wasixv2_syscalls::SysErr::Errno(Errno::EAGAIN))
+                    ));
+                    assert!(
+                        plan.result(0).is_none(),
+                        "failed replacement must not publish outputs"
+                    );
+                    let current = next.snapshot_descriptors(caller.task(), &[Fd(20)]).unwrap();
+                    assert!(
+                        current
+                            .get(Fd(20))
+                            .unwrap()
+                            .attachment
+                            .as_ref()
+                            .unwrap()
+                            .ptr_eq(&named)
+                    );
+                    return result;
+                }
+                Dispatch.call(caller, call, next).await
+            }))
+        }
+    }
+    let host: Arc<dyn wasixv2::Host> = Arc::new(wasixv2::TokioHost::default());
+    let root = Arc::new(wasixv2_vfs_mem::MemFs::new(
+        Arc::new(HostClock(host.clone())),
+        0o777,
+        1,
+        1,
+    ));
+    let mut abis = wasixv2_exec::Abis::new();
+    abis.push(Arc::new(wasixv2_wasix1::Wasix1::new()));
+    let abis = Arc::new(abis);
+    let kernel = Kernel::new(host.clone(), root).with_binfmt(abis.clone());
+    let task = kernel
+        .spawn(ProcessConfig {
+            args: vec!["conditional-destination".into()],
+            env: vec![],
+            stdio: Stdio::from_fns(|_| {}, |_| {}),
+        })
+        .unwrap();
+    let interleaved = Arc::new(AtomicBool::new(false));
+    let syscalls = Arc::new(Layered::new(
+        SyscallEntry(PauseDup(interleaved.clone())),
+        kernel,
+    ));
+    let store = wasmer::Store::default();
+    let module = wasixv2_exec::load(store.engine(), &wat::parse_str(r#"(module
+      (import "wasix_32v1" "fd_renumber" (func $renumber (param i32 i32) (result i32)))
+      (import "wasix_32v1" "fd_prestat_get" (func $prestat (param i32 i32) (result i32)))
+      (import "wasix_32v1" "fd_prestat_dir_name" (func $name (param i32 i32 i32) (result i32)))
+      (import "wasix_32v1" "fd_fdstat_get" (func $stat (param i32 i32) (result i32)))
+      (import "wasix_32v1" "proc_exit2" (func $exit (param i32)))
+      (memory (export "memory") 1)
+      (func $check (param $step i32) (param $actual i32) (param $expected i32)
+        (if (i32.ne (local.get $actual) (local.get $expected)) (then (call $exit (local.get $step)))))
+      (func (export "_start")
+        (call $check (i32.const 1) (call $renumber (i32.const 0) (i32.const 20)) (i32.const 0))
+        (call $check (i32.const 2) (call $renumber (i32.const 1) (i32.const 20)) (i32.const 6))
+        (call $check (i32.const 3) (call $prestat (i32.const 20) (i32.const 0)) (i32.const 0))
+        (call $check (i32.const 4) (i32.load (i32.const 4)) (i32.const 9))
+        (call $check (i32.const 5) (call $name (i32.const 20) (i32.const 64) (i32.const 9)) (i32.const 0))
+        (call $check (i32.const 6) (i32.load (i32.const 64)) (i32.const 0x746f7270))
+        (call $check (i32.const 7) (i32.load (i32.const 68)) (i32.const 0x65746365))
+        (call $check (i32.const 8) (i32.load8_u (i32.const 72)) (i32.const 100))
+        (call $check (i32.const 9) (call $stat (i32.const 20) (i32.const 128)) (i32.const 0))
+        (call $check (i32.const 10) (i32.load8_u (i32.const 128)) (i32.const 3))
+        (call $check (i32.const 11) (call $renumber (i32.const 1) (i32.const 20)) (i32.const 58))
+        (call $check (i32.const 12) (call $renumber (i32.const -1) (i32.const 20)) (i32.const 8))
+        (call $exit (i32.const 0))))"#).unwrap()).unwrap();
+    assert_eq!(
+        wasixv2_exec::run_with_abis(store, &module, syscalls, task, host, abis)
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(
+        interleaved.load(Ordering::Acquire),
+        "the guarded kernel call must actually be reached"
+    );
+}
+
 /// Create, write, seek, read, pread, pwrite, stat and truncate a file under `/tmp` through the
 /// root preopen.
 #[test]
