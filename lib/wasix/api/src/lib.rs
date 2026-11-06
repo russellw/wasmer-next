@@ -23,6 +23,11 @@ pub use package::{
 mod directory;
 pub use directory::{DirectoryEntry, populate_directory};
 
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+mod embedding;
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+pub use embedding::EmbeddingProcess;
+
 use std::{
     collections::HashSet,
     future::Future,
@@ -475,11 +480,7 @@ impl MachineBuilder {
         let root = root
             .unwrap_or_else(|| default_root(&host, &network.resolv_conf(), &user, uname.release()));
         #[cfg(feature = "wasix1")]
-        let wasix1 = Wasix1Commands {
-            http_provider,
-            wasix1_limits,
-            ..Wasix1Commands::default()
-        };
+        let wasix1 = Wasix1Commands::new(http_provider, wasix1_limits);
         let mut configured_abis = abis(
             loader,
             #[cfg(feature = "js")]
@@ -1025,7 +1026,7 @@ impl Machine {
     /// Spawns the process `config` describes, in the working directory, and keeps it on
     /// [`Machine::signal`]'s list while the returned guard lives; the guard kills it unless
     /// told that the run released it.
-    async fn start(&self, config: ProcessConfig) -> Result<(TaskId, Running<'_>), RunError> {
+    async fn start(&self, config: ProcessConfig) -> Result<(TaskId, Running), RunError> {
         self.in_use.store(true, Ordering::Relaxed);
         #[cfg(feature = "wasix1")]
         self.resolve_wasix1_commands().await;
@@ -1033,7 +1034,8 @@ impl Machine {
             .map_err(|errno| RunError::Spawn(errno_to_io(errno)))?;
         self.running.lock().unwrap().push(task);
         let running = Running {
-            machine: self,
+            syscalls: self.syscalls.clone(),
+            registrations: self.running.clone(),
             task,
             released: false,
         };
@@ -1222,13 +1224,29 @@ fn boot(
 /// The package commands WASIX v1 programs start with their defaults: the names registered,
 /// until the first process resolves them to the files in `files`, which `Wasix1` reads.
 #[cfg(feature = "wasix1")]
-#[derive(Default)]
 struct Wasix1Commands {
     names: Mutex<Vec<(String, CommandDefaults)>>,
     files: Arc<std::sync::RwLock<wasixv2_wasix1::Commands>>,
-    http_provider: Option<Arc<dyn wasix1_http::HttpProvider>>,
-    #[cfg(feature = "wasix1")]
-    wasix1_limits: wasixv2_wasix1::Limits,
+    abi: Arc<wasixv2_wasix1::Wasix1>,
+}
+
+#[cfg(feature = "wasix1")]
+impl Wasix1Commands {
+    fn new(
+        http_provider: Option<Arc<dyn wasix1_http::HttpProvider>>,
+        limits: wasixv2_wasix1::Limits,
+    ) -> Self {
+        let files = Arc::default();
+        let mut abi = wasixv2_wasix1::Wasix1::with_commands(Arc::clone(&files)).with_limits(limits);
+        if let Some(provider) = http_provider {
+            abi = abi.with_http_provider(provider);
+        }
+        Self {
+            names: Mutex::default(),
+            files,
+            abi: Arc::new(abi),
+        }
+    }
 }
 
 /// The guest ABIs programs may target, `wasixv2` first, and how their images compile: by
@@ -1253,14 +1271,7 @@ fn abis(
     }
     abis.push(Arc::new(Wasixv2));
     #[cfg(feature = "wasix1")]
-    {
-        let mut abi = wasixv2_wasix1::Wasix1::with_commands(wasix1.files.clone())
-            .with_limits(wasix1.wasix1_limits);
-        if let Some(provider) = &wasix1.http_provider {
-            abi = abi.with_http_provider(provider.clone());
-        }
-        abis.push(Arc::new(abi));
-    }
+    abis.push(wasix1.abi.clone());
     abis
 }
 
@@ -1339,28 +1350,28 @@ fn abandon(kernel: &Kernel, task: TaskId) {
 
 /// Takes a process off [`Machine::signal`]'s list however its run ends. A run whose future is
 /// dropped before it released the process kills it, so nothing of it is left running.
-struct Running<'a> {
-    machine: &'a Machine,
+struct Running {
+    syscalls: Arc<Stack>,
+    registrations: Arc<Mutex<Vec<TaskId>>>,
     task: TaskId,
     released: bool,
 }
 
-impl Running<'_> {
+impl Running {
     /// The run ended and released the process.
     fn released(mut self) {
         self.released = true;
     }
 }
 
-impl Drop for Running<'_> {
+impl Drop for Running {
     fn drop(&mut self) {
-        self.machine
-            .running
+        self.registrations
             .lock()
             .unwrap()
             .retain(|task| *task != self.task);
         if !self.released {
-            abandon(&self.machine.syscalls.inner, self.task);
+            abandon(&self.syscalls.inner, self.task);
         }
     }
 }
