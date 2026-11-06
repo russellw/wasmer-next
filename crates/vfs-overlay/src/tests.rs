@@ -549,7 +549,8 @@ fn persisted_file_protection_blocks_link_before_any_getattr() {
             leases: None,
         };
         assert_eq!(
-            block_on(vfs.link(&cx, &root, b"f", LookupFlags::follow(), &root, b"alias")),
+            block_on(vfs.link(&cx, &root, b"f", LookupFlags::follow(), &root, b"alias"))
+                .map_err(wasixv2_vfs::PathError::errno),
             Err(Errno::EPERM)
         );
     }

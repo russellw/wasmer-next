@@ -109,6 +109,304 @@ fn namespace(
 }
 
 #[test]
+fn bootstrap_namespace_empty_root_lists_only_dots_and_rejects_invalid_capabilities() {
+    struct Names(Vec<Vec<u8>>);
+    impl wasixv2_vfs::DirSink for Names {
+        fn push(&mut self, entry: wasixv2_vfs::DirEntry<'_>) -> bool {
+            self.0.push(entry.name.to_vec());
+            true
+        }
+    }
+    let world = World::new();
+    world.create(b"/outside");
+    let boot = namespace(&world, &[], None).unwrap();
+    let cx = Ctx {
+        root: &boot.root,
+        ..world.cx()
+    };
+    let how = OpenHow {
+        flags: OpenFlags::O_RDONLY | OpenFlags::O_DIRECTORY,
+        lookup: LookupFlags {
+            empty: true,
+            directory: true,
+            ..LookupFlags::default()
+        },
+        mode: 0,
+    };
+    let root = block_on(world.vfs.open(&cx, &boot.root, b"", &how)).unwrap();
+    let mut names = Names(Vec::new());
+    block_on(root.readdir(0, &mut names)).unwrap();
+    assert_eq!(names.0, [b".".to_vec(), b"..".to_vec()]);
+    assert!(boot.directories.is_empty());
+    assert_eq!(
+        block_on(
+            world
+                .vfs
+                .lookup(&cx, &boot.root, b"outside", LookupFlags::follow())
+        )
+        .err(),
+        Some(wasixv2_vfs::PathError::NamespaceBoundary)
+    );
+    let foreign = World::new();
+    let sources = vec![wasixv2_vfs::NamespaceDirectory {
+        source: foreign
+            .vfs
+            .open_tree(foreign.vfs.namespace(), &foreign.root, true)
+            .unwrap(),
+        lookup_name: None,
+    }];
+    assert_eq!(
+        world
+            .vfs
+            .bootstrap_namespace(
+                world.vfs.namespace(),
+                world.vfs.namespace().owner().clone(),
+                &sources,
+                None
+            )
+            .err(),
+        Some(Errno::EINVAL)
+    );
+    let sources = vec![wasixv2_vfs::NamespaceDirectory {
+        source: world.open(b"/outside", OpenFlags::O_RDONLY, true).unwrap(),
+        lookup_name: None,
+    }];
+    assert_eq!(
+        world
+            .vfs
+            .bootstrap_namespace(
+                world.vfs.namespace(),
+                world.vfs.namespace().owner().clone(),
+                &sources,
+                None
+            )
+            .err(),
+        Some(Errno::EINVAL)
+    );
+    assert!(world.lookup(b"/outside", LookupFlags::follow()).is_ok());
+}
+
+#[test]
+fn bootstrap_namespace_fallback_mutations_use_exact_relative_or_absolute_parents() {
+    use wasixv2_vfs::PathError;
+    let world = World::new();
+    world.mkdir(b"/left").unwrap();
+    world.mkdir(b"/left/named").unwrap();
+    world.mkdir(b"/left/directory").unwrap();
+    world.mkdir(b"/right").unwrap();
+    world.create(b"/left/file");
+    world.create(b"/right/marker");
+    let boot = namespace(
+        &world,
+        &[(b"/left", None), (b"/right", Some(b"named"))],
+        Some(0),
+    )
+    .unwrap();
+    let cx = Ctx {
+        root: &boot.root,
+        ..world.cx()
+    };
+    let mutation = Err(PathError::NamespaceMutation);
+    assert_eq!(
+        block_on(world.vfs.link(
+            &cx,
+            &boot.root,
+            b"/file",
+            LookupFlags::follow(),
+            &boot.root,
+            b"linked"
+        )),
+        mutation
+    );
+    block_on(world.vfs.link(
+        &cx,
+        &boot.root,
+        b"/file",
+        LookupFlags::follow(),
+        &boot.root,
+        b"/linked",
+    ))
+    .unwrap();
+    assert_eq!(
+        world
+            .lookup(b"/left/file", LookupFlags::follow())
+            .unwrap()
+            .dentry
+            .node()
+            .ino(),
+        world
+            .lookup(b"/left/linked", LookupFlags::follow())
+            .unwrap()
+            .dentry
+            .node()
+            .ino()
+    );
+    assert_eq!(
+        block_on(world.vfs.symlink(&cx, b"file", &boot.root, b"symbol")),
+        mutation
+    );
+    block_on(world.vfs.symlink(&cx, b"file", &boot.root, b"/symbol")).unwrap();
+    let original = block_on(
+        world
+            .vfs
+            .lookup(&cx, &boot.root, b"/file", LookupFlags::follow()),
+    )
+    .unwrap();
+    assert_eq!(
+        block_on(
+            world
+                .vfs
+                .lookup(&cx, &boot.root, b"/symbol", LookupFlags::follow())
+        )
+        .unwrap(),
+        original
+    );
+    assert_eq!(
+        block_on(world.vfs.rename(
+            &cx,
+            &boot.root,
+            b"file",
+            &boot.root,
+            b"/moved",
+            RenameMode::Replace
+        )),
+        mutation
+    );
+    assert_eq!(
+        block_on(world.vfs.rename(
+            &cx,
+            &boot.root,
+            b"/file",
+            &boot.root,
+            b"moved",
+            RenameMode::Replace
+        )),
+        mutation
+    );
+    block_on(world.vfs.rename(
+        &cx,
+        &boot.root,
+        b"/file",
+        &boot.root,
+        b"/moved",
+        RenameMode::Replace,
+    ))
+    .unwrap();
+    assert!(world.lookup(b"/left/moved", LookupFlags::follow()).is_ok());
+    assert_eq!(
+        block_on(world.vfs.unlink(&cx, &boot.root, b"linked")),
+        mutation
+    );
+    block_on(world.vfs.unlink(&cx, &boot.root, b"/linked")).unwrap();
+    assert_eq!(
+        block_on(world.vfs.rmdir(&cx, &boot.root, b"directory")),
+        mutation
+    );
+    block_on(world.vfs.rmdir(&cx, &boot.root, b"/directory")).unwrap();
+    assert_eq!(
+        block_on(world.vfs.rmdir(&cx, &boot.root, b"named")),
+        mutation
+    );
+    block_on(world.vfs.rmdir(&cx, &boot.root, b"/named")).unwrap();
+    assert_eq!(
+        block_on(
+            world
+                .vfs
+                .lookup(&cx, &boot.root, b"/named", LookupFlags::follow())
+        )
+        .unwrap(),
+        boot.directories[1]
+    );
+    block_on(world.vfs.mkdir(&cx, &boot.root, b"/named", 0o755)).unwrap();
+    assert!(world.lookup(b"/left/named", LookupFlags::follow()).is_ok());
+    assert!(
+        block_on(
+            world
+                .vfs
+                .lookup(&cx, &boot.root, b"/named/marker", LookupFlags::follow())
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn bootstrap_namespace_preserves_intermediate_lookup_provenance_for_every_mutation_family() {
+    use wasixv2_vfs::PathError;
+    for fallback in [None, Some(0)] {
+        let world = World::new();
+        world.mkdir(b"/left").unwrap();
+        world.mkdir(b"/right").unwrap();
+        world.create(b"/right/file");
+        let boot = namespace(
+            &world,
+            &[(b"/left", None), (b"/right", Some(b"named"))],
+            fallback,
+        )
+        .unwrap();
+        let cx = Ctx {
+            root: &boot.root,
+            ..world.cx()
+        };
+        for (path, expected) in [
+            (
+                b"outside/new".as_slice(),
+                if fallback.is_some() {
+                    PathError::Errno(Errno::ENOENT)
+                } else {
+                    PathError::NamespaceBoundary
+                },
+            ),
+            (
+                b"named/missing/new".as_slice(),
+                PathError::Errno(Errno::ENOENT),
+            ),
+        ] {
+            let results = [
+                block_on(world.vfs.mkdir(&cx, &boot.root, path, 0o755)),
+                block_on(world.vfs.rmdir(&cx, &boot.root, path)),
+                block_on(world.vfs.unlink(&cx, &boot.root, path)),
+                block_on(world.vfs.symlink(&cx, b"target", &boot.root, path)),
+                block_on(world.vfs.link(
+                    &cx,
+                    &boot.root,
+                    b"named/file",
+                    LookupFlags::follow(),
+                    &boot.root,
+                    path,
+                )),
+                block_on(world.vfs.link(
+                    &cx,
+                    &boot.root,
+                    path,
+                    LookupFlags::follow(),
+                    &boot.root,
+                    b"named/new",
+                )),
+                block_on(world.vfs.rename(
+                    &cx,
+                    &boot.root,
+                    b"named/file",
+                    &boot.root,
+                    path,
+                    RenameMode::Replace,
+                )),
+                block_on(world.vfs.rename(
+                    &cx,
+                    &boot.root,
+                    path,
+                    &boot.root,
+                    b"named/new",
+                    RenameMode::Replace,
+                )),
+            ];
+            for result in results {
+                assert_eq!(result, Err(expected));
+            }
+        }
+    }
+}
+
+#[test]
 fn bootstrap_namespace_uses_real_mount_ancestry_and_unreachable_private_anchors() {
     use wasixv2_vfs::PathError;
     let world = World::new();

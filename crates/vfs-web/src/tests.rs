@@ -78,10 +78,14 @@ impl Client {
                 },
             )
             .await
+            .map_err(wasixv2_vfs::PathError::errno)
     }
 
     async fn lookup(&self, path: &[u8], lookup: LookupFlags) -> FsResult<Path> {
-        self.vfs.lookup(&self.cx(), &self.root, path, lookup).await
+        self.vfs
+            .lookup(&self.cx(), &self.root, path, lookup)
+            .await
+            .map_err(wasixv2_vfs::PathError::errno)
     }
 }
 
@@ -189,6 +193,7 @@ fn existing_mount_composition_and_openat2_scope_use_vfs() {
                 ..LookupFlags::default()
             })
             .await
+            .map_err(wasixv2_vfs::PathError::errno)
             .err(),
             Some(Errno::EXDEV)
         );
@@ -199,6 +204,7 @@ fn existing_mount_composition_and_openat2_scope_use_vfs() {
                 ..LookupFlags::default()
             })
             .await
+            .map_err(wasixv2_vfs::PathError::errno)
             .err(),
             Some(Errno::ENOENT)
         );
@@ -209,6 +215,7 @@ fn existing_mount_composition_and_openat2_scope_use_vfs() {
                 ..LookupFlags::default()
             })
             .await
+            .map_err(wasixv2_vfs::PathError::errno)
             .err(),
             Some(Errno::ELOOP)
         );

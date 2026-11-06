@@ -91,7 +91,8 @@ fn read(setup: &Setup, path: &[u8]) -> Result<Vec<u8>, Errno> {
         mode: 0,
         lookup: LookupFlags::follow(),
     };
-    let file = block_on(setup.vfs.open(&cx, &root, path, &how))?;
+    let file =
+        block_on(setup.vfs.open(&cx, &root, path, &how)).map_err(wasixv2_vfs::PathError::errno)?;
     let mut buf = vec![0; 64];
     let n = block_on(file.read_at(&mut buf, 0))?;
     buf.truncate(n);
@@ -165,6 +166,7 @@ fn lookup(setup: &Setup, path: &[u8]) -> Result<wasixv2_vfs::Path, Errno> {
         leases: None,
     };
     block_on(setup.vfs.lookup(&cx, &root, path, LookupFlags::default()))
+        .map_err(wasixv2_vfs::PathError::errno)
 }
 
 #[test]
@@ -224,7 +226,7 @@ fn open(
         mode,
         lookup: LookupFlags::follow(),
     };
-    block_on(setup.vfs.open(&cx, &root, path, &how))
+    block_on(setup.vfs.open(&cx, &root, path, &how)).map_err(wasixv2_vfs::PathError::errno)
 }
 
 /// What `open(O_CREAT)` grants is the access asked for, whatever the new file's mode (git's

@@ -56,6 +56,255 @@ fn bootstrap_directory(
     }
 }
 
+fn bootstrap_drop_probe(
+    drops: &Arc<std::sync::atomic::AtomicUsize>,
+) -> wasixv2_syscalls::DescriptorAttachment {
+    struct Probe(Arc<std::sync::atomic::AtomicUsize>);
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    wasixv2_syscalls::DescriptorAttachment::new(Probe(drops.clone()))
+}
+
+struct BootstrapGateState {
+    ready: std::sync::atomic::AtomicBool,
+    opens: std::sync::atomic::AtomicUsize,
+}
+
+struct BootstrapGateFs {
+    inner: Arc<MemFs>,
+    root: Arc<BootstrapGateNode>,
+}
+
+struct BootstrapGateNode {
+    inner: Arc<dyn wasixv2_vfs::Node>,
+    state: Arc<BootstrapGateState>,
+}
+
+#[async_trait::async_trait(?Send)]
+impl wasixv2_vfs::Filesystem for BootstrapGateFs {
+    fn info(&self) -> wasixv2_vfs::FsInfo {
+        wasixv2_vfs::Filesystem::info(&*self.inner)
+    }
+    fn root(&self) -> Arc<dyn wasixv2_vfs::Node> {
+        self.root.clone()
+    }
+    async fn statfs(&self) -> wasixv2_vfs::FsResult<wasixv2_vfs::StatFs> {
+        wasixv2_vfs::Filesystem::statfs(&*self.inner).await
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl wasixv2_vfs::Node for BootstrapGateNode {
+    fn ino(&self) -> u64 {
+        self.inner.ino()
+    }
+    fn file_type(&self) -> wasixv2_vfs::FileType {
+        wasixv2_vfs::FileType::Directory
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    async fn getattr(&self) -> wasixv2_vfs::FsResult<wasixv2_vfs::Attr> {
+        self.inner.getattr().await
+    }
+    async fn setattr(
+        &self,
+        set: &wasixv2_vfs::SetAttr,
+    ) -> wasixv2_vfs::FsResult<wasixv2_vfs::Attr> {
+        self.inner.setattr(set).await
+    }
+    async fn open(
+        &self,
+        options: wasixv2_vfs::OpenOptions,
+    ) -> wasixv2_vfs::FsResult<Box<dyn wasixv2_vfs::Handle>> {
+        use std::sync::atomic::Ordering;
+        self.state.opens.fetch_add(1, Ordering::SeqCst);
+        std::future::poll_fn(|_| {
+            if self.state.ready.load(Ordering::SeqCst) {
+                std::task::Poll::Ready(())
+            } else {
+                std::task::Poll::Pending
+            }
+        })
+        .await;
+        self.inner.open(options).await
+    }
+}
+
+fn bootstrap_gated_directory(
+    kernel: &Kernel,
+    ready: bool,
+) -> (
+    DirectoryBootstrap,
+    Arc<BootstrapGateState>,
+    std::sync::Weak<BootstrapGateFs>,
+) {
+    let state = Arc::new(BootstrapGateState {
+        ready: std::sync::atomic::AtomicBool::new(ready),
+        opens: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let inner = Arc::new(MemFs::new(
+        Arc::new(HostClock(kernel.host.clone())),
+        0o755,
+        1,
+        1,
+    ));
+    let root = Arc::new(BootstrapGateNode {
+        inner: wasixv2_vfs::Filesystem::root(&*inner),
+        state: state.clone(),
+    });
+    let fs = Arc::new(BootstrapGateFs { inner, root });
+    let weak = Arc::downgrade(&fs);
+    let source = kernel.vfs().create_mount(
+        fs,
+        b"gate".to_vec(),
+        Default::default(),
+        false,
+        kernel.vfs().namespace().owner().clone(),
+    );
+    (
+        DirectoryBootstrap {
+            source,
+            lookup_name: None,
+            attachment: None,
+        },
+        state,
+        weak,
+    )
+}
+
+#[test]
+fn namespace_bootstrap_cancellation_and_late_task_limit_drop_every_prepared_owner() {
+    use std::{
+        future::Future,
+        sync::atomic::{AtomicUsize, Ordering},
+        task::{Context, Poll, Waker},
+    };
+    for reject_after_open in [false, true] {
+        let kernel =
+            test_kernel().with_guest_task_limit(if reject_after_open { Some(0) } else { None });
+        let (directory, state, weak) = bootstrap_gated_directory(&kernel, false);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut spawn = Box::pin(kernel.spawn_with_namespace(
+            bootstrap_config(),
+            NamespaceBootstrap {
+                directories: vec![directory],
+                root_attachment: Some(bootstrap_drop_probe(&drops)),
+                root_fallback: None,
+            },
+        ));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(spawn.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(state.opens.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert!(kernel.state.read_or_recover().tasks.is_empty());
+        if reject_after_open {
+            state.ready.store(true, Ordering::SeqCst);
+            assert!(matches!(
+                spawn.as_mut().poll(&mut cx),
+                Poll::Ready(Err(Errno::EAGAIN))
+            ));
+        }
+        drop(spawn);
+        assert!(kernel.state.read_or_recover().tasks.is_empty());
+        assert_eq!(kernel.state.read_or_recover().last_id, 0);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(
+            weak.upgrade().is_none(),
+            "canceled/rejected startup retained its source"
+        );
+    }
+}
+
+#[test]
+fn namespace_bootstrap_install_failure_releases_earlier_opened_files_and_attachments() {
+    use std::{
+        future::Future,
+        sync::atomic::{AtomicUsize, Ordering},
+        task::{Context, Poll, Waker},
+    };
+    let kernel = test_kernel();
+    kernel.nr_open.set(crate::file::NrOpen::MIN).unwrap();
+    let (directory, state, weak) = bootstrap_gated_directory(&kernel, false);
+    let mut directories = vec![directory];
+    // Stdio and root consume four slots; the final grant needs descriptor 32.
+    for _ in 1..29 {
+        let source = kernel
+            .vfs()
+            .open_tree(kernel.vfs().namespace(), &directories[0].source.path, true)
+            .unwrap();
+        directories.push(DirectoryBootstrap {
+            source,
+            lookup_name: None,
+            attachment: None,
+        });
+    }
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut spawn = Box::pin(kernel.spawn_with_namespace(
+        bootstrap_config(),
+        NamespaceBootstrap {
+            directories,
+            root_attachment: Some(bootstrap_drop_probe(&drops)),
+            root_fallback: None,
+        },
+    ));
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(spawn.as_mut().poll(&mut cx).is_pending());
+    state.ready.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        spawn.as_mut().poll(&mut cx),
+        Poll::Ready(Err(Errno::EMFILE))
+    ));
+    assert_eq!(state.opens.load(Ordering::SeqCst), 29);
+    drop(spawn);
+    assert!(kernel.state.read_or_recover().tasks.is_empty());
+    assert_eq!(kernel.state.read_or_recover().last_id, 0);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    assert!(
+        weak.upgrade().is_none(),
+        "failed installation retained prior directory opens"
+    );
+}
+
+#[test]
+fn namespace_bootstrap_pid_allocation_failure_releases_fully_prepared_namespace() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let kernel = test_kernel();
+    let max = crate::pid::PID_MAX_MIN;
+    kernel.init_ns.pid_for_children.set_pid_max(max).unwrap();
+    for _ in 1..max {
+        kernel.spawn(bootstrap_config()).unwrap();
+    }
+    let before = kernel.state.read_or_recover().tasks.len();
+    let last = kernel.state.read_or_recover().last_id;
+    let (directory, state, weak) = bootstrap_gated_directory(&kernel, true);
+    let drops = Arc::new(AtomicUsize::new(0));
+    let result = block_on(kernel.spawn_with_namespace(
+        bootstrap_config(),
+        NamespaceBootstrap {
+            directories: vec![directory],
+            root_attachment: Some(bootstrap_drop_probe(&drops)),
+            root_fallback: None,
+        },
+    ));
+    assert_eq!(result.err(), Some(Errno::EAGAIN));
+    assert_eq!(
+        state.opens.load(Ordering::SeqCst),
+        1,
+        "the files opened before PID allocation"
+    );
+    assert_eq!(kernel.state.read_or_recover().tasks.len(), before);
+    assert_eq!(kernel.state.read_or_recover().last_id, last);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    assert!(
+        weak.upgrade().is_none(),
+        "late publication failure retained prepared files"
+    );
+}
+
 #[test]
 fn namespace_bootstrap_installs_exact_bindings_before_exposure_and_keeps_processes_isolated() {
     let (kernel, original, memory) = machine();
