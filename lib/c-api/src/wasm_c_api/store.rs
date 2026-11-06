@@ -233,6 +233,13 @@ impl ManagedStore {
 #[cfg(feature = "sys")]
 impl Driver {
     fn run<R>(&self, future: impl std::future::Future<Output = R>) -> Result<R, RuntimeError> {
+        // This blocking boundary is not a Tokio task. A callback with an exact
+        // parked loan takes the synchronous path before reaching the driver.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return Err(RuntimeError::new(
+                "blocking C API entry has no parked Store loan in the entered runtime",
+            ));
+        }
         if self.active.replace(true) {
             return Err(RuntimeError::new(
                 "nested native entry requires a parked Store loan",
@@ -335,6 +342,60 @@ mod tests {
         module::wasm_module_t,
         value::{wasm_val_t, wasm_val_vec_t},
     };
+
+    #[test]
+    fn entered_runtime_calls_fail_without_panicking_and_leave_the_store_usable() {
+        let mut store = wasm_store_t {
+            inner: StoreRef::new(Store::default()).unwrap(),
+        };
+        let function = store
+            .inner
+            .with_mut(|store| Function::new_typed(store, || 19i32))
+            .unwrap();
+        let mut function = wasm_func_t {
+            extern_: wasm_extern_t::new(store.inner.clone(), function.into()),
+        };
+        let module = wasm_module_t {
+            inner: store
+                .inner
+                .with_mut(|store| Module::new(store, wat::parse_str("(module)").unwrap()))
+                .unwrap()
+                .unwrap(),
+        };
+        let imports: wasm_extern_vec_t = Vec::<Option<Box<wasm_extern_t>>>::new().into();
+        let args: wasm_val_vec_t = Vec::<wasm_val_t>::new().into();
+        let mut results: wasm_val_vec_t = vec![wasm_val_t::default()].into();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        {
+            let _entered = runtime.enter();
+            let trap = unsafe { wasm_func_call(Some(&mut function), Some(&args), &mut results) };
+            assert!(trap.is_some(), "an entered-runtime error remains a C trap");
+            let mut trap = std::ptr::null_mut();
+            assert!(
+                unsafe {
+                    wasm_instance_new(
+                        Some(&mut store),
+                        Some(&module),
+                        Some(&imports),
+                        Some(&mut trap),
+                    )
+                }
+                .is_none()
+            );
+            assert!(trap.is_null(), "host admission errors use last_error");
+        }
+        assert!(
+            unsafe { wasm_func_call(Some(&mut function), Some(&args), &mut results) }.is_none()
+        );
+        assert_eq!(unsafe { results.as_slice()[0].of.int32_t }, 19);
+        assert!(
+            unsafe { wasm_instance_new(Some(&mut store), Some(&module), Some(&imports), None) }
+                .is_some()
+        );
+    }
 
     #[test]
     fn native_c_entrypoints_suspend_engine_start_and_return_reactor_values() {
