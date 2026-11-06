@@ -52,8 +52,10 @@ Linux native NAPI/custom bindings and the v2 NAPI CLI are integrated from
 `a2336f0f3d7`: private/shared refill and GC (including switched-first contexts),
 protected leases, cancellation, JSPI, callback safety, startup/late DSO, threads,
 vfork/exec and CLI mounts passed the final-pin focused gates. Owning-thread
-affinity no longer blanket-disables contexts. Mandatory macOS, standalone export
-lock, retained full-suite evidence and browser validation remain open.
+affinity no longer blanket-disables contexts. Full native library (100), callback (38) and original paired native/WASIX C
+manifest (34 cases) suites pass. The repaired standalone export passed a forced
+locked build, real guest and 32 MiB refill execution. Mandatory macOS and
+browser validation remain open.
 
 ### Current unfinished source handoffs
 
