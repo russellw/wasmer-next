@@ -40,6 +40,133 @@ pub(crate) struct Driver {
     active: std::cell::Cell<bool>,
     owner: wasmer_api::sys::NativeCleanupOwner,
     enrolled: RefCell<Vec<Rc<std::cell::Cell<bool>>>>,
+    wake: std::sync::Arc<DriverWake>,
+}
+
+// The shared wake path carries only Send metadata. All local executor and
+// native-owner polling stays in the subscribing caller on its original thread.
+#[cfg(feature = "sys")]
+#[derive(Default)]
+struct DriverWake {
+    state: std::sync::Mutex<DriverWakeState>,
+}
+#[cfg(feature = "sys")]
+#[derive(Default)]
+struct DriverWakeState {
+    next: u64,
+    subscribers: std::collections::HashMap<u64, Option<std::sync::Arc<std::task::Waker>>>,
+}
+#[cfg(feature = "sys")]
+impl std::task::Wake for DriverWake {
+    fn wake(self: std::sync::Arc<Self>) {
+        self.wake_by_ref();
+    }
+    fn wake_by_ref(self: &std::sync::Arc<Self>) {
+        let subscribers = self
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .subscribers
+            .values()
+            .filter_map(Clone::clone)
+            .collect::<Vec<_>>();
+        let mut panic = None;
+        for subscriber in subscribers {
+            attempt_retirement(&mut panic, || subscriber.wake_by_ref());
+            attempt_retirement(&mut panic, || drop(subscriber));
+        }
+        if let Some(panic) = panic {
+            std::panic::resume_unwind(panic);
+        }
+    }
+}
+
+#[cfg(feature = "sys")]
+pub(crate) struct DriverSubscription {
+    wake: std::sync::Arc<DriverWake>,
+    owner: wasmer_api::sys::NativeCleanupOwner,
+    token: u64,
+}
+#[cfg(feature = "sys")]
+impl DriverSubscription {
+    pub(crate) fn with_real_context<R>(
+        &self,
+        fallback: &mut std::task::Context<'_>,
+        poll: impl FnOnce(&mut std::task::Context<'_>) -> R,
+    ) -> R {
+        let real = self
+            .wake
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .subscribers
+            .get(&self.token)
+            .and_then(Clone::clone);
+        match real {
+            Some(real) => poll(&mut std::task::Context::from_waker(&real)),
+            // A directly nested internal poll may already carry our stable
+            // observer. It creates no new consumer or substitute caller.
+            None => poll(fallback),
+        }
+    }
+
+    pub(crate) fn with_context<R>(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        poll: impl FnOnce(&mut std::task::Context<'_>) -> R,
+    ) -> R {
+        let waker = std::task::Waker::from(self.wake.clone());
+        // Nested polling can already carry this exact stable observer. It must
+        // never be stored as its own consumer (self-wake and an Arc cycle).
+        if !waker.will_wake(cx.waker()) {
+            let next = std::sync::Arc::new(cx.waker().clone());
+            let previous = {
+                let mut state = self.wake.state.lock().unwrap_or_else(|e| e.into_inner());
+                let slot = state.subscribers.get_mut(&self.token).unwrap();
+                if slot.as_ref().is_some_and(|old| old.will_wake(&next)) {
+                    Some(next)
+                } else {
+                    slot.replace(next)
+                }
+            };
+            drop(previous);
+        }
+        poll(&mut std::task::Context::from_waker(&waker))
+    }
+}
+#[cfg(feature = "sys")]
+impl Drop for DriverSubscription {
+    fn drop(&mut self) {
+        let unwinding = std::thread::panicking();
+        let previous = self
+            .wake
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .subscribers
+            .remove(&self.token);
+        let mut panic = None;
+        attempt_retirement(&mut panic, || drop(previous));
+        // Dropping a user Waker may admit a new subscriber. Check LAST only
+        // after its destructor has run, and never hold metadata during clear.
+        let empty = self
+            .wake
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .subscribers
+            .is_empty();
+        if empty {
+            attempt_retirement(&mut panic, || self.owner.clear_idle_waker());
+        }
+        if let Some(panic) = panic {
+            if unwinding {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(panic)));
+            } else {
+                std::panic::resume_unwind(panic);
+            }
+        }
+    }
 }
 
 #[cfg(all(feature = "sys", feature = "wasi"))]
@@ -107,6 +234,17 @@ pub(crate) struct CleanupRetirement {
 }
 #[cfg(feature = "sys")]
 impl CleanupRetirement {
+    #[cfg(feature = "wasi")]
+    pub(crate) fn subscribe(&self) -> DriverSubscription {
+        self.driver.subscribe()
+    }
+    #[cfg(feature = "wasi")]
+    pub(crate) fn notify_completion(&self) {
+        let wake = std::task::Waker::from(self.driver.wake.clone());
+        // The terminal flag/result are already published. Dispatch after the
+        // native pump releases its running guard, outside every metadata lock.
+        self.owner.after_pump(Box::new(move || wake.wake()));
+    }
     pub(crate) fn retain(
         &self,
         mut future: std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>,
@@ -122,6 +260,7 @@ impl CleanupRetirement {
 
 #[cfg(all(feature = "sys", feature = "wasi"))]
 struct NativeRetirementTail {
+    subscription: Option<DriverSubscription>,
     store: Option<StoreRef>,
     owner: CleanupRetirement,
     completed: Rc<std::cell::Cell<bool>>,
@@ -136,13 +275,19 @@ impl std::future::Future for NativeRetirementTail {
     ) -> std::task::Poll<()> {
         let this = self.get_mut();
         let driver = &this.owner.driver;
-        if !attempt_retirement(&mut this.panic, || driver.poll_retirement(cx)) {
+        if !attempt_retirement(&mut this.panic, || {
+            this.subscription
+                .as_ref()
+                .unwrap()
+                .with_context(cx, |cx| driver.poll_retirement(cx));
+        }) {
             // The native owner removed the panicked orchestration and retained
             // its replacement drain. Repoll that transferred state, not the
             // panicked future, through this same outer async poller.
-            cx.waker().wake_by_ref();
+            attempt_retirement(&mut this.panic, || cx.waker().wake_by_ref());
         }
         if this.completed.get() {
+            attempt_retirement(&mut this.panic, || drop(this.subscription.take()));
             if let Some(panic) = this.panic.take() {
                 std::panic::resume_unwind(panic);
             }
@@ -155,7 +300,15 @@ impl std::future::Future for NativeRetirementTail {
 #[cfg(all(feature = "sys", feature = "wasi"))]
 impl Drop for NativeRetirementTail {
     fn drop(&mut self) {
+        attempt_retirement(&mut self.panic, || drop(self.subscription.take()));
         if self.completed.get() {
+            if let Some(panic) = self.panic.take() {
+                if std::thread::panicking() {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(panic)));
+                } else {
+                    std::panic::resume_unwind(panic);
+                }
+            }
             return;
         }
         let mut store = self.store.take();
@@ -656,6 +809,7 @@ impl StoreRef {
             enrolled.push(completed.clone());
         }
         let tail = Box::pin(NativeRetirementTail {
+            subscription: Some(owner.subscribe()),
             store: Some(self.clone()),
             owner,
             completed,
@@ -693,6 +847,7 @@ impl ManagedStore {
             active: std::cell::Cell::new(false),
             owner: self.owner.clone(),
             enrolled: RefCell::default(),
+            wake: Default::default(),
         });
         *self.driver.borrow_mut() = Some(driver.clone());
         Ok(driver)
@@ -701,20 +856,34 @@ impl ManagedStore {
 
 #[cfg(feature = "sys")]
 impl Driver {
-    async fn drive<R>(&self, future: impl std::future::Future<Output = R>) -> R {
-        struct Clear(wasmer_api::sys::NativeCleanupOwner);
-        impl Drop for Clear {
-            fn drop(&mut self) {
-                self.0.clear_idle_waker();
-            }
+    fn subscribe(&self) -> DriverSubscription {
+        let token = {
+            let mut state = self.wake.state.lock().unwrap_or_else(|e| e.into_inner());
+            let token = state.next;
+            state.next = token.checked_add(1).expect("native wake token exhausted");
+            state.subscribers.insert(token, None);
+            token
+        };
+        DriverSubscription {
+            wake: self.wake.clone(),
+            owner: self.owner.clone(),
+            token,
         }
-        let _clear = Clear(self.owner.clone());
+    }
+
+    async fn drive<R>(
+        &self,
+        future: impl std::future::Future<Output = R>,
+        observer: &DriverSubscription,
+    ) -> R {
         let mut future = std::pin::pin!(future);
         let mut output = None;
         std::future::poll_fn(|cx| {
             let _ = self.owner.poll_idle(cx);
             if output.is_none() {
-                if let std::task::Poll::Ready(value) = future.as_mut().poll(cx) {
+                if let std::task::Poll::Ready(value) =
+                    observer.with_real_context(cx, |cx| future.as_mut().poll(cx))
+                {
                     output = Some(value);
                 }
             }
@@ -737,15 +906,18 @@ impl Driver {
     }
 
     async fn run_descendant<R>(&self, future: impl std::future::Future<Output = R>) -> R {
+        let observer = self.subscribe();
         if self.active.get() {
             // An ancestor's LocalSet already has an outer poller. Enter only
             // its spawn/runtime context; let that poller run its queued tasks.
             let mut future = std::pin::pin!(future);
             return std::future::poll_fn(|cx| {
-                let _runtime = self.runtime.enter();
-                let _local = self.local.enter();
-                let _ = self.owner.poll_idle(cx);
-                future.as_mut().poll(cx)
+                observer.with_context(cx, |cx| {
+                    let _runtime = self.runtime.enter();
+                    let _local = self.local.enter();
+                    let _ = self.owner.poll_idle(cx);
+                    observer.with_real_context(cx, |cx| future.as_mut().poll(cx))
+                })
             })
             .await;
         }
@@ -759,16 +931,26 @@ impl Driver {
         let _reset = Reset(&self.active);
         // Nested guest completion must return to its still-parked ancestor.
         // Global enrolled retirement joins belong to that outer call owner.
-        let mut run = std::pin::pin!(self.local.run_until(future));
+        // Only the LocalSet/pump observes the fanout Waker. The pinned user
+        // future sees its actual caller's Waker, so nested A/B/A boundaries
+        // cannot subscribe fanouts to each other.
+        let mut future = std::pin::pin!(future);
+        let user = std::future::poll_fn(|cx| {
+            observer.with_real_context(cx, |cx| future.as_mut().poll(cx))
+        });
+        let mut run = std::pin::pin!(self.local.run_until(user));
         std::future::poll_fn(|cx| {
-            let _runtime = self.runtime.enter();
-            std::future::Future::poll(run.as_mut(), cx)
+            observer.with_context(cx, |cx| {
+                let _runtime = self.runtime.enter();
+                std::future::Future::poll(run.as_mut(), cx)
+            })
         })
         .await
     }
 
     #[cfg(feature = "wasi")]
     async fn run_local<R>(&self, future: impl std::future::Future<Output = R>) -> R {
+        let observer = self.subscribe();
         assert!(!self.active.replace(true), "recursive native LocalSet poll");
         struct Reset<'a>(&'a std::cell::Cell<bool>);
         impl Drop for Reset<'_> {
@@ -777,10 +959,12 @@ impl Driver {
             }
         }
         let _reset = Reset(&self.active);
-        let mut run = std::pin::pin!(self.local.run_until(self.drive(future)));
+        let mut run = std::pin::pin!(self.local.run_until(self.drive(future, &observer)));
         std::future::poll_fn(|cx| {
-            let _runtime = self.runtime.enter();
-            std::future::Future::poll(run.as_mut(), cx)
+            observer.with_context(cx, |cx| {
+                let _runtime = self.runtime.enter();
+                std::future::Future::poll(run.as_mut(), cx)
+            })
         })
         .await
     }
@@ -826,9 +1010,11 @@ impl Driver {
             }
         }
         let _reset = Reset(&self.active);
-        Ok(self
-            .runtime
-            .block_on(self.local.run_until(self.drive(future))))
+        let observer = self.subscribe();
+        let mut run = std::pin::pin!(self.local.run_until(self.drive(future, &observer)));
+        Ok(self.runtime.block_on(std::future::poll_fn(|cx| {
+            observer.with_context(cx, |cx| run.as_mut().poll(cx))
+        })))
     }
 }
 
@@ -1372,6 +1558,7 @@ mod tests {
         let owner = target.cleanup_owner().unwrap();
         let completed = Rc::new(std::cell::Cell::new(false));
         let cleaned = completed.clone();
+        let completion = retirement.clone();
         retirement.retain(Box::pin(async move {
             let (send, receive) = tokio::sync::oneshot::channel();
             tokio::task::spawn_local(async move {
@@ -1381,6 +1568,7 @@ mod tests {
                 tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                 cleaned.set(true);
                 let _ = send.send(());
+                completion.notify_completion();
             });
             let _ = receive.await;
         }));
@@ -1413,6 +1601,158 @@ mod tests {
         drop(retirement);
     }
 
+    #[test]
+    fn native_post_tail_fanout_wakes_every_caller_before_resuming_a_waker_panic() {
+        struct Caller {
+            calls: std::sync::atomic::AtomicUsize,
+            panics: bool,
+        }
+        impl std::task::Wake for Caller {
+            fn wake(self: std::sync::Arc<Self>) {
+                self.wake_by_ref();
+            }
+            fn wake_by_ref(self: &std::sync::Arc<Self>) {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                assert!(!self.panics, "one caller Waker panicked");
+            }
+        }
+        let failing = std::sync::Arc::new(Caller {
+            calls: Default::default(),
+            panics: true,
+        });
+        let sibling = std::sync::Arc::new(Caller {
+            calls: Default::default(),
+            panics: false,
+        });
+        let wake = std::sync::Arc::new(DriverWake::default());
+        {
+            let mut state = wake.state.lock().unwrap();
+            for (token, caller) in [failing.clone(), sibling.clone()].into_iter().enumerate() {
+                state.subscribers.insert(
+                    token as u64,
+                    Some(std::sync::Arc::new(std::task::Waker::from(caller))),
+                );
+            }
+        }
+        let waker = std::task::Waker::from(wake);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| waker.wake_by_ref()))
+            .expect_err("the caller panic is preserved after fanout");
+        assert_eq!(
+            panic.downcast_ref::<&str>(),
+            Some(&"one caller Waker panicked")
+        );
+        assert_eq!(failing.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(sibling.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "wasi")]
+    #[test]
+    fn native_post_tail_two_local_callers_share_one_target_without_stranding_the_first() {
+        let target = StoreRef::new(Store::default()).unwrap();
+        let retirement = target.retirement_owner().unwrap();
+        let first_done = Rc::new(std::cell::Cell::new(false));
+        let second_done = Rc::new(std::cell::Cell::new(false));
+        let mut releases = Vec::new();
+        let mut callers = Vec::new();
+        let mut entered = Vec::new();
+        for done in [&first_done, &second_done] {
+            let (release, receive) = tokio::sync::oneshot::channel();
+            releases.push(release);
+            let cleaned = done.clone();
+            let completion = retirement.clone();
+            retirement.retain(Box::pin(async move {
+                let task = tokio::task::spawn_local(async move {
+                    receive.await.unwrap();
+                    tokio::task::yield_now().await;
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    cleaned.set(true);
+                    completion.notify_completion();
+                });
+                task.await.unwrap();
+            }));
+            let (started, observed) = tokio::sync::oneshot::channel();
+            entered.push(observed);
+            let started = RefCell::new(Some(started));
+            let weak = target.downgrade();
+            let done = done.clone();
+            let mut source = Store::default();
+            let function = Function::new_async(
+                &mut source,
+                wasmer_api::FunctionType::new([], [wasmer_api::Type::I32]),
+                move |_| {
+                    weak.upgrade()
+                        .unwrap()
+                        .enroll_native_retirement(done.clone())
+                        .unwrap();
+                    started.borrow_mut().take().unwrap().send(()).unwrap();
+                    std::future::ready(Ok(vec![Value::I32(37)]))
+                },
+            );
+            callers.push((function, source.into_async()));
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let source_tasks = tokio::task::LocalSet::new();
+        runtime.block_on(source_tasks.run_until(async {
+            let mut calls = callers.into_iter().map(|(function, source)| {
+                tokio::task::spawn_local(async move {
+                    function.call_async(&source, vec![]).await.unwrap()
+                })
+            });
+            let first = calls.next().unwrap();
+            let second = calls.next().unwrap();
+            for observed in entered {
+                observed.await.unwrap();
+            }
+            // Both actual source tasks have reached their pending tails. The
+            // first target job must wake its caller while the second stays held.
+            let mut releases = releases.into_iter();
+            releases.next().unwrap().send(()).unwrap();
+            let first = tokio::time::timeout(std::time::Duration::from_secs(5), first)
+                .await
+                .expect("the later caller must not replace the first caller's wake")
+                .unwrap();
+            assert_eq!(first[0].i32(), Some(37));
+            assert!(first_done.get());
+            assert!(!second_done.get());
+            assert!(!second.is_finished());
+            assert_eq!(
+                retirement
+                    .driver
+                    .wake
+                    .state
+                    .lock()
+                    .unwrap()
+                    .subscribers
+                    .len(),
+                1,
+                "the completed caller must not stay retained by unrelated work"
+            );
+            releases.next().unwrap().send(()).unwrap();
+            let second = tokio::time::timeout(std::time::Duration::from_secs(5), second)
+                .await
+                .expect("the remaining caller keeps its own subscription")
+                .unwrap();
+            assert_eq!(second[0].i32(), Some(37));
+        }));
+        assert!(second_done.get());
+        assert!(
+            retirement
+                .driver
+                .wake
+                .state
+                .lock()
+                .unwrap()
+                .subscribers
+                .is_empty()
+        );
+        assert!(target.cleanup_owner().unwrap().is_idle());
+        assert_eq!(Rc::strong_count(&target.inner), 1);
+        drop(retirement);
+    }
+
     #[cfg(feature = "wasi")]
     #[test]
     fn native_post_tail_drop_keeps_custody_for_an_existing_driver() {
@@ -1422,6 +1762,7 @@ mod tests {
         let owner = target.cleanup_owner().unwrap();
         let completed = Rc::new(std::cell::Cell::new(false));
         let cleaned = completed.clone();
+        let completion = retirement.clone();
         retirement.retain(Box::pin(async move {
             let (send, receive) = tokio::sync::oneshot::channel();
             tokio::task::spawn_local(async move {
@@ -1429,6 +1770,7 @@ mod tests {
                 tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                 cleaned.set(true);
                 let _ = send.send(());
+                completion.notify_completion();
             });
             let _ = receive.await;
         }));

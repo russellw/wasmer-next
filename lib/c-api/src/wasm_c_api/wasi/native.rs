@@ -1039,6 +1039,7 @@ impl Endpoint {
         let terminal_deactivated = deactivated.clone();
         let completed = Rc::new(Cell::new(false));
         let terminal_completed = completed.clone();
+        let terminal_completion = owner.clone();
         let terminal_env = self.env.clone();
         let terminal_store = asynchronous.store();
         let terminal_endpoint = self.clone();
@@ -1103,6 +1104,7 @@ impl Endpoint {
             *terminal_endpoint.process.borrow_mut() = process;
             terminal_completed.set(true);
             let _ = result_tx.send(result);
+            terminal_completion.notify_completion();
         }) as LocalFuture<'static, ()>;
         let keepalive = TerminalKeepalive {
             owner: owner.clone(),
@@ -1177,18 +1179,14 @@ impl Endpoint {
         }
         let queue_handoff = cancel.0.take().expect("one cancellation guard");
         let poll_owner = native_owner.clone();
+        let observer = owner.subscribe();
         let run = Box::new(move || {
             Box::pin(async move {
-                struct Clear(wasmer_api::sys::NativeCleanupOwner);
-                impl Drop for Clear {
-                    fn drop(&mut self) {
-                        self.0.clear_idle_waker();
-                    }
-                }
-                let _clear = Clear(poll_owner.clone());
                 let result = std::future::poll_fn(move |cx| {
-                    let _ = poll_owner.poll_idle(cx);
-                    Pin::new(&mut result_rx).poll(cx)
+                    observer.with_context(cx, |cx| {
+                        let _ = poll_owner.poll_idle(cx);
+                        observer.with_real_context(cx, |cx| Pin::new(&mut result_rx).poll(cx))
+                    })
                 })
                 .await;
                 let error = match result {
