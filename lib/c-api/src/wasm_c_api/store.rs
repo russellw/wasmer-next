@@ -49,11 +49,16 @@ impl StoreRef {
                 &mut store,
                 Some(owner.clone()),
             )?;
+            let store = store.into_async();
+            // Actual unlock must repump a retirement fence even for a bare Store
+            // that never constructed a WASI environment or cleanup driver.
+            let owner = wasmer_api::sys::native_cleanup_owner(&store)
+                .ok_or_else(|| RuntimeError::new("native cleanup owner is missing"))?;
             return Ok(Self {
                 inner: Rc::new(StoreState {
                     id,
                     mode: StoreMode::Native(ManagedStore {
-                        store: Some(store.into_async()),
+                        store: Some(store),
                         generation: Some(generation),
                         owner,
                         driver: RefCell::new(None),
@@ -325,6 +330,44 @@ impl Driver {
 }
 
 #[cfg(feature = "sys")]
+type RetirementPanic = Box<dyn std::any::Any + Send>;
+
+#[cfg(feature = "sys")]
+fn remember_retirement_panic(first: &mut Option<RetirementPanic>, panic: RetirementPanic) {
+    if first.is_none() {
+        *first = Some(panic);
+    } else {
+        // A later user panic payload may itself panic on destruction.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(panic)));
+    }
+}
+
+#[cfg(feature = "sys")]
+fn attempt_retirement(first: &mut Option<RetirementPanic>, cleanup: impl FnOnce()) -> bool {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(cleanup)) {
+        Ok(()) => true,
+        Err(panic) => {
+            remember_retirement_panic(first, panic);
+            false
+        }
+    }
+}
+
+#[cfg(feature = "sys")]
+async fn catch_retirement_future<F: std::future::Future>(
+    future: F,
+) -> Result<F::Output, RetirementPanic> {
+    let mut future = std::pin::pin!(future);
+    std::future::poll_fn(|cx| {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| future.as_mut().poll(cx))) {
+            Ok(poll) => poll.map(Ok),
+            Err(panic) => std::task::Poll::Ready(Err(panic)),
+        }
+    })
+    .await
+}
+
+#[cfg(feature = "sys")]
 impl Drop for ManagedStore {
     fn drop(&mut self) {
         let Some(mut generation) = self.generation.take() else {
@@ -334,12 +377,30 @@ impl Drop for ManagedStore {
         let driver = self.driver.get_mut().take();
         let fences = std::mem::take(self.cleanup_fences.get_mut());
         let owner = self.owner.clone();
-        generation.close();
         self.owner.retain(Box::pin(async move {
-            generation.close_and_wait_for_cleanup().await;
+            use wasmer_api::AsStoreAsync;
+            let mut first_panic = None;
+            // Commit concrete resource custody before close can pump a callback.
+            // Recreate interrupted observers without dropping the Store/driver.
+            loop {
+                match catch_retirement_future(generation.close_and_wait_for_cleanup()).await {
+                    Ok(()) => break,
+                    Err(panic) => remember_retirement_panic(&mut first_panic, panic),
+                }
+            }
+            // Physical root settlement is notified before its original guard
+            // unlocks. Fence the actual Store before any post-pump retirement.
+            if let Some(store) = &store {
+                loop {
+                    match catch_retirement_future(async { drop(store.write_lock().await) }).await {
+                        Ok(()) => break,
+                        Err(panic) => remember_retirement_panic(&mut first_panic, panic),
+                    }
+                }
+            }
             let final_owner = owner.clone();
             owner.after_pump(Box::new(move || {
-                retire_store(store, driver, fences, final_owner);
+                retire_store(store, driver, fences, final_owner, first_panic);
             }));
         }));
     }
@@ -351,6 +412,7 @@ fn retire_store(
     driver: Option<Rc<Driver>>,
     fences: Vec<Box<dyn Fn() -> bool>>,
     owner: wasmer_api::sys::NativeCleanupOwner,
+    mut first_panic: Option<RetirementPanic>,
 ) {
     use std::{
         future::Future,
@@ -376,56 +438,71 @@ fn retire_store(
     }
     let _clear = ClearWake(owner.clone());
     let signal = Arc::new(WakeSignal::default());
+    let runtime = driver.as_ref().map(|driver| driver.runtime.clone());
     let waker = Waker::from(signal.clone());
     let mut cx = Context::from_waker(&waker);
     let mut drain = |driver: Option<&Driver>, require_fences: bool| {
         loop {
             *signal.0.lock().unwrap_or_else(|e| e.into_inner()) = false;
-            let runtime = driver.as_ref().map(|driver| driver.runtime.clone());
-            let _enter = runtime.as_ref().map(|runtime| runtime.enter());
-            if let Some(driver) = driver {
-                let local = driver.local.run_until(std::future::pending::<()>());
-                let _ = std::pin::pin!(local).as_mut().poll(&mut cx);
-            }
-            let _local = driver.map(|driver| driver.local.enter());
-            // Unlike notify's fallback, this poll installs our real thread-safe
-            // wake signal in every retained continuation. Pump before waiting.
-            if owner.poll_idle(&mut cx).is_ready()
-                && (!require_fences || fences.iter().all(|closed| closed()))
-            {
+            let idle = {
+                // Also enter after LocalSet cancellation and VM Store drop:
+                // those destructors can retain finite timer/IO cleanup.
+                let _enter = runtime.as_ref().map(|runtime| runtime.enter());
+                if let Some(driver) = driver {
+                    let local = driver.local.run_until(std::future::pending::<()>());
+                    let _ = std::pin::pin!(local).as_mut().poll(&mut cx);
+                }
+                let _local = driver.map(|driver| driver.local.enter());
+                // Install our real signal in every retained continuation.
+                owner.poll_idle(&mut cx).is_ready()
+                    && (!require_fences || fences.iter().all(|closed| closed()))
+            };
+            if idle {
                 break;
             }
+            // No runtime or LocalSet context is held across this blocking wait.
             let mut ready = signal.0.lock().unwrap_or_else(|e| e.into_inner());
             while !*ready {
                 ready = signal.1.wait(ready).unwrap_or_else(|e| e.into_inner());
             }
         }
     };
-    drain(driver.as_deref(), true);
-    let runtime = driver.map(|driver| {
+    // Keep the concrete Store, driver and runtime outside every fallible poll.
+    // Native cleanup transfers interrupted custody before propagating a panic;
+    // repoll that replacement work before advancing to resource destruction.
+    while !attempt_retirement(&mut first_panic, || drain(driver.as_deref(), true)) {}
+    if let Some(driver) = driver {
         // Cleanup continuations may retain the driver until their fences settle.
         // Public calls retain StoreRef, so no other execution survives this point.
         let driver = Rc::try_unwrap(driver)
             .ok()
             .expect("native driver survived its Store owner");
-        let Driver { runtime, local, .. } = driver;
+        let Driver { local, .. } = driver;
         {
-            let _enter = runtime.enter();
+            let _enter = runtime.as_ref().map(|runtime| runtime.enter());
             // Loader/native obligations have settled. Cancel unrelated local work,
             // including tasks that would otherwise stay pending forever.
-            drop(local);
+            attempt_retirement(&mut first_panic, || drop(local));
         }
-        runtime
-    });
-    drain(None, false);
-    drop(store);
-    drain(None, false);
+    }
+    while !attempt_retirement(&mut first_panic, || drain(None, false)) {}
+    {
+        let _enter = runtime.as_ref().map(|runtime| runtime.enter());
+        attempt_retirement(&mut first_panic, || drop(store));
+    }
+    while !attempt_retirement(&mut first_panic, || drain(None, false)) {}
     drop(drain);
     drop(_clear);
     // Runtime destruction can block and is illegal in a foreign Tokio callback.
     // Only the Send runtime moves; all Store/LocalSet custody stayed on this thread.
     if let Some(runtime) = runtime {
-        let _ = std::thread::spawn(move || drop(runtime)).join();
+        let shutdown = std::thread::spawn(move || drop(runtime)).join();
+        if let Err(panic) = shutdown {
+            remember_retirement_panic(&mut first_panic, panic);
+        }
+    }
+    if let Some(panic) = first_panic {
+        std::panic::resume_unwind(panic);
     }
 }
 
@@ -477,11 +554,173 @@ pub unsafe extern "C" fn wasm_store_delete(_store: Option<Box<wasm_store_t>>) {}
 mod tests {
     use super::*;
     use crate::wasm_c_api::{
-        externals::{wasm_extern_t, wasm_extern_vec_t, wasm_func_call, wasm_func_t},
+        externals::{
+            wasm_extern_t, wasm_extern_vec_t, wasm_func_call, wasm_func_new_with_env, wasm_func_t,
+        },
         instance::wasm_instance_new,
         module::wasm_module_t,
+        trap::wasm_trap_t,
+        types::wasm_functype_t,
         value::{wasm_val_t, wasm_val_vec_t},
     };
+
+    #[test]
+    fn final_store_retirement_waits_for_a_bare_stores_actual_unlock() {
+        use std::{future::Future, task::Context};
+        use wasmer_api::AsStoreAsync;
+        let store = StoreRef::new(Store::default()).unwrap();
+        let weak = store.downgrade();
+        let asynchronous = store.async_store().unwrap();
+        let owner = match &store.inner.mode {
+            StoreMode::Native(native) => native.owner.clone(),
+            StoreMode::Plain(_) => unreachable!(),
+        };
+        let mut lock = std::pin::pin!(asynchronous.write_lock());
+        let std::task::Poll::Ready(guard) = lock
+            .as_mut()
+            .poll(&mut Context::from_waker(std::task::Waker::noop()))
+        else {
+            panic!("the unused Store must have an available write guard");
+        };
+        drop(store);
+        assert!(weak.upgrade().is_none());
+        assert!(
+            !owner.is_idle(),
+            "physical generation settlement must not bypass the actual guard"
+        );
+        drop(guard);
+        assert!(
+            owner.is_idle(),
+            "unlock alone must repump the bare Store fence"
+        );
+    }
+
+    #[test]
+    fn entered_runtime_final_store_retirement_drains_timer_cleanup_from_both_drop_phases() {
+        struct TimerOnDrop {
+            owner: wasmer_api::sys::NativeCleanupOwner,
+            complete: Rc<std::cell::Cell<bool>>,
+        }
+        impl Drop for TimerOnDrop {
+            fn drop(&mut self) {
+                let complete = self.complete.clone();
+                self.owner.retain(Box::pin(async move {
+                    // Construct the timer on a later retained poll, after the
+                    // cancellation/finalizer's own runtime guard has ended.
+                    tokio::task::yield_now().await;
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    complete.set(true);
+                }));
+            }
+        }
+        unsafe extern "C" fn callback(
+            _: *mut std::ffi::c_void,
+            _: &wasm_val_vec_t,
+            _: &mut wasm_val_vec_t,
+        ) -> Option<Box<wasm_trap_t>> {
+            None
+        }
+        unsafe extern "C" fn finalize(data: *mut std::ffi::c_void) {
+            // This C API Store and its user environment stay on this thread.
+            drop(unsafe { Box::from_raw(data.cast::<TimerOnDrop>()) });
+        }
+        let mut store = wasm_store_t {
+            inner: StoreRef::new(Store::default()).unwrap(),
+        };
+        let owner = match &store.inner.inner.mode {
+            StoreMode::Native(native) => native.owner.clone(),
+            StoreMode::Plain(_) => unreachable!(),
+        };
+        let cancellation = Rc::new(std::cell::Cell::new(false));
+        let vm_finalizer = Rc::new(std::cell::Cell::new(false));
+        let local_guard = TimerOnDrop {
+            owner: owner.clone(),
+            complete: cancellation.clone(),
+        };
+        store
+            .inner
+            .run_host(async move {
+                tokio::task::spawn_local(async move {
+                    let _guard = local_guard;
+                    std::future::pending::<()>().await;
+                });
+            })
+            .unwrap();
+        let data = Box::into_raw(Box::new(TimerOnDrop {
+            owner: owner.clone(),
+            complete: vm_finalizer.clone(),
+        }));
+        let ty = wasm_functype_t::new(wasmer_api::FunctionType::new([], []));
+        let function = unsafe {
+            wasm_func_new_with_env(
+                Some(&mut store),
+                Some(&ty),
+                Some(callback),
+                data.cast(),
+                Some(finalize),
+            )
+        }
+        .unwrap();
+        drop(function);
+        assert!(
+            !vm_finalizer.get(),
+            "the VM arena still owns the environment"
+        );
+        let foreign = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        {
+            let _entered = foreign.enter();
+            drop(store);
+        }
+        assert!(
+            cancellation.get(),
+            "cancellation-enqueued timer must finish"
+        );
+        assert!(
+            vm_finalizer.get(),
+            "VM-finalizer-enqueued timer must finish"
+        );
+        assert!(owner.is_idle());
+    }
+
+    #[test]
+    fn entered_runtime_final_store_retirement_keeps_custody_until_the_first_panic_is_resumed() {
+        let store = StoreRef::new(Store::default()).unwrap();
+        store.run_host(async {}).unwrap();
+        let (owner, runtime) = match &store.inner.mode {
+            StoreMode::Native(native) => (
+                native.owner.clone(),
+                std::sync::Arc::downgrade(&native.driver.borrow().as_ref().unwrap().runtime),
+            ),
+            StoreMode::Plain(_) => unreachable!(),
+        };
+        owner.retain(Box::pin(async {
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+            panic!("retirement panic sentinel");
+        }));
+        let foreign = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let panic = {
+            let _entered = foreign.enter();
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(store)))
+        }
+        .expect_err("the original cleanup panic must be resumed");
+        assert_eq!(
+            panic.downcast_ref::<&str>(),
+            Some(&"retirement panic sentinel")
+        );
+        assert!(
+            runtime.upgrade().is_none(),
+            "the owned runtime must be destroyed first"
+        );
+        assert!(owner.is_idle());
+    }
 
     #[test]
     fn final_store_retirement_cancels_unrelated_pending_local_work() {
