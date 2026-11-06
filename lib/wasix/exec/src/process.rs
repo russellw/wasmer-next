@@ -79,7 +79,7 @@ impl Handoff {
             cancellation.bind_image(self.clone());
         }
     }
-    fn cancellation(&self) -> Option<crate::cancellation::Cancellation> {
+    pub(crate) fn cancellation(&self) -> Option<crate::cancellation::Cancellation> {
         self.0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -309,6 +309,10 @@ where
             .map(|publication| publication.startup(self.syscalls.clone(), task));
         let owned = startup.is_some();
         let finished = startup.as_ref().map(|startup| startup.finished.clone());
+        let entered = startup.as_ref().map(|startup| startup.entered.clone());
+        let terminal = startup.as_ref().map(|startup| startup.terminal.clone());
+        #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+        let authority = startup.as_ref().map(|startup| startup.authority.clone());
         let host = self.host.clone();
         let syscalls = self.syscalls.clone();
         let owning_thread = self.abis.requires_owning_thread();
@@ -320,6 +324,11 @@ where
             let profile = crate::thread::OwningThread::required(owning_thread);
             let cleanup =
                 crate::cleanup::RunCleanup::new(wasixv2_host::LoaderCleanup::new(host), native);
+            #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+            let cleanup = match authority {
+                Some(authority) => cleanup.with_cancellation(authority),
+                None => cleanup,
+            };
             let scope = cleanup.clone();
             Box::pin(async move {
                 let profile = match profile {
@@ -341,12 +350,24 @@ where
                         return;
                     }
                 };
+                // Once entered, the executor must drive this worker through cancellation,
+                // physical retirement and group_wait. It may discard a never-polled factory,
+                // or an old worker whose authority already transferred to its successor.
+                if let Some(entered) = entered {
+                    entered.store(true, std::sync::atomic::Ordering::Release);
+                }
+                let terminal_syscalls = syscalls.clone();
                 match profile {
                     Some(profile) => {
-                        let guest = async move { run(scope).await };
                         let guest = async move {
-                            guest.await;
-                            if let Some(finished) = finished {
+                            let cancellation = scope.cancellation().cloned();
+                            if crate::cancellation::execution(cancellation.as_ref(), async move {
+                                run(scope).await
+                            })
+                            .await
+                            .is_some()
+                                && let Some(finished) = finished
+                            {
                                 finished.store(true, std::sync::atomic::Ordering::Release);
                             }
                         };
@@ -366,16 +387,23 @@ where
                         cleanup
                             .run_with_keepalive(
                                 async move {
-                                    if let Err(panic) =
-                                        crate::catch_panic(async move { run(scope).await }).await
-                                    {
+                                    let cancellation = scope.cancellation().cloned();
+                                    let result =
+                                        crate::catch_panic(crate::cancellation::execution(
+                                            cancellation.as_ref(),
+                                            async move { run(scope).await },
+                                        ))
+                                        .await;
+                                    if let Err(panic) = result {
                                         let error = if owned {
                                             crate::panic_error(task, panic)
                                         } else {
                                             crate::host_panicked(&*syscalls, task, panic)
                                         };
                                         report_failure(task, Err(error));
-                                    } else if let Some(finished) = finished {
+                                    } else if matches!(result, Ok(Some(())))
+                                        && let Some(finished) = finished
+                                    {
                                         finished.store(true, std::sync::atomic::Ordering::Release);
                                     }
                                 },
@@ -383,6 +411,14 @@ where
                             )
                             .await
                     }
+                }
+                if terminal
+                    .as_ref()
+                    .is_some_and(|terminal| terminal.load(std::sync::atomic::Ordering::Acquire))
+                {
+                    // Startup::drop claimed this image after the runner drained; a
+                    // transferred image never reaches this terminal release path.
+                    finish_task(&*terminal_syscalls, task).await;
                 }
             }) as wasixv2_host::LocalFuture<'static, ()>
         });

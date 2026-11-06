@@ -43,6 +43,8 @@ struct Proof {
     group: Mutex<Option<oneshot::Receiver<()>>>,
     pending: Mutex<HashMap<TaskId, VecDeque<GuestAction>>>,
     start: Mutex<Option<mpsc::Receiver<()>>>,
+    drop_worker: Mutex<Option<oneshot::Receiver<()>>>,
+    authority: Mutex<Option<WeakCancellation>>,
     reject: bool,
     complete: Mutex<Option<oneshot::Receiver<()>>>,
     sibling_done: Mutex<Option<oneshot::Sender<()>>>,
@@ -92,6 +94,7 @@ impl Executor for ProofHost {
             return Err(std::io::ErrorKind::Unsupported.into());
         }
         let gate = proof.start.lock().unwrap().take();
+        let drop_worker = proof.drop_worker.lock().unwrap().take();
         std::thread::Builder::new().spawn(move || {
             if let Some(gate) = gate {
                 gate.recv().unwrap();
@@ -99,7 +102,19 @@ impl Executor for ProofHost {
             let mut pool = LocalPool::new();
             SPAWNER.with(|slot| *slot.borrow_mut() = Some(pool.spawner()));
             proof.event("worker-start");
-            pool.run_until(start());
+            pool.run_until(async move {
+                match drop_worker {
+                    Some(drop_worker) => {
+                        if let futures::future::Either::Right((_, old_worker)) =
+                            futures::future::select(start(), drop_worker).await
+                        {
+                            drop(old_worker);
+                        }
+                    }
+                    None => start().await,
+                }
+            });
+            pool.run_until_stalled();
             // OwningThread::run must have released the exact old permit.
             thread::OwningThread::acquire()
                 .unwrap()
@@ -435,6 +450,8 @@ fn dropped_waiter(image: bool, retain_frame: bool) {
         group: Mutex::new(None),
         pending: Mutex::new(HashMap::new()),
         start: Mutex::new(None),
+        drop_worker: Mutex::new(None),
+        authority: Mutex::new(None),
         reject: false,
         complete: Mutex::new(None),
         sibling_done: Mutex::new(None),
@@ -594,6 +611,8 @@ fn lifecycle_proof(reject: bool) -> (Arc<Proof>, mpsc::Receiver<Event>) {
             group: Mutex::new(None),
             pending: Mutex::new(HashMap::new()),
             start: Mutex::new(None),
+            drop_worker: Mutex::new(None),
+            authority: Mutex::new(None),
             reject,
             complete: Mutex::new(None),
             sibling_done: Mutex::new(None),
@@ -617,6 +636,17 @@ impl InstantiationHook<PendingControl> for LifecycleHook {
         env: &FunctionEnv<ExecEnv<PendingControl>>,
         imports: &mut Imports,
     ) -> Result<Option<Box<dyn InstanceAttachment>>, RuntimeError> {
+        let data = env.as_ref(store);
+        if data.task() == TaskId(1) {
+            let mut authority = self.proof.authority.lock().unwrap();
+            if authority.is_none() {
+                *authority = data
+                    .proc
+                    .handoff
+                    .cancellation()
+                    .map(|owner| owner.downgrade());
+            }
+        }
         self.proof.event("lifecycle-prepare");
         imports.define(
             "custom",
@@ -971,6 +1001,146 @@ fn a_sibling_takeover_relinquishes_cancellation_before_the_old_image_finishes() 
             .filter(|event| event.0 == "release")
             .all(|event| event.1 == successor)
     );
+}
+
+#[test]
+fn published_child_takeover_survives_dropping_its_old_worker() {
+    if !subprocess("cancellation::tests::published_child_takeover_survives_dropping_its_old_worker")
+    {
+        return;
+    }
+    let (proof, observed) = lifecycle_proof(false);
+    let (drop_tx, drop_rx) = oneshot::channel();
+    *proof.drop_worker.lock().unwrap() = Some(drop_rx);
+    let (complete_tx, complete_rx) = oneshot::channel();
+    *proof.complete.lock().unwrap() = Some(complete_rx);
+    let image = wat::parse_str(
+        r#"(module
+        (import "custom" "complete" (func $complete))
+        (import "wasixv2" "exit_group" (func $exit (param i32)))
+        (memory (export "memory") 1)
+        (func (export "_start") call $complete i32.const 37 call $exit unreachable))"#,
+    )
+    .unwrap();
+    let mut abis = Abis::wasixv2();
+    abis.push_instantiation_hook(Arc::new(LifecycleHook {
+        proof: proof.clone(),
+        image,
+    }));
+    let spawner = process::spawner(
+        Store::default().engine().clone(),
+        Arc::new(PendingControl(proof.clone())),
+        Arc::new(ProofHost(proof)),
+        Arc::new(abis),
+    );
+    spawner.spawn_owned(
+        TaskId(1),
+        Image::copied(shared_module(true)),
+        crate::spawn_custody::Publication::test_child(TaskId(1)),
+    );
+    let mut events = Vec::new();
+    until(&observed, &mut events, "complete-pending");
+    if !events.iter().any(|event| event.0 == "old-pending") {
+        until(&observed, &mut events, "old-pending");
+    }
+    // A real guest on the sibling Store has already published the replacement.
+    // Discard the original worker itself, rather than its outer Rust waiter.
+    drop_tx.send(()).unwrap();
+    until(&observed, &mut events, "old-drained");
+    assert!(
+        events
+            .iter()
+            .all(|event| event.0 != "fault" && event.0 != "release")
+    );
+    complete_tx.send(()).unwrap();
+    while events
+        .iter()
+        .filter(|event| event.0 == "worker-done")
+        .count()
+        < 3
+    {
+        until(&observed, &mut events, "worker-done");
+    }
+    assert!(events.iter().all(|event| event.0 != "fault"));
+    assert_eq!(
+        events.iter().filter(|event| event.0 == "release").count(),
+        1
+    );
+    let replacement = events
+        .iter()
+        .find(|event| event.0 == "complete-pending")
+        .unwrap()
+        .1;
+    assert!(
+        events
+            .iter()
+            .filter(|event| event.0 == "release")
+            .all(|event| event.1 == replacement)
+    );
+}
+
+#[test]
+fn published_child_cancellation_drives_its_group_wait_before_release() {
+    if !subprocess(
+        "cancellation::tests::published_child_cancellation_drives_its_group_wait_before_release",
+    ) {
+        return;
+    }
+    let (proof, observed) = lifecycle_proof(false);
+    let (complete_tx, complete_rx) = oneshot::channel();
+    let (group_tx, group_rx) = oneshot::channel();
+    *proof.complete.lock().unwrap() = Some(complete_rx);
+    *proof.group.lock().unwrap() = Some(group_rx);
+    *proof.sibling_done.lock().unwrap() = Some(group_tx);
+    let mut abis = Abis::wasixv2();
+    abis.push_instantiation_hook(Arc::new(LifecycleHook {
+        proof: proof.clone(),
+        image: vec![],
+    }));
+    let spawner = process::spawner(
+        Store::default().engine().clone(),
+        Arc::new(PendingControl(proof.clone())),
+        Arc::new(ProofHost(proof.clone())),
+        Arc::new(abis),
+    );
+    spawner.spawn_owned(
+        TaskId(1),
+        Image::copied(shared_module(false)),
+        crate::spawn_custody::Publication::test_child(TaskId(1)),
+    );
+    let mut events = Vec::new();
+    until(&observed, &mut events, "complete-pending");
+    proof
+        .authority
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .upgrade()
+        .unwrap()
+        .request();
+    until(&observed, &mut events, "group-wait");
+    assert!(
+        events
+            .iter()
+            .all(|event| event.0 != "release" && event.0 != "sibling-release")
+    );
+    complete_tx.send(()).unwrap();
+    while events
+        .iter()
+        .filter(|event| event.0 == "worker-done")
+        .count()
+        < 2
+    {
+        until(&observed, &mut events, "worker-done");
+    }
+    let at = |phase| events.iter().position(|event| event.0 == phase).unwrap();
+    assert!(at("fault") < at("group-wait"));
+    assert!(at("sibling-release") < at("group-retired"));
+    assert!(at("group-retired") < at("release"));
+    for phase in ["fault", "release", "sibling-release"] {
+        assert_eq!(events.iter().filter(|event| event.0 == phase).count(), 1);
+    }
 }
 
 #[test]

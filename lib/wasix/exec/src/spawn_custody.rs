@@ -168,21 +168,51 @@ impl Drop for HostSpawn {
 
 pub(crate) struct Publication(Arc<Mutex<State>>);
 impl Publication {
+    #[cfg(all(test, feature = "sys", not(target_arch = "wasm32")))]
+    pub(crate) fn test_child(child: TaskId) -> Self {
+        Self(Arc::new(Mutex::new(State {
+            parent: TaskId(0),
+            child: Some(child),
+            returning: None,
+            published: false,
+            memory_left: false,
+            released: false,
+        })))
+    }
+
     pub(crate) fn startup<S: Control + Send + Sync + 'static>(
         &self,
         syscalls: Arc<S>,
         task: TaskId,
     ) -> Startup {
+        let entered = Arc::new(AtomicBool::new(false));
+        let terminal = Arc::new(AtomicBool::new(false));
+        #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+        let authority = crate::cancellation::Cancellation::new(task);
         Startup {
             state: self.0.clone(),
             finished: Arc::new(AtomicBool::new(false)),
+            entered: entered.clone(),
+            terminal: terminal.clone(),
+            #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+            authority: authority.clone(),
             cleanup: Some(Box::new(move || {
+                #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+                if !authority.claim_terminal() {
+                    return;
+                }
+                let running = entered.load(Ordering::Acquire);
+                // The driven worker awaits group_wait after its final physical drain.
+                // Only a never-entered factory can release synchronously here.
+                terminal.store(running, Ordering::Release);
                 let unwinding = std::thread::panicking();
                 let fault = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     syscalls.fault(task, Signal::SIGSEGV.0);
                 }));
                 let release = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    syscalls.release(task)
+                    if !running {
+                        syscalls.release(task);
+                    }
                 }));
                 for result in [fault, release] {
                     if let Err(panic) = result {
@@ -212,6 +242,10 @@ impl Publication {
 pub(crate) struct Startup {
     state: Arc<Mutex<State>>,
     pub(crate) finished: Arc<AtomicBool>,
+    pub(crate) entered: Arc<AtomicBool>,
+    pub(crate) terminal: Arc<AtomicBool>,
+    #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+    pub(crate) authority: crate::cancellation::Cancellation,
     cleanup: Option<Box<dyn FnOnce() + Send>>,
 }
 impl Drop for Startup {
@@ -536,7 +570,7 @@ mod tests {
             FactoryMode::Panic,
             FactoryMode::Capture,
         ] {
-            for poll in [false, true] {
+            {
                 let control = Arc::new(Recorder::default());
                 let host = Arc::new(FactoryHost {
                     mode: match mode {
@@ -573,12 +607,7 @@ mod tests {
                 );
                 let factory = host.factory.lock().unwrap().take();
                 if let Some(factory) = factory {
-                    let mut future = factory();
-                    if poll {
-                        let mut cx = Context::from_waker(std::task::Waker::noop());
-                        assert!(future.as_mut().poll(&mut cx).is_pending());
-                    }
-                    drop(future);
+                    drop(factory());
                 }
                 assert_eq!(
                     *control.faulted.lock().unwrap(),

@@ -77,7 +77,7 @@ impl WeakCancellation {
 }
 impl Cancellation {
     #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
-    fn new(task: TaskId) -> Self {
+    pub(crate) fn new(task: TaskId) -> Self {
         Self(Arc::new(Mutex::new(State {
             task,
             phase: Phase::Owned,
@@ -126,6 +126,20 @@ impl Cancellation {
         };
         if let Some(wake) = wake {
             wake.wake();
+        }
+    }
+    /// Called only after this owner's physical roots and cleanup have drained.
+    /// A synchronous takeover reservation has committed or unwound before then.
+    #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+    pub(crate) fn claim_terminal(&self) -> bool {
+        let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        match state.phase {
+            Phase::Owned => {
+                state.phase = Phase::Terminal;
+                true
+            }
+            Phase::Terminal | Phase::Transferred => false,
+            Phase::Transferring => unreachable!("takeover outlived the drained owner"),
         }
     }
     #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
