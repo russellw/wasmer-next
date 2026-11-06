@@ -65,6 +65,37 @@ impl<S: Syscalls + Control + Send + Sync + 'static> HostEnvironment<S> {
         instance: &Instance,
         abi: Arc<dyn AbiInstance<S>>,
     ) -> Result<(), ExecError> {
+        let memory = self.instance_memory(store, instance)?;
+        let asyncify = asyncify::Asyncify::new(instance, store)?;
+        let stack_pointer = crate::stack_pointer(instance);
+        let main_stack = memory::main_stack(instance, store);
+        let data = self.env.as_mut(store);
+        data.memory = Some(memory);
+        data.main_stack = main_stack;
+        data.stack_pointer = stack_pointer;
+        data.abi = Some(abi);
+        data.proc.set_module(instance.module());
+        data.asyncify = asyncify;
+        self.initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Checks identity before an ABI inspects Store-backed instance metadata.
+    /// Any same-Store instance with exported memory remains eligible.
+    pub fn validate_instance(
+        &self,
+        store: &mut StoreMut<'_>,
+        instance: &Instance,
+    ) -> Result<(), ExecError> {
+        self.instance_memory(store, instance).map(drop)
+    }
+
+    fn instance_memory(
+        &self,
+        store: &mut StoreMut<'_>,
+        instance: &Instance,
+    ) -> Result<Memory, ExecError> {
         if store.objects_mut().id() != self.store_id {
             return Err(ExecError::StoreMode(wasmer::RuntimeError::new(
                 "environment belongs to another Store",
@@ -83,19 +114,7 @@ impl<S: Syscalls + Control + Send + Sync + 'static> HostEnvironment<S> {
                 "instance belongs to another Store",
             )));
         }
-        let asyncify = asyncify::Asyncify::new(instance, store)?;
-        let stack_pointer = crate::stack_pointer(instance);
-        let main_stack = memory::main_stack(instance, store);
-        let data = self.env.as_mut(store);
-        data.memory = Some(memory);
-        data.main_stack = main_stack;
-        data.stack_pointer = stack_pointer;
-        data.abi = Some(abi);
-        data.proc.set_module(instance.module());
-        data.asyncify = asyncify;
-        self.initialized
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        Ok(())
+        Ok(memory)
     }
 
     /// Releases only this environment's Store-local handles after its calls settle.

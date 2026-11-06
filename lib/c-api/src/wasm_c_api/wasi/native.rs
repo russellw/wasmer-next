@@ -2,7 +2,7 @@
 
 use crate::wasm_c_api::store::StoreRef;
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     io,
     sync::{Arc, Condvar, Mutex},
 };
@@ -94,6 +94,7 @@ impl NativeWasi {
                 );
             }
         }
+        validate_preopens(&preopens)?;
         let startup_env: Vec<_> = env
             .iter()
             .map(|(key, value)| [key.as_bytes(), b"=", value].concat())
@@ -115,12 +116,10 @@ impl NativeWasi {
         let (process, environment) = store.run_host(async {
             let machine = Arc::new(Machine::new());
             let mut input_preopens = Vec::new();
-            for (name, host) in preopens {
-                let path = if name.starts_with('/') {
-                    name.clone()
-                } else {
-                    format!("/{name}")
-                };
+            for (index, (name, host)) in preopens.into_iter().enumerate() {
+                // Announced aliases are opaque legacy names, not normalized mount
+                // paths. Separate capabilities must never stack on the same mount.
+                let path = format!("/.wasmer-c-api/preopens/{index}");
                 machine
                     .mount_host_dir(&path, std::path::Path::new(&host), false)
                     .await?;
@@ -203,6 +202,7 @@ impl NativeWasi {
         store: &mut StoreMut<'_>,
         instance: &Instance,
     ) -> anyhow::Result<()> {
+        self.env.validate_instance(store, instance)?;
         let wasi = self
             .process
             .as_ref()
@@ -240,5 +240,98 @@ impl NativeWasi {
 impl Drop for NativeWasi {
     fn drop(&mut self) {
         self.close();
+    }
+}
+
+fn validate_preopens(preopens: &[(String, String)]) -> Result<(), WasiStateCreationError> {
+    let mut aliases = HashSet::new();
+    for (name, _) in preopens {
+        if !aliases.insert(name) {
+            return Err(WasiStateCreationError::WasiFsCreationError(format!(
+                "Found duplicate entry for alias `{name}`"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wasm_c_api::{engine::wasm_engine_new, store::wasm_store_new};
+
+    #[test]
+    fn duplicate_announced_aliases_fail_before_any_directory_is_mounted() {
+        let engine = wasm_engine_new();
+        let store = unsafe { wasm_store_new(Some(&engine)) }.unwrap();
+        let error = NativeWasi::new(
+            &store.inner,
+            vec!["duplicates".into()],
+            vec![],
+            vec![
+                ("same".into(), "a directory that does not exist".into()),
+                ("same".into(), ".".into()),
+            ],
+            false,
+            false,
+        )
+        .err()
+        .expect("duplicate aliases must fail before mounting the missing directory");
+        assert!(matches!(
+            error.downcast_ref::<WasiStateCreationError>(),
+            Some(WasiStateCreationError::WasiFsCreationError(message))
+                if message == "Found duplicate entry for alias `same`"
+        ));
+        validate_preopens(&[
+            ("same".into(), ".".into()),
+            ("same/".into(), ".".into()),
+            ("same/.".into(), ".".into()),
+        ])
+        .expect("distinct legacy aliases remain accepted even when paths normalize equally");
+    }
+
+    #[test]
+    fn foreign_instance_metadata_is_rejected_before_attachment_and_selection_survives() {
+        let engine = wasm_engine_new();
+        let store = unsafe { wasm_store_new(Some(&engine)) }.unwrap();
+        let env = NativeWasi::new(
+            &store.inner,
+            vec!["identity".into()],
+            vec![],
+            vec![],
+            false,
+            false,
+        )
+        .unwrap();
+        let source = wat::parse_str(
+            r#"(module
+                (memory (export "arbitrarily_named_memory") 1)
+                (global (export "__wasix_exec_table_stable") i32 (i32.const 1)))"#,
+        )
+        .unwrap();
+        let mut foreign_store = wasmer_api::Store::default();
+        let foreign_module = Module::new(&foreign_store, &source).unwrap();
+        let foreign = Instance::new(&mut foreign_store, &foreign_module, &Imports::new()).unwrap();
+        let local = store
+            .inner
+            .with_mut(|store| {
+                let module = Module::new(store, &source).unwrap();
+                Instance::new(store, &module, &Imports::new()).unwrap()
+            })
+            .unwrap();
+        store
+            .inner
+            .with_mut(|store| {
+                env.initialize(store, &local).unwrap();
+                let error = env.initialize(store, &foreign).unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("instance belongs to another Store")
+                );
+                // A failed foreign attachment does not prevent explicit reselection.
+                env.initialize(store, &local).unwrap();
+            })
+            .unwrap();
     }
 }
