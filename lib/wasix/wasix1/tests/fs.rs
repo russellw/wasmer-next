@@ -445,8 +445,8 @@ async fn descriptor_renumber_does_not_overwrite_a_named_target_installed_while_p
     use wasixv2_abi::{Errno, Fd, OpenFlags};
     use wasixv2_kernel::{Dispatch, HostClock, Kernel, SyscallEntry};
     use wasixv2_syscalls::{
-        Caller, DescriptorUpdate, Layer, Layered, MaybeFuture, SysResult, Syscall, SyscallRet,
-        Syscalls,
+        Caller, Control, DescriptorUpdate, Layer, Layered, MaybeFuture, SysResult, Syscall,
+        SyscallRet, Syscalls,
     };
     struct PauseDup(Arc<AtomicBool>);
     impl Layer<Kernel> for PauseDup {
