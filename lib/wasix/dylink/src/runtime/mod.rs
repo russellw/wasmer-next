@@ -1674,7 +1674,7 @@ impl<S: Syscalls + Control + Send + Sync + 'static> AbiInstance<S> for StoreImag
     fn retain_exec_process(
         &self,
         process: TaskId,
-    ) -> Result<Option<Box<dyn wasixv2_exec::ExecProcessLease>>, RuntimeError> {
+    ) -> Result<Option<Box<dyn wasixv2_exec::ExecProcessLease>>> {
         self.inner.retain_exec_process(process)
     }
 
