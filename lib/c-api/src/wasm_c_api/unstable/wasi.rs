@@ -157,12 +157,13 @@ unsafe fn wasi_get_unordered_imports_inner(
     imports: &mut wasmer_named_extern_vec_t,
 ) -> Option<()> {
     let wasi_env = wasi_env?;
+    let inner = &wasi_env.inner;
     let store = &mut wasi_env.store;
     let module = module?;
 
     let import_object =
         c_try!(c_try!(store.with_mut(|store| {
-            wasi_env.inner.import_object(store, &module.inner)
+            inner.import_object(store, &module.inner)
         })));
 
     imports.set_buffer(
@@ -177,7 +178,7 @@ unsafe fn wasi_get_unordered_imports_inner(
                     name,
                     r#extern: {
                         let mut value = Box::new(wasm_extern_t::new(store.clone(), extern_));
-                        wasi_env.inner.tag_import(&mut value);
+                        inner.tag_import(&mut value);
                         value
                     },
                 }))
