@@ -1964,7 +1964,7 @@ pub fn default_root(
             let file = vfs.open(&cx, &top, path.as_bytes(), &how).await?;
             file.write_at(contents.as_bytes(), 0).await?;
         }
-        Ok::<_, Errno>(())
+        Ok::<_, wasixv2_vfs::PathError>(())
     };
     now(layout).expect("a new memory filesystem takes the default layout");
     root
@@ -2108,7 +2108,7 @@ async fn mount_kernel_filesystems(kernel: &Kernel, host: &Arc<dyn Host>) {
             mount("/dev/pts", kernel.devpts(), flags(false, true)).await;
         }
         mount("/tmp", tmpfs(0o1777), flags(true, false)).await;
-        Ok::<_, Errno>(())
+        Ok::<_, wasixv2_vfs::PathError>(())
     };
     mounts
         .await

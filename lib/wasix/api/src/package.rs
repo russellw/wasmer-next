@@ -529,7 +529,7 @@ async fn volume_subtree(layer: Layer, path: Option<&str>) -> io::Result<Layer> {
                 },
             )
             .await
-            .map_err(crate::errno_to_io)?;
+            .map_err(|error| crate::errno_to_io(error.errno()))?;
         let layer = Layer(Arc::new(VolumeView {
             fs: layer.0,
             root: node.dentry.node().clone(),
