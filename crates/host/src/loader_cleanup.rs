@@ -1577,6 +1577,10 @@ mod local_custody_tests {
             }
         }
         struct DropPanicWake;
+        #[allow(
+            clippy::manual_noop_waker,
+            reason = "The panicking destructor is the test oracle; Waker::noop would remove it."
+        )]
         impl std::task::Wake for DropPanicWake {
             fn wake(self: Arc<Self>) {}
         }
@@ -1743,6 +1747,10 @@ mod local_custody_tests {
             }
         }
         struct DropPanicWake;
+        #[allow(
+            clippy::manual_noop_waker,
+            reason = "The panicking destructor is the test oracle; Waker::noop would remove it."
+        )]
         impl std::task::Wake for DropPanicWake {
             fn wake(self: Arc<Self>) {}
         }
