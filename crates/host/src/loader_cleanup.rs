@@ -2230,4 +2230,77 @@ mod local_custody_tests {
             assert!(settlement.is_ready());
         }
     }
+    #[test]
+    fn settlement_ready_snapshot_rearms_after_worker_enters_last_scope_host_drop() {
+        use std::sync::mpsc;
+        struct GatedHost {
+            executor: QueueHost,
+            entered: mpsc::Sender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+        }
+        impl Host for GatedHost {
+            fn realtime(&self) -> Duration {
+                Duration::ZERO
+            }
+            fn monotonic(&self) -> Duration {
+                Duration::ZERO
+            }
+            fn sleep(&self, _: Duration) -> LocalFuture<'_, ()> {
+                Box::pin(async {})
+            }
+            fn random(&self, _: &mut [u8]) {}
+            fn executor(&self) -> &dyn Executor {
+                &self.executor
+            }
+            fn report(&self, _: &str) {}
+        }
+        impl Drop for GatedHost {
+            fn drop(&mut self) {
+                self.entered.send(()).unwrap();
+                self.release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap();
+            }
+        }
+        let (entered, in_host_drop) = mpsc::channel();
+        let (release, host_release) = mpsc::channel();
+        let scope = LoaderCleanup::new(Arc::new(GatedHost {
+            executor: QueueHost(AtomicBool::new(false)),
+            entered,
+            release: Mutex::new(host_release),
+        }));
+        drop(scope.run(std::future::pending::<()>()));
+        let settlement = scope.settlement();
+        let mut observer = settlement.observer();
+        assert!(
+            Pin::new(&mut observer)
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_ready()
+        );
+        let worker = std::thread::spawn(move || drop(scope));
+        in_host_drop.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(
+            !settlement.is_ready(),
+            "Ready observation is not a permanent resource certificate"
+        );
+        let wake = Arc::new(SettlementWake(AtomicUsize::new(0)));
+        let waker = Waker::from(wake.clone());
+        assert!(
+            Pin::new(&mut observer)
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        assert_eq!(wake.0.load(Ordering::SeqCst), 0);
+        release.send(()).unwrap();
+        worker.join().unwrap();
+        assert_eq!(wake.0.load(Ordering::SeqCst), 1);
+        assert!(
+            Pin::new(&mut observer)
+                .poll(&mut Context::from_waker(&waker))
+                .is_ready()
+        );
+        assert!(settlement.is_ready());
+    }
 }
