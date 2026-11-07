@@ -316,21 +316,49 @@ impl<S: Syscalls + Control + Send + Sync + 'static> HostEnvironment<S> {
 
     /// Releases only this environment's Store-local handles after its calls settle.
     pub fn deactivate(&self, store: &mut StoreMut<'_>) {
+        let mut first = None;
+        let mut attempt = |action: &mut dyn FnMut()| {
+            if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(action)) {
+                if first.is_none() {
+                    first = Some(panic);
+                } else {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(panic)));
+                }
+            }
+        };
+        // InstanceHooks takes its attached cells before invoking any callbacks.
+        // A retry therefore never replays a panicked attachment.
         let hooks = self.env.as_ref(store).instance_hooks().cloned();
         if let Some(hooks) = hooks {
-            hooks.deactivate(store);
+            attempt(&mut || hooks.deactivate(store));
         }
-        let data = self.env.as_mut(store);
-        data.proc.handoff.retire_process();
-        data.memory = None;
-        data.abi = None;
-        data.imports = wasmer::Imports::new();
-        data.abi_imports = None;
-        data.threads = None;
-        data.proc.module = None;
-        data.asyncify = None;
-        data.base = None;
-        data.stack_pointer = None;
+        let handoff = self.env.as_ref(store).proc.handoff.clone();
+        attempt(&mut || handoff.retire_process());
+        // Take each actual owning handle BEFORE its destructor, and leave no
+        // user Drop under the Store's ExecEnv borrow. Continue after first panic.
+        macro_rules! clear {
+            ($field:ident) => {{
+                let value = self.env.as_mut(store).$field.take();
+                let mut value = Some(value);
+                attempt(&mut || drop(value.take()));
+            }};
+        }
+        clear!(memory);
+        clear!(abi);
+        let imports = std::mem::take(&mut self.env.as_mut(store).imports);
+        let mut imports = Some(imports);
+        attempt(&mut || drop(imports.take()));
+        clear!(abi_imports);
+        clear!(threads);
+        let module = self.env.as_mut(store).proc.module.take();
+        let mut module = Some(module);
+        attempt(&mut || drop(module.take()));
+        clear!(asyncify);
+        clear!(base);
+        clear!(stack_pointer);
+        if let Some(panic) = first {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     pub fn set_binding(&self, store: &mut StoreMut<'_>, abi: Arc<dyn AbiInstance<S>>) {
@@ -463,6 +491,18 @@ impl HostCallHandoff {
         self.handoff.wait().await
     }
 
+    /// Whether exact handoff retirement has committed its terminal disposition.
+    #[doc(hidden)]
+    pub fn is_retired(&self) -> bool {
+        matches!(
+            *self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            HostCallState::Retired
+        )
+    }
+
     /// Called by the retained old-thread owner only after its physical/loader
     /// drain. Accepted workers keep terminal authority; all other paths fault
     /// and release exactly once here, including starters that never ran.
@@ -494,10 +534,24 @@ impl HostCallHandoff {
                 _ => None,
             }
         };
+        let mut failure = None;
         if let Some(terminal) = terminal {
-            self.spawner
-                .retire_committed(terminal, self.handoff.clone())
-                .await;
+            let mut retiring = self
+                .spawner
+                .retire_committed(terminal.clone(), self.handoff.clone());
+            failure = std::future::poll_fn(|cx| {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    retiring.as_mut().poll(cx)
+                })) {
+                    Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+                    Ok(std::task::Poll::Ready(())) => std::task::Poll::Ready(None),
+                    Err(panic) if terminal.is_finished() => std::task::Poll::Ready(Some(panic)),
+                    // Generic Control gives no retry contract for an opaque
+                    // panicked observation. Never relabel it as settlement.
+                    Err(panic) => std::panic::resume_unwind(panic),
+                }
+            })
+            .await;
         }
         let old = std::mem::replace(
             &mut *self
@@ -506,7 +560,16 @@ impl HostCallHandoff {
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
             HostCallState::Retired,
         );
-        drop(old);
+        if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(old))) {
+            if failure.is_none() {
+                failure = Some(panic);
+            } else {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(panic)));
+            }
+        }
+        if let Some(panic) = failure {
+            std::panic::resume_unwind(panic);
+        }
     }
 }
 

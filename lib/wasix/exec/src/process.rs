@@ -397,6 +397,139 @@ where
     })
 }
 
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+#[derive(Clone, Copy)]
+enum RetirementPhase {
+    Admission,
+    Fault,
+    Group,
+    Release,
+    Image,
+    Publish,
+    Finished,
+    Done,
+}
+
+/// The same claimed entry and pending group observation survive every Pending.
+/// All finite synchronous teardown panics are delayed until terminal settlement;
+/// no generic Control future is reconstructed or repolled after a panic.
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+struct CommittedRetirement<S> {
+    syscalls: Arc<S>,
+    terminal: crate::PreinstalledTerminalCustody,
+    completion: Arc<Handoff>,
+    phase: RetirementPhase,
+    entry: Option<ExecImage>,
+    waiting: Option<wasixv2_host::LocalFuture<'static, ()>>,
+    first: Option<Box<dyn std::any::Any + Send>>,
+}
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+impl<S: Control + 'static> CommittedRetirement<S> {
+    fn new(
+        syscalls: Arc<S>,
+        terminal: crate::PreinstalledTerminalCustody,
+        completion: Arc<Handoff>,
+    ) -> Self {
+        let admission = terminal.clone();
+        Self {
+            syscalls,
+            terminal,
+            completion,
+            phase: RetirementPhase::Admission,
+            entry: None,
+            waiting: Some(Box::pin(async move { admission.retirement_ready().await })),
+            first: None,
+        }
+    }
+    fn attempt(&mut self, action: impl FnOnce(&mut Self)) {
+        if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| action(self)))
+        {
+            if self.first.is_none() {
+                self.first = Some(panic);
+            } else {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(panic)));
+            }
+        }
+    }
+}
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+impl<S: Control + 'static> Future for CommittedRetirement<S> {
+    type Output = ();
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<()> {
+        let this = self.get_mut();
+        loop {
+            match this.phase {
+                RetirementPhase::Admission => {
+                    if this
+                        .waiting
+                        .as_mut()
+                        .unwrap()
+                        .as_mut()
+                        .poll(cx)
+                        .is_pending()
+                    {
+                        return Poll::Pending;
+                    }
+                    this.attempt(|this| drop(this.waiting.take()));
+                    this.entry = this.terminal.claim_fallback();
+                    this.phase = if this.entry.is_some() {
+                        RetirementPhase::Fault
+                    } else {
+                        RetirementPhase::Done
+                    };
+                }
+                RetirementPhase::Fault => {
+                    this.phase = RetirementPhase::Group;
+                    // Unlike fault(), no exit_status/take_pending loop is
+                    // combined with the irreversible fault operation here.
+                    this.attempt(|this| {
+                        this.syscalls.fault(this.terminal.task(), Signal::SIGSEGV.0);
+                    });
+                    let syscalls = this.syscalls.clone();
+                    let task = this.terminal.task();
+                    this.waiting = Some(Box::pin(async move { syscalls.group_wait(task).await }));
+                }
+                RetirementPhase::Group => {
+                    if this
+                        .waiting
+                        .as_mut()
+                        .unwrap()
+                        .as_mut()
+                        .poll(cx)
+                        .is_pending()
+                    {
+                        return Poll::Pending;
+                    }
+                    this.phase = RetirementPhase::Release;
+                    this.attempt(|this| drop(this.waiting.take()));
+                }
+                RetirementPhase::Release => {
+                    this.phase = RetirementPhase::Image;
+                    this.attempt(|this| this.syscalls.release(this.terminal.task()));
+                }
+                RetirementPhase::Image => {
+                    this.phase = RetirementPhase::Publish;
+                    this.attempt(|this| drop(this.entry.take()));
+                }
+                RetirementPhase::Publish => {
+                    this.phase = RetirementPhase::Finished;
+                    this.attempt(|this| this.completion.complete(Err(ExecError::Dropped)));
+                }
+                RetirementPhase::Finished => {
+                    this.phase = RetirementPhase::Done;
+                    this.attempt(|this| this.terminal.mark_finished());
+                }
+                RetirementPhase::Done => {
+                    if let Some(panic) = this.first.take() {
+                        std::panic::resume_unwind(panic);
+                    }
+                    return Poll::Ready(());
+                }
+            }
+        }
+    }
+}
+
 impl<S> Spawn for Spawner<S>
 where
     S: Syscalls + Control + Send + Sync + 'static,
@@ -425,18 +558,11 @@ where
         terminal: crate::PreinstalledTerminalCustody,
         completion: Arc<Handoff>,
     ) -> wasixv2_host::LocalFuture<'static, ()> {
-        let syscalls = self.syscalls.clone();
-        Box::pin(async move {
-            // The caller has already fenced every predecessor and drained its loader.
-            terminal.retirement_ready().await;
-            if let Some(entry) = terminal.claim_fallback() {
-                fault(&*syscalls, terminal.task(), Signal::SIGSEGV.0);
-                finish_task(&*syscalls, terminal.task()).await;
-                drop(entry);
-                completion.complete(Err(ExecError::Dropped));
-                terminal.mark_finished();
-            }
-        })
+        Box::pin(CommittedRetirement::new(
+            self.syscalls.clone(),
+            terminal,
+            completion,
+        ))
     }
 
     fn spawn(&self, task: TaskId, image: ExecImage) {
@@ -1276,6 +1402,67 @@ pub(super) mod tests {
         drop(custody);
         assert_eq!(live.load(Ordering::SeqCst), 0);
         assert_eq!(retired.load(Ordering::SeqCst), 1000);
+    }
+
+    #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+    #[test]
+    fn committed_fallback_image_destructor_panic_is_delivered_after_exact_terminal_release() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Lease(Arc<AtomicUsize>);
+        impl crate::ExecProcessLease for Lease {}
+        impl Drop for Lease {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                panic!("fallback image lease destructor");
+            }
+        }
+        let control = Arc::new(Recorder::default());
+        let drops = Arc::new(AtomicUsize::new(0));
+        let task = TaskId(77);
+        let terminal = crate::PreinstalledTerminalCustody::new(
+            task,
+            ExecImage::new(
+                Image::copied(Vec::new()),
+                Some(Box::new(Lease(drops.clone()))),
+            ),
+        );
+        terminal.cancel();
+        let completion = Arc::new(Handoff::default());
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            futures::executor::block_on(CommittedRetirement::new(
+                control.clone(),
+                terminal.clone(),
+                completion.clone(),
+            ));
+        }))
+        .unwrap_err();
+        assert_eq!(
+            panic.downcast_ref::<&str>(),
+            Some(&"fallback image lease destructor")
+        );
+        assert!(
+            terminal.is_finished(),
+            "completion follows actual fallback release, not merely claimed entry"
+        );
+        assert_eq!(
+            *control.faulted.lock().unwrap(),
+            [(task, Signal::SIGSEGV.0)]
+        );
+        assert_eq!(*control.released.lock().unwrap(), [task]);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            futures::executor::block_on(completion.wait()),
+            Err(ExecError::Dropped)
+        ));
+        // Re-observation is safe only because the concrete phase committed
+        // finished; it cannot claim/drop/release the consumed entry again.
+        futures::executor::block_on(CommittedRetirement::new(
+            control.clone(),
+            terminal,
+            completion,
+        ));
+        assert_eq!(*control.released.lock().unwrap(), [task]);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 
     use std::{

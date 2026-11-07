@@ -478,6 +478,12 @@ impl PreinstalledTerminalCustody {
         state.phase = TerminalPhase::Terminal;
         state.entry.take()
     }
+    pub(crate) fn is_finished(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .finished
+    }
     pub(crate) fn mark_finished(&self) {
         let (wake, cancellation, fallback) = {
             let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
