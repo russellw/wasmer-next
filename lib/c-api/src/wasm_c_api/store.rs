@@ -530,7 +530,22 @@ impl Drop for RetirementRegistration {
         }
         if self.state.committed.get() {
             self.state.disposition.set(DeliveryDisposition::Cancelled);
-            self.state.ledger.enroll(&self.state);
+            // Successful terminal publication can retire an empty receipt
+            // before its result consumer is polled. This guard may then own
+            // the LAST strong state: re-enrolling just its Weak would leave a
+            // dead ledger row when the guard's fields finish dropping.
+            if self.state.physically_ready()
+                && !self.state.publishing.get()
+                && !self.state.receipt_queued.get()
+                && self.state.delivery_ack.get()
+                && self.state.failure.is_empty()
+            {
+                self.state.ledger.remove(&self.state);
+            } else {
+                // A queued receipt, active publisher or unfinished physical
+                // owner still retains the SAME exact state until settlement.
+                self.state.ledger.enroll(&self.state);
+            }
         } else {
             self.state.ledger.remove(&self.state);
         }
@@ -2046,6 +2061,121 @@ mod tests {
                     "inside actual poll"
                 })
             );
+        }
+    }
+
+    #[cfg(feature = "wasi")]
+    #[test]
+    fn completed_registration_cancellation_after_receipt_retirement_has_no_dead_weak() {
+        use std::future::Future;
+        // Actual LocalContinuation cancellation AFTER its terminal producer and
+        // receipt finish, but BEFORE its already-ready result is consumed.
+        {
+            let store = StoreRef::new(Store::default()).unwrap();
+            let owner = store.retirement_owner().unwrap();
+            let done = Rc::new(std::cell::Cell::new(false));
+            let registration = store
+                .register_owned_retirement(done.clone(), RetirementFailure::default())
+                .unwrap();
+            let state = registration.state();
+            let weak = Rc::downgrade(&state);
+            let release = store.retirement_release(state.clone()).unwrap();
+            store.retain_delivery(state).unwrap();
+            let registration = Rc::new(RefCell::new(Some(registration)));
+            let run_registration = registration.clone();
+            let consumed = Rc::new(std::cell::Cell::new(false));
+            let ran = consumed.clone();
+            let (send, receive) = tokio::sync::oneshot::channel::<()>();
+            let continuation = LocalContinuation {
+                store: store.clone(),
+                run: Some(Box::new(move || {
+                    let registration = run_registration.borrow_mut().take();
+                    Box::pin(async move {
+                        receive
+                            .await
+                            .map_err(|_| RuntimeError::new("test terminal disappeared"))?;
+                        ran.set(true);
+                        registration.unwrap().relinquish();
+                        Ok(())
+                    }) as ContinuationFuture
+                })),
+                cancel: Some(Box::new(move || {
+                    let owned = registration.borrow_mut().take();
+                    drop(owned);
+                })),
+            };
+            owner.retain(Box::pin(async move {
+                done.set(true); // real test terminal task has completed its work
+                send.send(()).unwrap();
+                release.release();
+            }));
+            assert!(owner.driver.ledger.snapshot().is_empty());
+            assert_eq!(
+                weak.strong_count(),
+                1,
+                "only the unconsumed registration owns the state"
+            );
+            assert!(!consumed.get());
+            drop(continuation); // production Drop runs its actual cancel entry
+            assert!(weak.upgrade().is_none());
+            assert!(
+                store.run_host(async {}).is_ok(),
+                "next actual Driver snapshot must not see a dead Weak"
+            );
+            assert!(owner.driver.ledger.snapshot().is_empty());
+            assert!(!consumed.get());
+        }
+        // Analogous live tail: first poll releases its actual receipts while an
+        // existing after_pump callback delays publication. Cancel only AFTER
+        // publication/empty-receipt retirement and BEFORE its next caller poll.
+        {
+            let store = StoreRef::new(Store::default()).unwrap();
+            let owner = store.retirement_owner().unwrap();
+            let done = Rc::new(std::cell::Cell::new(false));
+            let registration = store
+                .register_owned_retirement(done.clone(), RetirementFailure::default())
+                .unwrap();
+            let state = registration.state();
+            let weak = Rc::downgrade(&state);
+            store.retain_delivery(state.clone()).unwrap();
+            state.disposition.set(DeliveryDisposition::LiveTail);
+            let tail = Rc::new(RefCell::new(Box::pin(NativeRetirementTail {
+                subscription: Some(owner.subscribe()),
+                _store: store.downgrade(),
+                base: Some(store.async_store().unwrap()),
+                owner: Some(owner.clone()),
+                cleanup: owner.owner.clone(),
+                release: Some(store.retirement_release(state.clone()).unwrap()),
+                state,
+                registration: Some(registration),
+            })));
+            let first = tail.clone();
+            let terminal_owner = owner.clone();
+            owner.owner.after_pump(Box::new(move || {
+                terminal_owner.retain(Box::pin(async move {
+                    done.set(true);
+                }));
+                assert!(
+                    first
+                        .borrow_mut()
+                        .as_mut()
+                        .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+                        .is_pending()
+                );
+            }));
+            assert!(owner.driver.ledger.snapshot().is_empty());
+            assert_eq!(
+                weak.strong_count(),
+                2,
+                "the released tail owns its state and registration"
+            );
+            drop(tail);
+            assert!(weak.upgrade().is_none());
+            assert!(
+                store.run_host(async {}).is_ok(),
+                "released-tail cancellation must not resurrect a dead ledger row"
+            );
+            assert!(owner.driver.ledger.snapshot().is_empty());
         }
     }
 
