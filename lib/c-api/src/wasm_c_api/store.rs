@@ -1959,10 +1959,10 @@ mod tests {
     #[cfg(feature = "wasi")]
     #[test]
     fn retirement_ordinal_exhaustion_retains_exact_unstamped_payload_without_ack() {
-        struct Payload(Rc<std::cell::Cell<usize>>);
+        struct Payload(std::sync::Arc<std::sync::atomic::AtomicUsize>);
         impl Drop for Payload {
             fn drop(&mut self) {
-                self.0.set(self.0.get() + 1);
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
         }
         let store = StoreRef::new(Store::default()).unwrap();
@@ -1978,12 +1978,12 @@ mod tests {
         earlier.record(Box::new("already owned earlier event"));
         let owned = earlier.take_event().unwrap();
         clock.set(u64::MAX);
-        let drops = Rc::new(std::cell::Cell::new(0));
+        let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let payload = Box::new(Payload(drops.clone()));
         let address = (&*payload) as *const Payload;
         state.failure.record(payload);
         assert_eq!(clock.get(), u64::MAX);
-        assert_eq!(drops.get(), 0);
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(!state.failure.is_empty());
         assert!(state.failure.has_unstamped_event());
         assert!(state.failure.take_event().is_none());
@@ -2007,12 +2007,12 @@ mod tests {
             owned.payload.downcast_ref::<&str>(),
             Some(&"already owned earlier event")
         );
-        assert_eq!(drops.get(), 0);
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 0);
         // The unresolved value stays in its original carrier until real
         // cancellation destroys that carrier; no ordered completion is faked.
         drop(registration);
         drop(state);
-        assert_eq!(drops.get(), 1);
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[cfg(feature = "wasi")]
