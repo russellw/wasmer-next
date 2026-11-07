@@ -405,6 +405,7 @@ impl Future for PredecessorRetirement {
         if this.running.is_none() {
             this.running = Some(this.start.take().expect("one predecessor runner")());
         }
+        let entry_unwinding = std::thread::panicking();
         let polled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             this.running.as_mut().unwrap().as_mut().poll(cx)
         }));
@@ -419,7 +420,7 @@ impl Future for PredecessorRetirement {
                 this.done = true;
                 // Never repoll a panicked async guest. Runner::drop retains its
                 // real final drain and terminal keepalive in the same local sink.
-                this.failure.record(panic);
+                this.failure.record_caught(panic, entry_unwinding);
                 this.failure.attempt(|| drop(this.running.take()));
                 // The runner transferred its real final drain/keepalive. Do
                 // not surface the first failure before that terminal settles.

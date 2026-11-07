@@ -564,16 +564,19 @@ impl RetirementFailure {
             .as_ref()
             .is_some_and(|event| event.order.is_none())
     }
+    pub(crate) fn record_caught(&self, panic: RetirementPanic, entry_unwinding: bool) {
+        if entry_unwinding {
+            discard_retirement_panic(panic);
+        } else {
+            self.record(panic);
+        }
+    }
     pub(crate) fn attempt<R>(&self, action: impl FnOnce() -> R) -> Option<R> {
         let unwinding = std::thread::panicking();
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(action)) {
             Ok(value) => Some(value),
             Err(panic) => {
-                if unwinding {
-                    discard_retirement_panic(panic);
-                } else {
-                    self.record(panic);
-                }
+                self.record_caught(panic, unwinding);
                 None
             }
         }
@@ -2168,15 +2171,22 @@ fn attempt_retirement(first: &mut Option<RetirementPanic>, cleanup: impl FnOnce(
 #[cfg(feature = "sys")]
 async fn catch_retirement_future<F: std::future::Future>(
     future: F,
-) -> Result<F::Output, RetirementPanic> {
-    let mut future = std::pin::pin!(future);
-    std::future::poll_fn(|cx| {
+    failure: &RetirementFailure,
+) -> Result<F::Output, ()> {
+    let mut future = Box::pin(future);
+    let output = std::future::poll_fn(|cx| {
+        let unwinding = std::thread::panicking();
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| future.as_mut().poll(cx))) {
             Ok(poll) => poll.map(Ok),
-            Err(panic) => std::task::Poll::Ready(Err(panic)),
+            Err(panic) => {
+                failure.record_caught(panic, unwinding); // ORIGINAL catch, before frame Drop
+                std::task::Poll::Ready(Err(()))
+            }
         }
     })
-    .await
+    .await;
+    failure.attempt(|| drop(future)); // canonical frame Drop has its own entry flag
+    output
 }
 
 #[cfg(feature = "sys")]
@@ -2388,16 +2398,26 @@ impl NativeStoreFinalization {
             // These two observers are canonical and may be recreated after a
             // notification panic. No arbitrary consumed async frame is replayed.
             loop {
-                match catch_retirement_future(generation.close_and_wait_for_cleanup()).await {
+                match catch_retirement_future(
+                    generation.close_and_wait_for_cleanup(),
+                    &observe_failure,
+                )
+                .await
+                {
                     Ok(()) => break,
-                    Err(panic) => observe_failure.record(panic),
+                    Err(()) => (),
                 }
             }
             if let Some(store) = &store {
                 loop {
-                    match catch_retirement_future(async { drop(store.write_lock().await) }).await {
+                    match catch_retirement_future(
+                        async { drop(store.write_lock().await) },
+                        &observe_failure,
+                    )
+                    .await
+                    {
                         Ok(()) => break,
-                        Err(panic) => observe_failure.record(panic),
+                        Err(()) => (),
                     }
                 }
             }
@@ -2571,6 +2591,7 @@ impl NativeStoreFinalization {
                     // No callback-bearing owner-thread disposal between valid
                     // seal and final_done. Hold a shutdown panic until Done,
                     // since disposing a secondary payload may cancel a caller.
+                    let shutdown_unwinding = std::thread::panicking();
                     let shutdown = self
                         .runtime
                         .take()
@@ -2578,7 +2599,7 @@ impl NativeStoreFinalization {
                     self.phase = StoreFinalizationPhase::Done;
                     self.ledger.final_done.set(true);
                     if let Some(panic) = shutdown {
-                        self.failure.record(panic);
+                        self.failure.record_caught(panic, shutdown_unwinding);
                     }
                 }
                 StoreFinalizationPhase::Done => return Poll::Ready(()),
@@ -2637,6 +2658,7 @@ impl NativeStoreFinalization {
                 let owner = self.owner.clone();
                 let resume = move |notification_first| {
                     let exit = owner.enter_exit_boundary(); // BEFORE moving/polling phase
+                    let entry_unwinding = std::thread::panicking();
                     let mut actual = self;
                     assert!(
                         actual.destruction.is_complete()
@@ -2644,7 +2666,7 @@ impl NativeStoreFinalization {
                     );
                     actual.phase = StoreFinalizationPhase::StoreDrain;
                     if let Some(first) = notification_first {
-                        actual.failure.record(first);
+                        actual.failure.record_caught(first, entry_unwinding);
                     }
                     exit.defer(Box::new(move || actual.finish_blocking()));
                     None
@@ -4034,6 +4056,120 @@ mod tests {
             drop(state);
             drop(target);
         }
+    }
+
+    #[cfg(feature = "wasi")]
+    #[test]
+    fn active_store_drop_does_not_retain_secondary_canonical_write_observer_panic() {
+        use std::{
+            future::Future,
+            sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            },
+            task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
+        };
+        use wasmer_api::AsStoreAsync;
+        struct Signal {
+            clones: AtomicUsize,
+            wakes: AtomicUsize,
+        }
+        unsafe fn clone_signal(data: *const ()) -> RawWaker {
+            let signal = unsafe { &*data.cast::<Signal>() };
+            if signal.clones.fetch_add(1, Ordering::SeqCst) == 1 {
+                std::panic::panic_any("secondary canonical write observer N");
+            }
+            unsafe { Arc::increment_strong_count(data.cast::<Signal>()) };
+            RawWaker::new(data, &SIGNAL)
+        }
+        unsafe fn wake_signal(data: *const ()) {
+            unsafe {
+                wake_signal_ref(data);
+                drop_signal(data);
+            }
+        }
+        unsafe fn wake_signal_ref(data: *const ()) {
+            unsafe { &*data.cast::<Signal>() }
+                .wakes
+                .fetch_add(1, Ordering::SeqCst);
+        }
+        unsafe fn drop_signal(data: *const ()) {
+            drop(unsafe { Arc::from_raw(data.cast::<Signal>()) });
+        }
+        static SIGNAL: RawWakerVTable =
+            RawWakerVTable::new(clone_signal, wake_signal, wake_signal_ref, drop_signal);
+        let store = StoreRef::new(Store::default()).unwrap();
+        let StoreMode::Native(native) = &store.inner.mode else {
+            unreachable!()
+        };
+        let owner = native.owner.clone();
+        let failure = native.cleanup_failure.clone();
+        let ledger = native.ledger.clone();
+        let weak = store.downgrade();
+        let signal = Arc::new(Signal {
+            clones: AtomicUsize::new(0),
+            wakes: AtomicUsize::new(0),
+        });
+        let gate = Rc::new(std::cell::Cell::new(false));
+        let pending = gate.clone();
+        owner
+            .try_retain(std::future::poll_fn(move |_| {
+                if pending.get() {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            }))
+            .unwrap_or_else(|_| panic!("original finite owner job refused"));
+        {
+            let asynchronous = store.async_store().unwrap();
+            let mut lock = std::pin::pin!(asynchronous.write_lock());
+            let Poll::Ready(guard) = lock.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+            else {
+                panic!("unused actual Store guard must be available");
+            };
+            let waker = unsafe {
+                Waker::from_raw(RawWaker::new(Arc::into_raw(signal.clone()).cast(), &SIGNAL))
+            };
+            assert!(
+                owner
+                    .poll_idle(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+            assert_eq!(signal.clones.load(Ordering::SeqCst), 1);
+            let original = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _actual_public_store = store;
+                std::panic::panic_any("external active Rust G");
+            }))
+            .unwrap_err();
+            assert_eq!(
+                original.downcast_ref::<&str>(),
+                Some(&"external active Rust G")
+            );
+            assert!(weak.upgrade().is_none());
+            assert!(
+                signal.clones.load(Ordering::SeqCst) >= 3,
+                "actual canonical observer caught N and retried its own observer"
+            );
+            assert!(
+                failure.is_empty(),
+                "secondary N cannot outlive G as a fresh cleanup event"
+            );
+            gate.set(true); // original surviving caller, then real unlock producer
+            drop(guard);
+            assert!(owner.is_idle());
+            assert!(
+                !ledger.final_done.get(),
+                "independent backing still owns actual VM resources"
+            );
+        }
+        assert!(ledger.final_done.get() && owner.is_idle());
+        assert!(failure.is_empty());
+        assert_eq!(
+            ledger.clock.get(),
+            0,
+            "no ordinal assigned to active-unwind secondary N"
+        );
     }
 
     #[test]
