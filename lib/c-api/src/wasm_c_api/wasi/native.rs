@@ -2,7 +2,8 @@
 
 use super::{ConfigurationError, exit_trap, get_wasi_version, wasi_version_t};
 use crate::wasm_c_api::store::{
-    CleanupRetirement, ContinuationEndpoint, LocalContinuation, StoreRef,
+    CleanupRetirement, ContinuationEndpoint, LocalContinuation, NativeRetirementState,
+    RetirementFailure, StoreRef, TailRelease,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -392,6 +393,7 @@ struct PredecessorRetirement {
     start: Option<Box<dyn FnOnce() -> LocalFuture<'static, ()>>>,
     running: Option<LocalFuture<'static, ()>>,
     owner: CleanupRetirement,
+    failure: RetirementFailure,
     done: bool,
 }
 impl Future for PredecessorRetirement {
@@ -414,15 +416,18 @@ impl Future for PredecessorRetirement {
             Ok(Poll::Pending) => Poll::Pending,
             Ok(Poll::Ready(())) => {
                 this.done = true;
-                this.running = None;
+                this.failure.attempt(|| drop(this.running.take()));
                 Poll::Ready(())
             }
             Err(panic) => {
                 this.done = true;
                 // Never repoll a panicked async guest. Runner::drop retains its
                 // real final drain and terminal keepalive in the same local sink.
-                drop(this.running.take());
-                std::panic::resume_unwind(panic)
+                this.failure.record(panic);
+                this.failure.attempt(|| drop(this.running.take()));
+                // The runner transferred its real final drain/keepalive. Do
+                // not surface the first failure before that terminal settles.
+                Poll::Ready(())
             }
         }
     }
@@ -435,6 +440,7 @@ impl Drop for PredecessorRetirement {
                 start: self.start.take(),
                 running: self.running.take(),
                 owner: self.owner.clone(),
+                failure: self.failure.clone(),
                 done: false,
             };
             self.owner.retain(Box::pin(replacement));
@@ -442,13 +448,13 @@ impl Drop for PredecessorRetirement {
     }
 }
 struct TerminalKeepalive {
-    owner: CleanupRetirement,
+    owner: Option<CleanupRetirement>,
     terminal: Option<LocalFuture<'static, ()>>,
 }
 impl Drop for TerminalKeepalive {
     fn drop(&mut self) {
         if let Some(terminal) = self.terminal.take() {
-            self.owner.retain(terminal);
+            self.owner.take().unwrap().retain_receipt(terminal);
         }
     }
 }
@@ -463,6 +469,247 @@ impl Drop for CancelHandoff {
 enum Admission {
     Worker(Result<OwnedEntryWaiter, ExecError>),
     Detached,
+}
+
+#[derive(Clone, Copy)]
+enum TerminalPhase {
+    Fence,
+    ReleaseInputs,
+    Admission,
+    Wait,
+    ReleaseProcess,
+    Publish,
+    Done,
+}
+
+#[derive(Default)]
+struct FenceProgress {
+    acquired: Cell<bool>,
+    deactivation_consumed: Cell<bool>,
+}
+
+/// Actual fence/deactivation progress is separate from its opaque async frame.
+/// A pre-acquisition panic keeps that exact frame and base receipt owned, but
+/// never repolls it or opens the predecessor barrier as if it returned Ready.
+struct TerminalFence {
+    future: LocalFuture<'static, ()>,
+    progress: Rc<FenceProgress>,
+    failure: RetirementFailure,
+    poisoned: bool,
+}
+impl Future for TerminalFence {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = self.get_mut();
+        if this.poisoned {
+            return Poll::Pending;
+        }
+        match this.failure.attempt(|| this.future.as_mut().poll(cx)) {
+            Some(Poll::Pending) => Poll::Pending,
+            Some(Poll::Ready(())) | None
+                if this.progress.acquired.get() && this.progress.deactivation_consumed.get() =>
+            {
+                Poll::Ready(())
+            }
+            Some(Poll::Ready(())) | None => {
+                this.poisoned = true;
+                Poll::Pending
+            }
+        }
+    }
+}
+
+struct TerminalState {
+    phase: TerminalPhase,
+    store: Option<wasmer_api::StoreAsync>,
+    env: Option<HostEnvironment<MachineSyscalls>>,
+    endpoint: Option<Rc<Endpoint>>,
+    process: Option<EmbeddingProcess>,
+    handoff: HostCallHandoff,
+    fence: Option<TerminalFence>,
+    predecessor: Option<tokio::sync::oneshot::Sender<()>>,
+    admission: Option<tokio::sync::oneshot::Receiver<Admission>>,
+    waiter: Option<Pin<Box<OwnedEntryWaiter>>>,
+    detached: Option<LocalFuture<'static, Result<i32, ExecError>>>,
+    retire: Option<LocalFuture<'static, ()>>,
+    retired: bool,
+    result: Option<Result<i32, ExecError>>,
+    result_tx: Option<tokio::sync::oneshot::Sender<Result<i32, ExecError>>>,
+    completed: Rc<Cell<bool>>,
+    _registration: Rc<NativeRetirementState>,
+    release: Option<TailRelease>,
+    failure: RetirementFailure,
+}
+struct TerminalRetirement {
+    state: Option<TerminalState>,
+    owner: Option<CleanupRetirement>,
+}
+impl Future for TerminalRetirement {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = self.get_mut();
+        let state = this.state.as_mut().expect("terminal custody consumed once");
+        loop {
+            match state.phase {
+                TerminalPhase::Fence => {
+                    if let Some(fence) = state.fence.as_mut() {
+                        if Pin::new(fence).poll(cx).is_pending() {
+                            return Poll::Pending;
+                        }
+                        state.failure.attempt(|| drop(state.fence.take()));
+                    }
+                    state.phase = TerminalPhase::ReleaseInputs;
+                }
+                TerminalPhase::ReleaseInputs => {
+                    state.failure.attempt(|| drop(state.store.take()));
+                    state.failure.attempt(|| drop(state.env.take()));
+                    if let Some(predecessor) = state.predecessor.take() {
+                        state.failure.attempt(|| {
+                            let _ = predecessor.send(());
+                        });
+                    }
+                    state.phase = TerminalPhase::Admission;
+                }
+                TerminalPhase::Admission => {
+                    let admission = state
+                        .failure
+                        .attempt(|| Pin::new(state.admission.as_mut().unwrap()).poll(cx));
+                    let value = match admission {
+                        Some(Poll::Pending) => return Poll::Pending,
+                        Some(Poll::Ready(value)) => value.ok(),
+                        None => None,
+                    };
+                    state.failure.attempt(|| drop(state.admission.take()));
+                    match value {
+                        Some(Admission::Worker(Ok(waiter))) => {
+                            state.waiter = Some(Box::pin(waiter))
+                        }
+                        Some(Admission::Worker(Err(error))) => {
+                            state.failure.attempt(|| state.handoff.cancel());
+                            state.result = Some(Err(error));
+                        }
+                        Some(Admission::Detached) => {
+                            let handoff = state.handoff.clone();
+                            state.detached =
+                                Some(Box::pin(async move { handoff.wait_detached().await }));
+                        }
+                        None => {
+                            state.failure.attempt(|| state.handoff.cancel());
+                            state.result = Some(Err(ExecError::Dropped));
+                        }
+                    }
+                    if state.retire.is_none() {
+                        let handoff = state.handoff.clone();
+                        state.retire = Some(Box::pin(async move { handoff.retire().await }));
+                    }
+                    state.phase = TerminalPhase::Wait;
+                }
+                TerminalPhase::Wait => {
+                    if !state.retired && state.retire.is_some() {
+                        match state
+                            .failure
+                            .attempt(|| state.retire.as_mut().unwrap().as_mut().poll(cx))
+                        {
+                            Some(Poll::Pending) => (),
+                            Some(Poll::Ready(())) => {
+                                state.retired = true;
+                                state.failure.attempt(|| drop(state.retire.take()));
+                            }
+                            None => {
+                                // Existing retire() holds unknown opaque
+                                // failure internally and emits finite teardown
+                                // panic ONLY after exact Retired commitment.
+                                state.retired = true;
+                                state.failure.attempt(|| drop(state.retire.take()));
+                            }
+                        }
+                    }
+                    if let Some(waiter) = state.waiter.as_mut() {
+                        match state.failure.attempt(|| waiter.as_mut().poll(cx)) {
+                            Some(Poll::Pending) => (),
+                            Some(Poll::Ready(result)) => {
+                                state.result = Some(result);
+                                state.failure.attempt(|| drop(state.waiter.take()));
+                            }
+                            None => {
+                                state.failure.attempt(|| state.handoff.cancel());
+                                state.failure.attempt(|| drop(state.waiter.take()));
+                                state.result = Some(Err(ExecError::Dropped));
+                            }
+                        }
+                    }
+                    if let Some(detached) = state.detached.as_mut() {
+                        match state.failure.attempt(|| detached.as_mut().poll(cx)) {
+                            Some(Poll::Pending) => (),
+                            Some(Poll::Ready(result)) => {
+                                state.result = Some(result);
+                                state.failure.attempt(|| drop(state.detached.take()));
+                            }
+                            None => {
+                                state.failure.attempt(|| state.handoff.cancel());
+                                state.failure.attempt(|| drop(state.detached.take()));
+                                state.result = Some(Err(ExecError::Dropped));
+                            }
+                        }
+                    }
+                    if !state.retired || state.waiter.is_some() || state.detached.is_some() {
+                        return Poll::Pending;
+                    }
+                    state.phase = TerminalPhase::ReleaseProcess;
+                }
+                TerminalPhase::ReleaseProcess => {
+                    state.process = state.endpoint.as_ref().unwrap().process.borrow_mut().take();
+                    if let Some(process) = state.process.as_mut() {
+                        // released() consumes each actual registration option
+                        // before its destructor; retain the shell across panic.
+                        while state.failure.attempt(|| process.released()).is_none() {}
+                    }
+                    state.failure.attempt(|| drop(state.process.take()));
+                    state.failure.attempt(|| drop(state.endpoint.take()));
+                    state.phase = TerminalPhase::Publish;
+                }
+                TerminalPhase::Publish => {
+                    state.completed.set(true);
+                    if let Some(send) = state.result_tx.take() {
+                        let result = state.result.take().unwrap_or(Err(ExecError::Dropped));
+                        state.failure.attempt(|| {
+                            let _ = send.send(result);
+                        });
+                    }
+                    state.failure.attempt(|| {
+                        this.owner
+                            .as_ref()
+                            .unwrap()
+                            .notify_retirement(state.failure.clone())
+                    });
+                    state.phase = TerminalPhase::Done;
+                }
+                TerminalPhase::Done => {
+                    let failure = state.failure.clone();
+                    let release = state.release.take();
+                    failure.attempt(|| drop(this.state.take()));
+                    if let Some(release) = release {
+                        failure.attempt(|| release.release());
+                    }
+                    // Keep the owned payload in exact enrolled metadata. This
+                    // pump may itself be running inside a discarded Tokio task.
+                    return Poll::Ready(());
+                }
+            }
+        }
+    }
+}
+impl Drop for TerminalRetirement {
+    fn drop(&mut self) {
+        if let Some(state) = self.state.take() {
+            let owner = self.owner.take().unwrap();
+            let replacement = Self {
+                state: Some(state),
+                owner: Some(owner.clone()),
+            };
+            owner.retain_receipt(Box::pin(replacement));
+        }
+    }
 }
 
 impl Endpoint {
@@ -490,76 +737,83 @@ impl Endpoint {
         let deactivated = Rc::new(Cell::new(false));
         let terminal_deactivated = deactivated.clone();
         let completed = Rc::new(Cell::new(false));
-        let terminal_completed = completed.clone();
-        let terminal_completion = owner.clone();
+        let failure = RetirementFailure::default();
+        let registration = store.register_retirement(completed.clone(), failure.clone())?;
+        let release = if admitted {
+            Some(store.retirement_release(registration.clone())?)
+        } else {
+            None
+        };
         let terminal_env = self.env.clone();
+        let fence_env = terminal_env.clone();
         let terminal_store = asynchronous.store();
-        let terminal_endpoint = self.clone();
-        let terminal_handoff = handoff.clone();
-        // This future is owned before claim and before the synchronous starter.
-        // The original runner releases it only after its actual final drain.
-        let terminal = Box::pin(async move {
-            {
-                // A panic while obtaining the guest's original fence still has
-                // this final actual Store fence before the worker barrier opens.
-                let mut guard = terminal_store.write_lock().await;
-                if !terminal_deactivated.get() {
-                    terminal_env.deactivate(&mut guard.as_store_mut());
-                    terminal_deactivated.set(true);
-                }
-            }
-            drop(terminal_store);
-            drop(terminal_env);
-            let _ = predecessor_tx.send(());
-            let result = match admission_rx.await {
-                Ok(Admission::Worker(Ok(waiter))) => {
-                    // Poll fallback authority alongside the waiter: an executor
-                    // can accept and then drop its unentered ThreadStart closure.
-                    let mut waiter = Box::pin(waiter);
-                    let mut retire = Box::pin(terminal_handoff.retire());
-                    let mut result = None;
-                    let mut retired = false;
-                    std::future::poll_fn(|cx| {
-                        if !retired {
-                            retired = retire.as_mut().poll(cx).is_ready();
+        let fence_store = terminal_store.store();
+        let progress = Rc::new(FenceProgress::default());
+        let fence_progress = progress.clone();
+        let fence_failure = failure.clone();
+        let fence = TerminalFence {
+            progress,
+            failure: failure.clone(),
+            poisoned: false,
+            future: Box::pin(async move {
+                let mut actual = Box::pin(fence_store.write_lock());
+                let mut failed = false;
+                let mut guard = std::future::poll_fn(|cx| {
+                    if failed {
+                        return Poll::Pending;
+                    }
+                    match fence_failure.attempt(|| actual.as_mut().poll(cx)) {
+                        Some(Poll::Ready(guard)) => {
+                            fence_progress.acquired.set(true);
+                            Poll::Ready(guard)
                         }
-                        if result.is_none()
-                            && let Poll::Ready(value) = waiter.as_mut().poll(cx)
-                        {
-                            result = Some(value);
-                        }
-                        if retired && result.is_some() {
-                            Poll::Ready(result.take().unwrap())
-                        } else {
+                        Some(Poll::Pending) => Poll::Pending,
+                        None => {
+                            // Catch INSIDE the owning frame, before an unwind
+                            // could drop the actual canonical lock future.
+                            // It remains owned but must never be polled again.
+                            failed = true;
                             Poll::Pending
                         }
-                    })
-                    .await
+                    }
+                })
+                .await;
+                fence_failure.attempt(|| drop(actual));
+                if !terminal_deactivated.get() {
+                    // deactivate panic-completes actual owning options. Record
+                    // its finite failure only AFTER the real guard exists.
+                    fence_failure.attempt(|| fence_env.deactivate(&mut guard.as_store_mut()));
+                    terminal_deactivated.set(true);
                 }
-                Ok(Admission::Worker(Err(error))) => {
-                    terminal_handoff.cancel();
-                    Err(error)
-                }
-                Ok(Admission::Detached) => terminal_handoff.wait_detached().await,
-                Err(_) => {
-                    terminal_handoff.cancel();
-                    Err(ExecError::Dropped)
-                }
-            };
-            terminal_handoff.retire().await;
-            // The exact accepted/fallback owner has now finished native and
-            // loader cleanup and released the task. Disarm the host guard once.
-            let mut process = terminal_endpoint.process.borrow_mut().take();
-            if let Some(process) = process.as_mut() {
-                process.released();
-            }
-            *terminal_endpoint.process.borrow_mut() = process;
-            terminal_completed.set(true);
-            let _ = result_tx.send(result);
-            terminal_completion.notify_completion();
+                fence_progress.deactivation_consumed.set(true);
+            }),
+        };
+        let terminal = Box::pin(TerminalRetirement {
+            owner: Some(owner.clone()),
+            state: Some(TerminalState {
+                phase: TerminalPhase::Fence,
+                store: Some(terminal_store),
+                env: Some(terminal_env),
+                endpoint: Some(self.clone()),
+                process: None,
+                handoff: handoff.clone(),
+                fence: Some(fence),
+                predecessor: Some(predecessor_tx),
+                admission: Some(admission_rx),
+                waiter: None,
+                detached: None,
+                retire: None,
+                retired: false,
+                result: None,
+                result_tx: Some(result_tx),
+                completed: completed.clone(),
+                _registration: registration.clone(),
+                release,
+                failure: failure.clone(),
+            }),
         }) as LocalFuture<'static, ()>;
         let keepalive = TerminalKeepalive {
-            owner: owner.clone(),
+            owner: Some(owner.clone()),
             terminal: Some(terminal),
         };
         let retiring_env = self.env.clone();
@@ -578,6 +832,7 @@ impl Endpoint {
             start: Some(start),
             running: None,
             owner: owner.clone(),
+            failure,
             done: false,
         };
         self.committed.set(true);
@@ -595,8 +850,11 @@ impl Endpoint {
         // Enroll before retain can synchronously drive cleanup/finalizers. The
         // outer call future releases native custody and then polls this tail,
         // allowing a foreign current-thread executor to deliver deferred wakes.
+        // EVERY continuation owns a delivery receipt before predecessor
+        // admission can pump a finalizer, including admitted work later dropped.
+        store.retain_delivery(registration.clone())?;
         if !admitted {
-            store.enroll_native_retirement(completed)?;
+            store.enroll_retirement_tail(registration)?;
         }
         // NativeCleanupOwner commits this concrete custody before first polling.
         owner.retain(Box::pin(predecessor));
@@ -2091,6 +2349,753 @@ mod tests {
             drop(instance);
             drop(t);
             drop(directory);
+        }
+    }
+
+    #[test]
+    fn terminal_preacquisition_panic_keeps_the_actual_fence_and_predecessor_barrier_closed() {
+        struct BeforeAcquire {
+            _actual: LocalFuture<'static, ()>,
+            polls: Rc<Cell<usize>>,
+            drops: Rc<Cell<usize>>,
+        }
+        impl Future for BeforeAcquire {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+                self.polls.set(self.polls.get() + 1);
+                panic!("before actual terminal Store acquisition");
+            }
+        }
+        impl Drop for BeforeAcquire {
+            fn drop(&mut self) {
+                self.drops.set(self.drops.get() + 1);
+            }
+        }
+        let engine = wasm_engine_new();
+        let store = unsafe { wasm_store_new(Some(&engine)) }.unwrap();
+        let base = store.inner.async_store().unwrap();
+        let mut held_future = Box::pin(base.write_lock());
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let Poll::Ready(held) = held_future.as_mut().poll(&mut cx) else {
+            panic!("initial actual Store guard");
+        };
+        let exact_base = base.store();
+        let progress = Rc::new(FenceProgress::default());
+        let polls = Rc::new(Cell::new(0));
+        let drops = Rc::new(Cell::new(0));
+        let failure = RetirementFailure::default();
+        let fence = TerminalFence {
+            future: Box::pin(BeforeAcquire {
+                _actual: Box::pin(async move {
+                    drop(exact_base.write_lock().await);
+                }),
+                polls: polls.clone(),
+                drops: drops.clone(),
+            }),
+            progress: progress.clone(),
+            failure: failure.clone(),
+            poisoned: false,
+        };
+        let (predecessor, mut waiting) = tokio::sync::oneshot::channel();
+        let mut continuation = Box::pin(async move {
+            fence.await;
+            let _ = predecessor.send(());
+        });
+        assert!(continuation.as_mut().poll(&mut cx).is_pending());
+        assert!(continuation.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(
+            polls.get(),
+            1,
+            "never repoll the poisoned pre-acquisition frame"
+        );
+        assert_eq!(
+            drops.get(),
+            0,
+            "keep the SAME actual canonical fence receipt owned"
+        );
+        assert!(!progress.acquired.get());
+        assert!(!progress.deactivation_consumed.get());
+        assert!(
+            matches!(
+                waiting.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "no false predecessor barrier publication"
+        );
+        assert_eq!(
+            failure.inspect_message().as_deref(),
+            Some("before actual terminal Store acquisition")
+        );
+        // Unknown pre-acquisition panic progress is unproved. Dispose the mock
+        // final owner at this legal outer boundary; production TerminalRetirement
+        // transfers its SAME pending state to its existing cleanup owner on Drop.
+        drop(continuation);
+        assert_eq!(drops.get(), 1);
+        drop(held);
+        drop(held_future);
+        drop(base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discarded_admitted_continuation_delivers_its_owned_first_error_after_real_retirement() {
+        use crate::wasm_c_api::{
+            externals::{wasm_extern_t, wasm_func_call, wasm_func_t},
+            value::{wasm_val_t, wasm_val_vec_t},
+        };
+        use std::{
+            os::unix::fs::PermissionsExt,
+            sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+        };
+        use wasmer_api::{Function, Value};
+        struct Directory(std::path::PathBuf);
+        impl Drop for Directory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let directory = Directory(std::env::temp_dir().join(format!(
+            "wasmer-capi-admitted-delivery-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        )));
+        std::fs::create_dir(&directory.0).unwrap();
+        let child = wat::parse_str(
+            r#"(module
+            (import "wasix_32v1" "fd_write" (func $write (param i32 i32 i32 i32) (result i32)))
+            (import "wasix_32v1" "proc_exit2" (func $exit (param i32)))
+            (memory (export "memory") 1) (data (i32.const 100) "child-ran")
+            (func (export "_start")
+                i32.const 0 i32.const 100 i32.store
+                i32.const 4 i32.const 9 i32.store
+                i32.const 1 i32.const 0 i32.const 1 i32.const 8 call $write drop
+                i32.const 0 call $exit unreachable))"#,
+        )
+        .unwrap();
+        std::fs::write(directory.0.join("child.wasm"), child).unwrap();
+        std::fs::set_permissions(
+            directory.0.join("child.wasm"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let engine = wasm_engine_new();
+        let store = unsafe { wasm_store_new(Some(&engine)) }.unwrap();
+        let mut wasi = NativeWasi::new(
+            &store.inner,
+            vec!["parent".into()],
+            vec![],
+            vec![("prog".into(), directory.0.to_str().unwrap().into())],
+            true,
+            false,
+        )
+        .unwrap();
+        let capture = wasi.stdout.clone().unwrap();
+        let parent = wat::parse_str(r#"(module
+            (import "wasix_32v1" "proc_exec3" (func $exec (param i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+            (memory (export "memory") 1)
+            (global (export "resumed") (mut i32) (i32.const 0))
+            (data (i32.const 1000) "/prog/child.wasm") (data (i32.const 1040) "child\0a")
+            (func (export "run")
+                i32.const 1000 i32.const 16 i32.const 1040 i32.const 6
+                i32.const 0 i32.const 0 i32.const 0 i32.const 0 i32.const 0 call $exec drop
+                i32.const 1 global.set 0))"#).unwrap();
+        let instance = store
+            .inner
+            .with_mut(|store| {
+                let module = Module::new(store, parent).unwrap();
+                let imports = wasi.import_object(store, &module).unwrap();
+                let instance = Instance::new(store, &module, &imports).unwrap();
+                wasi.initialize(store, &instance).unwrap();
+                instance
+            })
+            .unwrap();
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let done = cleaned.clone();
+        let (release, waiting) = tokio::sync::oneshot::channel();
+        assert!(
+            wasi.environment()
+                .loader_cleanup()
+                .submit(Box::new(move || Box::pin(async move {
+                    let _ = waiting.await;
+                    tokio::task::yield_now().await;
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    done.store(true, Ordering::SeqCst);
+                })))
+                .is_ok()
+        );
+        let base = store.inner.async_store().unwrap();
+        let function = instance.exports.get_function("run").unwrap().clone();
+        // Reach the REAL proc_exec marker first, without fabricating an outcome.
+        let error = futures_block_on(function.call_async(&base, Vec::new())).unwrap_err();
+        assert!(wasixv2_exec::is_call_handoff(&error));
+        let mut continuation = wasi.endpoint.clone().prepare(&store.inner, &error).unwrap();
+        let states = store.inner.retirement_states_for_test();
+        assert_eq!(
+            states.len(),
+            1,
+            "admitted=true is registered BEFORE predecessor polling"
+        );
+        // This test isolates VALUE transport. The real predecessor-Drop test
+        // separately proves source capture; no panic is thrown into a C ABI.
+        states[0]
+            .failure
+            .record(Box::new("discarded admitted first error"));
+        drop(states); // Do not pin the sole error metadata from the test.
+        let mut running = continuation.run.take().unwrap()();
+        assert!(
+            running
+                .as_mut()
+                .poll(&mut Context::from_waker(std::task::Waker::noop()))
+                .is_pending()
+        );
+        assert!(!cleaned.load(Ordering::SeqCst));
+        drop(running);
+        drop(continuation); // cancel the EXISTING accepted worker, not a new releaser
+        release.send(()).unwrap();
+        let identity = store
+            .inner
+            .with_mut(|store| store.objects_mut().id())
+            .unwrap();
+        let sibling = store
+            .inner
+            .with_mut(|store| Function::new_typed(store, || 42i32))
+            .unwrap();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            store.inner.call(&sibling, Vec::new())
+        }))
+        .unwrap_err();
+        assert_eq!(
+            panic.downcast_ref::<&str>(),
+            Some(&"discarded admitted first error")
+        );
+        assert!(
+            cleaned.load(Ordering::SeqCst),
+            "first error follows real finite loader retirement"
+        );
+        assert!(
+            store.inner.retirement_states_for_test().is_empty(),
+            "actual terminal+receipt ack removed exact metadata before delivery"
+        );
+        assert_eq!(
+            store
+                .inner
+                .with_mut(|store| instance
+                    .exports
+                    .get_global("resumed")
+                    .unwrap()
+                    .get(store)
+                    .i32())
+                .unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            capture.read(&mut [0; 16]),
+            0,
+            "canceled committed worker never runs replacement"
+        );
+        let mut public = wasm_func_t {
+            extern_: wasm_extern_t::new(store.inner.clone(), sibling.into()),
+        };
+        let args: wasm_val_vec_t = Vec::<wasm_val_t>::new().into();
+        let mut results: wasm_val_vec_t =
+            vec![wasm_val_t::from_value(&Value::I32(-1), &store.inner).unwrap()].into();
+        assert!(unsafe { wasm_func_call(Some(&mut public), Some(&args), &mut results) }.is_none());
+        assert_eq!(
+            unsafe { results.as_slice()[0].of.int32_t },
+            42,
+            "healthy PUBLIC same-target sibling after once-only panic delivery"
+        );
+        assert_eq!(
+            store
+                .inner
+                .with_mut(|store| store.objects_mut().id())
+                .unwrap(),
+            identity
+        );
+        assert!(store.inner.retirement_states_for_test().is_empty());
+        wasi.close();
+        drop(public);
+        drop(results);
+        drop(instance);
+        drop(base);
+    }
+
+    #[test]
+    fn predecessor_destructor_panic_waits_for_its_actual_terminal_loader_drain() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct FailingDrop;
+        impl Drop for FailingDrop {
+            fn drop(&mut self) {
+                panic!("predecessor destructor first failure");
+            }
+        }
+        let engine = wasm_engine_new();
+        let store = unsafe { wasm_store_new(Some(&engine)) }.unwrap();
+        let wasi = NativeWasi::new(
+            &store.inner,
+            vec!["panic-retirement".into()],
+            vec![],
+            vec![],
+            true,
+            false,
+        )
+        .unwrap();
+        let scope = wasi.environment().loader_cleanup().clone();
+        let local =
+            wasixv2_exec::local_cleanup_runner(&store.inner.async_store().unwrap(), scope.clone())
+                .unwrap();
+        let owner = store.inner.retirement_owner().unwrap();
+        let completed = Rc::new(Cell::new(false));
+        let _registration = store
+            .inner
+            .enroll_native_retirement(completed.clone())
+            .unwrap();
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let finished = cleaned.clone();
+        assert!(
+            scope
+                .submit(Box::new(move || Box::pin(async move {
+                    tokio::task::yield_now().await;
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    finished.store(true, Ordering::SeqCst);
+                })))
+                .is_ok()
+        );
+        let failure = _registration.failure.clone();
+        let terminal_failure = failure.clone();
+        let terminal_completion = owner.clone();
+        let terminal_cleaned = cleaned.clone();
+        let keepalive = TerminalKeepalive {
+            owner: Some(owner.clone()),
+            terminal: Some(Box::pin(async move {
+                assert!(
+                    terminal_cleaned.load(Ordering::SeqCst),
+                    "real runner keepalive is released AFTER its finite loader drain"
+                );
+                completed.set(true);
+                assert!(
+                    !terminal_failure.is_empty(),
+                    "predecessor recorded first failure before dropping runner"
+                );
+                terminal_completion.notify_retirement(terminal_failure);
+                // The existing explicit run_host boundary owns delivery;
+                // never throw into this fire-and-forget task completion.
+            })),
+        };
+        let predecessor = PredecessorRetirement {
+            ancestry: None,
+            start: Some(Box::new(move || {
+                Box::pin(local.run_with_keepalive(
+                    async {
+                        drop(FailingDrop);
+                    },
+                    keepalive,
+                ))
+            })),
+            running: None,
+            owner: owner.clone(),
+            failure,
+            done: false,
+        };
+        owner.retain(Box::pin(predecessor));
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            store.inner.run_host(async {}).unwrap();
+        }))
+        .unwrap_err();
+        assert_eq!(
+            panic.downcast_ref::<&str>(),
+            Some(&"predecessor destructor first failure")
+        );
+        assert!(cleaned.load(Ordering::SeqCst));
+        assert!(store.inner.cleanup_owner().unwrap().is_idle());
+        drop(_registration);
+        drop(owner);
+        drop(wasi);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn actual_caller_drop_is_retired_by_the_original_public_sibling_driver() {
+        use super::super::{
+            wasi_config_capture_stdout, wasi_config_mapdir, wasi_config_new, wasi_env_delete,
+            wasi_env_initialize_instance, wasi_env_new, wasi_env_t, wasi_get_imports,
+        };
+        use crate::wasm_c_api::{
+            externals::{
+                wasm_extern_t, wasm_extern_vec_t, wasm_func_call, wasm_func_new_with_env,
+                wasm_func_t,
+            },
+            instance::wasm_instance_new,
+            module::wasm_module_new,
+            trap::wasm_trap_t,
+            types::{wasm_byte_vec_t, wasm_functype_t},
+            value::{wasm_val_t, wasm_val_vec_t},
+        };
+        use std::{
+            ffi::CString,
+            os::unix::fs::PermissionsExt,
+            sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+        };
+        use wasmer_api::{Function, FunctionType, Value};
+        struct Directory(std::path::PathBuf);
+        impl Drop for Directory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        struct Invoke {
+            target: RefCell<Option<wasm_func_t>>,
+            env: RefCell<Option<Box<wasi_env_t>>>,
+            calls: Rc<Cell<usize>>,
+            finalized: Rc<Cell<bool>>,
+        }
+        unsafe extern "C" fn invoke(
+            data: *mut std::ffi::c_void,
+            _: &wasm_val_vec_t,
+            _: &mut wasm_val_vec_t,
+        ) -> Option<Box<wasm_trap_t>> {
+            let invoke = unsafe { &*data.cast::<Invoke>() };
+            let mut target = invoke.target.borrow_mut().take().unwrap();
+            let args: wasm_val_vec_t = Vec::<wasm_val_t>::new().into();
+            let mut results: wasm_val_vec_t =
+                vec![wasm_val_t::from_value(&Value::I64(1234567), &target.extern_.store).unwrap()]
+                    .into();
+            let trap = unsafe { wasm_func_call(Some(&mut target), Some(&args), &mut results) };
+            assert!(trap.is_some());
+            assert_eq!(unsafe { results.as_slice()[0].of.int64_t }, 1234567);
+            invoke.calls.set(invoke.calls.get() + 1);
+            drop(trap);
+            drop(results);
+            drop(target); // The callback arena must not pin the target Store.
+            let environment = invoke.env.borrow_mut().take();
+            wasi_env_delete(environment);
+            None // Deliberately swallow the actual committed nested exec trap.
+        }
+        unsafe extern "C" fn finalize(data: *mut std::ffi::c_void) {
+            let invoke = unsafe { Box::from_raw(data.cast::<Invoke>()) };
+            invoke.finalized.set(true);
+            drop(invoke);
+        }
+        struct PanicWake {
+            caller: std::task::Waker,
+            dropped: Arc<AtomicBool>,
+        }
+        impl std::task::Wake for PanicWake {
+            fn wake(self: Arc<Self>) {
+                self.caller.wake_by_ref();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.caller.wake_by_ref();
+            }
+        }
+        impl Drop for PanicWake {
+            fn drop(&mut self) {
+                self.dropped.store(true, Ordering::SeqCst);
+                panic!("actual caller retirement waker destructor");
+            }
+        }
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        for panic_waker in [false, true] {
+            let directory = Directory(std::env::temp_dir().join(format!(
+                "wasmer-capi-caller-drop-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            )));
+            std::fs::create_dir(&directory.0).unwrap();
+            let child = wat::parse_str(
+                r#"(module
+            (import "wasix_32v1" "fd_write" (func $write (param i32 i32 i32 i32) (result i32)))
+            (import "wasix_32v1" "proc_exit2" (func $exit (param i32)))
+            (memory (export "memory") 1) (data (i32.const 100) "MUST-NOT-RUN")
+            (func (export "_start")
+                i32.const 0 i32.const 100 i32.store
+                i32.const 4 i32.const 12 i32.store
+                i32.const 1 i32.const 0 i32.const 1 i32.const 8 call $write drop
+                i32.const 0 call $exit unreachable))"#,
+            )
+            .unwrap();
+            std::fs::write(directory.0.join("child.wasm"), child).unwrap();
+            std::fs::set_permissions(
+                directory.0.join("child.wasm"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+            let engine = wasm_engine_new();
+            let mut target = unsafe { wasm_store_new(Some(&engine)) }.unwrap();
+            let weak_target = target.inner.downgrade();
+            let program = CString::new("parent").unwrap();
+            let alias = CString::new("prog").unwrap();
+            let host = CString::new(directory.0.to_str().unwrap()).unwrap();
+            let mut config = unsafe { wasi_config_new(program.as_ptr()) }.unwrap();
+            wasi_config_capture_stdout(&mut config);
+            assert!(unsafe { wasi_config_mapdir(&mut config, alias.as_ptr(), host.as_ptr()) });
+            let mut environment = unsafe { wasi_env_new(Some(&mut target), config) }.unwrap();
+            let capture = native_backend(&environment).stdout.clone().unwrap();
+            let bytes: wasm_byte_vec_t = wat::parse_str(r#"(module
+            (import "wasix_32v1" "proc_exec3" (func $exec (param i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+            (memory (export "memory") 1)
+            (global (export "resumed") (mut i32) (i32.const 0))
+            (data (i32.const 1000) "/prog/child.wasm") (data (i32.const 1040) "child\0a")
+            (func (export "run") (result i64)
+                i32.const 1000 i32.const 16 i32.const 1040 i32.const 6
+                i32.const 0 i32.const 0 i32.const 0 i32.const 0 i32.const 0 call $exec drop
+                i32.const 1 global.set 0 i64.const -1))"#).unwrap().into();
+            let module = unsafe { wasm_module_new(Some(&mut target), Some(&bytes)) }.unwrap();
+            let mut imports: wasm_extern_vec_t = Vec::<Option<Box<wasm_extern_t>>>::new().into();
+            assert!(unsafe {
+                wasi_get_imports(
+                    Some(&target),
+                    Some(&mut environment),
+                    Some(&module),
+                    &mut imports,
+                )
+            });
+            let mut instance = unsafe {
+                wasm_instance_new(Some(&mut target), Some(&module), Some(&imports), None)
+            }
+            .unwrap();
+            assert!(unsafe {
+                wasi_env_initialize_instance(&mut environment, &mut target, &mut instance)
+            });
+            let started = Arc::new(AtomicBool::new(false));
+            let cleaned = Arc::new(AtomicBool::new(false));
+            let (release, waiting) = tokio::sync::oneshot::channel::<()>();
+            let entered = started.clone();
+            let finished = cleaned.clone();
+            assert!(
+                native_backend(&environment)
+                    .environment()
+                    .loader_cleanup()
+                    .submit(Box::new(move || Box::pin(async move {
+                        entered.store(true, Ordering::SeqCst);
+                        let _ = waiting.await;
+                        let (send, receive) = tokio::sync::oneshot::channel();
+                        tokio::task::spawn_local(async move {
+                            tokio::task::yield_now().await;
+                            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                            finished.store(true, Ordering::SeqCst);
+                            let _ = send.send(());
+                        });
+                        let _ = receive.await;
+                    })))
+                    .is_ok()
+            );
+            let target_id = target
+                .inner
+                .with_mut(|store| store.objects_mut().id())
+                .unwrap();
+            let function = wasm_func_t {
+                extern_: wasm_extern_t::new(
+                    target.inner.clone(),
+                    instance
+                        .inner
+                        .exports
+                        .get_function("run")
+                        .unwrap()
+                        .clone()
+                        .into(),
+                ),
+            };
+            let calls = Rc::new(Cell::new(0));
+            let finalized = Rc::new(Cell::new(false));
+            let data = Box::into_raw(Box::new(Invoke {
+                target: RefCell::new(Some(function)),
+                env: RefCell::new(Some(environment)),
+                calls: calls.clone(),
+                finalized: finalized.clone(),
+            }));
+            let mut source = unsafe { wasm_store_new(Some(&engine)) }.unwrap();
+            let ty = wasm_functype_t::new(FunctionType::new([], []));
+            let callback = unsafe {
+                wasm_func_new_with_env(
+                    Some(&mut source),
+                    Some(&ty),
+                    Some(invoke),
+                    data.cast(),
+                    Some(finalize),
+                )
+            }
+            .unwrap();
+            let outer = source
+                .inner
+                .with_mut(|store| {
+                    let module = Module::new(
+                        store,
+                        r#"(module
+                (import "test" "invoke" (func $invoke))
+                (global (export "resumed") (mut i32) (i32.const 0))
+                (func (export "run") (result i64) call $invoke
+                    i32.const 1 global.set 0 i64.const 99))"#,
+                    )
+                    .unwrap();
+                    Instance::new(
+                        store,
+                        &module,
+                        &wasmer_api::imports! {"test" => {"invoke" => callback.extern_.function()}},
+                    )
+                    .unwrap()
+                })
+                .unwrap();
+            let function = outer.exports.get_function("run").unwrap().clone();
+            let asynchronous = source.inner.async_store().unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let wake_dropped = Arc::new(AtomicBool::new(false));
+            runtime.block_on(async {
+                let mut caller = Box::pin(function.call_async(&asynchronous, vec![]));
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    std::future::poll_fn(|cx| {
+                        assert!(
+                            caller.as_mut().poll(cx).is_pending(),
+                            "real loader retirement must still be held"
+                        );
+                        if started.load(Ordering::SeqCst) {
+                            Poll::Ready(())
+                        } else {
+                            Poll::Pending
+                        }
+                    }),
+                )
+                .await
+                .expect("real proc_exec reached its finite retirement job");
+                assert!(!cleaned.load(Ordering::SeqCst));
+                if panic_waker {
+                    // The root has settled and is now polling only its actual
+                    // target retirement tail. Install a real caller Waker whose
+                    // final destructor runs when that tail unsubscribes on Drop.
+                    std::future::poll_fn(|cx| {
+                        let waker = std::task::Waker::from(Arc::new(PanicWake {
+                            caller: cx.waker().clone(),
+                            dropped: wake_dropped.clone(),
+                        }));
+                        assert!(
+                            caller
+                                .as_mut()
+                                .poll(&mut Context::from_waker(&waker))
+                                .is_pending()
+                        );
+                        Poll::Ready(())
+                    })
+                    .await;
+                }
+                let dropped =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(caller)));
+                assert!(
+                    dropped.is_ok(),
+                    "concrete tail preserves its destructor panic until finite cleanup"
+                );
+                assert!(!cleaned.load(Ordering::SeqCst));
+            });
+            assert_eq!(calls.get(), 1);
+            assert!(wasmer_api::Store::with_current(|_| ()).is_none());
+            assert!(wasmer_api::sys::WeakNativeInvocation::current().is_none());
+            release.send(()).unwrap();
+            // The ordinary PUBLIC same-target call is the only retirement producer.
+            // No private Driver clone/run_local or extra task/runtime is introduced.
+            let sibling = target
+                .inner
+                .with_mut(|store| Function::new_typed(store, || 42i32))
+                .unwrap();
+            let mut public = wasm_func_t {
+                extern_: wasm_extern_t::new(target.inner.clone(), sibling.clone().into()),
+            };
+            let args: wasm_val_vec_t = Vec::<wasm_val_t>::new().into();
+            let mut results: wasm_val_vec_t =
+                vec![wasm_val_t::from_value(&Value::I32(-1), &target.inner).unwrap()].into();
+            if panic_waker {
+                // Injected Rust panic is observed at the existing common Rust call
+                // boundary, never by unwinding across an extern C function.
+                let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    target.inner.call(&sibling, Vec::new())
+                }))
+                .unwrap_err();
+                assert_eq!(
+                    panic.downcast_ref::<&str>(),
+                    Some(&"actual caller retirement waker destructor")
+                );
+                assert!(wake_dropped.load(Ordering::SeqCst));
+                assert!(
+                    cleaned.load(Ordering::SeqCst),
+                    "first panic surfaces after finite cleanup"
+                );
+            }
+            assert!(
+                unsafe { wasm_func_call(Some(&mut public), Some(&args), &mut results) }.is_none()
+            );
+            assert_eq!(unsafe { results.as_slice()[0].of.int32_t }, 42);
+            assert!(cleaned.load(Ordering::SeqCst));
+            assert_eq!(
+                target
+                    .inner
+                    .with_mut(|store| store.objects_mut().id())
+                    .unwrap(),
+                target_id
+            );
+            assert_eq!(
+                target
+                    .inner
+                    .with_mut(|store| instance
+                        .inner
+                        .exports
+                        .get_global("resumed")
+                        .unwrap()
+                        .get(store)
+                        .i32())
+                    .unwrap(),
+                Some(0)
+            );
+            assert_eq!(
+                source
+                    .inner
+                    .with_mut(|store| outer
+                        .exports
+                        .get_global("resumed")
+                        .unwrap()
+                        .get(store)
+                        .i32())
+                    .unwrap(),
+                Some(0)
+            );
+            let base = target.inner.async_store().unwrap();
+            let mut lock = Box::pin(base.write_lock());
+            assert!(
+                lock.as_mut()
+                    .poll(&mut Context::from_waker(std::task::Waker::noop()))
+                    .is_ready(),
+                "actual target write/loan fence released"
+            );
+            drop(lock);
+            drop(base);
+            assert!(target.inner.cleanup_owner().unwrap().is_idle());
+            assert_eq!(
+                capture.read(&mut [0; 16]),
+                0,
+                "canceled unclaimed exec never runs child"
+            );
+            assert!(
+                unsafe { wasm_func_call(Some(&mut public), Some(&args), &mut results) }.is_none()
+            );
+            drop(results);
+            drop(public);
+            drop(imports);
+            drop(instance);
+            drop(module);
+            // Legal outer shutdown boundary: R is no longer actively polling. This
+            // does not claim last-Store destruction inside an active R is solved.
+            drop(target);
+            assert!(
+                weak_target.upgrade().is_none(),
+                "no completion job retains C API StoreState"
+            );
+            drop(outer);
+            drop(callback);
+            drop(asynchronous);
+            drop(source);
+            assert!(finalized.get());
         }
     }
 

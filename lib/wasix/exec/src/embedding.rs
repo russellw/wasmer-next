@@ -316,21 +316,51 @@ impl<S: Syscalls + Control + Send + Sync + 'static> HostEnvironment<S> {
 
     /// Releases only this environment's Store-local handles after its calls settle.
     pub fn deactivate(&self, store: &mut StoreMut<'_>) {
+        let mut first = None;
+        let mut attempt = |action: &mut dyn FnMut()| {
+            if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(action)) {
+                if first.is_none() {
+                    first = Some(panic);
+                } else {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(panic)));
+                }
+            }
+        };
+        // InstanceHooks takes its attached cells before invoking any callbacks.
+        // A retry therefore never replays a panicked attachment.
         let hooks = self.env.as_ref(store).instance_hooks().cloned();
         if let Some(hooks) = hooks {
-            hooks.deactivate(store);
+            attempt(&mut || hooks.deactivate(store));
         }
-        let data = self.env.as_mut(store);
-        data.proc.handoff.retire_process();
-        data.memory = None;
-        data.abi = None;
-        data.imports = wasmer::Imports::new();
-        data.abi_imports = None;
-        data.threads = None;
-        data.proc.module = None;
-        data.asyncify = None;
-        data.base = None;
-        data.stack_pointer = None;
+        let handoff = self.env.as_ref(store).proc.handoff.clone();
+        attempt(&mut || handoff.retire_process());
+        // Take each actual owning handle BEFORE its destructor, and leave no
+        // user Drop under the Store's ExecEnv borrow. Continue after first panic.
+        macro_rules! clear {
+            ($field:ident) => {{
+                let value = self.env.as_mut(store).$field.take();
+                let mut value = Some(value);
+                attempt(&mut || {
+                    let _value = value.take();
+                });
+            }};
+        }
+        clear!(memory);
+        clear!(abi);
+        let imports = std::mem::take(&mut self.env.as_mut(store).imports);
+        let mut imports = Some(imports);
+        attempt(&mut || drop(imports.take()));
+        clear!(abi_imports);
+        clear!(threads);
+        let module = self.env.as_mut(store).proc.module.take();
+        let mut module = Some(module);
+        attempt(&mut || drop(module.take()));
+        clear!(asyncify);
+        clear!(base);
+        clear!(stack_pointer);
+        if let Some(panic) = first {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     pub fn set_binding(&self, store: &mut StoreMut<'_>, abi: Arc<dyn AbiInstance<S>>) {
@@ -494,10 +524,39 @@ impl HostCallHandoff {
                 _ => None,
             }
         };
+        let mut failure = None;
         if let Some(terminal) = terminal {
-            self.spawner
-                .retire_committed(terminal, self.handoff.clone())
-                .await;
+            let mut opaque_failure = None;
+            let mut retiring = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.spawner
+                    .retire_committed(terminal.clone(), self.handoff.clone())
+            })) {
+                Ok(retiring) => Some(retiring),
+                Err(panic) => {
+                    opaque_failure = Some(panic);
+                    None
+                }
+            };
+            failure = std::future::poll_fn(|cx| {
+                if opaque_failure.is_some() {
+                    return std::task::Poll::Pending;
+                }
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    retiring.as_mut().unwrap().as_mut().poll(cx)
+                })) {
+                    Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+                    Ok(std::task::Poll::Ready(())) => std::task::Poll::Ready(None),
+                    Err(panic) if terminal.is_finished() => std::task::Poll::Ready(Some(panic)),
+                    // Keep the SAME unfinished retirement future/entry and
+                    // panic inside this caller-owned continuation. No generic
+                    // opaque-future retry, unwind, or fake completion is legal.
+                    Err(panic) => {
+                        opaque_failure = Some(panic);
+                        std::task::Poll::Pending
+                    }
+                }
+            })
+            .await;
         }
         let old = std::mem::replace(
             &mut *self
@@ -506,7 +565,16 @@ impl HostCallHandoff {
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
             HostCallState::Retired,
         );
-        drop(old);
+        if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(old))) {
+            if failure.is_none() {
+                failure = Some(panic);
+            } else {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(panic)));
+            }
+        }
+        if let Some(panic) = failure {
+            std::panic::resume_unwind(panic);
+        }
     }
 }
 
@@ -514,6 +582,59 @@ impl HostCallHandoff {
 mod selection_tests {
     use super::*;
     use crate::process::tests::{NoThreads, Recorder};
+
+    #[test]
+    fn existing_retire_commits_its_exact_state_before_delivering_fallback_drop_panic() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Lease(Arc<AtomicUsize>);
+        impl crate::ExecProcessLease for Lease {}
+        impl Drop for Lease {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                panic!("retired handoff lease destructor");
+            }
+        }
+        let store = wasmer::Store::default();
+        let control = Arc::new(Recorder::default());
+        let drops = Arc::new(AtomicUsize::new(0));
+        let task = wasixv2_syscalls::TaskId(79);
+        let terminal = crate::PreinstalledTerminalCustody::new(
+            task,
+            process::ExecImage::new(
+                wasixv2_syscalls::Image::copied(Vec::new()),
+                Some(Box::new(Lease(drops.clone()))),
+            ),
+        );
+        terminal.cancel();
+        let handoff = HostCallHandoff {
+            handoff: Arc::default(),
+            spawner: process::spawner(
+                store.engine().clone(),
+                control.clone(),
+                Arc::new(NoThreads),
+                Arc::new(Abis::wasixv2()),
+            ),
+            state: Arc::new(std::sync::Mutex::new(HostCallState::Exec(terminal.clone()))),
+        };
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            futures::executor::block_on(handoff.retire());
+        }))
+        .unwrap_err();
+        assert_eq!(
+            panic.downcast_ref::<&str>(),
+            Some(&"retired handoff lease destructor")
+        );
+        assert!(terminal.is_finished());
+        assert!(matches!(
+            *handoff.state.lock().unwrap(),
+            HostCallState::Retired
+        ));
+        assert_eq!(*control.released.lock().unwrap(), [task]);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        futures::executor::block_on(handoff.retire());
+        assert_eq!(*control.released.lock().unwrap(), [task]);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn rejected_host_selection_never_recreates_an_expired_attachment() {
