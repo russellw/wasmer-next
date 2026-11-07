@@ -340,7 +340,9 @@ impl<S: Syscalls + Control + Send + Sync + 'static> HostEnvironment<S> {
             ($field:ident) => {{
                 let value = self.env.as_mut(store).$field.take();
                 let mut value = Some(value);
-                attempt(&mut || drop(value.take()));
+                attempt(&mut || {
+                    let _value = value.take();
+                });
             }};
         }
         clear!(memory);
