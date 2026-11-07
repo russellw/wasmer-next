@@ -482,29 +482,38 @@ impl RetirementFailure {
         binding.bound = true;
         Ok(())
     }
-    pub(crate) fn record(&self, payload: RetirementPanic) {
+    fn stamp(&self, payload: RetirementPanic) -> RetirementEvent {
         let clock = self.binding().borrow().clock.clone();
         let order = clock.get().checked_add(1);
         if let Some(order) = order {
             clock.set(order);
         }
-        // Exhaustion retains the exact first payload in THIS carrier, without
-        // fabricating an ordinal, panicking, or acknowledging delivery.
-        if let Err(secondary) = self.accept_event(RetirementEvent {
+        RetirementEvent {
             order,
             clock,
             payload,
-        }) {
-            // This record follows an already-owned first event in the SAME
-            // carrier. Preserve that earlier event; secondary Drop is guarded.
-            if let Err(panic) =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(secondary)))
-            {
-                discard_retirement_panic(panic);
-            }
         }
     }
+    pub(crate) fn record(&self, payload: RetirementPanic) {
+        let event = self.stamp(payload);
+        let secondary = match self.publish_event(event) {
+            Ok(secondary) => secondary,
+            // A following raw event in THIS carrier cannot displace its already
+            // owned unstamped first. Preserve it, but catch actual secondary Drop.
+            Err(secondary) => Some(secondary),
+        };
+        self.dispose_secondary(secondary);
+    }
     fn accept_event(&self, event: RetirementEvent) -> Result<(), RetirementEvent> {
+        let secondary = self.publish_event(event)?;
+        self.dispose_secondary(secondary);
+        Ok(())
+    }
+    // Metadata-only commit. No user callback/payload Drop under these borrows.
+    fn publish_event(
+        &self,
+        event: RetirementEvent,
+    ) -> Result<Option<RetirementEvent>, RetirementEvent> {
         {
             let mut binding = self.binding().borrow_mut();
             assert!(
@@ -518,9 +527,6 @@ impl RetirementFailure {
         let previous = self.0.borrow_mut().take();
         let (first, secondary) = match previous {
             Some(previous) if previous.order.is_none() || event.order.is_none() => {
-                // No ordering between unstamped distinct carriers is defined.
-                // A transfer returns exact custody to its caller, keeping the
-                // current first payload rather than replacing it with an error.
                 *self.0.borrow_mut() = Some(previous);
                 return Err(event);
             }
@@ -529,14 +535,28 @@ impl RetirementFailure {
             None => (event, None),
         };
         *self.0.borrow_mut() = Some(first);
-        // Payload destruction can reenter. Publish the actual earlier value
-        // before disposing a secondary, and hold no carrier/binding borrow.
-        if let Err(panic) =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(secondary)))
-        {
-            discard_retirement_panic(panic);
+        Ok(secondary)
+    }
+    fn dispose_secondary(&self, mut secondary: Option<RetirementEvent>) {
+        while let Some(event) = secondary.take() {
+            let unwinding = std::thread::panicking();
+            let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(event)))
+            else {
+                return;
+            };
+            if unwinding {
+                discard_retirement_panic(panic);
+                return;
+            }
+            // Reentry may have CLAIMED the published first value. A newly
+            // caught N then belongs to this SAME carrier and must reopen it
+            // before another callback/destructor, never be silently discarded.
+            let event = self.stamp(panic);
+            secondary = match self.publish_event(event) {
+                Ok(secondary) => secondary,
+                Err(secondary) => Some(secondary),
+            };
         }
-        Ok(())
     }
     fn has_unstamped_event(&self) -> bool {
         self.0
@@ -3719,6 +3739,9 @@ mod tests {
         struct Reenter {
             owner: wasmer_api::sys::NativeCleanupOwner,
             jobs: Rc<std::cell::Cell<usize>>,
+            consume: std::cell::Cell<bool>,
+            state: Option<Rc<NativeRetirementState>>,
+            claimed: Rc<RefCell<Option<RetirementPanic>>>,
         }
         unsafe extern "C" fn admit(
             data: *mut std::ffi::c_void,
@@ -3726,6 +3749,14 @@ mod tests {
             _: &mut wasm_val_vec_t,
         ) -> Option<Box<wasm_trap_t>> {
             let control = unsafe { &*data.cast::<Reenter>() };
+            if control.consume.replace(false) {
+                let state = control.state.as_ref().unwrap();
+                assert!(state.physically_ready());
+                let mut owned = None;
+                assert!(state.claim(&mut owned)); // OWN exact I BEFORE real ack
+                *control.claimed.borrow_mut() = owned;
+                assert!(state.delivery_ack.get());
+            }
             let jobs = control.jobs.clone();
             control
                 .owner
@@ -3799,6 +3830,9 @@ mod tests {
             let control = Box::into_raw(Box::new(Reenter {
                 owner: owner.clone(),
                 jobs: jobs.clone(),
+                consume: std::cell::Cell::new(false),
+                state: None,
+                claimed: Rc::default(),
             }));
             let mut public = wasm_store_t {
                 inner: source.clone(),
@@ -3870,6 +3904,135 @@ mod tests {
             drop(function);
             drop(public);
             drop(source);
+        }
+        // Actual release publication owns the SAME receipt while SOURCE claims
+        // and acknowledges I, then Q's destructor throws newly unclaimed N.
+        {
+            struct WakeQ(std::sync::Mutex<Option<Chain>>);
+            impl std::task::Wake for WakeQ {
+                fn wake(self: Arc<Self>) {
+                    self.wake_by_ref();
+                }
+                fn wake_by_ref(self: &Arc<Self>) {
+                    let chain = self.0.lock().unwrap().take();
+                    if let Some(chain) = chain {
+                        std::panic::resume_unwind(Box::new(chain));
+                    }
+                }
+            }
+            let target = StoreRef::new(Store::default()).unwrap();
+            let owner = target.cleanup_owner().unwrap();
+            let exit = owner.enter_exit_boundary();
+            let done = Rc::new(std::cell::Cell::new(false));
+            let registration = target
+                .register_owned_retirement(done.clone(), RetirementFailure::default())
+                .unwrap();
+            registration.commit();
+            let state = registration.state();
+            registration.relinquish();
+            target.retain_delivery(state.clone()).unwrap();
+            let first = Box::new(Primary(0x1357_2468));
+            let first_address = (&*first) as *const Primary;
+            state.failure.record(first);
+            let claimed = Rc::new(RefCell::new(None));
+            let source = StoreRef::new(Store::default()).unwrap();
+            let jobs = Rc::new(std::cell::Cell::new(0));
+            let control = Box::into_raw(Box::new(Reenter {
+                owner: owner.clone(),
+                jobs: jobs.clone(),
+                consume: std::cell::Cell::new(true),
+                state: Some(state.clone()),
+                claimed: claimed.clone(),
+            }));
+            let mut public = wasm_store_t {
+                inner: source.clone(),
+            };
+            let ty = wasm_functype_t::new(wasmer_api::FunctionType::new([], []));
+            let function = unsafe {
+                wasm_func_new_with_env(
+                    Some(&mut public),
+                    Some(&ty),
+                    Some(admit),
+                    control.cast(),
+                    Some(release),
+                )
+            }
+            .unwrap();
+            let visits = Arc::new(AtomicUsize::new(0));
+            let wake =
+                std::task::Waker::from(Arc::new(WakeQ(std::sync::Mutex::new(Some(Chain {
+                    remaining: 3,
+                    drops: visits.clone(),
+                    owner: std::thread::current().id(),
+                    source: source.downgrade(),
+                    callback: function.extern_.function(),
+                })))));
+            assert!(state.register_release_waker(&wake));
+            let release_receipt = target.retirement_release(state.clone()).unwrap();
+            owner
+                .try_retain(async move {
+                    done.set(true);
+                    release_receipt.release();
+                })
+                .unwrap_or_else(|_| panic!("actual terminal task refused"));
+            assert_eq!(
+                claimed
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .downcast_ref::<Primary>()
+                    .unwrap() as *const _,
+                first_address
+            );
+            assert!(state.physically_ready() && !state.publishing.get());
+            assert!(
+                !state.delivery_ack.get(),
+                "new N REOPENS the same acknowledged carrier"
+            );
+            assert!(
+                state.receipt_queued.get(),
+                "actual publisher repairs SAME delivery receipt after reentry"
+            );
+            assert_eq!(state.failure.0.borrow().as_ref().unwrap().order, Some(3));
+            assert_eq!(
+                state
+                    .failure
+                    .0
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .payload
+                    .downcast_ref::<Chain>()
+                    .unwrap()
+                    .remaining,
+                2
+            );
+            assert_eq!(
+                visits.load(Ordering::SeqCst),
+                1,
+                "N is still OWNED, never discarded at its original catch"
+            );
+            assert_eq!(jobs.get(), 1);
+            let pending = state.ledger.snapshot();
+            assert_eq!(pending.len(), 1);
+            assert!(Rc::ptr_eq(&pending[0], &state));
+            let mut n = None;
+            assert!(state.claim(&mut n));
+            owner.notify();
+            assert!(state.delivery_ack.get() && !state.receipt_queued.get());
+            assert!(state.ledger.snapshot().is_empty());
+            discard_retirement_panic(n.unwrap()); // explicit final consumer owns N
+            assert_eq!(visits.load(Ordering::SeqCst), 4);
+            assert_eq!(jobs.get(), 4);
+            drop(claimed.borrow_mut().take());
+            drop(wake);
+            drop(exit);
+            drop(function);
+            drop(public);
+            drop(source);
+            drop(pending);
+            drop(state);
+            drop(target);
         }
     }
 
