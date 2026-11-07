@@ -244,6 +244,17 @@ impl LoaderSettlement {
     }
 }
 impl LoaderSettlementObserver {
+    fn subscribe(&self) {
+        let identity = Arc::downgrade(&self.waiter);
+        let mut waiters = self
+            .state
+            .waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !waiters.iter().any(|waiter| waiter.ptr_eq(&identity)) {
+            waiters.push(identity);
+        }
+    }
     fn unregister(&self) {
         self.state
             .waiters
@@ -267,6 +278,10 @@ impl Future for LoaderSettlementObserver {
             self.unregister();
             return Poll::Ready(());
         }
+        // Closed readiness is nonmonotonic: a later real callback/destructor
+        // span may be active after Ready removed this observer's registration.
+        // Rearm the SAME identity before callback-bearing clone/drop code.
+        self.subscribe();
         let next = Arc::new(cx.waker().clone());
         let previous = self
             .waiter
@@ -2126,6 +2141,93 @@ mod local_custody_tests {
                     .poll(&mut Context::from_waker(Waker::noop()))
                     .is_ready()
             );
+        }
+    }
+    #[test]
+    fn settlement_ready_observer_rearms_during_actual_scope_destruction_and_unwind() {
+        struct ReenterHost {
+            executor: QueueHost,
+            observer: Arc<Mutex<Option<LoaderSettlementObserver>>>,
+            wake: Arc<SettlementWake>,
+            entered: Arc<AtomicUsize>,
+            panic: bool,
+        }
+        impl Host for ReenterHost {
+            fn realtime(&self) -> Duration {
+                Duration::ZERO
+            }
+            fn monotonic(&self) -> Duration {
+                Duration::ZERO
+            }
+            fn sleep(&self, _: Duration) -> LocalFuture<'_, ()> {
+                Box::pin(async {})
+            }
+            fn random(&self, _: &mut [u8]) {}
+            fn executor(&self) -> &dyn Executor {
+                &self.executor
+            }
+            fn report(&self, _: &str) {}
+        }
+        impl Drop for ReenterHost {
+            fn drop(&mut self) {
+                let mut observer = self.observer.lock().unwrap().take().unwrap();
+                let waker = Waker::from(self.wake.clone());
+                assert!(
+                    Pin::new(&mut observer)
+                        .poll(&mut Context::from_waker(&waker))
+                        .is_pending(),
+                    "the actual host resource destructor is still running"
+                );
+                *self.observer.lock().unwrap() = Some(observer);
+                self.entered.fetch_add(1, Ordering::SeqCst);
+                if self.panic {
+                    panic!("original scope host callback");
+                }
+            }
+        }
+        for panic in [false, true] {
+            let observer = Arc::new(Mutex::new(None));
+            let wake = Arc::new(SettlementWake(AtomicUsize::new(0)));
+            let entered = Arc::new(AtomicUsize::new(0));
+            let scope = LoaderCleanup::new(Arc::new(ReenterHost {
+                executor: QueueHost(AtomicBool::new(false)),
+                observer: observer.clone(),
+                wake: wake.clone(),
+                entered: entered.clone(),
+                panic,
+            }));
+            let settlement = scope.settlement();
+            drop(scope.run(std::future::pending::<()>())); // REAL canonical closer
+            let mut same = settlement.observer();
+            assert!(
+                Pin::new(&mut same)
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_ready()
+            );
+            *observer.lock().unwrap() = Some(same);
+            assert_eq!(wake.0.load(Ordering::SeqCst), 0);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(scope)));
+            if panic {
+                assert_eq!(
+                    result.unwrap_err().downcast_ref::<&str>(),
+                    Some(&"original scope host callback")
+                );
+            } else {
+                assert!(result.is_ok());
+            }
+            assert_eq!(entered.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                wake.0.load(Ordering::SeqCst),
+                1,
+                "completion must wake the rearmed original observer"
+            );
+            let mut same = observer.lock().unwrap().take().unwrap();
+            assert!(
+                Pin::new(&mut same)
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_ready()
+            );
+            assert!(settlement.is_ready());
         }
     }
 }
