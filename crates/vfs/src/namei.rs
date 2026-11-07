@@ -332,10 +332,11 @@ impl<'a> Walk<'a> {
     }
 
     fn cross_entry(&self, mut entry: ResolvedEntry) -> PathResult<ResolvedEntry> {
-        if let ResolvedEntry::Pinned(path) = &mut entry {
-            if self.vfs.tree.follow_mounts(path) && self.flags.no_xdev {
-                return Err(Errno::EXDEV.into());
-            }
+        if let ResolvedEntry::Pinned(path) = &mut entry
+            && self.vfs.tree.follow_mounts(path)
+            && self.flags.no_xdev
+        {
+            return Err(Errno::EXDEV.into());
         }
         Ok(entry)
     }

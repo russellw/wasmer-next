@@ -14,7 +14,7 @@ use wasixv2_abi::OpenFlags;
 use wasixv2_vfs::{
     Attr, Clock, Cred, Ctx, Errno, FileType, Filesystem, FsInfo, FsResult, Handle, LookupEntry,
     LookupFlags, NewKind, NewNode, Node, ObservedAttr, OpenHow, OpenOptions, ResolvedEntry,
-    Security, SetAttr, StatFs, Timestamp, Vfs,
+    SetAttr, StatFs, Timestamp, Vfs,
 };
 use wasixv2_vfs_mem::MemFs;
 
