@@ -3700,7 +3700,7 @@ fn macos_name_observations_preserve_guest_stat_write_grants_and_parent_name_oper
         .unwrap();
     assert_eq!(fs::metadata(dir.path().join("write")).unwrap().len(), 0);
     assert_eq!(t.write(fd, b"new"), Ok(3));
-    fs::set_permissions(dir.path().join("write"), fs::Permissions::from_mode(0)).unwrap();
+    fs::set_permissions(dir.path().join("write"), fs::Permissions::from_mode(0o000)).unwrap();
     assert_eq!(block_on(kernel.ftruncate64(&t.caller, fd, 1)), Ok(0));
     assert_eq!(t.write(fd, b"!"), Ok(1));
     assert_eq!(
