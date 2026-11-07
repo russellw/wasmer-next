@@ -2453,8 +2453,6 @@ mod tests {
             0,
             "the actual independent pin still owns the opaque receipt"
         );
-        drop(a);
-        drop(b);
         drop(store);
         assert_eq!(unsafe { pin.as_ptr().read() }, 93);
         drop(pin);

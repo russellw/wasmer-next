@@ -205,15 +205,15 @@ pub(crate) trait ContinuationEndpoint {
 }
 
 #[cfg(all(feature = "sys", feature = "wasi"))]
+type ContinuationFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), RuntimeError>>>>;
+#[cfg(all(feature = "sys", feature = "wasi"))]
+type ContinuationEntry = Box<dyn FnOnce() -> ContinuationFuture>;
+
+#[cfg(all(feature = "sys", feature = "wasi"))]
 pub(crate) struct LocalContinuation {
     pub(crate) store: StoreRef,
-    pub(crate) run: Option<
-        Box<
-            dyn FnOnce() -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = Result<(), RuntimeError>>>,
-            >,
-        >,
-    >,
+    pub(crate) run: Option<ContinuationEntry>,
     pub(crate) cancel: Option<Box<dyn FnOnce()>>,
 }
 #[cfg(all(feature = "sys", feature = "wasi"))]
@@ -548,6 +548,8 @@ impl StoreRef {
         })?
     }
 
+    // Preserve the engine's existing typed instantiation error at this boundary.
+    #[allow(clippy::result_large_err)]
     pub(crate) fn instantiate(
         &self,
         module: &Module,
@@ -586,6 +588,7 @@ impl StoreRef {
     }
 
     #[cfg(feature = "sys")]
+    #[allow(clippy::result_large_err)]
     fn instantiate_native(
         &self,
         module: &Module,
@@ -880,12 +883,11 @@ impl Driver {
         let mut output = None;
         std::future::poll_fn(|cx| {
             let _ = self.owner.poll_idle(cx);
-            if output.is_none() {
-                if let std::task::Poll::Ready(value) =
+            if output.is_none()
+                && let std::task::Poll::Ready(value) =
                     observer.with_real_context(cx, |cx| future.as_mut().poll(cx))
-                {
-                    output = Some(value);
-                }
+            {
+                output = Some(value);
             }
             // The guest can finish a nested local observer which clears the
             // same pump's drain registration. Reinstall before waiting for any
@@ -1180,7 +1182,6 @@ fn retire_store(
         attempt_retirement(&mut first_panic, || drop(store));
     }
     while !attempt_retirement(&mut first_panic, || drain(None, false)) {}
-    drop(drain);
     drop(_clear);
     // Runtime destruction can block and is illegal in a foreign Tokio callback.
     // Only the Send runtime moves; all Store/LocalSet custody stayed on this thread.

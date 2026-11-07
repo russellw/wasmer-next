@@ -96,7 +96,7 @@ pub unsafe extern "C" fn wasm_memory_size(memory: Option<&wasm_memory_t>) -> u32
         update_last_error("memory pointer is null");
         return 0;
     };
-    c_try!(memory.extern_.store.with_mut(|store| memory.extern_.memory().view(store).size().0 as u32); otherwise 0)
+    c_try!(memory.extern_.store.with_mut(|store| memory.extern_.memory().view(store).size().0); otherwise 0)
 }
 
 // delta is in pages

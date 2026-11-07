@@ -27,9 +27,11 @@ use wasixv2_wasix1::{
 };
 use wasmer_api::{AsStoreAsync, AsStoreMut, Imports, Instance, Module, RuntimeError, StoreMut};
 
+type CaptureState = (VecDeque<(Vec<u8>, usize)>, bool);
+
 #[derive(Default)]
 struct Capture {
-    queue: Mutex<(VecDeque<(Vec<u8>, usize)>, bool)>,
+    queue: Mutex<CaptureState>,
     ready: Condvar,
 }
 struct Writer(Arc<Capture>);
@@ -383,10 +385,320 @@ fn validate_preopens(preopens: &[(String, String)]) -> Result<(), ConfigurationE
     Ok(())
 }
 
+/// Keeps the original loader runner when canceled and transfers it before any
+/// destructor callback. A panicked runner transfers its own final-drain keepalive.
+struct PredecessorRetirement {
+    ancestry: Option<wasmer_api::sys::NativeAncestrySettlement>,
+    start: Option<Box<dyn FnOnce() -> LocalFuture<'static, ()>>>,
+    running: Option<LocalFuture<'static, ()>>,
+    owner: CleanupRetirement,
+    done: bool,
+}
+impl Future for PredecessorRetirement {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = self.get_mut();
+        if let Some(ancestry) = &mut this.ancestry {
+            if Pin::new(ancestry).poll(cx).is_pending() {
+                return Poll::Pending;
+            }
+            this.ancestry = None;
+        }
+        if this.running.is_none() {
+            this.running = Some(this.start.take().expect("one predecessor runner")());
+        }
+        let polled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            this.running.as_mut().unwrap().as_mut().poll(cx)
+        }));
+        match polled {
+            Ok(Poll::Pending) => Poll::Pending,
+            Ok(Poll::Ready(())) => {
+                this.done = true;
+                this.running = None;
+                Poll::Ready(())
+            }
+            Err(panic) => {
+                this.done = true;
+                // Never repoll a panicked async guest. Runner::drop retains its
+                // real final drain and terminal keepalive in the same local sink.
+                drop(this.running.take());
+                std::panic::resume_unwind(panic)
+            }
+        }
+    }
+}
+impl Drop for PredecessorRetirement {
+    fn drop(&mut self) {
+        if !self.done {
+            let replacement = Self {
+                ancestry: self.ancestry.take(),
+                start: self.start.take(),
+                running: self.running.take(),
+                owner: self.owner.clone(),
+                done: false,
+            };
+            self.owner.retain(Box::pin(replacement));
+        }
+    }
+}
+struct TerminalKeepalive {
+    owner: CleanupRetirement,
+    terminal: Option<LocalFuture<'static, ()>>,
+}
+impl Drop for TerminalKeepalive {
+    fn drop(&mut self) {
+        if let Some(terminal) = self.terminal.take() {
+            self.owner.retain(terminal);
+        }
+    }
+}
+struct CancelHandoff(Option<HostCallHandoff>);
+impl Drop for CancelHandoff {
+    fn drop(&mut self) {
+        if let Some(handoff) = self.0.take() {
+            handoff.cancel();
+        }
+    }
+}
+enum Admission {
+    Worker(Result<OwnedEntryWaiter, ExecError>),
+    Detached,
+}
+
+impl Endpoint {
+    fn enqueue(
+        self: Rc<Self>,
+        store: &StoreRef,
+        error: &RuntimeError,
+        admitted: bool,
+    ) -> Result<LocalContinuation, RuntimeError> {
+        let handoff = store
+            .with_mut(|store| self.env.call_handoff(store, error))?
+            .ok_or_else(|| {
+                RuntimeError::new("WASI handoff no longer belongs to this environment")
+            })?;
+        let asynchronous = store.async_store()?;
+        let owner = store.retirement_owner()?;
+        let native_owner = store.cleanup_owner()?;
+        let ancestry = wasmer_api::sys::NativeAncestrySettlement::current(Some(&native_owner));
+        let local =
+            wasixv2_exec::local_cleanup_runner(&asynchronous, self.env.loader_cleanup().clone())
+                .ok_or_else(|| RuntimeError::new("native loader retirement runner is missing"))?;
+        let (predecessor_tx, predecessor_rx) = tokio::sync::oneshot::channel::<()>();
+        let (admission_tx, admission_rx) = tokio::sync::oneshot::channel::<Admission>();
+        let (result_tx, mut result_rx) = tokio::sync::oneshot::channel::<Result<i32, ExecError>>();
+        let deactivated = Rc::new(Cell::new(false));
+        let terminal_deactivated = deactivated.clone();
+        let completed = Rc::new(Cell::new(false));
+        let terminal_completed = completed.clone();
+        let terminal_completion = owner.clone();
+        let terminal_env = self.env.clone();
+        let terminal_store = asynchronous.store();
+        let terminal_endpoint = self.clone();
+        let terminal_handoff = handoff.clone();
+        // This future is owned before claim and before the synchronous starter.
+        // The original runner releases it only after its actual final drain.
+        let terminal = Box::pin(async move {
+            {
+                // A panic while obtaining the guest's original fence still has
+                // this final actual Store fence before the worker barrier opens.
+                let mut guard = terminal_store.write_lock().await;
+                if !terminal_deactivated.get() {
+                    terminal_env.deactivate(&mut guard.as_store_mut());
+                    terminal_deactivated.set(true);
+                }
+            }
+            drop(terminal_store);
+            drop(terminal_env);
+            let _ = predecessor_tx.send(());
+            let result = match admission_rx.await {
+                Ok(Admission::Worker(Ok(waiter))) => {
+                    // Poll fallback authority alongside the waiter: an executor
+                    // can accept and then drop its unentered ThreadStart closure.
+                    let mut waiter = Box::pin(waiter);
+                    let mut retire = Box::pin(terminal_handoff.retire());
+                    let mut result = None;
+                    let mut retired = false;
+                    std::future::poll_fn(|cx| {
+                        if !retired {
+                            retired = retire.as_mut().poll(cx).is_ready();
+                        }
+                        if result.is_none()
+                            && let Poll::Ready(value) = waiter.as_mut().poll(cx)
+                        {
+                            result = Some(value);
+                        }
+                        if retired && result.is_some() {
+                            Poll::Ready(result.take().unwrap())
+                        } else {
+                            Poll::Pending
+                        }
+                    })
+                    .await
+                }
+                Ok(Admission::Worker(Err(error))) => {
+                    terminal_handoff.cancel();
+                    Err(error)
+                }
+                Ok(Admission::Detached) => terminal_handoff.wait_detached().await,
+                Err(_) => {
+                    terminal_handoff.cancel();
+                    Err(ExecError::Dropped)
+                }
+            };
+            terminal_handoff.retire().await;
+            // The exact accepted/fallback owner has now finished native and
+            // loader cleanup and released the task. Disarm the host guard once.
+            let mut process = terminal_endpoint.process.borrow_mut().take();
+            if let Some(process) = process.as_mut() {
+                process.released();
+            }
+            *terminal_endpoint.process.borrow_mut() = process;
+            terminal_completed.set(true);
+            let _ = result_tx.send(result);
+            terminal_completion.notify_completion();
+        }) as LocalFuture<'static, ()>;
+        let keepalive = TerminalKeepalive {
+            owner: owner.clone(),
+            terminal: Some(terminal),
+        };
+        let retiring_env = self.env.clone();
+        let start = Box::new(move || {
+            Box::pin(local.run_with_keepalive(
+                async move {
+                    let mut guard = asynchronous.write_lock().await;
+                    retiring_env.deactivate(&mut guard.as_store_mut());
+                    deactivated.set(true);
+                },
+                keepalive,
+            )) as LocalFuture<'static, ()>
+        });
+        let predecessor = PredecessorRetirement {
+            ancestry,
+            start: Some(start),
+            running: None,
+            owner: owner.clone(),
+            done: false,
+        };
+        self.committed.set(true);
+        *self.handoff.borrow_mut() = Some(handoff.clone());
+        let mut cancel = CancelHandoff(Some(handoff.clone()));
+        // A missing owner admits no worker; publish that disposition before an
+        // already-settled ancestry can synchronously pump its cancellation path.
+        let mut admission_tx = Some(admission_tx);
+        if !admitted {
+            let _ = admission_tx
+                .take()
+                .unwrap()
+                .send(Admission::Worker(Err(ExecError::Dropped)));
+        }
+        // Enroll before retain can synchronously drive cleanup/finalizers. The
+        // outer call future releases native custody and then polls this tail,
+        // allowing a foreign current-thread executor to deliver deferred wakes.
+        if !admitted {
+            store.enroll_native_retirement(completed)?;
+        }
+        // NativeCleanupOwner commits this concrete custody before first polling.
+        owner.retain(Box::pin(predecessor));
+        let old = self.retire.borrow_mut().take();
+        drop(old);
+        // Retain can synchronously run old-image cleanup/finalizers. Deletion
+        // there irrevocably cancels this endpoint before any replacement claim.
+        if self.retired.get() {
+            handoff.cancel();
+        }
+        if admitted {
+            handoff.claim()?;
+        }
+        if self.retired.get() {
+            handoff.cancel();
+        }
+        if admitted {
+            let admission = if handoff.is_detached() {
+                Admission::Detached
+            } else if self.retired.get() {
+                drop(predecessor_rx);
+                Admission::Worker(Err(ExecError::Dropped))
+            } else {
+                Admission::Worker(handoff.start(Box::pin(async move {
+                    let _ = predecessor_rx.await;
+                })))
+            };
+            let _ = admission_tx.take().unwrap().send(admission);
+        } else {
+            handoff.cancel();
+            drop(predecessor_rx);
+        }
+        let queue_handoff = cancel.0.take().expect("one cancellation guard");
+        let poll_owner = native_owner.clone();
+        let observer = owner.subscribe();
+        let run = Box::new(move || {
+            Box::pin(async move {
+                let result = std::future::poll_fn(move |cx| {
+                    observer.with_context(cx, |cx| {
+                        let _ = poll_owner.poll_idle(cx);
+                        observer.with_real_context(cx, |cx| Pin::new(&mut result_rx).poll(cx))
+                    })
+                })
+                .await;
+                let error = match result {
+                    Ok(Ok(status)) => exit_trap(status),
+                    Ok(Err(error)) => RuntimeError::user(Box::new(error)),
+                    Err(_) => RuntimeError::new("WASI completion owner disappeared"),
+                };
+                Err(crate::wasm_c_api::store::completed_handoff(error))
+            }) as Pin<Box<dyn Future<Output = Result<(), RuntimeError>>>>
+        });
+        Ok(LocalContinuation {
+            store: store.clone(),
+            run: Some(run),
+            cancel: Some(Box::new(move || queue_handoff.cancel())),
+        })
+    }
+}
+impl ContinuationEndpoint for Endpoint {
+    fn matches(&self, store: &mut StoreMut<'_>, error: &RuntimeError) -> bool {
+        self.env.call_handoff(store, error).is_some()
+    }
+    fn prepare(
+        self: Rc<Self>,
+        store: &StoreRef,
+        error: &RuntimeError,
+    ) -> Result<LocalContinuation, RuntimeError> {
+        self.enqueue(store, error, true)
+    }
+    fn cancel_unclaimed(
+        self: Rc<Self>,
+        store: &StoreRef,
+        error: &RuntimeError,
+    ) -> Result<(), RuntimeError> {
+        // A plain Rust outer root has no explicit C API owner. Capture its exact
+        // ancestry but never create a dispatcher or admit a replacement worker.
+        let continuation = self.enqueue(store, error, false)?;
+        drop(continuation);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::wasm_c_api::{engine::wasm_engine_new, store::wasm_store_new};
+
+    fn native_backend(environment: &super::super::wasi_env_t) -> &NativeWasi {
+        #[cfg(not(feature = "v8"))]
+        {
+            let super::super::WasiBackend::Native(native) = &environment.inner;
+            native
+        }
+        #[cfg(feature = "v8")]
+        {
+            match &environment.inner {
+                super::super::WasiBackend::Native(native) => native,
+                super::super::WasiBackend::Legacy(_) => panic!("native backend required"),
+            }
+        }
+    }
 
     #[test]
     fn duplicate_announced_aliases_fail_before_any_directory_is_mounted() {
@@ -510,8 +822,8 @@ mod tests {
     fn public_remote_memory_selection_uses_distinct_shared_backings_and_preserves_private_boundary()
     {
         use super::super::{
-            WasiBackend, wasi_config_new, wasi_env_delete, wasi_env_initialize_instance,
-            wasi_env_new, wasi_get_imports,
+            wasi_config_new, wasi_env_delete, wasi_env_initialize_instance, wasi_env_new,
+            wasi_get_imports,
         };
         use crate::wasm_c_api::{
             externals::{
@@ -679,11 +991,7 @@ mod tests {
         let probe_imports: wasm_extern_vec_t = store
             .inner
             .with_mut(|store| {
-                let native = match &environment.inner {
-                    WasiBackend::Native(native) => native,
-                    #[cfg(feature = "v8")]
-                    WasiBackend::Legacy(_) => panic!("this proof requires the native C API"),
-                };
+                let native = native_backend(&environment);
                 let imports =
                     Wasixv2.imports(store, native.environment().environment(), &probe.inner);
                 probe
@@ -1006,9 +1314,7 @@ mod tests {
         let environment = Rc::new(RefCell::new(Some(environment)));
         let (syscalls, leader, capture, local, cleanup) = {
             let environment = environment.borrow();
-            let WasiBackend::Native(native) = &environment.as_ref().unwrap().inner else {
-                panic!("native backend required");
-            };
+            let native = native_backend(environment.as_ref().unwrap());
             let process = native.endpoint.process.borrow();
             let process = process.as_ref().unwrap();
             (
@@ -1316,7 +1622,10 @@ mod tests {
             trap.is_some(),
             "Detached completion remains a trap, never fabricated i64 results; {diagnostic}"
         );
-        assert_eq!(results.as_slice()[0].kind, wasm_valkind_enum::WASM_I64 as u8);
+        assert_eq!(
+            results.as_slice()[0].kind,
+            wasm_valkind_enum::WASM_I64 as u8
+        );
         assert_eq!(unsafe { results.as_slice()[0].of.int64_t }, 0x123456789);
         assert_eq!(
             observed.get(),
@@ -1793,300 +2102,5 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(future)
-    }
-}
-
-/// Keeps the original loader runner when canceled and transfers it before any
-/// destructor callback. A panicked runner transfers its own final-drain keepalive.
-struct PredecessorRetirement {
-    ancestry: Option<wasmer_api::sys::NativeAncestrySettlement>,
-    start: Option<Box<dyn FnOnce() -> LocalFuture<'static, ()>>>,
-    running: Option<LocalFuture<'static, ()>>,
-    owner: CleanupRetirement,
-    done: bool,
-}
-impl Future for PredecessorRetirement {
-    type Output = ();
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        let this = self.get_mut();
-        if let Some(ancestry) = &mut this.ancestry {
-            if Pin::new(ancestry).poll(cx).is_pending() {
-                return Poll::Pending;
-            }
-            this.ancestry = None;
-        }
-        if this.running.is_none() {
-            this.running = Some(this.start.take().expect("one predecessor runner")());
-        }
-        let polled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            this.running.as_mut().unwrap().as_mut().poll(cx)
-        }));
-        match polled {
-            Ok(Poll::Pending) => Poll::Pending,
-            Ok(Poll::Ready(())) => {
-                this.done = true;
-                this.running = None;
-                Poll::Ready(())
-            }
-            Err(panic) => {
-                this.done = true;
-                // Never repoll a panicked async guest. Runner::drop retains its
-                // real final drain and terminal keepalive in the same local sink.
-                drop(this.running.take());
-                std::panic::resume_unwind(panic)
-            }
-        }
-    }
-}
-impl Drop for PredecessorRetirement {
-    fn drop(&mut self) {
-        if !self.done {
-            let replacement = Self {
-                ancestry: self.ancestry.take(),
-                start: self.start.take(),
-                running: self.running.take(),
-                owner: self.owner.clone(),
-                done: false,
-            };
-            self.owner.retain(Box::pin(replacement));
-        }
-    }
-}
-struct TerminalKeepalive {
-    owner: CleanupRetirement,
-    terminal: Option<LocalFuture<'static, ()>>,
-}
-impl Drop for TerminalKeepalive {
-    fn drop(&mut self) {
-        if let Some(terminal) = self.terminal.take() {
-            self.owner.retain(terminal);
-        }
-    }
-}
-struct CancelHandoff(Option<HostCallHandoff>);
-impl Drop for CancelHandoff {
-    fn drop(&mut self) {
-        if let Some(handoff) = self.0.take() {
-            handoff.cancel();
-        }
-    }
-}
-enum Admission {
-    Worker(Result<OwnedEntryWaiter, ExecError>),
-    Detached,
-}
-
-impl Endpoint {
-    fn enqueue(
-        self: Rc<Self>,
-        store: &StoreRef,
-        error: &RuntimeError,
-        admitted: bool,
-    ) -> Result<LocalContinuation, RuntimeError> {
-        let handoff = store
-            .with_mut(|store| self.env.call_handoff(store, error))?
-            .ok_or_else(|| {
-                RuntimeError::new("WASI handoff no longer belongs to this environment")
-            })?;
-        let asynchronous = store.async_store()?;
-        let owner = store.retirement_owner()?;
-        let native_owner = store.cleanup_owner()?;
-        let ancestry = wasmer_api::sys::NativeAncestrySettlement::current(Some(&native_owner));
-        let local =
-            wasixv2_exec::local_cleanup_runner(&asynchronous, self.env.loader_cleanup().clone())
-                .ok_or_else(|| RuntimeError::new("native loader retirement runner is missing"))?;
-        let (predecessor_tx, predecessor_rx) = tokio::sync::oneshot::channel::<()>();
-        let (admission_tx, admission_rx) = tokio::sync::oneshot::channel::<Admission>();
-        let (result_tx, mut result_rx) = tokio::sync::oneshot::channel::<Result<i32, ExecError>>();
-        let deactivated = Rc::new(Cell::new(false));
-        let terminal_deactivated = deactivated.clone();
-        let completed = Rc::new(Cell::new(false));
-        let terminal_completed = completed.clone();
-        let terminal_completion = owner.clone();
-        let terminal_env = self.env.clone();
-        let terminal_store = asynchronous.store();
-        let terminal_endpoint = self.clone();
-        let terminal_handoff = handoff.clone();
-        // This future is owned before claim and before the synchronous starter.
-        // The original runner releases it only after its actual final drain.
-        let terminal = Box::pin(async move {
-            {
-                // A panic while obtaining the guest's original fence still has
-                // this final actual Store fence before the worker barrier opens.
-                let mut guard = terminal_store.write_lock().await;
-                if !terminal_deactivated.get() {
-                    terminal_env.deactivate(&mut guard.as_store_mut());
-                    terminal_deactivated.set(true);
-                }
-            }
-            drop(terminal_store);
-            drop(terminal_env);
-            let _ = predecessor_tx.send(());
-            let result = match admission_rx.await {
-                Ok(Admission::Worker(Ok(waiter))) => {
-                    // Poll fallback authority alongside the waiter: an executor
-                    // can accept and then drop its unentered ThreadStart closure.
-                    let mut waiter = Box::pin(waiter);
-                    let mut retire = Box::pin(terminal_handoff.retire());
-                    let mut result = None;
-                    let mut retired = false;
-                    std::future::poll_fn(|cx| {
-                        if !retired {
-                            retired = retire.as_mut().poll(cx).is_ready();
-                        }
-                        if result.is_none() {
-                            if let Poll::Ready(value) = waiter.as_mut().poll(cx) {
-                                result = Some(value);
-                            }
-                        }
-                        if retired && result.is_some() {
-                            Poll::Ready(result.take().unwrap())
-                        } else {
-                            Poll::Pending
-                        }
-                    })
-                    .await
-                }
-                Ok(Admission::Worker(Err(error))) => {
-                    terminal_handoff.cancel();
-                    Err(error)
-                }
-                Ok(Admission::Detached) => terminal_handoff.wait_detached().await,
-                Err(_) => {
-                    terminal_handoff.cancel();
-                    Err(ExecError::Dropped)
-                }
-            };
-            terminal_handoff.retire().await;
-            // The exact accepted/fallback owner has now finished native and
-            // loader cleanup and released the task. Disarm the host guard once.
-            let mut process = terminal_endpoint.process.borrow_mut().take();
-            if let Some(process) = process.as_mut() {
-                process.released();
-            }
-            *terminal_endpoint.process.borrow_mut() = process;
-            terminal_completed.set(true);
-            let _ = result_tx.send(result);
-            terminal_completion.notify_completion();
-        }) as LocalFuture<'static, ()>;
-        let keepalive = TerminalKeepalive {
-            owner: owner.clone(),
-            terminal: Some(terminal),
-        };
-        let retiring_env = self.env.clone();
-        let start = Box::new(move || {
-            Box::pin(local.run_with_keepalive(
-                async move {
-                    let mut guard = asynchronous.write_lock().await;
-                    retiring_env.deactivate(&mut guard.as_store_mut());
-                    deactivated.set(true);
-                },
-                keepalive,
-            )) as LocalFuture<'static, ()>
-        });
-        let predecessor = PredecessorRetirement {
-            ancestry,
-            start: Some(start),
-            running: None,
-            owner: owner.clone(),
-            done: false,
-        };
-        self.committed.set(true);
-        *self.handoff.borrow_mut() = Some(handoff.clone());
-        let mut cancel = CancelHandoff(Some(handoff.clone()));
-        // A missing owner admits no worker; publish that disposition before an
-        // already-settled ancestry can synchronously pump its cancellation path.
-        let mut admission_tx = Some(admission_tx);
-        if !admitted {
-            let _ = admission_tx
-                .take()
-                .unwrap()
-                .send(Admission::Worker(Err(ExecError::Dropped)));
-        }
-        // Enroll before retain can synchronously drive cleanup/finalizers. The
-        // outer call future releases native custody and then polls this tail,
-        // allowing a foreign current-thread executor to deliver deferred wakes.
-        if !admitted {
-            store.enroll_native_retirement(completed)?;
-        }
-        // NativeCleanupOwner commits this concrete custody before first polling.
-        owner.retain(Box::pin(predecessor));
-        let old = self.retire.borrow_mut().take();
-        drop(old);
-        // Retain can synchronously run old-image cleanup/finalizers. Deletion
-        // there irrevocably cancels this endpoint before any replacement claim.
-        if self.retired.get() {
-            handoff.cancel();
-        }
-        if admitted {
-            handoff.claim()?;
-        }
-        if self.retired.get() {
-            handoff.cancel();
-        }
-        if admitted {
-            let admission = if handoff.is_detached() {
-                Admission::Detached
-            } else if self.retired.get() {
-                drop(predecessor_rx);
-                Admission::Worker(Err(ExecError::Dropped))
-            } else {
-                Admission::Worker(handoff.start(Box::pin(async move {
-                    let _ = predecessor_rx.await;
-                })))
-            };
-            let _ = admission_tx.take().unwrap().send(admission);
-        } else {
-            handoff.cancel();
-            drop(predecessor_rx);
-        }
-        let queue_handoff = cancel.0.take().expect("one cancellation guard");
-        let poll_owner = native_owner.clone();
-        let observer = owner.subscribe();
-        let run = Box::new(move || {
-            Box::pin(async move {
-                let result = std::future::poll_fn(move |cx| {
-                    observer.with_context(cx, |cx| {
-                        let _ = poll_owner.poll_idle(cx);
-                        observer.with_real_context(cx, |cx| Pin::new(&mut result_rx).poll(cx))
-                    })
-                })
-                .await;
-                let error = match result {
-                    Ok(Ok(status)) => exit_trap(status),
-                    Ok(Err(error)) => RuntimeError::user(Box::new(error)),
-                    Err(_) => RuntimeError::new("WASI completion owner disappeared"),
-                };
-                Err(crate::wasm_c_api::store::completed_handoff(error))
-            }) as Pin<Box<dyn Future<Output = Result<(), RuntimeError>>>>
-        });
-        Ok(LocalContinuation {
-            store: store.clone(),
-            run: Some(run),
-            cancel: Some(Box::new(move || queue_handoff.cancel())),
-        })
-    }
-}
-impl ContinuationEndpoint for Endpoint {
-    fn matches(&self, store: &mut StoreMut<'_>, error: &RuntimeError) -> bool {
-        self.env.call_handoff(store, error).is_some()
-    }
-    fn prepare(
-        self: Rc<Self>,
-        store: &StoreRef,
-        error: &RuntimeError,
-    ) -> Result<LocalContinuation, RuntimeError> {
-        self.enqueue(store, error, true)
-    }
-    fn cancel_unclaimed(
-        self: Rc<Self>,
-        store: &StoreRef,
-        error: &RuntimeError,
-    ) -> Result<(), RuntimeError> {
-        // A plain Rust outer root has no explicit C API owner. Capture its exact
-        // ancestry but never create a dispatcher or admit a replacement worker.
-        let continuation = self.enqueue(store, error, false)?;
-        drop(continuation);
-        Ok(())
     }
 }

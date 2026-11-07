@@ -596,7 +596,6 @@ fn dropped_waiter_mode(image: bool, retain_frame: bool, detached: bool) {
     );
     tail_tx.send(()).unwrap();
     until("worker-done");
-    drop(until);
     if let Some(completion) = &mut completion {
         assert!(matches!(
             completion
