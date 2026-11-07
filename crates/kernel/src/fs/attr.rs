@@ -11,7 +11,8 @@ use wasixv2_syscalls::{
     read_value, write_value,
 };
 use wasixv2_vfs::{
-    Attr, FileType, Path, TimeSet, Timestamp, XATTR_NAME_MAX, XATTR_SIZE_MAX, XattrSet,
+    Attr, FileType, Path, ResolvedEntry, TimeSet, Timestamp, XATTR_NAME_MAX, XATTR_SIZE_MAX,
+    XattrSet,
 };
 
 use super::{Env, read_path};
@@ -69,9 +70,9 @@ impl Kernel {
         let path = super::read_path_maybe_null(caller.memory(), filename, flags).await?;
         let env = self.env(caller);
         let target = self
-            .resolve_at(caller, &env, dfd, &path, flags, true)
+            .resolve_entry_at(caller, &env, dfd, &path, flags, true)
             .await?;
-        let attr = self.vfs.stat(&target).await?;
+        let attr = self.vfs.stat_entry(&target).await?;
         let ns = self.cred(caller).user_ns.clone();
         let statx = statx(&target, &attr, mask, &ns);
         write_value(caller.memory(), buffer, &statx).await?;
@@ -185,10 +186,10 @@ impl Kernel {
         }
         let lookup_flags = flags & (AtFlags::AT_SYMLINK_NOFOLLOW | AtFlags::AT_EMPTY_PATH);
         let target = self
-            .resolve_at(caller, &env, dfd, &path, lookup_flags, true)
+            .resolve_entry_at(caller, &env, dfd, &path, lookup_flags, true)
             .await?;
         // R_OK, W_OK and X_OK are MAY_READ, MAY_WRITE and MAY_EXEC.
-        self.vfs.access(&env.cx(), &target, mode.0).await?;
+        self.vfs.access_entry(&env.cx(), &target, mode.0).await?;
         Ok(0)
     }
 
@@ -518,38 +519,34 @@ impl Kernel {
     }
 }
 
-/// `st_mode`. Anonymous inodes have no file type (`anon_inode_getattr`).
-fn st_mode(path: &Path, attr: &Attr) -> u32 {
-    match path.dentry.sb().info.magic {
-        crate::pseudo::ANON_INODE_FS_MAGIC => attr.mode,
-        _ => attr.st_mode(),
-    }
-}
-
 /// `statx`'s result. The mount id is the unique one if `request` asks for it
 /// (`STATX_MNT_ID_UNIQUE`), else the one `mountinfo` shows. The owner is as the caller's user
 /// namespace `ns` sees it (`cp_statx`).
-fn statx(path: &Path, attr: &Attr, request: StatxMask, ns: &UserNs) -> Statx {
+fn statx(entry: &ResolvedEntry, attr: &Attr, request: StatxMask, ns: &UserNs) -> Statx {
     let dev = attr.dev.unwrap_or_default();
+    let mount = entry.mount();
+    let flags = match entry {
+        ResolvedEntry::Pinned(path) => path.dentry.node().inode_flags(),
+        ResolvedEntry::Observation(observation) => observation.inode_flags,
+    };
     let (mnt_id, mnt_mask) = match request.contains(StatxMask::STATX_MNT_ID_UNIQUE) {
-        true => (path.mnt.unique_id(), StatxMask::STATX_MNT_ID_UNIQUE),
-        false => (path.mnt.id, StatxMask::STATX_MNT_ID),
+        true => (mount.unique_id(), StatxMask::STATX_MNT_ID_UNIQUE),
+        false => (mount.id, StatxMask::STATX_MNT_ID),
     };
     let mut mask = StatxMask::STATX_BASIC_STATS | mnt_mask;
     if attr.btime.is_some() {
         mask |= StatxMask::STATX_BTIME;
     }
     let mut attributes = StatxAttributes(0);
-    if path.is_mount_root() {
+    if matches!(entry, ResolvedEntry::Pinned(path) if path.is_mount_root()) {
         attributes = StatxAttributes(StatxAttributes::STATX_ATTR_MOUNT_ROOT.0);
     }
     // `generic_fill_statx_attr`, and tmpfs's `STATX_ATTR_NODUMP`.
-    let flags = path.dentry.node().inode_flags();
     let mut attributes_mask = StatxAttributes::STATX_ATTR_MOUNT_ROOT.0
         | StatxAttributes::STATX_ATTR_AUTOMOUNT.0
         | StatxAttributes::STATX_ATTR_IMMUTABLE.0
         | StatxAttributes::STATX_ATTR_APPEND.0;
-    if path.dentry.sb().info.magic == wasixv2_vfs::TMPFS_MAGIC {
+    if mount.sb().info.magic == wasixv2_vfs::TMPFS_MAGIC {
         attributes_mask |= StatxAttributes::STATX_ATTR_NODUMP.0;
     }
     for (flag, attribute) in [
@@ -577,7 +574,11 @@ fn statx(path: &Path, attr: &Attr, request: StatxMask, ns: &UserNs) -> Statx {
         stx_nlink: attr.nlink,
         stx_uid: ns.munged_uid(Kuid(attr.uid)),
         stx_gid: ns.munged_gid(Kgid(attr.gid)),
-        stx_mode: st_mode(path, attr) as u16,
+        // Anonymous inodes have no file type (`anon_inode_getattr`).
+        stx_mode: match mount.sb().info.magic {
+            crate::pseudo::ANON_INODE_FS_MAGIC => attr.mode,
+            _ => attr.st_mode(),
+        } as u16,
         stx_ino: attr.ino,
         stx_size: attr.size,
         stx_blocks: attr.blocks,

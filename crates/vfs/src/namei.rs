@@ -8,10 +8,10 @@ use wasixv2_abi::Errno;
 use crate::{
     Vfs,
     cred::MAY_EXEC,
-    driver::{Link, NamespaceComponent},
+    driver::{Link, LookupEntry, NamespaceComponent},
     mount::Path,
     ops::Ctx,
-    types::{FileType, PathError, PathResult},
+    types::{Attr, FileType, FsResult, PathError, PathResult},
 };
 
 /// Linux's `MAXSYMLINKS`: symlinks one walk may follow in total.
@@ -61,6 +61,45 @@ pub enum Last {
     Root,
     /// The walk ended on a magic link's object, which has no name to look up (`LAST_BIND`).
     Bind,
+}
+
+/// A current-name attribute sample, anchored in a genuine parent directory capability.
+/// This value is operation-scoped: it must not become a Node, dentry, inode, descriptor,
+/// export handle, alias or lock identity. Its inode number is informational only.
+pub struct NameObservation {
+    pub parent: Path,
+    pub name: Vec<u8>,
+    pub attr: Attr,
+    pub inode_flags: u32,
+}
+
+/// Terminal resolution can observe a name without retaining its object.
+pub enum ResolvedEntry {
+    Pinned(Path),
+    Observation(NameObservation),
+}
+
+impl ResolvedEntry {
+    pub fn file_type(&self) -> FileType {
+        match self {
+            Self::Pinned(path) => path.dentry.file_type(),
+            Self::Observation(observation) => observation.attr.file_type,
+        }
+    }
+
+    pub fn mount(&self) -> &Arc<crate::Mount> {
+        match self {
+            Self::Pinned(path) => &path.mnt,
+            Self::Observation(observation) => &observation.parent.mnt,
+        }
+    }
+
+    pub async fn getattr(&self) -> FsResult<Attr> {
+        match self {
+            Self::Pinned(path) => path.dentry.node().getattr().await,
+            Self::Observation(observation) => Ok(observation.attr.clone()),
+        }
+    }
 }
 
 /// One string being walked: the path itself, or a symlink body.
@@ -216,7 +255,7 @@ impl<'a> Walk<'a> {
                 Last::Dot | Last::Root | Last::Bind => {}
                 Last::DotDot => self.dotdot()?,
                 Last::Normal(name) => {
-                    let child = self.child(&name).await?;
+                    let child = self.child_component(&name).await?;
                     if child.dentry.file_type() == FileType::Symlink {
                         self.follow_link(&child).await?;
                     } else {
@@ -253,6 +292,90 @@ impl<'a> Walk<'a> {
         Ok(Some(child))
     }
 
+    pub(crate) async fn step_last_entry(
+        &mut self,
+        last: &Last,
+    ) -> PathResult<Option<ResolvedEntry>> {
+        let Last::Normal(name) = last else {
+            return self
+                .step_last(last)
+                .await
+                .map(|path| path.map(ResolvedEntry::Pinned));
+        };
+        self.select_component_parent(name).await?;
+        let entry = {
+            let _lock = self.path.dentry.inode().lock().await;
+            self.child_entry_locked(name).await?
+        };
+        if entry.file_type() == FileType::Symlink && self.flags.follow {
+            let child = match entry {
+                ResolvedEntry::Pinned(path) => path,
+                ResolvedEntry::Observation(observation) => {
+                    // A body read needs a real symlink capability and current host grant.
+                    let _lock = observation.parent.dentry.inode().lock().await;
+                    let node = observation
+                        .parent
+                        .dentry
+                        .node()
+                        .lookup(&observation.name)
+                        .await?;
+                    Path {
+                        mnt: observation.parent.mnt.clone(),
+                        dentry: observation.parent.dentry.child(&observation.name, node),
+                    }
+                }
+            };
+            self.follow_link(&child).await?;
+            return Ok(None);
+        }
+        Ok(Some(entry))
+    }
+
+    fn cross_entry(&self, mut entry: ResolvedEntry) -> PathResult<ResolvedEntry> {
+        if let ResolvedEntry::Pinned(path) = &mut entry
+            && self.vfs.tree.follow_mounts(path)
+            && self.flags.no_xdev
+        {
+            return Err(Errno::EXDEV.into());
+        }
+        Ok(entry)
+    }
+
+    pub(crate) async fn resolve_entry(&mut self) -> PathResult<ResolvedEntry> {
+        loop {
+            let last = self.walk_parent().await?;
+            if let Some(entry) = self.step_last_entry(&last).await? {
+                if self.flags.directory && entry.file_type() != FileType::Directory {
+                    return Err(Errno::ENOTDIR.into());
+                }
+                return Ok(entry);
+            }
+        }
+    }
+
+    /// Terminal entry lookup with the current directory already locked by the caller.
+    async fn child_entry_locked(&mut self, name: &[u8]) -> PathResult<ResolvedEntry> {
+        let original = self.path.clone();
+        self.select_component_parent(name).await?;
+        let _lock = if self.path != original {
+            Some(self.path.dentry.inode().lock().await)
+        } else {
+            None
+        };
+        self.cross_entry(lookup_entry_one(&self.path, name).await?)
+    }
+
+    pub(crate) async fn child_entry_opt_locked(
+        &mut self,
+        name: &[u8],
+    ) -> PathResult<Option<ResolvedEntry>> {
+        match self.child_entry_locked(name).await {
+            Ok(entry) => Ok(Some(entry)),
+            Err(PathError::Errno(Errno::ENOENT)) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Resolves the whole path (`path_lookupat`).
     pub(crate) async fn resolve(&mut self) -> PathResult<Path> {
         loop {
@@ -262,6 +385,44 @@ impl<'a> Walk<'a> {
                     return Err(Errno::ENOTDIR.into());
                 }
                 return Ok(path);
+            }
+        }
+    }
+
+    async fn child_component(&mut self, name: &[u8]) -> PathResult<Path> {
+        self.select_component_parent(name).await?;
+        let _lock = self.path.dentry.inode().lock().await;
+        let entry = self.child_entry_locked(name).await?;
+        match entry {
+            ResolvedEntry::Pinned(path) => Ok(path),
+            ResolvedEntry::Observation(observation) => {
+                let node = match observation.attr.file_type {
+                    FileType::Directory => {
+                        observation
+                            .parent
+                            .dentry
+                            .node()
+                            .lookup_search(&observation.name)
+                            .await?
+                    }
+                    FileType::Symlink => {
+                        observation
+                            .parent
+                            .dentry
+                            .node()
+                            .lookup(&observation.name)
+                            .await?
+                    }
+                    _ => return Err(Errno::ENOTDIR.into()),
+                };
+                let path = Path {
+                    mnt: observation.parent.mnt.clone(),
+                    dentry: observation.parent.dentry.child(&observation.name, node),
+                };
+                match self.cross_entry(ResolvedEntry::Pinned(path))? {
+                    ResolvedEntry::Pinned(path) => Ok(path),
+                    _ => unreachable!(),
+                }
             }
         }
     }
@@ -287,15 +448,6 @@ impl<'a> Walk<'a> {
             return Err(Errno::EXDEV.into());
         }
         Ok(path)
-    }
-
-    /// Like `child_locked`, but `None` if the name does not exist.
-    pub(crate) async fn child_opt_locked(&mut self, name: &[u8]) -> PathResult<Option<Path>> {
-        match self.child_locked(name).await {
-            Ok(path) => Ok(Some(path)),
-            Err(PathError::Errno(Errno::ENOENT)) => Ok(None),
-            Err(errno) => Err(errno),
-        }
     }
 
     /// The prefix's parent, independent of full lookup's final fallback search.
@@ -499,8 +651,18 @@ pub(crate) async fn lookup_one(dir: &Path, name: &[u8]) -> PathResult<Path> {
             dentry: cached,
         });
     }
-    let node = match dir.dentry.node().lookup(name).await {
-        Ok(node) => node,
+    let node = match dir.dentry.node().lookup_entry(name).await {
+        Ok(LookupEntry::Pinned(node)) => node,
+        Ok(LookupEntry::Observation(metadata))
+            if metadata.attr.file_type == FileType::Directory =>
+        {
+            let node = dir.dentry.node().lookup_search(name).await?;
+            if node.file_type() != FileType::Directory {
+                return Err(Errno::ENOTDIR.into());
+            }
+            node
+        }
+        Ok(LookupEntry::Observation(_)) => return Err(Errno::EACCES.into()),
         Err(Errno::ENOENT) => {
             dir.dentry.forget_name(name);
             return Err(Errno::ENOENT.into());
@@ -511,6 +673,61 @@ pub(crate) async fn lookup_one(dir: &Path, name: &[u8]) -> PathResult<Path> {
         mnt: dir.mnt.clone(),
         dentry: dir.dentry.child(name, node),
     })
+}
+
+/// A terminal observation never passes through Dentry::child or Superblock::iget.
+pub(crate) async fn lookup_entry_one(dir: &Path, name: &[u8]) -> PathResult<ResolvedEntry> {
+    if !matches!(
+        dir.dentry.node().namespace_component(name),
+        NamespaceComponent::Ordinary
+    ) {
+        return Err(PathError::NamespaceBoundary);
+    }
+    if name.len() > dir.dentry.sb().info.name_max {
+        return Err(Errno::ENAMETOOLONG.into());
+    }
+    if dir.dentry.inode().is_dead() {
+        return Err(Errno::ENOENT.into());
+    }
+    if dir.dentry.sb().info.stable
+        && let Some(cached) = dir.dentry.cached_child(name)
+    {
+        return Ok(ResolvedEntry::Pinned(Path {
+            mnt: dir.mnt.clone(),
+            dentry: cached,
+        }));
+    }
+    match dir.dentry.node().lookup_entry(name).await {
+        Ok(LookupEntry::Pinned(node)) => Ok(ResolvedEntry::Pinned(Path {
+            mnt: dir.mnt.clone(),
+            dentry: dir.dentry.child(name, node),
+        })),
+        Ok(LookupEntry::Observation(_))
+            if dir
+                .dentry
+                .cached_child(name)
+                .is_some_and(|child| child.is_mountpoint()) =>
+        {
+            // A name sample cannot establish whether the old mountpoint still exists.
+            // Only a genuine capability may match its dentry; otherwise fail explicitly.
+            let node = dir.dentry.node().lookup(name).await?;
+            Ok(ResolvedEntry::Pinned(Path {
+                mnt: dir.mnt.clone(),
+                dentry: dir.dentry.child(name, node),
+            }))
+        }
+        Ok(LookupEntry::Observation(metadata)) => Ok(ResolvedEntry::Observation(NameObservation {
+            parent: dir.clone(),
+            name: name.to_vec(),
+            attr: metadata.attr,
+            inode_flags: metadata.inode_flags,
+        })),
+        Err(Errno::ENOENT) => {
+            dir.dentry.forget_name(name);
+            Err(Errno::ENOENT.into())
+        }
+        Err(errno) => Err(errno.into()),
+    }
 }
 
 fn classify(comp: Vec<u8>) -> Last {

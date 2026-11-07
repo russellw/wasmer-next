@@ -108,7 +108,7 @@ impl SharedPages for Memfd {
     /// macOS has no hole punching for shared memory: the bytes are overwritten with zeros.
     #[cfg(target_os = "macos")]
     fn punch_hole(&self, offset: u64, len: u64) -> io::Result<()> {
-        const ZEROS: [u8; 1 << 16] = [0; 1 << 16];
+        static ZEROS: [u8; 1 << 16] = [0; 1 << 16];
         let end = offset.saturating_add(len).min(self.size());
         let mut at = offset;
         while at < end {

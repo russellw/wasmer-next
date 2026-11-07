@@ -289,15 +289,17 @@ impl Drop for Inode {
 }
 
 impl Superblock {
-    /// The VFS inode for `node` (`iget`): the live one with its inode number, else a new one.
-    pub(crate) fn iget(self: &Arc<Self>, node: Arc<dyn Node>) -> Arc<Inode> {
-        let ino = node.ino();
-        let mut inodes = self.inodes.lock().unwrap();
-        if let Some(inode) = inodes.get(&ino).and_then(Weak::upgrade) {
-            return inode;
-        }
+    /// Look up an already-retained identity without admitting a new inode. The caller
+    /// holds a genuine node from this superblock; retained nodes prevent inode-number reuse.
+    pub(crate) fn retained_inode(&self, node: &Arc<dyn Node>) -> Option<Arc<Inode>> {
+        self.inodes.lock().unwrap().get(&node.ino())?.upgrade()
+    }
+
+    /// A provisional inode for a genuine opened capability, before policy approval. It is
+    /// not entered in the canonical cache and must never wrap a name observation.
+    pub(crate) fn uncached_inode(self: &Arc<Self>, node: Arc<dyn Node>) -> Arc<Inode> {
         let sealable = self.info.magic == TMPFS_MAGIC && node.file_type() == FileType::Regular;
-        let inode = Arc::new(Inode {
+        Arc::new(Inode {
             node,
             sb: self.clone(),
             lock: Arc::default(),
@@ -307,8 +309,172 @@ impl Superblock {
             mmap_writable: AtomicI32::new(0),
             writecount: AtomicI32::new(0),
             readcount: AtomicI32::new(0),
-        });
+        })
+    }
+
+    /// The VFS inode for `node` (`iget`): the live one with its inode number, else a new one.
+    pub(crate) fn iget(self: &Arc<Self>, node: Arc<dyn Node>) -> Arc<Inode> {
+        let ino = node.ino();
+        let mut inodes = self.inodes.lock().unwrap();
+        if let Some(inode) = inodes.get(&ino).and_then(Weak::upgrade) {
+            return inode;
+        }
+        let inode = self.uncached_inode(node);
         inodes.insert(ino, Arc::downgrade(&inode));
         inode
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use futures::{FutureExt, executor::block_on};
+    use std::sync::atomic::AtomicBool;
+
+    use super::*;
+    use crate::{
+        Attr, Filesystem, FsInfo, FsResult, FsWatcher, Perm, SetAttr, StatFs, Timestamp, Vfs,
+        dentry::Dentry,
+    };
+
+    struct PolicyFs;
+    struct PolicyNode(u64, FileType);
+    #[async_trait::async_trait(?Send)]
+    impl Filesystem for PolicyFs {
+        fn info(&self) -> FsInfo {
+            FsInfo {
+                name: "policy",
+                magic: TMPFS_MAGIC,
+                name_max: 255,
+                read_only: false,
+                dev: None,
+                has_btime: false,
+                stable: false,
+            }
+        }
+        fn root(&self) -> Arc<dyn Node> {
+            Arc::new(PolicyNode(1, FileType::Directory))
+        }
+        async fn statfs(&self) -> FsResult<StatFs> {
+            Ok(StatFs::default())
+        }
+    }
+    #[async_trait::async_trait(?Send)]
+    impl Node for PolicyNode {
+        fn ino(&self) -> u64 {
+            self.0
+        }
+        fn file_type(&self) -> FileType {
+            self.1
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        async fn getattr(&self) -> FsResult<Attr> {
+            Ok(Attr {
+                ino: self.0,
+                file_type: self.1,
+                mode: 0o777,
+                nlink: 1,
+                uid: 1,
+                gid: 1,
+                rdev: Default::default(),
+                size: 0,
+                blocks: 0,
+                blksize: 4096,
+                atime: Timestamp::default(),
+                mtime: Timestamp::default(),
+                ctime: Timestamp::default(),
+                btime: None,
+                dev: None,
+            })
+        }
+        async fn setattr(&self, _: &SetAttr) -> FsResult<Attr> {
+            Err(Errno::EOPNOTSUPP)
+        }
+        async fn open(&self, _: crate::OpenOptions) -> FsResult<Box<dyn crate::Handle>> {
+            Err(Errno::EOPNOTSUPP)
+        }
+    }
+    struct DenyAfterWait {
+        expected: Arc<Inode>,
+        release: Arc<AtomicBool>,
+    }
+    impl FsWatcher for DenyAfterWait {
+        fn event(&self, _: &crate::FsEvent<'_>) {}
+        fn permission(&self, path: &crate::Path, _: Perm) -> Option<crate::PermAnswer> {
+            assert!(Arc::ptr_eq(path.dentry.inode(), &self.expected));
+            let release = self.release.clone();
+            Some(Box::pin(futures::future::poll_fn(move |_| {
+                if release.load(Ordering::SeqCst) {
+                    std::task::Poll::Ready(Err(Errno::EACCES))
+                } else {
+                    std::task::Poll::Pending
+                }
+            })))
+        }
+    }
+
+    #[test]
+    fn policy_views_never_publish_aliases_while_permission_is_pending_or_denied() {
+        for kind in [FileType::Regular, FileType::Directory] {
+            let node: Arc<dyn Node> = Arc::new(PolicyNode(2, kind));
+            let vfs = Vfs::new(Arc::new(PolicyFs));
+            let root = vfs.root();
+            let held = {
+                let _lock = block_on(root.dentry.inode().lock());
+                root.dentry.child(b"held", node.clone())
+            };
+            let inode = held.inode().clone();
+            let count = root.dentry.sb().inodes.lock().unwrap().len();
+            let assert_unchanged = || {
+                let state = inode.state.lock().unwrap();
+                assert!(Arc::ptr_eq(&state.last.upgrade().unwrap(), &held));
+                if kind == FileType::Directory {
+                    assert!(Arc::ptr_eq(&state.alias.upgrade().unwrap(), &held));
+                } else {
+                    assert!(state.alias.upgrade().is_none());
+                }
+                assert!(Arc::ptr_eq(
+                    &root.dentry.cached_child(b"held").unwrap(),
+                    &held
+                ));
+                assert!(root.dentry.cached_child(b"candidate").is_none());
+                assert_eq!(root.dentry.sb().inodes.lock().unwrap().len(), count);
+            };
+            let fresh = Dentry::provisional(&root.dentry, b"candidate", node);
+            assert!(!Arc::ptr_eq(fresh.inode(), &inode));
+            let policy = crate::Path {
+                mnt: root.mnt.clone(),
+                dentry: fresh.policy_view(),
+            };
+            let watcher = DenyAfterWait {
+                expected: inode.clone(),
+                release: Arc::new(AtomicBool::new(false)),
+            };
+            let mut answer = watcher.permission(&policy, Perm::Open).unwrap();
+            assert!(answer.as_mut().now_or_never().is_none());
+            assert_unchanged();
+            watcher.release.store(true, Ordering::SeqCst);
+            assert_eq!(answer.as_mut().now_or_never(), Some(Err(Errno::EACCES)));
+            drop(answer);
+            drop(policy);
+            drop(fresh);
+            assert_unchanged();
+
+            // A real newly acquired object gets only an uncached policy identity.
+            let node: Arc<dyn Node> = Arc::new(PolicyNode(3, kind));
+            let fresh = Dentry::provisional(&root.dentry, b"new", node.clone());
+            let policy = fresh.policy_view();
+            assert!(Arc::ptr_eq(fresh.inode(), policy.inode()));
+            assert!(root.dentry.sb().retained_inode(&node).is_none());
+            let state = fresh.inode().state.lock().unwrap();
+            assert!(state.alias.upgrade().is_none());
+            assert!(state.last.upgrade().is_none());
+            assert!(root.dentry.cached_child(b"new").is_none());
+            drop(state);
+            drop(policy);
+            drop(fresh);
+            assert_unchanged();
+        }
     }
 }

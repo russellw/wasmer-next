@@ -603,3 +603,271 @@ fn tsync_is_not_lost_when_another_thread_prepares_credentials() {
     assert_eq!(kernel.task_cred(worker).user.fs.0, 1000);
     assert!(kernel.task_cred(worker).landlock.is_some());
 }
+
+/// An unstable layer can observe a terminal name while a rule retains an earlier
+/// genuine capability to the same object. Acquisitions may select an external replacement.
+struct ObservedFiles {
+    memory: Arc<MemFs>,
+    directory: Arc<ObservedFilesRoot>,
+}
+struct ObservedFilesRoot {
+    inner: Arc<dyn wasixv2_vfs::Node>,
+    observe: std::sync::atomic::AtomicBool,
+    replace: std::sync::atomic::AtomicBool,
+    prepared: Arc<std::sync::atomic::AtomicUsize>,
+}
+struct ObservedFileGrant {
+    inner: Box<dyn wasixv2_vfs::Handle>,
+    prepared: Arc<std::sync::atomic::AtomicUsize>,
+}
+#[async_trait::async_trait(?Send)]
+impl wasixv2_vfs::Filesystem for ObservedFiles {
+    fn info(&self) -> wasixv2_vfs::FsInfo {
+        let mut info = wasixv2_vfs::Filesystem::info(self.memory.as_ref());
+        info.stable = false;
+        info
+    }
+    fn root(&self) -> Arc<dyn wasixv2_vfs::Node> {
+        self.directory.clone()
+    }
+    async fn statfs(&self) -> wasixv2_vfs::FsResult<wasixv2_vfs::StatFs> {
+        wasixv2_vfs::Filesystem::statfs(self.memory.as_ref()).await
+    }
+}
+#[async_trait::async_trait(?Send)]
+impl wasixv2_vfs::Node for ObservedFilesRoot {
+    fn ino(&self) -> u64 {
+        self.inner.ino()
+    }
+    fn file_type(&self) -> wasixv2_vfs::FileType {
+        wasixv2_vfs::FileType::Directory
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    async fn getattr(&self) -> wasixv2_vfs::FsResult<wasixv2_vfs::Attr> {
+        self.inner.getattr().await
+    }
+    async fn setattr(
+        &self,
+        attr: &wasixv2_vfs::SetAttr,
+    ) -> wasixv2_vfs::FsResult<wasixv2_vfs::Attr> {
+        self.inner.setattr(attr).await
+    }
+    async fn open(
+        &self,
+        options: wasixv2_vfs::OpenOptions,
+    ) -> wasixv2_vfs::FsResult<Box<dyn wasixv2_vfs::Handle>> {
+        self.inner.open(options).await
+    }
+    async fn lookup(&self, name: &[u8]) -> wasixv2_vfs::FsResult<Arc<dyn wasixv2_vfs::Node>> {
+        if self.observe.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(Errno::EACCES);
+        }
+        self.inner.lookup(name).await
+    }
+    async fn lookup_entry(&self, name: &[u8]) -> wasixv2_vfs::FsResult<wasixv2_vfs::LookupEntry> {
+        let node = self.inner.lookup(name).await?;
+        if self.observe.load(std::sync::atomic::Ordering::SeqCst) {
+            Ok(wasixv2_vfs::LookupEntry::Observation(
+                node.getattr().await?.into(),
+            ))
+        } else {
+            Ok(wasixv2_vfs::LookupEntry::Pinned(node))
+        }
+    }
+    async fn open_existing(
+        &self,
+        name: &[u8],
+        options: wasixv2_vfs::OpenOptions,
+    ) -> wasixv2_vfs::FsResult<(Arc<dyn wasixv2_vfs::Node>, Box<dyn wasixv2_vfs::Handle>)> {
+        if self
+            .replace
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.inner
+                .rename(
+                    name,
+                    &self.inner,
+                    b"saved",
+                    wasixv2_vfs::RenameMode::Replace,
+                )
+                .await?;
+            self.inner
+                .rename(
+                    b"replacement",
+                    &self.inner,
+                    name,
+                    wasixv2_vfs::RenameMode::Replace,
+                )
+                .await?;
+        }
+        let node = self.inner.lookup(name).await?;
+        let handle = node.open(options).await?;
+        Ok((
+            node,
+            Box::new(ObservedFileGrant {
+                inner: handle,
+                prepared: self.prepared.clone(),
+            }),
+        ))
+    }
+}
+#[async_trait::async_trait(?Send)]
+impl wasixv2_vfs::Handle for ObservedFileGrant {
+    async fn prepare_open(&self) -> wasixv2_vfs::FsResult<()> {
+        self.prepared
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+    async fn write_at(&self, data: &[u8], offset: u64) -> wasixv2_vfs::FsResult<usize> {
+        self.inner.write_at(data, offset).await
+    }
+    async fn set_size(&self, size: u64) -> wasixv2_vfs::FsResult<()> {
+        self.inner.set_size(size).await
+    }
+}
+
+#[test]
+fn exact_file_rules_follow_retained_identity_through_observation_and_actual_replacement() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use wasixv2_vfs::{Filesystem, NewKind, NewNode, OpenOptions};
+    let memory_fs = Arc::new(MemFs::new(
+        Arc::new(HostClock(Arc::new(TestHost))),
+        0o755,
+        1,
+        1,
+    ));
+    let mut files = Vec::new();
+    for name in [b"allowed".as_slice(), b"denied", b"replacement"] {
+        let (node, handle) = block_on(memory_fs.root().create_open(
+            name,
+            &NewNode {
+                kind: NewKind::Regular,
+                mode: 0o200,
+                uid: 1,
+                gid: 1,
+                umask: 0,
+                task: 0,
+                quota_exempt: false,
+            },
+            OpenOptions {
+                write: true,
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+        block_on(handle.write_at(b"original", 0)).unwrap();
+        files.push(node);
+    }
+    let directory = Arc::new(ObservedFilesRoot {
+        inner: memory_fs.root(),
+        observe: AtomicBool::new(false),
+        replace: AtomicBool::new(false),
+        prepared: Arc::new(AtomicUsize::new(0)),
+    });
+    let fs = Arc::new(ObservedFiles {
+        memory: memory_fs.clone(),
+        directory: directory.clone(),
+    });
+    let (kernel, task, memory) = super::ipc::machine();
+    block_on(
+        kernel
+            .vfs()
+            .mount(b"/observed", fs, Default::default(), true),
+    )
+    .unwrap();
+    let t = T::new(&kernel, task, &memory);
+    let handled = WRITE_FILE | TRUNCATE;
+    let ruleset = t.ruleset(handled, 0, 0).unwrap();
+    assert_eq!(t.allow_path(ruleset, "/observed/allowed", handled), Ok(0));
+    t.prctl_nnp();
+    assert_eq!(t.restrict(ruleset), Ok(0));
+    directory.observe.store(true, Ordering::SeqCst);
+    let flags = OpenFlags::O_WRONLY | OpenFlags::O_TRUNC;
+    let fd = t.open("/observed/allowed", flags).unwrap();
+    put(&memory, 0x2000, b"allowed");
+    assert_eq!(
+        block_on(kernel.write(&t.caller, fd, UserSlice::new(0x2000, 7))),
+        Ok(7)
+    );
+    block_on(kernel.close(&t.caller, fd)).unwrap();
+    assert_eq!(directory.prepared.load(Ordering::SeqCst), 1);
+    assert_eq!(block_on(files[0].getattr()).unwrap().size, 7);
+    assert_eq!(errno(t.open("/observed/denied", flags)), Errno::EACCES);
+    assert_eq!(block_on(files[1].getattr()).unwrap().size, 8);
+    directory.replace.store(true, Ordering::SeqCst);
+    assert_eq!(errno(t.open("/observed/allowed", flags)), Errno::EACCES);
+    assert_eq!(block_on(files[2].getattr()).unwrap().size, 8);
+    assert_eq!(block_on(files[0].getattr()).unwrap().size, 7);
+    assert_eq!(directory.prepared.load(Ordering::SeqCst), 1);
+    let root = memory_fs.root();
+    block_on(root.rename(
+        b"allowed",
+        &root,
+        b"replacement",
+        wasixv2_vfs::RenameMode::Replace,
+    ))
+    .unwrap();
+    block_on(root.rename(
+        b"saved",
+        &root,
+        b"allowed",
+        wasixv2_vfs::RenameMode::Replace,
+    ))
+    .unwrap();
+    let fd = t.open("/observed/allowed", flags).unwrap();
+    block_on(kernel.close(&t.caller, fd)).unwrap();
+    assert_eq!(block_on(files[0].getattr()).unwrap().size, 0);
+    assert_eq!(directory.prepared.load(Ordering::SeqCst), 2);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_name_observations_landlock_exact_write_only_file_keeps_its_rule_identity() {
+    use std::{fs, os::unix::fs::PermissionsExt};
+    assert_ne!(
+        unsafe { libc::geteuid() },
+        0,
+        "Darwin permission proof requires an unprivileged host"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["allowed", "replacement"] {
+        fs::write(dir.path().join(name), b"original").unwrap();
+    }
+    let (kernel, task, memory) = super::ipc::machine();
+    let host = wasixv2_vfs_host::open(dir.path(), Arc::new(TestHost), Default::default()).unwrap();
+    block_on(kernel.vfs().mount(b"/mac", host, Default::default(), true)).unwrap();
+    let t = T::new(&kernel, task, &memory);
+    let handled = WRITE_FILE | TRUNCATE;
+    let ruleset = t.ruleset(handled, 0, 0).unwrap();
+    assert_eq!(t.allow_path(ruleset, "/mac/allowed", handled), Ok(0));
+    t.prctl_nnp();
+    assert_eq!(t.restrict(ruleset), Ok(0));
+    for name in ["allowed", "replacement"] {
+        let path = dir.path().join(name);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o200)).unwrap();
+        assert_eq!(
+            fs::File::open(&path).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
+    let flags = OpenFlags::O_WRONLY | OpenFlags::O_TRUNC;
+    let fd = t.open("/mac/allowed", flags).unwrap();
+    put(&memory, 0x2000, b"granted");
+    assert_eq!(
+        block_on(kernel.write(&t.caller, fd, UserSlice::new(0x2000, 7))),
+        Ok(7)
+    );
+    block_on(kernel.close(&t.caller, fd)).unwrap();
+    assert_eq!(fs::metadata(dir.path().join("allowed")).unwrap().len(), 7);
+    fs::rename(dir.path().join("allowed"), dir.path().join("saved")).unwrap();
+    fs::rename(dir.path().join("replacement"), dir.path().join("allowed")).unwrap();
+    assert_eq!(errno(t.open("/mac/allowed", flags)), Errno::EACCES);
+    assert_eq!(fs::metadata(dir.path().join("allowed")).unwrap().len(), 8);
+    fs::rename(dir.path().join("allowed"), dir.path().join("replacement")).unwrap();
+    fs::rename(dir.path().join("saved"), dir.path().join("allowed")).unwrap();
+    let fd = t.open("/mac/allowed", flags).unwrap();
+    block_on(kernel.close(&t.caller, fd)).unwrap();
+    assert_eq!(fs::metadata(dir.path().join("allowed")).unwrap().len(), 0);
+}

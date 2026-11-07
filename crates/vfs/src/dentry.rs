@@ -51,6 +51,26 @@ impl Dentry {
         Self::new(sb.iget(node), b"/".to_vec(), None)
     }
 
+    /// A policy view of an actual opened object, without inode/name-cache publication.
+    pub(crate) fn provisional(parent: &Arc<Self>, name: &[u8], node: Arc<dyn Node>) -> Arc<Self> {
+        Self::allocate(
+            parent.sb().uncached_inode(node),
+            name.to_vec(),
+            Some(parent.clone()),
+            false,
+        )
+    }
+
+    /// Security sees an existing retained inode's identity, while permission checks keep
+    /// the fresh provisional inode and its uncached ACLs. Neither view registers aliases.
+    pub(crate) fn policy_view(&self) -> Arc<Self> {
+        let inode = self
+            .sb()
+            .retained_inode(self.node())
+            .unwrap_or_else(|| self.inode.clone());
+        Self::allocate(inode, self.name(), self.parent(), false)
+    }
+
     /// A dentry with no name, for an `O_TMPFILE` file.
     pub(crate) fn anonymous(sb: &Arc<Superblock>, node: Arc<dyn Node>) -> Arc<Self> {
         let dentry = Self::new(sb.iget(node), b"#".to_vec(), None);
@@ -90,7 +110,21 @@ impl Dentry {
         pseudo: bool,
     ) -> Arc<Self> {
         let is_dir = inode.file_type() == FileType::Directory;
-        let dentry = Arc::new(Self {
+        let dentry = Self::allocate(inode, name, parent, pseudo);
+        if is_dir {
+            dentry.inode.set_alias(&dentry);
+        }
+        dentry.inode.set_last(&dentry);
+        dentry
+    }
+
+    fn allocate(
+        inode: Arc<Inode>,
+        name: Vec<u8>,
+        parent: Option<Arc<Dentry>>,
+        pseudo: bool,
+    ) -> Arc<Self> {
+        Arc::new(Self {
             inode,
             inner: Mutex::new(Inner {
                 name,
@@ -100,12 +134,7 @@ impl Dentry {
             }),
             mounts: AtomicU32::new(0),
             pseudo,
-        });
-        if is_dir {
-            dentry.inode.set_alias(&dentry);
-        }
-        dentry.inode.set_last(&dentry);
-        dentry
+        })
     }
 
     pub fn inode(&self) -> &Arc<Inode> {

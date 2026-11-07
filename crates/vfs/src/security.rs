@@ -5,7 +5,14 @@
 
 use std::sync::Arc;
 
-use crate::{dentry::Dentry, mount::Path, types::FileType, types::FsResult};
+use crate::{Attr, Errno, dentry::Dentry, mount::Path, types::FileType, types::FsResult};
+
+/// A parent/name operation's observed attributes, not an inode or retained identity.
+pub struct NameView<'a> {
+    pub directory: &'a Path,
+    pub name: &'a [u8],
+    pub attr: &'a Attr,
+}
 
 /// A security module's checks (`security_file_open`, `security_path_*`). Each says why not
 /// with an errno, or lets the operation go on.
@@ -21,6 +28,23 @@ pub trait Security: Send + Sync {
 
     /// `security_path_unlink`, `security_path_rmdir`: `victim` goes from `dir`.
     fn path_remove(&self, dir: &Path, victim: &Arc<Dentry>) -> FsResult<()>;
+
+    /// A name-only removal cannot be passed to the inode hook as a fabricated dentry.
+    /// Existing policies fail closed until they explicitly support observations.
+    fn path_remove_observation(&self, _entry: NameView<'_>) -> FsResult<()> {
+        Err(Errno::EOPNOTSUPP)
+    }
+
+    fn path_rename_observations(
+        &self,
+        _old: NameView<'_>,
+        _new_directory: &Path,
+        _new_name: &[u8],
+        _target: Option<NameView<'_>>,
+        _exchange: bool,
+    ) -> FsResult<()> {
+        Err(Errno::EOPNOTSUPP)
+    }
 
     /// `security_path_link`: `old` gets a new name in `new_dir`.
     fn path_link(&self, old: &Path, new_dir: &Path) -> FsResult<()>;
