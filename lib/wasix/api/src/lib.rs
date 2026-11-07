@@ -274,6 +274,8 @@ pub struct MachineBuilder {
     http_provider: Option<Arc<dyn wasix1_http::HttpProvider>>,
     #[cfg(feature = "wasix1")]
     wasix1_limits: wasixv2_wasix1::Limits,
+    #[cfg(feature = "wasix1")]
+    wasix1_initial_command: bool,
     console: Option<(Console, [bool; 3])>,
     console_input_eof: ConsoleInputEof,
     console_stdio_outputs: bool,
@@ -320,6 +322,8 @@ impl MachineBuilder {
             http_provider: None,
             #[cfg(feature = "wasix1")]
             wasix1_limits: wasixv2_wasix1::Limits::default(),
+            #[cfg(feature = "wasix1")]
+            wasix1_initial_command: false,
             console: None,
             console_input_eof: ConsoleInputEof::Hangup,
             console_stdio_outputs: false,
@@ -327,6 +331,16 @@ impl MachineBuilder {
             #[cfg(all(feature = "host-network", unix))]
             vsock: None,
         }
+    }
+
+    /// Opts a private machine into the WASI command entry convention for an
+    /// original import-free initial module. Defaults to false; file execution
+    /// and guest execve format admission remain unchanged. The embedder must
+    /// check the original command before preparation injects runtime imports.
+    #[cfg(feature = "wasix1")]
+    pub fn wasix1_initial_command(mut self, enabled: bool) -> Self {
+        self.wasix1_initial_command = enabled;
+        self
     }
 
     /// Adds ordered custom imports and paired setup to process, thread and side-module
@@ -486,6 +500,8 @@ impl MachineBuilder {
             http_provider,
             #[cfg(feature = "wasix1")]
             wasix1_limits,
+            #[cfg(feature = "wasix1")]
+            wasix1_initial_command,
             console,
             console_input_eof,
             console_stdio_outputs,
@@ -511,7 +527,7 @@ impl MachineBuilder {
         let root = root
             .unwrap_or_else(|| default_root(&host, &network.resolv_conf(), &user, uname.release()));
         #[cfg(feature = "wasix1")]
-        let wasix1 = Wasix1Commands::new(http_provider, wasix1_limits);
+        let wasix1 = Wasix1Commands::new(http_provider, wasix1_limits, wasix1_initial_command);
         let mut configured_abis = abis(
             loader,
             #[cfg(feature = "js")]
@@ -1333,9 +1349,13 @@ impl Wasix1Commands {
     fn new(
         http_provider: Option<Arc<dyn wasix1_http::HttpProvider>>,
         limits: wasixv2_wasix1::Limits,
+        initial_command_entry: bool,
     ) -> Self {
         let files = Arc::default();
         let mut abi = wasixv2_wasix1::Wasix1::with_commands(Arc::clone(&files)).with_limits(limits);
+        if initial_command_entry {
+            abi = abi.with_initial_command_entry();
+        }
         if let Some(provider) = http_provider {
             abi = abi.with_http_provider(provider);
         }

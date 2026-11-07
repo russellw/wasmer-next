@@ -78,6 +78,7 @@ pub struct Wasix1 {
     commands: Arc<RwLock<Commands>>,
     http: Option<Arc<dyn http::HttpProvider>>,
     limits: Limits,
+    initial_command_entry: bool,
 }
 
 impl Wasix1 {
@@ -94,7 +95,17 @@ impl Wasix1 {
             commands,
             http: None,
             limits: Limits::default(),
+            initial_command_entry: false,
         }
+    }
+
+    /// Also serves import-free initial commands, including the execution layer's
+    /// injected function imports. Embedders must opt in only for a private
+    /// machine whose original initial command has no imports. This does not
+    /// admit import-free files through the kernel's exec image format check.
+    pub fn with_initial_command_entry(mut self) -> Self {
+        self.initial_command_entry = true;
+        self
     }
 
     /// Sets immutable import request ceilings, retained by every image and thread binding.
@@ -135,7 +146,11 @@ where
         matches!(
             module_flavor(module),
             Some(V1Flavor::Wasm32 | V1Flavor::HttpClient)
-        )
+        ) || (self.initial_command_entry
+            && module.imports().all(|import| {
+                import.module() == "wasixv2-exec"
+                    && matches!(import.ty(), wasmer::ExternType::Function(_))
+            }))
     }
 
     fn matches_image(&self, image: &[u8]) -> bool {

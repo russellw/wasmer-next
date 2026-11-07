@@ -51,9 +51,24 @@ parallelism is deferred. Browser/Node/macOS are held. Canonical opt-in legacy
 append offsets and native endpoint policy use the reviewed WLK main API. All 21
 WLK packages have one Git-main identity at
 `8ec0fc67017353513321617103f85739b07556b9`; no development path overrides remain.
-Import-free raw `_start` modules with exported memory remain a parity gap: the old native runner could execute them,
-while the facade reports NoAbi. A narrow initial-entry profile fix is pending;
-no direct-instance fallback is provided.
+Initial native commands with no imports use a private, default-off WASI entry
+profile. The SDK checks the selected original command atom, compiles it through
+the same NativeLoader/cache and uses the facade's common admitted module path.
+Exported memory, `_initialize`, `_start`, protected hooks, Store ownership and
+cleanup retain their ordinary ABI machinery. Returning normally exits with zero;
+successful returned Wasm values retain the recovered runner's discarded-value
+behavior. Startup failures remain errors and executed traps retain the kernel's
+fault status. Imported commands keep file execution; global/default ABI selection
+and guest `execve` admission are unchanged. The old import-free behavior was
+source-inferred, rather than covered by an original public fixture.
+The initial-entry slice passes seven facade controls, one original-atom classifier
+unit and four public SDK contracts in both default and N-API profiles. These prove
+initialized/grown memory, normal return, discarded return values, actual trap and
+call failures, owning-run cancellation and cached waits with a live sibling.
+Hook denial, protected import replacement and unchanged guest `execve` rejection
+are exercised through real instances. The original imported-helper discriminator
+was corrected to its actual signature and rerun in both SDK profiles. Scoped
+all-target Clippy passes for the facade, v1 ABI and SDK in both profiles.
 The accepted pre-retirement base is d0b6c749f373 on WLK
 049156e0b7a92588f4827c1915d722b182f97a75. Its default native suite passed
 62 tests, and the optional N-API success gate passed all eight original fixture

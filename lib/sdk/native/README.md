@@ -68,6 +68,10 @@ module must export `_start` and gets one command and entrypoint named `main`
 automatically. WEBC commands and entrypoints are preserved. Use
 `sandbox.command(package)` to run the package entrypoint.
 
+An initial native command may have no imports. It must export linear `memory`
+and `_start`; `_initialize`, when present, runs first. A normal return succeeds
+with status zero. This entry convention does not change guest `execve` admission.
+
 `Packages::create` builds a package directly from owned module bytes and files,
 without a WEBC archive or registry request:
 
@@ -87,8 +91,8 @@ let output = sandbox.command(package).arg("--help").run().await?;
 sandbox.close().await?;
 ```
 
-`wasm_bytes` can be a `Vec<u8>`. Command modules must export `_start` and be
-compatible with the existing WASI/WASIX runner. A sole command is the inferred
+`wasm_bytes` can be a `Vec<u8>`. Command modules export `_start`; they can use
+supported WASI/WASIX imports or be import-free. A sole command is the inferred
 entrypoint; for multiple commands, set `entrypoint` or select a command by name.
 Files use canonical absolute guest paths and private execution overlays. Use
 the sandbox workspace for persistent writes. Definitions with changed commands
