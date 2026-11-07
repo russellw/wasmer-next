@@ -4916,3 +4916,181 @@ fn oneshot_poll_detaches_its_wait_entries_on_the_first_wake() {
         assert_eq!(ring.reap().len(), 1);
     }
 }
+
+/// Replacing the table need not release A: an armed request owns its exact
+/// old Node. Its eventual completion runs under enter's submit gate.
+#[test]
+fn foreign_retirement_fixed_request_posts_its_tag_after_submit_unlock() {
+    use super::introspect::{ForeignSelector, RetirementMemory, SyncMemory};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let m = Machine::new();
+    let ring = m.ring(8, 0);
+    let caller = m.caller();
+    let (r, w) = pipe(&m.kernel, &caller, OpenFlags(0));
+    let mm = m.kernel.mm(m.task);
+    let ctx = crate::io_uring::ring_of(&m.kernel.caller_file(&caller, ring.fd).unwrap()).unwrap();
+    let first = SyncMemory::new(block_on(m.memory.size()) as usize, 0);
+    let drops = Arc::new(AtomicUsize::new(0));
+    let observed = drops.clone();
+    let check_mm = mm.clone();
+    let check_ctx = ctx.clone();
+    let owner = RetirementMemory::new(first.clone(), move || {
+        assert!(check_mm.op.try_lock().is_some());
+        assert!(
+            check_ctx.test_retirement_unlocked(),
+            "last Node retirement must follow submit/state unlock"
+        );
+        observed.fetch_add(1, Ordering::SeqCst);
+    });
+    let weak = Arc::downgrade(&owner);
+    let selector = ForeignSelector::new(owner);
+    m.kernel.attach_memory(m.task, selector.clone());
+    let data = SCRATCH + 64;
+    let tags = SCRATCH + 96;
+    put_value(
+        &m,
+        data,
+        Iovec {
+            iov_base: BUF,
+            iov_len: 4,
+        },
+    );
+    put_value(&m, tags, 719u64);
+    assert_eq!(register_resources(&ring, true, 1, data, tags), Ok(0));
+    ring.push(IoUringSqe {
+        addr: u64::from(BUF),
+        len: 4,
+        ..sqe(IoUringOp::IORING_OP_READ_FIXED, r.0, 718)
+    });
+    assert_eq!(ring.submit(1), Ok(1));
+    assert!(ring.reap().is_empty());
+    selector.publish(SyncMemory::new(block_on(m.memory.size()) as usize, 0));
+    put_value(&m, data, Iovec::ZERO);
+    assert_eq!(update_resources(&ring, true, 0, 1, data, 0), Ok(1));
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    m.memory.put(BUF + 64, b"kept");
+    assert_eq!(
+        block_on(m.kernel.write(&caller, w, UserSlice::new(BUF + 64, 4))),
+        Ok(4)
+    );
+    let mut cqes = ring.wait(2);
+    cqes.sort_by_key(|c| c.user_data);
+    assert_eq!(
+        res(&cqes),
+        [(718, 4), (719, 0)],
+        "primary and resource-tag CQEs precede return"
+    );
+    assert_eq!(first.get(BUF, 4), b"kept");
+    assert!(weak.upgrade().is_none());
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn foreign_retirement_partial_registration_error_cancel_and_panic_unlock_first() {
+    use super::introspect::{ForeignSelector, RetirementMemory, SyncMemory};
+    use futures::FutureExt as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct StopRead<'a> {
+        memory: &'a dyn UserMemory,
+        at: u32,
+        mode: u8,
+    }
+    impl UserMemory for StopRead<'_> {
+        fn read<'a>(&'a self, addr: u32, out: &'a mut [u8]) -> LocalFuture<'a, Result<(), Fault>> {
+            Box::pin(async move {
+                if addr == self.at {
+                    match self.mode {
+                        0 => return Err(Fault),
+                        1 => std::future::pending().await,
+                        _ => panic!("original iovec failure"),
+                    }
+                }
+                self.memory.read(addr, out).await
+            })
+        }
+        fn write<'a>(&'a self, addr: u32, data: &'a [u8]) -> LocalFuture<'a, Result<(), Fault>> {
+            self.memory.write(addr, data)
+        }
+        fn size(&self) -> LocalFuture<'_, u64> {
+            self.memory.size()
+        }
+        fn grow(&self, pages: u32) -> LocalFuture<'_, Option<u64>> {
+            self.memory.grow(pages)
+        }
+    }
+    for mode in 0..3 {
+        let m = Machine::new();
+        let ring = m.ring(8, 0);
+        let mm = m.kernel.mm(m.task);
+        let ctx =
+            crate::io_uring::ring_of(&m.kernel.caller_file(&m.caller(), ring.fd).unwrap()).unwrap();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let observed = drops.clone();
+        let check_mm = mm.clone();
+        let check_ctx = ctx.clone();
+        let owner = RetirementMemory::new(
+            SyncMemory::new(block_on(m.memory.size()) as usize, 0),
+            move || {
+                assert!(check_mm.op.try_lock().is_some());
+                assert!(check_ctx.test_retirement_unlocked());
+                observed.fetch_add(1, Ordering::SeqCst);
+                if mode == 2 {
+                    panic!("secondary allocation-owner failure");
+                }
+            },
+        );
+        let weak = Arc::downgrade(&owner);
+        let selector = ForeignSelector::new(owner);
+        m.kernel.attach_memory(m.task, selector.clone());
+        let publish = Arc::downgrade(&selector);
+        let next = SyncMemory::new(block_on(m.memory.size()) as usize, 0);
+        selector.after_capture(move || publish.upgrade().unwrap().publish(next));
+        let data = SCRATCH + 64;
+        put_value(
+            &m,
+            data,
+            Iovec {
+                iov_base: BUF,
+                iov_len: 4,
+            },
+        );
+        let local = StopRead {
+            memory: &m.memory,
+            at: data + Iovec::SIZE as u32,
+            mode,
+        };
+        let caller = Caller::new(m.task, &local);
+        let mut register =
+            Box::pin(
+                m.kernel
+                    .io_uring_register(&caller, ring.fd, 0, GuestPtrMut::new(data), 2),
+            );
+        if mode == 1 {
+            assert!(register.as_mut().now_or_never().is_none());
+            assert_eq!(
+                drops.load(Ordering::SeqCst),
+                0,
+                "candidate survives the pending iovec read"
+            );
+            drop(register);
+        } else {
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| block_on(register)));
+            if mode == 0 {
+                assert_eq!(errno(result.unwrap()), Errno::EFAULT);
+            } else {
+                assert_eq!(
+                    result.unwrap_err().downcast_ref::<&str>(),
+                    Some(&"original iovec failure")
+                );
+            }
+        }
+        assert!(weak.upgrade().is_none());
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            errno(ring.register(1, 0, 0)),
+            Errno::ENXIO,
+            "failed candidate never published"
+        );
+    }
+}

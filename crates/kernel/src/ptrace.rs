@@ -257,10 +257,10 @@ pub(crate) async fn access_remote_vm(
     // Serialize with unmap, replacement and protection changes in this mm.
     // Rotation can make this operation the last owner of an old backing.
     // Declare it before the guard so cancellation/return unlocks before Drop.
-    let memory;
+    let mut retired = crate::mm::MemoryRetirement::default();
     let _op = mm.op.lock().await;
-    memory = match mm.foreign() {
-        Some(memory) => memory,
+    let memory = match mm.foreign() {
+        Some(memory) => retired.memory(memory),
         None => return 0,
     };
     let size = memory.size().await;

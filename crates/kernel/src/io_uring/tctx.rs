@@ -171,12 +171,13 @@ impl Kernel {
                     // This cooperative return hook leaves busy work notified
                     // for the next boundary/enter instead of parking its executor
                     // behind another task's long buffer registration.
+                    let mut retired = super::SubmissionRetirement::default();
                     let Some(_submit) = ctx.submit.try_lock() else {
                         tctx.pending.store(true, Ordering::Release);
                         signals.group().notify_uring(caller.task());
                         return;
                     };
-                    self.run_task_work(caller, &ctx, mm).await;
+                    self.run_task_work(caller, &ctx, mm, &mut retired).await;
                 }
             }
         })

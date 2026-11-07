@@ -70,6 +70,35 @@ pub(crate) enum Source {
     Mapped(Mapped),
 }
 
+impl Source {
+    pub(super) fn retire(self, errors: &mut crate::sync::DropErrors) {
+        match self {
+            Self::Private { file, .. } => errors.run(|| drop(file)),
+            Self::Mapped(Mapped {
+                file,
+                pages,
+                segment,
+                writer,
+                ..
+            }) => {
+                errors.run(|| drop(file));
+                errors.run(|| drop(pages));
+                errors.run(|| drop(segment));
+                errors.run(|| drop(writer));
+            }
+            Self::Shared(Shared { object, writer, .. }) => {
+                errors.run(|| drop(object));
+                errors.run(|| drop(writer));
+            }
+        }
+    }
+}
+impl Mapping {
+    pub(super) fn retire(self, errors: &mut crate::sync::DropErrors) {
+        self.source.retire(errors);
+    }
+}
+
 /// A mapping of a shared object's pages ([`UserMemory::map_shared`]).
 #[derive(Clone)]
 pub(crate) struct Mapped {

@@ -3,6 +3,8 @@
 //! `rw.c`, `net.c`, `poll.c`, `timeout.c`, `cancel.c`, `openclose.c`, `fs.c`, `sync.c`,
 //! `kbuf.c`, `nop.c`).
 
+use super::retirement::{Resources, SubmissionRetirement};
+
 use std::{
     collections::VecDeque,
     sync::{Arc, Weak},
@@ -149,6 +151,26 @@ pub(crate) struct Req {
     cqe_extra: Option<[u64; 2]>,
 }
 
+impl Drop for Req {
+    fn drop(&mut self) {
+        let mut errors = crate::sync::DropErrors::new();
+        errors.run(|| drop(self.pbuf.take()));
+        errors.run(|| drop(self.buffer_node.take()));
+        errors.run(|| drop(self.file_node.take()));
+        errors.run(|| drop(self.input_node.take()));
+        errors.run(|| drop(self.file.take()));
+        errors.run(|| drop(self.input.take()));
+        for req in self.link.drain(..) {
+            errors.run(|| drop(req));
+        }
+        if let Some(mut timeout) = self.link_timeout.take() {
+            errors.run(|| drop(timeout.timer.take()));
+            errors.run(|| drop(timeout.req));
+        }
+        errors.finish();
+    }
+}
+
 /// A link timeout and its armed timer.
 struct LinkTimeout {
     req: Box<Req>,
@@ -195,7 +217,7 @@ impl Waiting {
         }
     }
 
-    fn req_mut(&mut self) -> &mut Req {
+    pub(super) fn req_mut(&mut self) -> &mut Req {
         match self {
             Waiting::Futex { req, .. }
             | Waiting::Armed { req, .. }
@@ -307,7 +329,7 @@ impl Req {
     }
 
     /// An empty request in place of one that moved on.
-    fn taken(&self) -> Self {
+    pub(super) fn taken(&self) -> Self {
         Req::new(0, self.sqe, (0, TaskId(0)))
     }
 }
@@ -369,14 +391,31 @@ impl Ctx {
     /// Completes `req` (`io_req_complete_post`): its link timeout loses, its CQE is posted
     /// unless `IOSQE_CQE_SKIP_SUCCESS` skips a success, and its link goes on, or, if it
     /// failed and was not hard-linked, is cancelled.
-    pub(crate) fn finish(&self, mut req: Req, res: i32, flags: u32, fail: bool) {
-        if let Some(lt) = req.link_timeout.take() {
-            drop(lt.timer);
-            self.finish(*lt.req, -Errno::ECANCELED.0, 0, true);
+    pub(crate) fn finish(&self, req: Req, res: i32, flags: u32, fail: bool) {
+        let mut retired = Resources::default();
+        self.finish_in(req, res, flags, fail, &mut retired);
+    }
+
+    pub(super) fn finish_in(
+        &self,
+        req: Req,
+        res: i32,
+        flags: u32,
+        fail: bool,
+        retired: &mut Resources,
+    ) {
+        let slot = retired.requests.len();
+        retired.requests.push(Box::new(req));
+        if let Some(mut lt) = retired.requests[slot].link_timeout.take() {
+            retired.timers.push(lt.timer.take());
+            self.finish_in(*lt.req, -Errno::ECANCELED.0, 0, true, retired);
         }
-        if let Some(pbuf) = req.pbuf.take() {
-            self.recycle(&req, pbuf);
+        if let Some(pbuf) = retired.requests[slot].pbuf.take() {
+            retired.pbufs.push(pbuf);
+            let req = &retired.requests[slot];
+            kbuf::recycle(self, req.sqe.buf_index, retired.pbufs.last().unwrap());
         }
+        let req = &retired.requests[slot];
         let skip = req.has(IosqeFlags::IOSQE_CQE_SKIP_SUCCESS) && res >= 0;
         let flags = flags
             | if req.zc_notif.is_some() {
@@ -384,77 +423,56 @@ impl Ctx {
             } else {
                 0
             };
+        let (data, timeout, extra) = (req.sqe.user_data, req.is_timeout(), req.cqe_extra);
         if !skip {
-            if let Some(extra) = req.cqe_extra {
-                let flags = flags
-                    | if self
-                        .shape
-                        .has(wasixv2_abi::IoringSetupFlags::IORING_SETUP_CQE_MIXED)
-                    {
-                        IoringCqeFlags::IORING_CQE_F_32.0
-                    } else {
-                        0
-                    };
-                self.post_extended(req.sqe.user_data, res, flags, req.is_timeout(), extra);
-            } else {
-                self.post(req.sqe.user_data, res, flags, req.is_timeout());
-            }
+            let (flags, extra) = match extra {
+                Some(extra) => (
+                    flags
+                        | if self
+                            .shape
+                            .has(wasixv2_abi::IoringSetupFlags::IORING_SETUP_CQE_MIXED)
+                        {
+                            IoringCqeFlags::IORING_CQE_F_32.0
+                        } else {
+                            0
+                        },
+                    extra,
+                ),
+                None => (flags, [0; 2]),
+            };
+            self.post_extended_in(data, res, flags, timeout, extra, retired);
         }
-        // io_uring/net.c:io_send_zc_cleanup, notif.c:io_notif_tw_complete:
-        // copying has relinquished the buffer already, including on failure.
-        if let Some((data, report)) = req.zc_notif.take() {
-            self.post(
+        if let Some((data, report)) = retired.requests[slot].zc_notif.take() {
+            self.post_in(
                 data,
                 if report { i32::MIN } else { 0 },
                 IoringCqeFlags::IORING_CQE_F_NOTIF.0,
                 false,
+                retired,
             );
         }
-        let link = std::mem::take(&mut req.link);
-        let broken = fail && !req.has(IosqeFlags::IOSQE_IO_HARDLINK);
-        self.request_done();
-        self.continue_link(link, broken);
-    }
-
-    /// Starts the next request of a link, or fails all of them with `ECANCELED`.
-    fn continue_link(&self, mut link: VecDeque<Req>, broken: bool) {
-        let Some(mut next) = link.pop_front() else {
-            return;
-        };
-        next.link = link;
-        match broken {
-            true => self.finish(next, -Errno::ECANCELED.0, 0, true),
-            false => self.queue_ready(next),
+        let broken = fail && !retired.requests[slot].has(IosqeFlags::IOSQE_IO_HARDLINK);
+        self.request_done_in(retired);
+        if let Some(mut next) = retired.requests[slot].link.pop_front() {
+            next.link = std::mem::take(&mut retired.requests[slot].link);
+            match broken {
+                true => self.finish_in(next, -Errno::ECANCELED.0, 0, true, retired),
+                false => self.queue_ready(next),
+            }
         }
     }
 
-    /// One request fewer in flight; a drain whose predecessors all completed goes on.
-    fn request_done(&self) {
+    fn request_done_in(&self, retired: &mut Resources) {
         let released = {
             let mut state = self.state.lock_or_recover();
             state.inflight = state.inflight.saturating_sub(1);
             release_drained(&mut state)
         };
-        for req in released {
-            self.queue_ready(req);
+        let start = retired.ready.len();
+        retired.ready.extend(released.into_iter().map(Some));
+        for slot in start..retired.ready.len() {
+            self.queue_ready(retired.ready[slot].take().unwrap());
         }
-    }
-
-    /// Completes a request that waited, ending its wait.
-    pub(crate) fn finish_waiting(&self, waiting: Waiting, res: i32) {
-        // Linux io_uring/timeout.c:io_kill_timeout counts sequence-triggered
-        // timeouts, but io_timeout_cancel does not count cancellation.
-        if res == 0 && matches!(&waiting, Waiting::Timeout { .. }) {
-            self.timeout_seq
-                .fetch_add(1, std::sync::atomic::Ordering::Release);
-        }
-        let req = waiting.into_req();
-        self.finish(req, res, 0, res < 0);
-    }
-
-    /// Gives a provided buffer back to its group's head (`io_kbuf_recycle_legacy`).
-    fn recycle(&self, req: &Req, pbuf: Pbuf) {
-        kbuf::recycle(self, req.sqe.buf_index, pbuf);
     }
 
     /// Removes the waiting request `id`.
@@ -494,7 +512,7 @@ pub(crate) fn expired_timeouts(state: &mut State) -> Vec<Waiting> {
 
 /// From the owning task: a waiting request's file woke it. An armed request becomes task
 /// work; a poll that finds its events completes, or, multishot, posts and waits on.
-pub(crate) fn handle_wakeup(ctx: &Ctx, id: u64) {
+pub(crate) fn handle_wakeup(ctx: &Ctx, id: u64, retired: &mut Resources) {
     let futex = {
         let state = ctx.state.lock_or_recover();
         match state.waiting.get(&id) {
@@ -506,7 +524,7 @@ pub(crate) fn handle_wakeup(ctx: &Ctx, id: u64) {
         if let Some(res) = result
             && let Some(waiting) = ctx.take_waiting(id)
         {
-            ctx.finish(waiting.into_req(), res, 0, false);
+            ctx.finish_in(retired.take_waiting(waiting), res, 0, false, retired);
         }
         return;
     }
@@ -525,34 +543,48 @@ pub(crate) fn handle_wakeup(ctx: &Ctx, id: u64) {
         }
     };
     let Some((file, events, multishot, user_data)) = poll else {
-        if let Some(Waiting::Armed { mut req, .. }) = ctx.take_waiting(id) {
+        if let Some(waiting) = ctx.take_waiting(id) {
+            let mut req = retired.take_waiting(waiting);
             req.retried = true;
             ctx.queue_ready(req);
         }
         return;
     };
     let mask = match file {
-        Some(file) => wasixv2_wait::Pollable::poll(&*file, None) & events,
+        Some(file) => {
+            retired.open_files.push(Some(file));
+            wasixv2_wait::Pollable::poll(
+                &**retired.open_files.last().unwrap().as_ref().unwrap(),
+                None,
+            ) & events
+        }
         None => return,
     };
     if mask.is_empty() {
         if !multishot && let Some(waiting) = ctx.take_waiting(id) {
             // Linux poll.c:io_poll_check_events reissues a one-shot poll whose
             // wake became stale after its wait entries were detached.
-            ctx.queue_ready(waiting.into_req());
+            ctx.queue_ready(retired.take_waiting(waiting));
         }
         return;
     }
     match multishot {
-        true => ctx.post(
+        true => ctx.post_in(
             user_data,
             mask.0 as i32,
             IoringCqeFlags::IORING_CQE_F_MORE.0,
             false,
+            retired,
         ),
         false => {
             if let Some(waiting) = ctx.take_waiting(id) {
-                ctx.finish(waiting.into_req(), mask.0 as i32, 0, false);
+                ctx.finish_in(
+                    retired.take_waiting(waiting),
+                    mask.0 as i32,
+                    0,
+                    false,
+                    retired,
+                );
             }
         }
     }
@@ -653,14 +685,16 @@ impl Kernel {
         ctx: &Arc<Ctx>,
         mm: u64,
         submission: (IoUringSqe, Option<Errno>),
-        link: &mut Option<Req>,
+        retired: &mut SubmissionRetirement,
     ) -> bool {
         let (sqe, prep_error) = submission;
-        let mut req = Req::new(ctx.next_id(), sqe, (mm, caller.task()));
+        assert!(retired.preparing.is_none());
+        retired.preparing = Some(Box::new(Req::new(ctx.next_id(), sqe, (mm, caller.task()))));
+        let req = retired.preparing.as_mut().unwrap();
         req.task_work = Some(self.uring_task_work(caller.task()));
         let mut init = match prep_error {
             Some(err) => Err(err),
-            None => init_req(ctx, &mut req),
+            None => init_req(ctx, req),
         };
         let mut link_at = None;
         if init.is_ok() && req.opcode() == op(IoUringOp::IORING_OP_LINK_TIMEOUT) {
@@ -709,7 +743,8 @@ impl Kernel {
         ctx.state.lock_or_recover().inflight += 1;
         let linked = req.sqe.flags & LINK_FLAGS != 0;
         let link_timeout = req.opcode() == op(IoUringOp::IORING_OP_LINK_TIMEOUT);
-        match link {
+        let mut req = *retired.preparing.take().unwrap();
+        match &mut retired.link {
             Some(head) => {
                 let failed = req.failed.is_some();
                 if failed && head.failed.is_none() {
@@ -732,55 +767,87 @@ impl Kernel {
                     head.link.push_back(req);
                 }
                 if !linked {
-                    let head = link.take().expect("a chain");
-                    self.queue_sqe(caller, ctx, head).await;
+                    let head = retired.link.take().expect("a chain");
+                    self.queue_sqe(caller, ctx, head, retired).await;
                 }
             }
             None if link_timeout => {
                 req.failed.get_or_insert(Errno::EINVAL);
-                self.queue_sqe(caller, ctx, req).await;
+                self.queue_sqe(caller, ctx, req, retired).await;
             }
-            None if linked => *link = Some(req),
-            None => self.queue_sqe(caller, ctx, req).await,
+            None if linked => retired.link = Some(req),
+            None => self.queue_sqe(caller, ctx, req, retired).await,
         }
         init.is_ok()
     }
 
     /// `io_queue_sqe`: a failed chain completes at once; a drained request, and any behind a
     /// drain, waits for its predecessors; the rest are issued now.
-    pub(super) async fn queue_sqe(&self, caller: &Caller<'_>, ctx: &Arc<Ctx>, req: Req) {
-        if let Some(errno) = req.failed {
-            fail_chain(ctx, req, errno);
+    pub(super) async fn queue_sqe(
+        &self,
+        caller: &Caller<'_>,
+        ctx: &Arc<Ctx>,
+        req: Req,
+        retired: &mut SubmissionRetirement,
+    ) {
+        assert!(retired.issuing.is_none());
+        retired.issuing = Some(Box::new(req));
+        if let Some(errno) = retired.issuing.as_ref().unwrap().failed {
+            fail_chain(
+                ctx,
+                *retired.issuing.take().unwrap(),
+                errno,
+                &mut retired.resources,
+            );
             return;
         }
         let deferred = {
             let mut state = ctx.state.lock_or_recover();
+            let req = retired.issuing.as_ref().unwrap();
             let drain = req.has(IosqeFlags::IOSQE_IO_DRAIN);
-            let others = state.inflight - 1 - chain_len(&req);
+            let others = state.inflight - 1 - chain_len(req);
             if (drain && others > 0) || !state.drain.is_empty() {
-                state.drain.push_back(req);
-                None
+                state.drain.push_back(*retired.issuing.take().unwrap());
+                true
             } else {
-                Some(req)
+                false
             }
         };
-        if let Some(req) = deferred {
-            self.issue(caller, ctx, req).await;
+        if !deferred {
+            self.issue(caller, ctx, *retired.issuing.take().unwrap(), retired)
+                .await;
         }
     }
 
     /// `io_issue_sqe`: one attempt at `req` that does not block, and what follows from it.
-    pub(super) async fn issue(&self, caller: &Caller<'_>, ctx: &Arc<Ctx>, mut req: Req) {
-        if let Some(errno) = req.failed {
-            ctx.finish(req, -errno.0, 0, true);
+    pub(super) async fn issue(
+        &self,
+        caller: &Caller<'_>,
+        ctx: &Arc<Ctx>,
+        req: Req,
+        retired: &mut SubmissionRetirement,
+    ) {
+        assert!(retired.issuing.is_none());
+        retired.issuing = Some(Box::new(req));
+        if let Some(errno) = retired.issuing.as_ref().unwrap().failed {
+            ctx.finish_in(
+                *retired.issuing.take().unwrap(),
+                -errno.0,
+                0,
+                true,
+                &mut retired.resources,
+            );
             return;
         }
         loop {
+            let req = retired.issuing.as_mut().unwrap();
             let lent = req
                 .creds
                 .clone()
                 .map(|cred| self.lend_cred(caller.task(), cred));
-            let issued = self.issue_op(caller, ctx, &mut req).await;
+            let issued = self
+                .issue_op(caller, ctx, req, &mut retired.resources)
+                .await;
             drop(lent);
             let outcome = match issued {
                 Ok(outcome) => outcome,
@@ -788,32 +855,68 @@ impl Kernel {
             };
             match outcome {
                 Outcome::Done { res, flags, fail } => {
-                    ctx.finish(req, res, flags, fail);
+                    ctx.finish_in(
+                        *retired.issuing.take().unwrap(),
+                        res,
+                        flags,
+                        fail,
+                        &mut retired.resources,
+                    );
                     return;
                 }
                 Outcome::More { res, flags } => {
                     if ctx.cq_ready() >= ctx.shape.cq_entries {
-                        // io_uring/rw.c:io_read_mshot: overflow ends multishot.
-                        ctx.finish(req, res, flags, false);
+                        ctx.finish_in(
+                            *retired.issuing.take().unwrap(),
+                            res,
+                            flags,
+                            false,
+                            &mut retired.resources,
+                        );
                         return;
                     }
                     let more = flags | IoringCqeFlags::IORING_CQE_F_MORE.0;
-                    ctx.post(req.sqe.user_data, res, more, false);
-                    if req.opcode() == op(IoUringOp::IORING_OP_READ_MULTISHOT) {
-                        arm(ctx, req, PollMask::READABLE);
+                    let req = retired.issuing.as_ref().unwrap();
+                    let (data, read_multi) = (
+                        req.sqe.user_data,
+                        req.opcode() == op(IoUringOp::IORING_OP_READ_MULTISHOT),
+                    );
+                    ctx.post_in(data, res, more, false, &mut retired.resources);
+                    if read_multi {
+                        arm(
+                            ctx,
+                            *retired.issuing.take().unwrap(),
+                            PollMask::READABLE,
+                            &mut retired.resources,
+                        );
                         return;
                     }
                 }
                 Outcome::AgainOn(targets) => {
-                    arm_on(ctx, req, targets);
+                    arm_on(
+                        ctx,
+                        *retired.issuing.take().unwrap(),
+                        targets,
+                        &mut retired.resources,
+                    );
                     return;
                 }
                 Outcome::Again(events) => {
-                    arm(ctx, req, events);
+                    arm(
+                        ctx,
+                        *retired.issuing.take().unwrap(),
+                        events,
+                        &mut retired.resources,
+                    );
                     return;
                 }
                 Outcome::Wait(waiting) => {
-                    wait(ctx, *waiting);
+                    // The operation exchanged the issuing slot for an empty Req.
+                    retired
+                        .resources
+                        .requests
+                        .push(retired.issuing.take().unwrap());
+                    wait(ctx, *waiting, &mut retired.resources);
                     return;
                 }
             }
@@ -837,7 +940,7 @@ impl Kernel {
                 let files = state.files.as_ref().ok_or(Errno::EBADF)?;
                 let slot = files.get(req.sqe.fd as u32 as usize).ok_or(Errno::EBADF)?;
                 let node = slot.clone().ok_or(Errno::EBADF)?;
-                let file = node.item.clone();
+                let file = node.item().clone();
                 req.file_node = Some(node);
                 file
             }
@@ -853,6 +956,7 @@ impl Kernel {
         caller: &Caller<'_>,
         ctx: &Arc<Ctx>,
         req: &mut Req,
+        retired: &mut Resources,
     ) -> Result<Outcome, Errno> {
         let sqe = req.sqe;
         match IoUringOp(sqe.opcode) {
@@ -860,7 +964,7 @@ impl Kernel {
             | IoUringOp::IORING_OP_FUTEX_WAKE
             | IoUringOp::IORING_OP_FUTEX_WAITV => self.op_futex(caller, ctx, req).await,
             IoUringOp::IORING_OP_WAITID => self.op_waitid(caller, ctx, req).await,
-            IoUringOp::IORING_OP_MSG_RING => self.op_msg_ring(caller, ctx, req),
+            IoUringOp::IORING_OP_MSG_RING => self.op_msg_ring(caller, ctx, req, retired),
             IoUringOp::IORING_OP_SPLICE | IoUringOp::IORING_OP_TEE => {
                 self.op_splice(caller, ctx, req).await
             }
@@ -874,7 +978,7 @@ impl Kernel {
                     return Err(Errno::EINVAL);
                 }
                 let done = if sqe.off as u32 == u32::MAX {
-                    self.alloc_file_indices(caller, ctx, sqe.addr, sqe.len)
+                    self.alloc_file_indices(caller, ctx, sqe.addr, sqe.len, retired)
                         .await
                 } else {
                     let up = wasixv2_abi::IoUringRsrcUpdate2 {
@@ -883,7 +987,7 @@ impl Kernel {
                         nr: sqe.len,
                         ..wasixv2_abi::IoUringRsrcUpdate2::ZERO
                     };
-                    self.update_resources(caller, ctx, up, false).await
+                    self.update_resources(caller, ctx, up, false, retired).await
                 };
                 Ok(Outcome::of(done))
             }
@@ -918,7 +1022,7 @@ impl Kernel {
             | IoUringOp::IORING_OP_WRITE_FIXED
             | IoUringOp::IORING_OP_READV_FIXED
             | IoUringOp::IORING_OP_WRITEV_FIXED
-            | IoUringOp::IORING_OP_READ_MULTISHOT => self.op_rw(caller, ctx, req).await,
+            | IoUringOp::IORING_OP_READ_MULTISHOT => self.op_rw(caller, ctx, req, retired).await,
             IoUringOp::IORING_OP_EPOLL_CTL => {
                 // io_uring/epoll.c:io_epoll_ctl; this opcode does normal fd lookups.
                 if sqe.buf_index != 0 || sqe.splice_fd_in != 0 {
@@ -954,7 +1058,7 @@ impl Kernel {
                     result => Ok(Outcome::of(result)),
                 }
             }
-            IoUringOp::IORING_OP_PIPE => self.op_pipe(caller, ctx, &sqe).await,
+            IoUringOp::IORING_OP_PIPE => self.op_pipe(caller, ctx, &sqe, retired).await,
             IoUringOp::IORING_OP_SYNC_FILE_RANGE => {
                 if sqe.addr != 0 || sqe.buf_index != 0 || sqe.splice_fd_in != 0 {
                     return Err(Errno::EINVAL);
@@ -986,19 +1090,21 @@ impl Kernel {
                 Ok(Outcome::of(synced.map(|()| 0).map_err(SysErr::from)))
             }
             IoUringOp::IORING_OP_POLL_ADD => self.op_poll_add(caller, ctx, req),
-            IoUringOp::IORING_OP_POLL_REMOVE => op_poll_remove(ctx, &sqe),
+            IoUringOp::IORING_OP_POLL_REMOVE => op_poll_remove(ctx, &sqe, retired),
             IoUringOp::IORING_OP_TIMEOUT => self.op_timeout(caller, ctx, req).await,
-            IoUringOp::IORING_OP_TIMEOUT_REMOVE => self.op_timeout_remove(caller, ctx, &sqe).await,
+            IoUringOp::IORING_OP_TIMEOUT_REMOVE => {
+                self.op_timeout_remove(caller, ctx, &sqe, retired).await
+            }
             IoUringOp::IORING_OP_LINK_TIMEOUT => Err(Errno::EINVAL),
-            IoUringOp::IORING_OP_ASYNC_CANCEL => self.op_async_cancel(caller, ctx, &sqe),
-            IoUringOp::IORING_OP_ACCEPT => self.op_accept(caller, ctx, req).await,
+            IoUringOp::IORING_OP_ASYNC_CANCEL => self.op_async_cancel(caller, ctx, &sqe, retired),
+            IoUringOp::IORING_OP_ACCEPT => self.op_accept(caller, ctx, req, retired).await,
             IoUringOp::IORING_OP_CONNECT => self.op_connect(caller, ctx, req).await,
             IoUringOp::IORING_OP_SEND
             | IoUringOp::IORING_OP_RECV
             | IoUringOp::IORING_OP_SENDMSG
             | IoUringOp::IORING_OP_RECVMSG
             | IoUringOp::IORING_OP_SEND_ZC
-            | IoUringOp::IORING_OP_SENDMSG_ZC => self.op_net(caller, ctx, req).await,
+            | IoUringOp::IORING_OP_SENDMSG_ZC => self.op_net(caller, ctx, req, retired).await,
             IoUringOp::IORING_OP_SHUTDOWN => {
                 if sqe.off != 0 || sqe.addr != 0 || sqe.op_flags != 0 || sqe.buf_index != 0 {
                     return Err(Errno::EINVAL);
@@ -1024,9 +1130,9 @@ impl Kernel {
                 Ok(Outcome::of(done))
             }
             IoUringOp::IORING_OP_OPENAT | IoUringOp::IORING_OP_OPENAT2 => {
-                self.op_openat(caller, ctx, req).await
+                self.op_openat(caller, ctx, req, retired).await
             }
-            IoUringOp::IORING_OP_CLOSE => self.op_close(caller, ctx, req).await,
+            IoUringOp::IORING_OP_CLOSE => self.op_close(caller, ctx, req, retired).await,
             IoUringOp::IORING_OP_STATX => {
                 if sqe.buf_index != 0 || sqe.splice_fd_in != 0 {
                     return Err(Errno::EINVAL);
@@ -1047,7 +1153,7 @@ impl Kernel {
             IoUringOp::IORING_OP_REMOVE_BUFFERS => {
                 Ok(Outcome::of(kbuf::remove(ctx, &sqe).map_err(SysErr::from)))
             }
-            _ => self.op_misc(caller, ctx, req).await,
+            _ => self.op_misc(caller, ctx, req, retired).await,
         }
     }
 
@@ -1154,7 +1260,13 @@ impl Kernel {
     }
 
     /// io_uring/msg_ring.c:io_msg_ring_data/io_msg_send_fd.
-    fn op_msg_ring(&self, caller: &Caller<'_>, ctx: &Ctx, req: &mut Req) -> Result<Outcome, Errno> {
+    fn op_msg_ring(
+        &self,
+        caller: &Caller<'_>,
+        ctx: &Ctx,
+        req: &mut Req,
+        retired: &mut Resources,
+    ) -> Result<Outcome, Errno> {
         let s = req.sqe;
         if s.buf_index != 0 || s.personality != 0 || s.op_flags & !3 != 0 {
             return Err(Errno::EINVAL);
@@ -1184,7 +1296,7 @@ impl Kernel {
                 {
                     return Err(Errno::EINVAL);
                 }
-                if !target.post_aux(s.off, s.len as i32, flags) {
+                if !target.post_aux_in(s.off, s.len as i32, flags, retired) {
                     return Err(Errno::EOVERFLOW);
                 }
                 0
@@ -1204,11 +1316,11 @@ impl Kernel {
                         .as_ref()
                         .and_then(|table| table.get(index))
                         .and_then(|entry| entry.as_ref())
-                        .map(|node| node.item.clone())
+                        .map(|node| node.item().clone())
                         .ok_or(Errno::EBADF)?
                 };
-                let result = target.install_direct(file, s.splice_fd_in as u32)?;
-                if s.op_flags & 1 == 0 && !target.post_aux(s.off, result, 0) {
+                let result = target.install_direct_in(file, s.splice_fd_in as u32, retired)?;
+                if s.op_flags & 1 == 0 && !target.post_aux_in(s.off, result, 0, retired) {
                     return Err(Errno::EOVERFLOW);
                 }
                 result
@@ -1243,7 +1355,7 @@ impl Kernel {
                     .and_then(|table| table.get(s.splice_fd_in as u32 as usize))
                     .and_then(Clone::clone)
                     .ok_or(Errno::EBADF)?;
-                let file = node.item.clone();
+                let file = node.item().clone();
                 req.input_node = Some(node);
                 file
             } else {
@@ -1288,6 +1400,7 @@ impl Kernel {
         caller: &Caller<'_>,
         ctx: &Ctx,
         req: &mut Req,
+        retired: &mut Resources,
     ) -> Result<Outcome, Errno> {
         use wasixv2_abi::{AddressFamily, MadviseAdvice, RenameFlags, XattrFlags};
         let s = req.sqe;
@@ -1316,8 +1429,14 @@ impl Kernel {
                 let addr = u32::try_from(s.addr).map_err(|_| Errno::EFAULT)?;
                 let len = u32::try_from(if s.off == 0 { u64::from(s.len) } else { s.off })
                     .map_err(|_| Errno::EINVAL)?;
-                self.sys_madvise(caller, addr, len, MadviseAdvice(s.op_flags as i32))
-                    .await
+                self.madvise_in(
+                    caller,
+                    addr,
+                    len,
+                    MadviseAdvice(s.op_flags as i32),
+                    &mut retired.memory,
+                )
+                .await
             }
             IoUringOp::IORING_OP_FADVISE => {
                 if s.buf_index != 0 || s.splice_fd_in != 0 {
@@ -1479,7 +1598,7 @@ impl Kernel {
                 let dest = if index == 0 {
                     crate::fs::FileDest::Table
                 } else {
-                    crate::fs::FileDest::Direct(ctx, index)
+                    crate::fs::FileDest::Direct(ctx, index, retired)
                 };
                 self.socket_to(
                     caller,
@@ -1583,6 +1702,7 @@ impl Kernel {
         caller: &Caller<'_>,
         ctx: &Ctx,
         sqe: &IoUringSqe,
+        retired: &mut Resources,
     ) -> Result<Outcome, Errno> {
         if sqe.fd != 0 || sqe.off != 0 || sqe.addr3 != 0 {
             return Err(Errno::EINVAL);
@@ -1614,11 +1734,11 @@ impl Kernel {
         );
         let [read, write] = files.map(Arc::new);
         let allocated = index == u32::MAX;
-        let first = ctx.install_direct(read, index)?;
+        let first = ctx.install_direct_in(read, index, retired)?;
         let first = if allocated { first as u32 } else { index - 1 };
         let second_index = if allocated { index } else { index + 1 };
         let result = async {
-            let second = ctx.install_direct(write, second_index)?;
+            let second = ctx.install_direct_in(write, second_index, retired)?;
             let second = if allocated {
                 second as u32
             } else {
@@ -1628,21 +1748,27 @@ impl Kernel {
             fds[..4].copy_from_slice(&first.to_le_bytes());
             fds[4..].copy_from_slice(&second.to_le_bytes());
             if caller.memory().write(addr, &fds).await.is_err() {
-                ctx.remove_direct(second)?;
+                ctx.remove_direct_in(second, retired)?;
                 return Err(Errno::EFAULT);
             }
             Ok(())
         }
         .await;
         if result.is_err() {
-            ctx.remove_direct(first)?;
+            ctx.remove_direct_in(first, retired)?;
         }
         Ok(Outcome::of(result.map(|()| 0).map_err(SysErr::from)))
     }
 
     /// `io_read` and `io_write` (`rw.c`): a non-blocking attempt; a pollable file that would
     /// block is armed for `EPOLLIN` or `EPOLLOUT`, unless `RWF_NOWAIT` asked for `EAGAIN`.
-    async fn op_rw(&self, caller: &Caller<'_>, ctx: &Ctx, req: &mut Req) -> Result<Outcome, Errno> {
+    async fn op_rw(
+        &self,
+        caller: &Caller<'_>,
+        ctx: &Ctx,
+        req: &mut Req,
+        retired: &mut Resources,
+    ) -> Result<Outcome, Errno> {
         let sqe = req.sqe;
         let opcode = IoUringOp(sqe.opcode);
         let write = matches!(
@@ -1723,8 +1849,8 @@ impl Kernel {
                 for iov in &vectors {
                     let end = u64::from(iov.iov_base) + u64::from(iov.iov_len);
                     if iov.iov_len == 0
-                        || iov.iov_base < node.item.addr
-                        || end > u64::from(node.item.addr) + u64::from(node.item.len)
+                        || iov.iov_base < node.item().addr
+                        || end > u64::from(node.item().addr) + u64::from(node.item().len)
                     {
                         return Err(Errno::EFAULT);
                     }
@@ -1760,7 +1886,7 @@ impl Kernel {
             .as_ref()
             .map(|node| crate::mm::RetainedMemory {
                 memory: caller.memory(),
-                range: &node.item,
+                range: node.item(),
             });
         let redirected = retained
             .as_ref()
@@ -1783,7 +1909,8 @@ impl Kernel {
         match done {
             Err(SysErr::Errno(Errno::EAGAIN)) if multi || !flags.contains(RwfFlags::RWF_NOWAIT) => {
                 if let Some(pbuf) = req.pbuf.take() {
-                    ctx.recycle(req, pbuf);
+                    retired.pbufs.push(pbuf);
+                    kbuf::recycle(ctx, req.sqe.buf_index, retired.pbufs.last().unwrap());
                 }
                 if file.can_poll() {
                     return Ok(Outcome::Again(events));
@@ -1793,12 +1920,16 @@ impl Kernel {
             Ok(n) => {
                 if multi && n == 0 {
                     if let Some(pbuf) = req.pbuf.take() {
-                        ctx.recycle(req, pbuf);
+                        retired.pbufs.push(pbuf);
+                        kbuf::recycle(ctx, req.sqe.buf_index, retired.pbufs.last().unwrap());
                     }
                     return Ok(Outcome::of(Ok(0)));
                 }
                 let flags = match req.pbuf.take() {
-                    Some(pbuf) => kbuf::complete(caller, pbuf, n).await?,
+                    Some(pbuf) => {
+                        retired.pbufs.push(pbuf);
+                        kbuf::complete(caller, retired.pbufs.last().unwrap(), n).await?
+                    }
                     None => 0,
                 };
                 if multi {
@@ -1824,6 +1955,7 @@ impl Kernel {
         caller: &Caller<'_>,
         ctx: &Ctx,
         req: &mut Req,
+        retired: &mut Resources,
     ) -> Result<Outcome, Errno> {
         let sqe = req.sqe;
         let zc = matches!(
@@ -1958,11 +2090,11 @@ impl Kernel {
         let mut more_payload = true;
         let done = if fixed_send && msg {
             let node = req.buffer_node.as_ref().expect("fixed buffer imported");
-            self.uring_sendmsg_fixed(caller, file.clone(), addr, flags, &node.item)
+            self.uring_sendmsg_fixed(caller, file.clone(), addr, flags, node.item().as_ref())
                 .await
         } else if vector_send {
             let iovecs = read_iovecs(caller.memory(), GuestPtr::new(addr), len).await?;
-            let fixed = req.buffer_node.as_ref().map(|node| &*node.item);
+            let fixed = req.buffer_node.as_ref().map(|node| &**node.item());
             self.uring_send_vectors(caller, file.clone(), iovecs, flags, destination, fixed)
                 .await
         } else if let Some(hdr) = selected_header {
@@ -1982,7 +2114,7 @@ impl Kernel {
         } else {
             match opcode {
                 IoUringOp::IORING_OP_SEND => {
-                    let fixed = req.buffer_node.as_ref().map(|node| &*node.item);
+                    let fixed = req.buffer_node.as_ref().map(|node| &**node.item());
                     self.uring_send_vectors(
                         caller,
                         file.clone(),
@@ -2014,13 +2146,17 @@ impl Kernel {
         match done {
             Err(SysErr::Errno(Errno::EAGAIN)) if !nowait => {
                 if let Some(pbuf) = req.pbuf.take() {
-                    ctx.recycle(req, pbuf);
+                    retired.pbufs.push(pbuf);
+                    kbuf::recycle(ctx, req.sqe.buf_index, retired.pbufs.last().unwrap());
                 }
                 Ok(Outcome::Again(events))
             }
             Ok(n) => {
                 let flags = match req.pbuf.take() {
-                    Some(pbuf) => kbuf::complete(caller, pbuf, n as u32).await?,
+                    Some(pbuf) => {
+                        retired.pbufs.push(pbuf);
+                        kbuf::complete(caller, retired.pbufs.last().unwrap(), n as u32).await?
+                    }
                     None => 0,
                 };
                 // A stream's end ends a multishot receive.
@@ -2047,6 +2183,7 @@ impl Kernel {
         caller: &Caller<'_>,
         ctx: &Ctx,
         req: &mut Req,
+        retired: &mut Resources,
     ) -> Result<Outcome, Errno> {
         let sqe = req.sqe;
         if sqe.len != 0 || sqe.buf_index != 0 {
@@ -2069,7 +2206,7 @@ impl Kernel {
         let dest = if index == 0 {
             crate::fs::FileDest::Table
         } else {
-            crate::fs::FileDest::Direct(ctx, index)
+            crate::fs::FileDest::Direct(ctx, index, retired)
         };
         let file = self.req_file(caller, ctx, req)?;
         if iou & poll_first != 0 && !req.retried {
@@ -2121,7 +2258,13 @@ impl Kernel {
     }
 
     /// `io_openat` and `io_openat2` (`openclose.c`), including direct descriptors.
-    async fn op_openat(&self, caller: &Caller<'_>, ctx: &Ctx, req: &Req) -> Result<Outcome, Errno> {
+    async fn op_openat(
+        &self,
+        caller: &Caller<'_>,
+        ctx: &Ctx,
+        req: &Req,
+        retired: &mut Resources,
+    ) -> Result<Outcome, Errno> {
         let sqe = req.sqe;
         if sqe.buf_index != 0 {
             return Err(Errno::EINVAL);
@@ -2133,7 +2276,7 @@ impl Kernel {
         let dest = if index == 0 {
             crate::fs::FileDest::Table
         } else {
-            crate::fs::FileDest::Direct(ctx, index)
+            crate::fs::FileDest::Direct(ctx, index, retired)
         };
         let path = GuestPtr::new(u32::try_from(sqe.addr).map_err(|_| Errno::EFAULT)?);
         let opened = match IoUringOp(sqe.opcode) {
@@ -2153,7 +2296,13 @@ impl Kernel {
 
     /// `io_close`: closes a descriptor of the caller, or empties a registered file's slot
     /// (`file_index`). A ring cannot be closed this way (`EBADF`).
-    async fn op_close(&self, caller: &Caller<'_>, ctx: &Ctx, req: &Req) -> Result<Outcome, Errno> {
+    async fn op_close(
+        &self,
+        caller: &Caller<'_>,
+        ctx: &Ctx,
+        req: &Req,
+        retired: &mut Resources,
+    ) -> Result<Outcome, Errno> {
         let sqe = req.sqe;
         if sqe.off != 0 || sqe.addr != 0 || sqe.len != 0 || sqe.op_flags != 0 || sqe.buf_index != 0
         {
@@ -2167,7 +2316,7 @@ impl Kernel {
             if sqe.fd != 0 {
                 return Err(Errno::EINVAL);
             }
-            ctx.remove_direct(slot - 1)?;
+            ctx.remove_direct_in(slot - 1, retired)?;
             return Ok(Outcome::of(Ok(0)));
         }
         let file = self.caller_file(caller, Fd(sqe.fd))?;
@@ -2346,6 +2495,7 @@ impl Kernel {
         caller: &Caller<'_>,
         ctx: &Arc<Ctx>,
         sqe: &IoUringSqe,
+        retired: &mut Resources,
     ) -> Result<Outcome, Errno> {
         if sqe.buf_index != 0 || sqe.len != 0 || sqe.splice_fd_in != 0 {
             return Err(Errno::EINVAL);
@@ -2370,7 +2520,7 @@ impl Kernel {
             };
             // Linux io_uring/timeout.c:io_timeout_cancel uses
             // io_req_task_queue_fail; io_timeout_remove completes inline first.
-            let mut req = waiting.into_req();
+            let mut req = retired.take_waiting(waiting);
             req.failed = Some(Errno::ECANCELED);
             ctx.queue_ready(req);
             return Ok(Outcome::of(Ok(0)));
@@ -2444,6 +2594,7 @@ impl Kernel {
         caller: &Caller<'_>,
         ctx: &Arc<Ctx>,
         sqe: &IoUringSqe,
+        retired: &mut Resources,
     ) -> Result<Outcome, Errno> {
         if sqe.off != 0 || sqe.splice_fd_in != 0 {
             return Err(Errno::EINVAL);
@@ -2484,10 +2635,16 @@ impl Kernel {
             }
             matched
         };
-        let cancelled = cancel(ctx, matches, flags & (all | any) != 0);
+        let cancelled = cancel_in(ctx, matches, flags & (all | any) != 0, retired);
         let n = cancelled.len() as i32;
-        for req in cancelled {
-            ctx.finish(req, -Errno::ECANCELED.0, 0, true);
+        for slot in cancelled {
+            ctx.finish_in(
+                retired.ready[slot].take().unwrap(),
+                -Errno::ECANCELED.0,
+                0,
+                true,
+                retired,
+            );
         }
         Ok(Outcome::of(match n {
             0 => Err(Errno::ENOENT.into()),
@@ -2595,34 +2752,54 @@ fn chain_len(req: &Req) -> u32 {
 
 /// Fails every request of a chain whose submission failed (`io_req_defer_failed`): each with
 /// its own error, or `ECANCELED`.
-fn fail_chain(ctx: &Ctx, mut req: Req, errno: Errno) {
-    let mut link = std::mem::take(&mut req.link);
-    if let Some(lt) = req.link_timeout.take() {
-        ctx.finish(*lt.req, -Errno::ECANCELED.0, 0, true);
-    }
-    ctx.finish(req, -errno.0, 0, true);
-    while let Some(mut next) = link.pop_front() {
-        let errno = next.failed.unwrap_or(Errno::ECANCELED);
-        if let Some(lt) = next.link_timeout.take() {
-            ctx.finish(*lt.req, -Errno::ECANCELED.0, 0, true);
-        }
-        ctx.finish(next, -errno.0, 0, true);
+fn fail_chain(ctx: &Ctx, req: Req, errno: Errno, retired: &mut Resources) {
+    let head = retired.requests.len();
+    retired.requests.push(Box::new(req));
+    let mut next = Some(errno);
+    loop {
+        let (request, errno) = match next.take() {
+            Some(errno) => {
+                let req = &mut *retired.requests[head];
+                let mut request = std::mem::replace(req, req.taken());
+                req.link = std::mem::take(&mut request.link);
+                (request, errno)
+            }
+            None => match retired.requests[head].link.pop_front() {
+                Some(mut req) => {
+                    let errno = req.failed.unwrap_or(Errno::ECANCELED);
+                    // Keep the remaining chain owned by the outer slot.
+                    retired.requests[head].link.append(&mut req.link);
+                    (req, errno)
+                }
+                None => break,
+            },
+        };
+        ctx.finish_in(request, -errno.0, 0, true, retired);
     }
 }
 
 /// Arms `req` on its file's queues for `events` (`io_arm_poll_handler`), and its link timeout.
 /// A file that became ready meanwhile makes it task work at once; one that cannot wait fails
 /// it with `EAGAIN`.
-fn arm(ctx: &Arc<Ctx>, req: Req, events: PollMask) {
+fn arm(ctx: &Arc<Ctx>, req: Req, events: PollMask, retired: &mut Resources) {
     let Some(file) = req.file.clone() else {
-        ctx.finish(req, -Errno::EAGAIN.0, 0, true);
+        ctx.finish_in(req, -Errno::EAGAIN.0, 0, true, retired);
         return;
     };
-    arm_on(ctx, req, vec![(file, events)]);
+    arm_on(ctx, req, vec![(file, events)], retired);
 }
 
-fn arm_on(ctx: &Arc<Ctx>, mut req: Req, targets: Vec<(Arc<OpenFile>, PollMask)>) {
-    arm_link_timeout(ctx, &mut req);
+fn arm_on(
+    ctx: &Arc<Ctx>,
+    req: Req,
+    targets: Vec<(Arc<OpenFile>, PollMask)>,
+    retired: &mut Resources,
+) {
+    let slot = retired.requests.len();
+    retired.requests.push(Box::new(req));
+    arm_link_timeout(ctx, &mut retired.requests[slot]);
+    let req = &mut *retired.requests[slot];
+    let req = std::mem::replace(req, req.taken());
     let id = req.id;
     // In the table before its entries are on the queues, so no wakeup misses it.
     ctx.state.lock_or_recover().waiting.insert(
@@ -2656,20 +2833,21 @@ fn arm_on(ctx: &Arc<Ctx>, mut req: Req, targets: Vec<(Arc<OpenFile>, PollMask)>)
             None => None,
         }
     };
-    let Some(Waiting::Armed { mut req, .. }) = taken else {
+    let Some(waiting) = taken else {
         return;
     };
+    let mut req = retired.take_waiting(waiting);
     match ready {
         true => {
             req.retried = true;
             ctx.queue_ready(req);
         }
-        false => ctx.finish(req, -Errno::EAGAIN.0, 0, true),
+        false => ctx.finish_in(req, -Errno::EAGAIN.0, 0, true, retired),
     }
 }
 
 /// Keeps a request that waits for its wakeup or timer, with its link timeout armed.
-fn wait(ctx: &Arc<Ctx>, waiting: Waiting) {
+fn wait(ctx: &Arc<Ctx>, waiting: Waiting, retired: &mut Resources) {
     let id = waiting.req().id;
     let noticed = waiting.req().queue_noticed.clone();
     let futex = matches!(waiting, Waiting::Futex { .. });
@@ -2685,13 +2863,20 @@ fn wait(ctx: &Arc<Ctx>, waiting: Waiting) {
         // A count already reached.
         expired_timeouts(&mut state)
     };
+    let start = retired.ready.len();
     for waiting in fired {
-        ctx.finish_waiting(waiting, 0);
+        let req = retired.take_waiting(waiting);
+        retired.ready.push(Some(req));
+    }
+    for slot in start..retired.ready.len() {
+        ctx.timeout_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        ctx.finish_in(retired.ready[slot].take().unwrap(), 0, 0, false, retired);
     }
     // Linux io_uring/poll.c:io_arm_poll_handler closes the publication race
     // with actual wake ownership, not an unconditional task-work notification.
     if futex {
-        handle_wakeup(ctx, id);
+        handle_wakeup(ctx, id, retired);
     } else if noticed.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
         ctx.woken(id);
     }
@@ -2724,9 +2909,14 @@ fn arm_link_timeout(ctx: &Arc<Ctx>, req: &mut Req) {
 }
 
 /// Takes the waiting, ready and drained requests that match, every one or the first.
-pub(super) fn cancel(ctx: &Ctx, matches: impl Fn(&Req) -> bool, all: bool) -> Vec<Req> {
-    let mut waiting = Vec::new();
-    let mut cancelled = Vec::new();
+pub(super) fn cancel_in(
+    ctx: &Ctx,
+    matches: impl Fn(&Req) -> bool,
+    all: bool,
+    retired: &mut Resources,
+) -> std::ops::Range<usize> {
+    let start = retired.ready.len();
+    let first_waiting = retired.waiting.len();
     let mut state = ctx.state.lock_or_recover();
     let ids: Vec<u64> = state
         .waiting
@@ -2735,34 +2925,46 @@ pub(super) fn cancel(ctx: &Ctx, matches: impl Fn(&Req) -> bool, all: bool) -> Ve
         .map(|(&id, _)| id)
         .collect();
     for id in ids {
-        if !all && !waiting.is_empty() {
+        if !all && retired.waiting.len() > first_waiting {
             break;
         }
-        waiting.extend(state.waiting.remove(&id));
+        if let Some(waiting) = state.waiting.remove(&id) {
+            retired.waiting.push(waiting);
+        }
     }
     let queues: &mut State = &mut state;
     for queue in [&mut queues.ready, &mut queues.drain] {
         let mut at = 0;
-        while at < queue.len() && (all || (cancelled.is_empty() && waiting.is_empty())) {
+        while at < queue.len()
+            && (all || (retired.ready.len() == start && retired.waiting.len() == first_waiting))
+        {
             if matches(&queue[at]) {
-                cancelled.extend(queue.remove(at));
+                retired.ready.push(queue.remove(at));
             } else {
                 at += 1;
             }
         }
     }
     drop(state);
-    // Entries leave their queues with the state unlocked: a wake running them takes it.
-    waiting
-        .into_iter()
-        .map(Waiting::into_req)
-        .chain(cancelled)
-        .collect()
+    // Keep the wait's actual registrations/timers outside its caller's gates too.
+    for slot in first_waiting..retired.waiting.len() {
+        let req = retired.waiting[slot].req_mut();
+        let req = std::mem::replace(req, req.taken());
+        retired.ready.push(Some(req));
+    }
+    // Preserve cancel's original waiting-before-ready/drain CQE order.
+    let waiting_count = retired.waiting.len() - first_waiting;
+    retired.ready[start..].rotate_right(waiting_count);
+    start..retired.ready.len()
 }
 
 /// `io_poll_remove`: cancels a poll (its CQE says `ECANCELED`) or updates its events and
 /// `user_data`; `ENOENT` if none matches.
-fn op_poll_remove(ctx: &Arc<Ctx>, sqe: &IoUringSqe) -> Result<Outcome, Errno> {
+fn op_poll_remove(
+    ctx: &Arc<Ctx>,
+    sqe: &IoUringSqe,
+    retired: &mut Resources,
+) -> Result<Outcome, Errno> {
     if sqe.buf_index != 0 || sqe.splice_fd_in != 0 {
         return Err(Errno::EINVAL);
     }
@@ -2776,15 +2978,22 @@ fn op_poll_remove(ctx: &Arc<Ctx>, sqe: &IoUringSqe) -> Result<Outcome, Errno> {
     let target = sqe.addr;
     let poll = |w: &Waiting| matches!(w, Waiting::Poll { .. }) && w.req().sqe.user_data == target;
     if flags & (update_events | update_user_data) == 0 {
-        let found = cancel(
+        let found = cancel_in(
             ctx,
             |req| req.sqe.user_data == target && req.opcode() == op(IoUringOp::IORING_OP_POLL_ADD),
             false,
+            retired,
         );
-        let Some(req) = found.into_iter().next() else {
+        let Some(slot) = found.into_iter().next() else {
             return Ok(Outcome::of(Err(Errno::ENOENT.into())));
         };
-        ctx.finish(req, -Errno::ECANCELED.0, 0, true);
+        ctx.finish_in(
+            retired.ready[slot].take().unwrap(),
+            -Errno::ECANCELED.0,
+            0,
+            true,
+            retired,
+        );
         return Ok(Outcome::of(Ok(0)));
     }
     let mut state = ctx.state.lock_or_recover();
@@ -2824,7 +3033,7 @@ fn fixed_node(ctx: &Ctx, req: &mut Req) -> Result<super::rsrc::BufferNode, Errno
             .and_then(Clone::clone)
             .ok_or(Errno::EFAULT)?
     };
-    node.item.check_mm(req.mm)?;
+    node.item().check_mm(req.mm)?;
     req.buffer_node = Some(node.clone());
     Ok(node)
 }
@@ -2833,7 +3042,7 @@ fn fixed_node(ctx: &Ctx, req: &mut Req) -> Result<super::rsrc::BufferNode, Errno
 fn fixed_buffer(ctx: &Ctx, req: &mut Req) -> Result<Iovec, Errno> {
     let sqe = req.sqe;
     let node = fixed_node(ctx, req)?;
-    let (base, size) = (node.item.addr, node.item.len);
+    let (base, size) = (node.item().addr, node.item().len);
     let end = sqe
         .addr
         .checked_add(u64::from(sqe.len))

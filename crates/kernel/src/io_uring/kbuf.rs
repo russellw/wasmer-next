@@ -1,6 +1,6 @@
 //! Provided buffers (`io_uring/kbuf.c`): legacy lists and retained user/MMAP rings.
 
-use super::Ctx;
+use super::{Ctx, Resources};
 use crate::{
     Kernel,
     mm::{PAGE_SIZE, Retained},
@@ -81,6 +81,7 @@ impl Kernel {
         caller: &Caller<'_>,
         ctx: &Ctx,
         arg: u32,
+        retired: &mut Resources,
     ) -> SysResult<i32> {
         let reg: IoUringBufReg = read_value(caller.memory(), GuestPtr::new(arg)).await?;
         if reg.resv != [0; 5]
@@ -110,19 +111,25 @@ impl Kernel {
                 return Err(Errno::EINVAL.into());
             }
             let addr = u32::try_from(reg.ring_addr).map_err(|_| Errno::EFAULT)?;
-            Storage::User(self.retain_pages(caller, addr, size as u32).await?)
+            Storage::User(
+                self.retain_pages_in(caller, addr, size as u32, &mut retired.memory)
+                    .await?,
+            )
         };
-        let ring = BufferRing {
+        let candidate = retired.groups.len();
+        retired.groups.push(Some(Group::Ring(Arc::new(BufferRing {
             storage,
             mask: (reg.ring_entries - 1) as u16,
             head: AtomicU16::new(0),
             inc: reg.flags & 2 != 0,
             min_left: reg.min_left.max(1),
-        };
-        ctx.state
+        }))));
+        let old = ctx
+            .state
             .lock_or_recover()
             .pbufs
-            .insert(reg.bgid, Group::Ring(Arc::new(ring)));
+            .insert(reg.bgid, retired.groups[candidate].take().unwrap());
+        retired.groups.push(old);
         Ok(0)
     }
 
@@ -131,6 +138,7 @@ impl Kernel {
         caller: &Caller<'_>,
         ctx: &Ctx,
         arg: u32,
+        retired: &mut Resources,
     ) -> SysResult<i32> {
         let reg: IoUringBufReg = read_value(caller.memory(), GuestPtr::new(arg)).await?;
         if reg.resv != [0; 5] || reg.flags != 0 {
@@ -143,7 +151,7 @@ impl Kernel {
                 Group::Ring(_) => state.pbufs.remove(&reg.bgid),
             }
         };
-        drop(old);
+        retired.groups.push(old);
         Ok(0)
     }
 
@@ -236,11 +244,11 @@ pub(super) async fn select(
 /// fewer than min_left bytes remain. EAGAIN recycles without advancing the head.
 pub(super) async fn complete(
     caller: &Caller<'_>,
-    buffer: Pbuf,
+    buffer: &Pbuf,
     consumed: u32,
 ) -> Result<u32, Errno> {
     let mut flags = IoringCqeFlags::IORING_CQE_F_BUFFER.0 | (u32::from(buffer.bid) << 16);
-    if let Some(ring) = buffer.ring {
+    if let Some(ring) = &buffer.ring {
         let head = ring.head.load(Ordering::Relaxed);
         let left = buffer.full_len.saturating_sub(consumed);
         if ring.inc && (consumed == 0 || left >= ring.min_left || buffer.full_len == 0) {
@@ -271,10 +279,11 @@ pub(super) async fn complete(
     Ok(flags)
 }
 
-pub(super) fn recycle(ctx: &Ctx, bgid: u16, mut buffer: Pbuf) {
+pub(super) fn recycle(ctx: &Ctx, bgid: u16, buffer: &Pbuf) {
     if buffer.ring.is_some() {
         return;
     }
+    let mut buffer = buffer.clone();
     buffer.len = buffer.full_len;
     if let Some(Group::Legacy(list)) = ctx.state.lock_or_recover().pbufs.get_mut(&bgid) {
         list.push_front(buffer);

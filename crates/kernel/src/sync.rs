@@ -51,6 +51,47 @@ impl<T: ?Sized> RwLockExt<T> for RwLock<T> {
     }
 }
 
+/// First-panic custody for owned resources retired after core guards unlock.
+/// This contains no resources or ambient state; callers own the concrete items.
+pub(crate) struct DropErrors {
+    first: Option<Box<dyn std::any::Any + Send>>,
+    unwinding: bool,
+}
+impl DropErrors {
+    pub(crate) fn new() -> Self {
+        Self {
+            first: None,
+            unwinding: std::thread::panicking(),
+        }
+    }
+    pub(crate) fn run(&mut self, drop: impl FnOnce()) {
+        if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(drop)) {
+            if self.first.is_none() {
+                self.first = Some(panic);
+            } else {
+                Self::discard(panic);
+            }
+        }
+    }
+    fn discard(mut payload: Box<dyn std::any::Any + Send>) {
+        loop {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(payload))) {
+                Ok(()) => return,
+                Err(next) => payload = next,
+            }
+        }
+    }
+    pub(crate) fn finish(mut self) {
+        if let Some(panic) = self.first.take() {
+            if self.unwinding {
+                Self::discard(panic);
+            } else {
+                std::panic::resume_unwind(panic);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{sync::Arc, thread};

@@ -60,7 +60,7 @@ impl Drop for MemlockCharge {
     }
 }
 
-struct Page {
+pub(super) struct Page {
     kind: PageKind,
     // Acquired before reserving a spare: retained host copies cost at most the
     // accounted number of guest pages, including after munmap or ring inheritance.
@@ -109,6 +109,114 @@ pub(crate) struct Retained {
     pages: Vec<Arc<Page>>,
 }
 
+/// Actual ownership stays in the caller that owns the OUTERMOST gate.
+/// Helpers borrow this collection; error/cancel never drops its items early.
+#[derive(Default)]
+pub(crate) struct MemoryRetirement {
+    pub(super) pages: Vec<Arc<Page>>,
+    pub(super) mappings: MappingRetirement,
+    memories: Vec<Arc<dyn UserMemory + Send + Sync>>,
+    candidates: Vec<RetainedCandidate>,
+}
+#[derive(Default)]
+pub(super) struct MappingRetirement {
+    pub(super) groups: Vec<Vec<super::Mapping>>,
+    pub(super) sources: Vec<Option<super::Source>>,
+    pub(super) pages: Vec<Arc<dyn SharedPages>>,
+}
+impl Drop for MappingRetirement {
+    fn drop(&mut self) {
+        let mut errors = crate::sync::DropErrors::new();
+        for mappings in self.groups.drain(..) {
+            for mapping in mappings {
+                mapping.retire(&mut errors);
+            }
+        }
+        for source in self.sources.drain(..) {
+            if let Some(source) = source {
+                source.retire(&mut errors);
+            }
+        }
+        for pages in self.pages.drain(..) {
+            errors.run(|| drop(pages));
+        }
+        errors.finish();
+    }
+}
+
+#[derive(Default)]
+struct RetainedCandidate {
+    records: Vec<Arc<Page>>,
+    fallback: Option<Option<Arc<dyn UserMemory + Send + Sync>>>,
+}
+impl MemoryRetirement {
+    pub(crate) fn memory(
+        &mut self,
+        memory: Arc<dyn UserMemory + Send + Sync>,
+    ) -> &Arc<dyn UserMemory + Send + Sync> {
+        self.memories.push(memory);
+        self.memories.last().unwrap()
+    }
+    fn dispose_page(page: Arc<Page>, errors: &mut crate::sync::DropErrors) {
+        match Arc::try_unwrap(page) {
+            Err(page) => errors.run(|| drop(page)),
+            Ok(Page { kind, _charge }) => {
+                match kind {
+                    PageKind::Local(source) => errors.run(|| drop(source.into_inner())),
+                    PageKind::Foreign { memory, source } => {
+                        let memory = memory.into_inner_or_recover();
+                        let source = source.into_inner_or_recover();
+                        errors.run(|| drop(memory));
+                        errors.run(|| drop(source));
+                    }
+                }
+                errors.run(|| drop(_charge));
+            }
+        }
+    }
+}
+impl Drop for MemoryRetirement {
+    fn drop(&mut self) {
+        let mut errors = crate::sync::DropErrors::new();
+        for page in self.pages.drain(..) {
+            Self::dispose_page(page, &mut errors);
+        }
+        for mut candidate in self.candidates.drain(..) {
+            for page in candidate.records.drain(..) {
+                Self::dispose_page(page, &mut errors);
+            }
+            errors.run(|| drop(candidate.fallback.take()));
+        }
+        errors.run(|| drop(std::mem::take(&mut self.mappings)));
+        for memory in self.memories.drain(..) {
+            errors.run(|| drop(memory));
+        }
+        errors.finish();
+    }
+}
+
+impl Drop for Retained {
+    fn drop(&mut self) {
+        let mut errors = crate::sync::DropErrors::new();
+        for page in self.pages.drain(..) {
+            MemoryRetirement::dispose_page(page, &mut errors);
+        }
+        errors.finish();
+    }
+}
+
+/// Owned by the actual host reservation before any operation guard. Captured
+/// pin metadata precedes destructive progress; every removed page is owned
+/// here before copying, with a per-copy commit bit for idempotent retirement.
+#[derive(Default)]
+pub(crate) struct HostDetach {
+    metadata: Option<(usize, u64)>,
+    closing: bool,
+    copied: Vec<(u64, usize, bool)>,
+    retired: MemoryRetirement,
+    pub(crate) complete: bool,
+}
+
 impl Kernel {
     /// Like FOLL_WRITE|FOLL_LONGTERM: validate now; later mprotect/munmap do not
     /// invalidate a registration. The mm holds only weak references to these pages.
@@ -118,11 +226,19 @@ impl Kernel {
         addr: u32,
         len: u32,
     ) -> Result<Arc<Retained>, Errno> {
-        // Both fresh fallback memory and existing Page clones can become the
-        // last old-backing owner after rotation. They outlive the op guard on
-        // error/cancellation as well as successful publication.
-        let mut records = Vec::new();
-        let mut foreign_fallback = None;
+        let mut retired = MemoryRetirement::default();
+        self.retain_pages_in(caller, addr, len, &mut retired).await
+    }
+
+    pub(crate) async fn retain_pages_in(
+        &self,
+        caller: &Caller<'_>,
+        addr: u32,
+        len: u32,
+        retired: &mut MemoryRetirement,
+    ) -> Result<Arc<Retained>, Errno> {
+        retired.candidates.push(RetainedCandidate::default());
+        let candidate = retired.candidates.last_mut().unwrap();
         let mm = self.mm(caller.task());
         let _op = mm.op.lock().await;
         let end = u64::from(addr) + u64::from(len);
@@ -183,7 +299,10 @@ impl Kernel {
                 };
                 let foreign = match mm.host_retention_foreign(base)? {
                     Some(memory) => Some(memory),
-                    None => foreign_fallback.get_or_insert_with(|| mm.foreign()).clone(),
+                    None => candidate
+                        .fallback
+                        .get_or_insert_with(|| mm.foreign())
+                        .clone(),
                 };
                 let kind = match foreign {
                     Some(memory) => PageKind::Foreign {
@@ -197,8 +316,8 @@ impl Kernel {
                     _charge: charge,
                 })
             };
-            records.push(page);
-            let page = records.last().unwrap();
+            candidate.records.push(page);
+            let page = candidate.records.last().unwrap();
             #[cfg(test)]
             {
                 let pause = mm.retained.1.lock_or_recover().take();
@@ -227,7 +346,7 @@ impl Kernel {
             addr,
             len,
             owner: mm.id(),
-            pages: records,
+            pages: std::mem::take(&mut candidate.records),
         }))
     }
 }
@@ -368,8 +487,21 @@ impl Mm {
         start: u64,
         end: u64,
         pin: &dyn wasixv2_syscalls::HostMemoryPin,
+        progress: &mut HostDetach,
     ) {
-        {
+        if progress.complete {
+            return;
+        }
+        // These methods may be supplied by an opaque pin provider. A panic
+        // here changes no range/registry state and leaves the real pin owned.
+        if progress.metadata.is_none() {
+            let len = pin.len();
+            assert_eq!(len, end - start);
+            let pointer = pin.as_ptr() as usize;
+            progress.metadata = Some((pointer, len));
+        }
+        let (pointer, _) = progress.metadata.unwrap();
+        if !progress.closing {
             let _registry = self.retained.0.lock_or_recover();
             let mut space = self.space();
             let record = space
@@ -377,12 +509,48 @@ impl Mm {
                 .get_mut(&start)
                 .expect("owned host range remains registered");
             assert_eq!((record.nonce, record.end), (nonce, end));
-            assert!(record.published && !record.closing);
+            assert!(record.published);
             record.closing = true;
+            progress.closing = true;
         }
         loop {
-            // Closing rejects every new registration before it can insert. Remove
-            // one weak row at a time, with no Drop-time allocation or callback lock.
+            // Complete any owned interrupted copy BEFORE removing a new row.
+            for (at, index, copied) in &mut progress.copied {
+                if *copied {
+                    continue;
+                }
+                // Reserve before removing a field's actual last memory owner.
+                progress.retired.memories.reserve(1);
+                let page = &progress.retired.pages[*index];
+                let PageKind::Foreign { memory, source } = &page.kind else {
+                    unreachable!("host admission excludes local retained pages");
+                };
+                let old_memory = {
+                    let mut source = source.lock_or_recover();
+                    if let Source::Live { addr, spare } = &mut *source {
+                        assert_eq!(u64::from(*addr), *at);
+                        assert_eq!(spare.len(), PAGE_SIZE as usize);
+                        // SAFETY: the actual pin still owns this whole page.
+                        // Its metadata was captured before any destructive step.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                (pointer as *const u8).add((*at - start) as usize),
+                                spare.as_mut_ptr(),
+                                PAGE_SIZE as usize,
+                            );
+                        }
+                        *source = Source::Owned(std::mem::take(spare));
+                    }
+                    memory.lock_or_recover().take()
+                };
+                if let Some(memory) = old_memory {
+                    progress.retired.memories.push(memory);
+                }
+                *copied = true;
+            }
+            // Reserve stable outer storage before taking the next weak row.
+            progress.retired.pages.reserve(1);
+            progress.copied.reserve(1);
             let next = {
                 let mut registry = self.retained.0.lock_or_recover();
                 let at = registry.range(start..end).next().map(|(&at, _)| at);
@@ -396,9 +564,9 @@ impl Mm {
             let Some(page) = page else {
                 continue;
             };
-            let PageKind::Foreign { memory, source } = &page.kind else {
-                unreachable!("host admission excludes local retained pages");
-            };
+            let index = progress.retired.pages.len();
+            progress.retired.pages.push(page);
+            progress.copied.push((at, index, false));
             #[cfg(test)]
             {
                 let observed = self.retained.2.lock_or_recover().take();
@@ -406,44 +574,33 @@ impl Mm {
                     let _ = observed.send(());
                 }
             }
-            let old_memory = {
-                let mut source = source.lock_or_recover();
-                if let Source::Live { addr, spare } = &mut *source {
-                    assert_eq!(u64::from(*addr), at);
-                    assert_eq!(spare.len(), PAGE_SIZE as usize);
-                    // SAFETY: exact pin still owns every byte of this whole page.
-                    // Source mutex serializes all registered IO; spare is separate,
-                    // preallocated charged memory, with no borrowed Store or await.
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            pin.as_ptr().add((at - start) as usize),
-                            spare.as_mut_ptr(),
-                            PAGE_SIZE as usize,
-                        );
-                    }
-                    *source = Source::Owned(std::mem::take(spare));
-                }
-                let old_memory = memory.lock_or_recover().take();
-                drop(source);
-                old_memory
-            };
-            // The lease still owns the exact original foreign Arc, so this cannot
-            // run its destructor while other pages still need their live pin.
-            drop(old_memory);
-            drop(page);
         }
+        progress.complete = true;
     }
 
     /// Called under Mm::op before any old bytes or mappings are discarded.
-    pub(super) async fn retain_unmapped(&self, memory: &dyn UserMemory, start: u64, end: u64) {
-        let pages: Vec<_> = {
+    pub(super) async fn retain_unmapped(
+        &self,
+        memory: &dyn UserMemory,
+        start: u64,
+        end: u64,
+        retired: &mut MemoryRetirement,
+    ) {
+        let first = retired.pages.len();
+        let addresses = {
             let table = self.retained.0.lock_or_recover();
             table
                 .range(start..end)
-                .filter_map(|(&at, page)| page.upgrade().map(|page| (at, page)))
-                .collect()
+                .filter_map(|(&at, weak)| {
+                    weak.upgrade().map(|page| {
+                        retired.pages.push(page);
+                        at
+                    })
+                })
+                .collect::<Vec<_>>()
         };
-        for (at, page) in pages {
+        for (index, at) in addresses.into_iter().enumerate() {
+            let page = &retired.pages[first + index];
             match &page.kind {
                 PageKind::Local(source) => {
                     let mut source = source.lock().await;
@@ -479,12 +636,14 @@ impl Mm {
                     // bytes and SharedPages no longer need the image's handle.
                     let old_memory = memory.lock_or_recover().take();
                     drop(source);
-                    drop(old_memory);
+                    if let Some(memory) = old_memory {
+                        retired.memories.push(memory);
+                    }
                 }
             }
             // Source is now independent of the old mapping. Until this point its
             // exact weak row stays visible to synchronous host lease retirement.
-            let expected = Arc::downgrade(&page);
+            let expected = Arc::downgrade(page);
             let removed = {
                 let mut table = self.retained.0.lock_or_recover();
                 if table
@@ -498,7 +657,6 @@ impl Mm {
             };
             drop(removed);
             drop(expected);
-            drop(page);
         }
     }
 
@@ -510,17 +668,25 @@ impl Mm {
         len: u64,
         target: u64,
         moving: impl std::future::Future<Output = Result<(), Errno>>,
+        retired: &mut Vec<Arc<Page>>,
     ) -> Result<(), Errno> {
-        let pages: Vec<_> = self
+        let first = retired.len();
+        let addresses = self
             .retained
             .0
             .lock_or_recover()
             .range(start..start + len)
-            .filter_map(|(&at, page)| page.upgrade().map(|page| (at, page)))
-            .collect();
+            .filter_map(|(&at, weak)| {
+                weak.upgrade().map(|page| {
+                    retired.push(page);
+                    at
+                })
+            })
+            .collect::<Vec<_>>();
+        let pages = &retired[first..];
         let mut held = Vec::with_capacity(pages.len());
         // Always lock in address order, including when a registration spans pages.
-        for (_, page) in &pages {
+        for page in pages {
             held.push(match &page.kind {
                 PageKind::Local(source) => LockedSource::Local(source.lock().await),
                 PageKind::Foreign { source, .. } => LockedSource::Foreign(source.lock_or_recover()),
@@ -528,7 +694,7 @@ impl Mm {
         }
         moving.await?;
         let mut table = self.retained.0.lock_or_recover();
-        for ((at, page), source) in pages.iter().zip(&mut held) {
+        for ((at, page), source) in addresses.iter().zip(pages).zip(&mut held) {
             let new = target + at - start;
             if let Source::Live { addr, .. } = source.source() {
                 *addr = new as u32;

@@ -41,6 +41,7 @@ mod cachestat;
 mod mseal;
 mod process_vm;
 mod retained;
+pub(crate) use retained::{HostDetach, MemoryRetirement};
 mod shared;
 pub(crate) use retained::{MemlockUsers, Retained, RetainedMemory};
 
@@ -255,11 +256,26 @@ impl HostRange {
         self.mm
             .publish_host_range(self.nonce, self.start, self.start + self.len);
     }
-    pub(crate) fn detach_retained(&mut self, pin: &dyn wasixv2_syscalls::HostMemoryPin) {
-        assert_eq!(pin.len(), self.len);
+    pub(crate) fn published(&self) -> bool {
+        let space = self.mm.space();
+        let record = space
+            .host_ranges
+            .get(&self.start)
+            .expect("owned host range remains registered");
+        assert_eq!(
+            (record.nonce, record.end),
+            (self.nonce, self.start + self.len)
+        );
+        record.published
+    }
+    pub(crate) fn detach_retained(
+        &mut self,
+        pin: &dyn wasixv2_syscalls::HostMemoryPin,
+        progress: &mut HostDetach,
+    ) {
         self.mm
-            .detach_host_retained(self.nonce, self.start, self.start + self.len, pin);
-        self.retired = true;
+            .detach_host_retained(self.nonce, self.start, self.start + self.len, pin, progress);
+        self.retired = progress.complete;
     }
 }
 
@@ -408,12 +424,20 @@ impl Mm {
 
     /// Same teardown as munmap, while the caller holds this mm's op lock. Loader leases use
     /// the original mm and foreign memory, never a recycled task id or its exec's new mm.
-    pub(crate) async fn release_range(&self, memory: &dyn UserMemory, start: u64, end: u64) {
+    pub(crate) async fn release_range(
+        &self,
+        memory: &dyn UserMemory,
+        start: u64,
+        end: u64,
+        retired: &mut MemoryRetirement,
+    ) {
         if self.space().host_overlap(start, end) {
             return;
         }
-        self.retain_unmapped(memory, start, end).await;
-        for mut mapping in self.take_range(start, end) {
+        self.retain_unmapped(memory, start, end, retired).await;
+        let slot = retired.mappings.groups.len();
+        retired.mappings.groups.push(self.take_range(start, end));
+        for mapping in &mut retired.mappings.groups[slot] {
             let _ = mapping.release(memory).await;
         }
         self.space().unmap(start, end - start);
@@ -1825,6 +1849,7 @@ impl Kernel {
     /// `mm/mmap.c:sys_brk`: layout metadata fixes start_brk independently of mmap.
     /// Without it the break retains the original end-of-memory initialization.
     pub(crate) async fn sys_brk(&self, caller: &Caller<'_>, brk: Uptr) -> SysResult<i32> {
+        let mut retired = MemoryRetirement::default();
         let mm = self.mm(caller.task());
         let _op = mm.op.lock().await;
         let size = self.mem_size(caller).await;
@@ -1879,7 +1904,8 @@ impl Kernel {
             mm.space().set_locked(old_end, new_end, locked);
         } else {
             let (from, to) = (new_end * PAGE_SIZE, old_end * PAGE_SIZE);
-            mm.retain_unmapped(caller.memory(), from, to).await;
+            mm.retain_unmapped(caller.memory(), from, to, &mut retired)
+                .await;
             mm.space().unmap(from, to - from);
         }
         mm.space().set_brk(start, new);
@@ -1934,11 +1960,13 @@ impl Kernel {
             self.pre_content_permission(caller, file, Some(offset as u64), u64::from(len))
                 .await?;
         }
+        let mut retired = MemoryRetirement::default();
         let mm = self.mm(caller.task());
         let _op = mm.op.lock().await;
         let locked = self.check_lock_new(caller, map_locked, pages * PAGE_SIZE)?;
         let kind = flags & MapFlags::MAP_TYPE;
-        let source = match &file {
+        let source_slot = retired.mappings.sources.len();
+        retired.mappings.sources.push(match &file {
             None => match kind {
                 MapFlags::MAP_SHARED => self.shared_anonymous(pages)?,
                 MapFlags::MAP_PRIVATE => None,
@@ -1953,10 +1981,11 @@ impl Kernel {
                 flags,
                 &self.cred(caller).fs(),
             )?,
-        };
+        });
         let start = if flags.intersects(MapFlags::MAP_FIXED | MapFlags::MAP_FIXED_NOREPLACE) {
             let noreplace = !flags.contains(MapFlags::MAP_FIXED);
-            self.map_fixed(caller, addr, pages, noreplace).await?
+            self.map_fixed(caller, addr, pages, noreplace, &mut retired)
+                .await?
         } else {
             self.map_anywhere(caller, pages).await? as Uptr
         };
@@ -1976,10 +2005,17 @@ impl Kernel {
             space.set_locked(first, first + pages, locked);
             space.set_prot(first, first + pages, prot);
         }
-        let Some(source) = source else {
+        let Some(source) = retired.mappings.sources[source_slot].take() else {
             return Ok(start);
         };
-        let mut mapping = Mapping::new(start.into(), pages * PAGE_SIZE, source, prot);
+        let slot = retired.mappings.groups.len();
+        retired.mappings.groups.push(vec![Mapping::new(
+            start.into(),
+            pages * PAGE_SIZE,
+            source,
+            prot,
+        )]);
+        let mapping = &mut retired.mappings.groups[slot][0];
         let mut filled = mapping.fill(caller.memory()).await;
         if filled == Err(Errno::EOPNOTSUPP)
             && let Some(file) = file
@@ -1988,11 +2024,12 @@ impl Kernel {
             // Memory that cannot show a file's pages gets a copy of them.
             let (offset, writer) = (mapped.offset, mapped.writer.take());
             let shared = Shared::new(Object::File(file), offset, mapped.writable, writer);
-            mapping.source = Source::Shared(shared);
+            let old = std::mem::replace(&mut mapping.source, Source::Shared(shared));
+            retired.mappings.sources.push(Some(old));
             filled = mapping.fill(caller.memory()).await;
         }
         match filled {
-            Ok(()) => mm.insert(mapping),
+            Ok(()) => mm.insert(retired.mappings.groups[slot].pop().unwrap()),
             // Memory that cannot show the object's pages keeps the zeroed pages it has, shared
             // only within the address space.
             Err(Errno::EOPNOTSUPP) if mapping.mapped().is_some() => {}
@@ -2109,6 +2146,7 @@ impl Kernel {
         addr: Uptr,
         pages: u64,
         noreplace: bool,
+        retired: &mut MemoryRetirement,
     ) -> SysResult<Uptr> {
         check_aligned(addr)?;
         let first = u64::from(addr) / PAGE_SIZE;
@@ -2138,7 +2176,7 @@ impl Kernel {
             }
         };
         if replace {
-            self.unmap_range(caller, first * PAGE_SIZE, end * PAGE_SIZE)
+            self.unmap_range(caller, first * PAGE_SIZE, end * PAGE_SIZE, retired)
                 .await;
         }
         // Pages between the end of memory and the mapping stay free.
@@ -2283,9 +2321,15 @@ impl Kernel {
 
     /// `do_vmi_munmap`: writes back the shared mappings in `[start, end)`, takes mapped objects'
     /// pages out, drops every mapping there and frees the pages. The caller holds `Mm::op`.
-    async fn unmap_range(&self, caller: &Caller<'_>, start: u64, end: u64) {
+    async fn unmap_range(
+        &self,
+        caller: &Caller<'_>,
+        start: u64,
+        end: u64,
+        retired: &mut MemoryRetirement,
+    ) {
         let mm = self.mm(caller.task());
-        mm.release_range(caller.memory(), start, end).await;
+        mm.release_range(caller.memory(), start, end, retired).await;
     }
 
     pub(crate) async fn sys_munmap(
@@ -2300,6 +2344,7 @@ impl Kernel {
         }
         let start = u64::from(addr);
         let end = (start + u64::from(len)).div_ceil(PAGE_SIZE) * PAGE_SIZE;
+        let mut retired = MemoryRetirement::default();
         let mm = self.mm(caller.task());
         let _op = mm.op.lock().await;
         if mm.space().host_overlap(start, end) {
@@ -2314,7 +2359,7 @@ impl Kernel {
                 space.check_splits(1, self.vm.map_limit())?;
             }
         }
-        self.unmap_range(caller, start, end).await;
+        self.unmap_range(caller, start, end, &mut retired).await;
         Ok(0)
     }
 
@@ -2331,6 +2376,7 @@ impl Kernel {
         let remap = Remap::check(addr, old_len, new_len, flags, new_addr)?;
         let (addr64, old_size, new_size) = (remap.addr, remap.old_size, remap.new_size);
         let new_pages = new_size / PAGE_SIZE;
+        let mut retired = MemoryRetirement::default();
         let mm = self.mm(caller.task());
         let _op = mm.op.lock().await;
         if mm
@@ -2340,7 +2386,7 @@ impl Kernel {
             return Err(Errno::EBUSY.into());
         }
         if old_size == 0 {
-            return self.mremap_duplicate(caller, &remap).await;
+            return self.mremap_duplicate(caller, &remap, &mut retired).await;
         }
         self.check_mapped(caller, addr64, old_size)
             .await
@@ -2352,41 +2398,66 @@ impl Kernel {
         let moves = remap.implies_new_addr();
         let ring = mm.aio.ring_mremap(sizes, moves, remap.dont_unmap)?;
         // Reserve before moving/unmapping anything: quota failure leaves the old VMA intact.
-        let mut growth = if new_size > old_size {
-            mm.space().mappings.aliases(addr64, addr64 + old_size).pop()
+        let growth_slot = retired.mappings.groups.len();
+        retired.mappings.groups.push(if new_size > old_size {
+            mm.space()
+                .mappings
+                .aliases(addr64, addr64 + old_size)
+                .pop()
+                .into_iter()
+                .collect()
         } else {
-            None
-        };
-        if let Some(mapping) = &mut growth {
-            if mapping.end() == addr64 + old_size {
+            Vec::new()
+        });
+        let growth = match retired.mappings.groups[growth_slot].last_mut() {
+            Some(mapping) if mapping.end() == addr64 + old_size => {
                 mapping.len += new_size - old_size;
                 mapping.materialize(&self.cred(caller).fs())?;
-            } else {
-                growth = None;
+                Some(growth_slot)
             }
-        }
+            _ => None,
+        };
         if remap.implies_new_addr() {
             let target = match remap.fixed {
-                true => u64::from(self.map_fixed(caller, new_addr, new_pages, false).await?),
+                true => u64::from(
+                    self.map_fixed(caller, new_addr, new_pages, false, &mut retired)
+                        .await?,
+                ),
                 false => self.map_anywhere(caller, new_pages).await?,
             };
             // `MREMAP_DONTUNMAP` leaves the source mapped, as it was before its pages moved.
-            let stay = match remap.dont_unmap {
+            let stay = retired.mappings.groups.len();
+            retired.mappings.groups.push(match remap.dont_unmap {
                 true => mm.space().mappings.aliases(addr64, addr64 + old_size),
                 false => Vec::new(),
-            };
+            });
             mm.retain_unmapped(
                 caller.memory(),
                 addr64 + old_size.min(new_size),
                 addr64 + old_size,
+                &mut retired,
             )
             .await;
-            mm.retain_moved(addr64, old_size.min(new_size), target, async {
-                copy(caller.memory(), addr64, target, old_size.min(new_size)).await?;
-                mm.space().remap_flags(addr64, old_size, target, new_size);
-                self.move_mappings(caller, addr64, old_size, target, new_size, growth)
+            mm.retain_moved(
+                addr64,
+                old_size.min(new_size),
+                target,
+                async {
+                    copy(caller.memory(), addr64, target, old_size.min(new_size)).await?;
+                    mm.space().remap_flags(addr64, old_size, target, new_size);
+                    self.move_mappings(
+                        caller,
+                        addr64,
+                        old_size,
+                        target,
+                        new_size,
+                        growth,
+                        &mut retired.mappings,
+                    )
                     .await
-            })
+                },
+                &mut retired.pages,
+            )
             .await?;
             match remap.dont_unmap {
                 true => {
@@ -2394,7 +2465,8 @@ impl Kernel {
                     let first = addr64 / PAGE_SIZE;
                     mm.space()
                         .set_locked(first, first + old_size / PAGE_SIZE, false);
-                    self.refault(caller, addr64, old_size, stay).await?
+                    self.refault(caller, addr64, old_size, stay, &mut retired.mappings)
+                        .await?
                 }
                 false => mm.space().unmap(addr64, old_size),
             }
@@ -2405,7 +2477,7 @@ impl Kernel {
         }
         let (first, old_pages) = (addr64 / PAGE_SIZE, old_size / PAGE_SIZE);
         if new_pages <= old_pages {
-            self.unmap_range(caller, addr64 + new_size, addr64 + old_size)
+            self.unmap_range(caller, addr64 + new_size, addr64 + old_size, &mut retired)
                 .await;
             return Ok(addr as i32);
         }
@@ -2420,20 +2492,42 @@ impl Kernel {
                 .is_ok()
         {
             mm.space().remap_flags(addr64, old_size, addr64, new_size);
-            self.move_mappings(caller, addr64, old_size, addr64, new_size, growth)
-                .await?;
+            self.move_mappings(
+                caller,
+                addr64,
+                old_size,
+                addr64,
+                new_size,
+                growth,
+                &mut retired.mappings,
+            )
+            .await?;
             return Ok(addr as i32);
         }
         if !remap.may_move {
             return Err(Errno::ENOMEM.into());
         }
         let target = self.map_anywhere(caller, new_pages).await?;
-        mm.retain_moved(addr64, old_size, target, async {
-            copy(caller.memory(), addr64, target, old_size).await?;
-            mm.space().remap_flags(addr64, old_size, target, new_size);
-            self.move_mappings(caller, addr64, old_size, target, new_size, growth)
+        mm.retain_moved(
+            addr64,
+            old_size,
+            target,
+            async {
+                copy(caller.memory(), addr64, target, old_size).await?;
+                mm.space().remap_flags(addr64, old_size, target, new_size);
+                self.move_mappings(
+                    caller,
+                    addr64,
+                    old_size,
+                    target,
+                    new_size,
+                    growth,
+                    &mut retired.mappings,
+                )
                 .await
-        })
+            },
+            &mut retired.pages,
+        )
         .await?;
         mm.space().unmap(addr64, old_size);
         Ok(target as i32)
@@ -2443,7 +2537,12 @@ impl Kernel {
     /// (Linux's "duplicate shm area"). Anonymous shared memory the host could not give an object
     /// is private here (see `sys_mmap`), so like a private mapping it cannot be duplicated. The
     /// caller holds `Mm::op`.
-    async fn mremap_duplicate(&self, caller: &Caller<'_>, remap: &Remap) -> SysResult<i32> {
+    async fn mremap_duplicate(
+        &self,
+        caller: &Caller<'_>,
+        remap: &Remap,
+        retired: &mut MemoryRetirement,
+    ) -> SysResult<i32> {
         let mm = self.mm(caller.task());
         self.check_mapped(caller, remap.addr, 1)
             .await
@@ -2455,8 +2554,12 @@ impl Kernel {
                 .is_shared()
                 .then(|| mapping.alias(remap.addr - mapping.start, target, remap.new_size))
         };
-        let mut prepared = alias(0).ok_or(Errno::EINVAL)?;
-        prepared.materialize(&self.cred(caller).fs())?;
+        let prepared = retired.mappings.groups.len();
+        retired
+            .mappings
+            .groups
+            .push(vec![alias(0).ok_or(Errno::EINVAL)?]);
+        retired.mappings.groups[prepared][0].materialize(&self.cred(caller).fs())?;
         let locked = self.check_lock_growth(caller, remap.addr, remap.new_size)?;
         // Growing a mapping of nothing in place never fits: `addr` itself is mapped.
         if !remap.may_move {
@@ -2464,7 +2567,10 @@ impl Kernel {
         }
         let pages = remap.new_size / PAGE_SIZE;
         let target = match remap.fixed {
-            true => u64::from(self.map_fixed(caller, remap.new_addr, pages, false).await?),
+            true => u64::from(
+                self.map_fixed(caller, remap.new_addr, pages, false, retired)
+                    .await?,
+            ),
             false => self.map_anywhere(caller, pages).await?,
         };
         // A fixed target may have replaced the source (`vma_lookup` after `do_munmap`).
@@ -2472,13 +2578,13 @@ impl Kernel {
             mm.space().unmap(target, remap.new_size);
             return Err(Errno::EFAULT.into());
         }
-        let mut alias = prepared;
+        let alias = &mut retired.mappings.groups[prepared][0];
         alias.start = target;
         if let Err(errno) = alias.fill(caller.memory()).await {
             mm.space().unmap(target, remap.new_size);
             return Err(errno.into());
         }
-        mm.insert(alias);
+        mm.insert(retired.mappings.groups[prepared].pop().unwrap());
         let first = target / PAGE_SIZE;
         mm.space()
             .set_locked(first, first + remap.new_size / PAGE_SIZE, locked);
@@ -2493,16 +2599,16 @@ impl Kernel {
         caller: &Caller<'_>,
         addr: u64,
         len: u64,
-        stay: Vec<Mapping>,
+        stay: usize,
+        retired: &mut retained::MappingRetirement,
     ) -> Result<(), Errno> {
         zero(caller.memory(), addr, len).await?;
-        let mut filled = Vec::with_capacity(stay.len());
         let mut result = Ok(());
-        for mut mapping in stay {
+        for mapping in &mut retired.groups[stay] {
             result = result.and(mapping.fill(caller.memory()).await);
-            filled.push(mapping);
         }
-        self.mm(caller.task()).restore(filled);
+        self.mm(caller.task())
+            .restore(std::mem::take(&mut retired.groups[stay]));
         result
     }
 
@@ -2517,46 +2623,66 @@ impl Kernel {
         old_len: u64,
         to: u64,
         new_len: u64,
-        growth: Option<Mapping>,
+        growth: Option<usize>,
+        retired: &mut retained::MappingRetirement,
     ) -> Result<(), Errno> {
         let mm = self.mm(caller.task());
-        let mut moved = mm.take_range(from, from + old_len);
+        let moved = retired.groups.len();
+        retired.groups.push(mm.take_range(from, from + old_len));
+        let tails = retired.groups.len();
+        retired.groups.push(Vec::new());
         let keep = old_len.min(new_len);
-        let mut kept = Vec::new();
+        let mut kept = Vec::new(); // indices only: actual Mapping custody stays outer
         let mut result = Ok(());
-        for mut mapping in moved.drain(..) {
+        for index in 0..retired.groups[moved].len() {
+            let mapping = &mut retired.groups[moved][index];
             if mapping.start >= from + keep {
                 let _ = mapping.release(caller.memory()).await;
                 continue;
             }
             if mapping.end() > from + keep {
-                let mut tail = mapping.split_off(from + keep);
-                let _ = tail.release(caller.memory()).await;
+                let tail = mapping.split_off(from + keep);
+                retired.groups[tails].push(tail);
+                let _ = retired.groups[tails]
+                    .last_mut()
+                    .unwrap()
+                    .release(caller.memory())
+                    .await;
             }
+            let mapping = &mut retired.groups[moved][index];
             let old = mapping.start;
             mapping.start = mapping.start - from + to;
             if mapping.start != old {
                 result = result.and(mapping.relocate(caller.memory(), old).await);
             }
-            kept.push(mapping);
+            kept.push(index);
         }
         if new_len > old_len
-            && let Some(last) = kept.last_mut()
-            && last.end() == to + old_len
+            && let Some(&index) = kept.last()
         {
-            if let (
-                Source::Mapped(last),
-                Some(Mapping {
-                    source: Source::Mapped(prepared),
-                    ..
-                }),
-            ) = (&mut last.source, growth)
-            {
-                last.pages = prepared.pages;
+            let prepared = growth
+                .and_then(|slot| retired.groups[slot].last())
+                .and_then(Mapping::mapped)
+                .map(|mapped| mapped.pages.clone());
+            let last = &mut retired.groups[moved][index];
+            if last.end() == to + old_len {
+                if let (Source::Mapped(last), Some(prepared)) = (&mut last.source, prepared) {
+                    retired
+                        .pages
+                        .push(std::mem::replace(&mut last.pages, prepared));
+                }
+                result = result.and(last.grow(caller.memory(), new_len - old_len).await);
+            } else if let Some(prepared) = prepared {
+                retired.pages.push(prepared);
             }
-            result = result.and(last.grow(caller.memory(), new_len - old_len).await);
         }
-        mm.restore(kept);
+        // No await/callback between taking these mappings and table publication.
+        let mut publish = Vec::with_capacity(kept.len());
+        for index in kept.into_iter().rev() {
+            publish.push(retired.groups[moved].remove(index));
+        }
+        publish.reverse();
+        mm.restore(publish);
         result
     }
 
@@ -2626,6 +2752,19 @@ impl Kernel {
         len: Usize,
         advice: MadviseAdvice,
     ) -> SysResult<i32> {
+        let mut retired = MemoryRetirement::default();
+        self.madvise_in(caller, start, len, advice, &mut retired)
+            .await
+    }
+
+    pub(crate) async fn madvise_in(
+        &self,
+        caller: &Caller<'_>,
+        start: Uptr,
+        len: Usize,
+        advice: MadviseAdvice,
+        retired: &mut MemoryRetirement,
+    ) -> SysResult<i32> {
         check_aligned(start)?;
         if !advice_valid(advice) {
             return Err(Errno::EINVAL.into());
@@ -2682,7 +2821,9 @@ impl Kernel {
                 space.check_splits(splits, self.vm.map_limit())?;
                 space.set_dont_dump(first, end, on);
             }
-            MadviseAdvice::MADV_DONTNEED => self.drop_pages(caller, start.into(), len).await?,
+            MadviseAdvice::MADV_DONTNEED => {
+                self.drop_pages(caller, start.into(), len, retired).await?
+            }
             MadviseAdvice::MADV_REMOVE => return Err(Errno::EINVAL.into()),
             MadviseAdvice::MADV_WIPEONFORK => {
                 self.madvise_wipe_on_fork(caller, start.into(), len, true)
@@ -2722,7 +2863,7 @@ impl Kernel {
         };
         let signals = self.interrupt(caller);
         // An old selected backing can be owned only by this operation.
-        let foreign;
+        let mut retired = MemoryRetirement::default();
         let _op = wasixv2_wait::interruptible(mm.op.lock(), &signals.killable())
             .await
             .map_err(|_| Errno::EINTR)?;
@@ -2746,14 +2887,13 @@ impl Kernel {
                 }
             }
         }
-        foreign = mm.foreign();
+        let foreign = mm.foreign().map(|memory| retired.memory(memory));
         let mine = self.mm(caller.task());
         let memory: &dyn UserMemory = if Arc::ptr_eq(&mm, &mine) {
             caller.memory()
         } else {
             foreign
-                .as_deref()
-                .map(|m| m as &dyn UserMemory)
+                .map(|memory| &**memory as &dyn UserMemory)
                 .ok_or(Errno::EAGAIN)?
         };
         // Preserve VMAs and shared file mappings for exit_mmap/writeback. The
@@ -2870,6 +3010,7 @@ impl Kernel {
         let offset = u64::from(pgoff)
             .checked_mul(PAGE_SIZE)
             .ok_or(Errno::EINVAL)?;
+        let mut retired = MemoryRetirement::default();
         let mm = self.mm(caller.task());
         let _op = mm.op.lock().await;
         if mm.space().host_overlap(start, end) {
@@ -2897,7 +3038,8 @@ impl Kernel {
             prot |= ProtFlags::PROT_WRITE;
         }
         let pages = size / PAGE_SIZE;
-        self.map_fixed(caller, start as u32, pages, false).await?;
+        self.map_fixed(caller, start as u32, pages, false, &mut retired)
+            .await?;
         let first = start / PAGE_SIZE;
         {
             let mut space = mm.space();
@@ -2934,6 +3076,7 @@ impl Kernel {
         len: Usize,
         flags: MsyncFlags,
     ) -> SysResult<i32> {
+        let mut retired = MemoryRetirement::default();
         check_aligned(start)?;
         let known = MsyncFlags::MS_ASYNC | MsyncFlags::MS_INVALIDATE | MsyncFlags::MS_SYNC;
         if !(flags & !known).is_empty()
@@ -2956,9 +3099,13 @@ impl Kernel {
         if flags.contains(MsyncFlags::MS_INVALIDATE) && mm.space().locked.count(first, end) > 0 {
             return Err(Errno::EBUSY.into());
         }
-        let mut mappings = mm.take_range(start, start + len);
+        let slot = retired.mappings.groups.len();
+        retired
+            .mappings
+            .groups
+            .push(mm.take_range(start, start + len));
         let mut result = Ok(());
-        for mapping in &mut mappings {
+        for mapping in &mut retired.mappings.groups[slot] {
             if !mapping.is_shared() {
                 continue;
             }
@@ -2978,13 +3125,19 @@ impl Kernel {
             };
             result = result.and(synced);
         }
-        mm.restore(mappings);
+        mm.restore(std::mem::take(&mut retired.mappings.groups[slot]));
         result?;
         Ok(0)
     }
 
     /// `MADV_DONTNEED` over `[start, start + len)`.
-    async fn drop_pages(&self, caller: &Caller<'_>, start: u64, len: u64) -> Result<(), Errno> {
+    async fn drop_pages(
+        &self,
+        caller: &Caller<'_>,
+        start: u64,
+        len: u64,
+        retired: &mut MemoryRetirement,
+    ) -> Result<(), Errno> {
         let mm = self.mm(caller.task());
         let _op = mm.op.lock().await;
         if mm.space().host_overlap(start, start + len) {
@@ -3000,12 +3153,16 @@ impl Kernel {
         {
             return Err(Errno::EINVAL);
         }
-        mm.retain_unmapped(caller.memory(), start, start + len)
+        mm.retain_unmapped(caller.memory(), start, start + len, retired)
             .await;
-        let mut mappings = mm.take_range(start, start + len);
+        let slot = retired.mappings.groups.len();
+        retired
+            .mappings
+            .groups
+            .push(mm.take_range(start, start + len));
         let mut at = start;
         let mut result = Ok(());
-        for mapping in &mut mappings {
+        for mapping in &mut retired.mappings.groups[slot] {
             if mapping.start > at {
                 result = result.and(zero(caller.memory(), at, mapping.start - at).await);
             }
@@ -3020,7 +3177,7 @@ impl Kernel {
         if at < start + len {
             result = result.and(zero(caller.memory(), at, start + len - at).await);
         }
-        mm.restore(mappings);
+        mm.restore(std::mem::take(&mut retired.mappings.groups[slot]));
         result
     }
 
@@ -3197,14 +3354,19 @@ impl Kernel {
     }
 
     async fn sync_where(&self, caller: &Caller<'_>, pick: impl FnMut(&Mapping) -> bool) {
+        let mut retired = MemoryRetirement::default();
         let mm = self.mm(caller.task());
         let _op = mm.op.lock().await;
-        let mut mappings = mm.space().take_mappings_where(pick);
-        for mapping in &mut mappings {
+        let slot = retired.mappings.groups.len();
+        retired
+            .mappings
+            .groups
+            .push(mm.space().take_mappings_where(pick));
+        for mapping in &mut retired.mappings.groups[slot] {
             // Nothing to report to: the syscall that got here is about something else.
             let _ = mapping.sync(caller.memory()).await;
         }
-        mm.restore(mappings);
+        mm.restore(std::mem::take(&mut retired.mappings.groups[slot]));
     }
 
     /// The ranges of `task`'s memory that show shared objects' pages, lowest first: what a fork
@@ -3259,22 +3421,26 @@ impl Kernel {
     /// `exit_mmap` while the memory is still there, by its last user: writes back every shared
     /// mapping and drops all of them.
     pub(crate) async fn exit_mmap(&self, caller: &Caller<'_>) {
+        let mut retired = MemoryRetirement::default();
         let mm = self.mm(caller.task());
         // `__mmput`: `exit_aio` before `exit_mmap`.
         self.exit_aio(&mm);
         let _op = mm.op.lock().await;
-        mm.retain_unmapped(caller.memory(), 0, 1 << 32).await;
-        let mappings = mm.space().clear_mappings();
-        for mut mapping in mappings {
+        mm.retain_unmapped(caller.memory(), 0, 1 << 32, &mut retired)
+            .await;
+        let slot = retired.mappings.groups.len();
+        retired.mappings.groups.push(mm.space().clear_mappings());
+        for mapping in &mut retired.mappings.groups[slot] {
             let _ = mapping.write_back(caller.memory()).await;
             let _ = mapping.mark_write_time().await;
         }
         mm.shared.store(false, Ordering::Release);
         // `mmput`: nobody reaches the memory any more. Backing destructors
         // run only after both the slot and the completed mm operation unlock.
-        let attached = { mm.foreign.lock_or_recover().take() };
+        if let Some(attached) = { mm.foreign.lock_or_recover().take() } {
+            retired.memory(attached);
+        }
         drop(_op);
-        drop(attached);
     }
 
     /// Maps a SysV segment attachment of `len` bytes at `addr`, or anywhere for 0, replacing
@@ -3297,6 +3463,9 @@ impl Kernel {
             Source::Shared(shared) if !shared.writable => ProtFlags::PROT_READ,
             _ => ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
         };
+        let mut retired = MemoryRetirement::default();
+        let source_slot = retired.mappings.sources.len();
+        retired.mappings.sources.push(Some(source));
         let mm = self.mm(caller.task());
         let _op = mm.op.lock().await;
         let locked = self.check_lock_new(caller, false, pages * PAGE_SIZE)?;
@@ -3312,12 +3481,19 @@ impl Kernel {
                 if busy && !remap {
                     return Err(Errno::EINVAL);
                 }
-                self.map_fixed(caller, addr, pages, false)
+                self.map_fixed(caller, addr, pages, false, &mut retired)
                     .await
                     .map_err(|_| Errno::EINVAL)?
             }
         };
-        let mut mapping = Mapping::new(start.into(), pages * PAGE_SIZE, source, prot);
+        let slot = retired.mappings.groups.len();
+        retired.mappings.groups.push(vec![Mapping::new(
+            start.into(),
+            pages * PAGE_SIZE,
+            retired.mappings.sources[source_slot].take().unwrap(),
+            prot,
+        )]);
+        let mapping = &mut retired.mappings.groups[slot][0];
         let mut filled = mapping.fill(caller.memory()).await;
         if filled == Err(Errno::EOPNOTSUPP)
             && let Source::Mapped(mapped) = &mapping.source
@@ -3325,14 +3501,17 @@ impl Kernel {
         {
             let object = Object::Segment(attachment.clone());
             let shared = Shared::new(object, mapped.offset, mapped.writable, None);
-            mapping.source = Source::Shared(shared);
+            retired.mappings.sources.push(Some(std::mem::replace(
+                &mut mapping.source,
+                Source::Shared(shared),
+            )));
             filled = mapping.fill(caller.memory()).await;
         }
         if let Err(errno) = filled {
             mm.space().unmap(start.into(), pages * PAGE_SIZE);
             return Err(errno);
         }
-        mm.insert(mapping);
+        mm.insert(retired.mappings.groups[slot].pop().unwrap());
         let first = u64::from(start) / PAGE_SIZE;
         let mut space = mm.space();
         space.set_locked(first, first + pages, locked);
@@ -3343,6 +3522,7 @@ impl Kernel {
     /// `shmdt`: unmaps the attachment that starts at `addr`, every part of it. `EINVAL` if no
     /// attachment starts there.
     pub(crate) async fn unmap_segment(&self, caller: &Caller<'_>, addr: Uptr) -> Result<(), Errno> {
+        let mut retired = MemoryRetirement::default();
         let mm = self.mm(caller.task());
         let _op = mm.op.lock().await;
         let attachment = {
@@ -3358,14 +3538,24 @@ impl Kernel {
                 .attachment()
                 .is_some_and(|other| Arc::ptr_eq(other, &attachment))
         };
-        let parts = mm.space().take_mappings_where(same);
-        for mut part in parts {
+        let slot = retired.mappings.groups.len();
+        retired
+            .mappings
+            .groups
+            .push(mm.space().take_mappings_where(same));
+        for index in 0..retired.mappings.groups[slot].len() {
+            let (start, len) = {
+                let part = &retired.mappings.groups[slot][index];
+                (part.start, part.len)
+            };
             // ipc/shm.c:ksys_shmdt uses do_vmi_munmap: pins survive detachment,
             // and a later mapping at this address must get fresh page records.
-            mm.retain_unmapped(caller.memory(), part.start, part.start + part.len)
+            mm.retain_unmapped(caller.memory(), start, start + len, &mut retired)
                 .await;
-            let _ = part.release(caller.memory()).await;
-            mm.space().unmap(part.start, part.len);
+            let _ = retired.mappings.groups[slot][index]
+                .release(caller.memory())
+                .await;
+            mm.space().unmap(start, len);
         }
         let any = mm.space().mappings.any_shared();
         mm.shared.store(any, Ordering::Release);

@@ -826,7 +826,7 @@ impl ForeignSelector {
     pub(super) fn captures(&self) -> usize {
         self.captures.load(std::sync::atomic::Ordering::SeqCst)
     }
-    fn after_capture(&self, callback: impl FnOnce() + Send + 'static) {
+    pub(super) fn after_capture(&self, callback: impl FnOnce() + Send + 'static) {
         assert!(
             self.next
                 .lock()
@@ -1016,7 +1016,7 @@ fn foreign_attachment_drop_runs_outside_task_slot_and_mm_operation_locks() {
             let kernel = self.kernel.upgrade().unwrap();
             let mm = self.mm.upgrade().unwrap();
             assert!(
-                kernel.state.try_write().is_ok(),
+                kernel.state.0.try_write().is_ok(),
                 "task state unlocked before backing Drop"
             );
             assert!(
@@ -1103,4 +1103,95 @@ fn foreign_snapshot_issued_view_outlives_mm_exit_without_resurrecting_it() {
     assert!(allocation.upgrade().is_some());
     drop(issued);
     assert!(allocation.upgrade().is_none());
+}
+
+/// An opaque allocation owner, deliberately allowed to reenter kernel gates.
+/// Tests retain no extra owner Arc: rotation leaves the real operation/page as
+/// its last owner, so an early gated Drop cannot pass by accident.
+pub(super) struct RetirementMemory {
+    memory: Arc<SyncMemory>,
+    _owner: Arc<RetirementOwner>,
+}
+struct RetirementOwner(Mutex<Option<Box<dyn FnOnce() + Send>>>);
+impl Drop for RetirementOwner {
+    fn drop(&mut self) {
+        (self.0.get_mut().unwrap().take().unwrap())();
+    }
+}
+impl RetirementMemory {
+    pub(super) fn new(memory: Arc<SyncMemory>, drop: impl FnOnce() + Send + 'static) -> Arc<Self> {
+        Arc::new(Self {
+            memory,
+            _owner: Arc::new(RetirementOwner(Mutex::new(Some(Box::new(drop))))),
+        })
+    }
+}
+impl UserMemory for RetirementMemory {
+    fn read<'a>(&'a self, addr: u32, out: &'a mut [u8]) -> LocalFuture<'a, Result<(), Fault>> {
+        self.memory.read(addr, out)
+    }
+    fn write<'a>(&'a self, addr: u32, data: &'a [u8]) -> LocalFuture<'a, Result<(), Fault>> {
+        self.memory.write(addr, data)
+    }
+    fn size(&self) -> LocalFuture<'_, u64> {
+        self.memory.size()
+    }
+    fn grow(&self, pages: u32) -> LocalFuture<'_, Option<u64>> {
+        self.memory.grow(pages)
+    }
+}
+
+#[test]
+fn foreign_retirement_unmap_and_exit_release_the_actual_owner_after_mm_unlock() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for exit in [false, true] {
+        let (kernel, task, _) = setup(b"");
+        let local = memory();
+        let caller = Caller::new(task, &local);
+        let page = crate::mm::PAGE_SIZE as u32;
+        let addr = block_on(kernel.mmap(
+            &caller,
+            0,
+            page,
+            ProtFlags(3),
+            MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS,
+            Fd(-1),
+            0,
+        ))
+        .unwrap();
+        let mm = kernel.mm(task);
+        let first = SyncMemory::new(block_on(local.size()) as usize, 0);
+        first.put(addr, b"old");
+        let drops = Arc::new(AtomicUsize::new(0));
+        let probe_mm = mm.clone();
+        let probe_drops = drops.clone();
+        let owner = RetirementMemory::new(first, move || {
+            assert!(
+                probe_mm.op.try_lock().is_some(),
+                "actual allocation owner released outside mm.op"
+            );
+            probe_drops.fetch_add(1, Ordering::SeqCst);
+        });
+        let weak = Arc::downgrade(&owner);
+        let selector = ForeignSelector::new(owner);
+        kernel.attach_memory(task, selector.clone());
+        let held = block_on(kernel.retain_pages(&caller, addr, 3)).unwrap();
+        selector.publish(SyncMemory::new(block_on(local.size()) as usize, 0));
+        assert!(
+            weak.upgrade().is_some(),
+            "actual retained Page owns A after rotation"
+        );
+        if exit {
+            block_on(kernel.exit_mmap(&caller));
+        } else {
+            assert_eq!(block_on(kernel.munmap(&caller, addr, page)), Ok(0));
+        }
+        assert!(weak.upgrade().is_none());
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        let mut bytes = [0; 3];
+        held.read_sync(0, &mut bytes).unwrap();
+        assert_eq!(&bytes, b"old");
+        drop(held);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
 }

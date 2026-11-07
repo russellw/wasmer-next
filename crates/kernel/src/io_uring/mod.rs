@@ -37,6 +37,7 @@
 mod kbuf;
 mod ops;
 mod register;
+mod retirement;
 mod rsrc;
 mod tctx;
 
@@ -76,6 +77,8 @@ use crate::{
 };
 
 pub(crate) use ops::Req;
+pub(crate) use retirement::Resources;
+use retirement::SubmissionRetirement;
 pub(crate) use tctx::{Cancel, Tctx};
 
 /// `IORING_MAX_ENTRIES` and `IORING_MAX_CQ_ENTRIES`.
@@ -299,6 +302,14 @@ impl Ctx {
         self.submit.lock().await
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_retirement_unlocked(&self) -> bool {
+        let Some(_submit) = self.submit.try_lock() else {
+            return false;
+        };
+        self.state.try_lock().is_ok()
+    }
+
     fn read_word(&self, offset: u64) -> u32 {
         let mut word = [0; 4];
         let _ = self.rings.read_at(&mut word, offset);
@@ -426,10 +437,28 @@ impl Ctx {
     /// Posts a completion (`io_fill_cqe_req`), behind any that overflowed. A timeout's own
     /// completion does not count towards other timeouts; any other may end some.
     pub(crate) fn post(&self, user_data: u64, res: i32, flags: u32, timeout: bool) {
-        self.post_extended(user_data, res, flags, timeout, [0; 2]);
+        let mut retired = Resources::default();
+        self.post_in(user_data, res, flags, timeout, &mut retired);
     }
-
-    fn post_extended(&self, user_data: u64, res: i32, flags: u32, timeout: bool, extra: [u64; 2]) {
+    fn post_in(
+        &self,
+        user_data: u64,
+        res: i32,
+        flags: u32,
+        timeout: bool,
+        retired: &mut Resources,
+    ) {
+        self.post_extended_in(user_data, res, flags, timeout, [0; 2], retired);
+    }
+    fn post_extended_in(
+        &self,
+        user_data: u64,
+        res: i32,
+        flags: u32,
+        timeout: bool,
+        extra: [u64; 2],
+        retired: &mut Resources,
+    ) {
         let fired = {
             let mut state = self.state.lock_or_recover();
             let cqe = Cqe {
@@ -449,14 +478,20 @@ impl Ctx {
                 Vec::new()
             }
         };
-        self.notify(true);
+        // Put ALL removed requests in the caller before notification can unwind.
+        let start = retired.ready.len();
         for waiting in fired {
-            self.finish_waiting(waiting, 0);
+            let req = retired.take_waiting(waiting);
+            retired.ready.push(Some(req));
+        }
+        self.notify(true);
+        for slot in start..retired.ready.len() {
+            self.timeout_seq.fetch_add(1, Ordering::Release);
+            self.finish_in(retired.ready[slot].take().unwrap(), 0, 0, false, retired);
         }
     }
 
-    /// Auxiliary CQEs (MSG_RING) may not use the overflow list.
-    fn post_aux(&self, data: u64, res: i32, flags: u32) -> bool {
+    fn post_aux_in(&self, data: u64, res: i32, flags: u32, retired: &mut Resources) -> bool {
         let expired = {
             let mut state = self.state.lock_or_recover();
             if !state.overflow.is_empty()
@@ -475,9 +510,15 @@ impl Ctx {
             state.seq += 1;
             ops::expired_timeouts(&mut state)
         };
-        self.notify(true);
+        let start = retired.ready.len();
         for waiting in expired {
-            self.finish_waiting(waiting, 0);
+            let req = retired.take_waiting(waiting);
+            retired.ready.push(Some(req));
+        }
+        self.notify(true);
+        for slot in start..retired.ready.len() {
+            self.timeout_seq.fetch_add(1, Ordering::Release);
+            self.finish_in(retired.ready[slot].take().unwrap(), 0, 0, false, retired);
         }
         true
     }
@@ -554,7 +595,7 @@ impl Ctx {
     }
 
     /// Processes this task's queued wakes, with no file wait-queue lock held.
-    fn run_woken(&self, task: TaskId) -> bool {
+    fn run_woken(&self, task: TaskId, retired: &mut Resources) -> bool {
         let woken = {
             let mut state = self.state.lock_or_recover();
             let pending = std::mem::take(&mut state.woken);
@@ -571,7 +612,7 @@ impl Ctx {
         };
         let ran = !woken.is_empty();
         for id in woken {
-            ops::handle_wakeup(self, id);
+            ops::handle_wakeup(self, id, retired);
         }
         ran
     }
@@ -589,9 +630,21 @@ impl Ctx {
     /// `io_uring_try_cancel_requests` for the task `task`: its requests that `how` takes
     /// complete with `ECANCELED`.
     fn cancel_task(&self, task: TaskId, how: Cancel) {
-        let cancelled = ops::cancel(self, |req| req.task == task && how.matches(req), true);
-        for req in cancelled {
-            self.finish(req, -Errno::ECANCELED.0, 0, true);
+        let mut retired = Resources::default();
+        let cancelled = ops::cancel_in(
+            self,
+            |req| req.task == task && how.matches(req),
+            true,
+            &mut retired,
+        );
+        for slot in cancelled {
+            self.finish_in(
+                retired.ready[slot].take().unwrap(),
+                -Errno::ECANCELED.0,
+                0,
+                true,
+                &mut retired,
+            );
         }
     }
 
@@ -705,7 +758,7 @@ impl FileObject for IoRing {
         out += &format!("UserFiles:\t{}\n", files.map_or(0, Vec::len));
         for (i, file) in files.into_iter().flatten().enumerate() {
             if let Some(file) = file {
-                let name = String::from_utf8_lossy(&file.item.path().dentry.name()).into_owned();
+                let name = String::from_utf8_lossy(&file.item().path().dentry.name()).into_owned();
                 out += &format!("{i:5}: {name}\n");
             }
         }
@@ -713,7 +766,7 @@ impl FileObject for IoRing {
         out += &format!("UserBufs:\t{}\n", buffers.map_or(0, Vec::len));
         for (i, buffer) in buffers.into_iter().flatten().enumerate() {
             if let Some(buffer) = buffer {
-                let (addr, len) = (buffer.item.addr, buffer.item.len);
+                let (addr, len) = (buffer.item().addr, buffer.item().len);
                 out += &format!("{i:5}: 0x{addr:x}/{len}\n");
             }
         }
@@ -951,9 +1004,12 @@ impl Kernel {
                 return Err(Errno::EEXIST.into());
             }
             self.tctx(caller.task()).add(&ctx);
+            let mut retired = SubmissionRetirement::default();
             let _submit = ctx.submit.lock().await;
-            self.run_task_work(caller, &ctx, mm).await;
-            ret = self.submit_sqes(caller, &ctx, mm, to_submit).await?;
+            self.run_task_work(caller, &ctx, mm, &mut retired).await;
+            ret = self
+                .submit_sqes(caller, &ctx, mm, to_submit, &mut retired)
+                .await?;
             if ret != to_submit as i32 {
                 return Ok(ret);
             }
@@ -966,30 +1022,41 @@ impl Kernel {
                 return waited;
             }
         } else if to_submit == 0 && ctx.allowed_run_tw(caller.task()) {
+            let mut retired = SubmissionRetirement::default();
             let _submit = ctx.submit.lock().await;
-            self.run_task_work(caller, &ctx, mm).await;
+            self.run_task_work(caller, &ctx, mm, &mut retired).await;
         }
         Ok(ret)
     }
 
     /// `io_run_task_work` for a ring: issues the requests a wakeup made ready, those of the
     /// caller's memory, and flushes overflowed completions. The caller holds `submit`.
-    async fn run_task_work(&self, caller: &Caller<'_>, ctx: &Arc<Ctx>, mm: u64) {
+    async fn run_task_work(
+        &self,
+        caller: &Caller<'_>,
+        ctx: &Arc<Ctx>,
+        mm: u64,
+        retired: &mut SubmissionRetirement,
+    ) {
         ctx.flush_overflow();
         loop {
-            let woke = ctx.run_woken(caller.task());
+            let woke = ctx.run_woken(caller.task(), &mut retired.resources);
             let req = {
                 let mut state = ctx.state.lock_or_recover();
                 let at = state
                     .ready
                     .iter()
                     .position(|req| req.mm == mm && req.task == caller.task());
-                let req = at.and_then(|at| state.ready.remove(at));
+                let slot = retired.resources.ready.len();
+                retired
+                    .resources
+                    .ready
+                    .push(at.and_then(|at| state.ready.remove(at)));
                 ctx.update_sq_flags(&state);
-                req
+                retired.resources.ready[slot].take()
             };
             match req {
-                Some(req) => self.issue(caller, ctx, req).await,
+                Some(req) => self.issue(caller, ctx, req, retired).await,
                 None if woke => continue,
                 None => break,
             }
@@ -1005,6 +1072,7 @@ impl Kernel {
         ctx: &Arc<Ctx>,
         mm: u64,
         nr: u32,
+        retired: &mut SubmissionRetirement,
     ) -> SysResult<i32> {
         let tail = ctx.read_word(SQ_TAIL);
         let head = ctx.state.lock_or_recover().sq_head;
@@ -1013,7 +1081,6 @@ impl Kernel {
         } else {
             tail.wrapping_sub(head).min(ctx.shape.sq_entries).min(nr)
         };
-        let mut link: Option<Req> = None;
         let mut submitted = 0;
         let mut left = entries;
         while left != 0 {
@@ -1022,14 +1089,14 @@ impl Kernel {
                 continue;
             };
             submitted += (before - left) as i32;
-            let ok = self.submit_sqe(caller, ctx, mm, sqe, &mut link).await;
+            let ok = self.submit_sqe(caller, ctx, mm, sqe, retired).await;
             if !ok && !ctx.shape.has(IoringSetupFlags::IORING_SETUP_SUBMIT_ALL) {
                 break;
             }
         }
         // A chain the batch left open still runs (`io_submit_state_end`).
-        if let Some(head) = link.take() {
-            self.queue_sqe(caller, ctx, head).await;
+        if let Some(head) = retired.link.take() {
+            self.queue_sqe(caller, ctx, head, retired).await;
         }
         if ctx.shape.has(IoringSetupFlags::IORING_SETUP_SQ_REWIND) {
             ctx.state.lock_or_recover().sq_head = 0;
@@ -1120,8 +1187,9 @@ impl Kernel {
         let ret = loop {
             self.io_uring_run_task_work(caller).await;
             {
+                let mut retired = SubmissionRetirement::default();
                 let _submit = ctx.submit.lock().await;
-                self.run_task_work(caller, ctx, mm).await;
+                self.run_task_work(caller, ctx, mm, &mut retired).await;
             }
             // Linux io_uring/wait.c:io_cqring_wait snapshots after initial
             // task work. io_uring.h:io_should_wake returns on any subsequent
@@ -1207,12 +1275,13 @@ impl Kernel {
         }
         let file = self.ring_ctx_file(caller, fd, registered)?;
         let ctx = ring_of(&file)?;
+        let mut retired = Resources::default();
         let _submit = ctx.submit.lock().await;
         let submitter = ctx.state.lock_or_recover().submitter;
         if submitter.is_some_and(|task| task != caller.task()) {
             return Err(Errno::EEXIST.into());
         }
-        self.register(caller, &ctx, opcode, arg.addr(), nr_args)
+        self.register(caller, &ctx, opcode, arg.addr(), nr_args, &mut retired)
             .await
     }
 }

@@ -10,7 +10,7 @@ use wasixv2_abi::{
 };
 use wasixv2_syscalls::{Caller, Errno, Fd, SysResult, read_value};
 
-use super::{Ctx, is_ring, ops::SUPPORTED, rsrc::Node};
+use super::{Ctx, Resources, is_ring, ops::SUPPORTED, rsrc::Node};
 use crate::{Kernel, cred::Cred, file::OpenFile, sync::MutexExt};
 
 /// `IORING_MAX_FIXED_FILES`.
@@ -29,6 +29,7 @@ impl Kernel {
         opcode: u32,
         arg: u32,
         nr_args: u32,
+        retired: &mut Resources,
     ) -> SysResult<i32> {
         match IoUringRegisterOp(opcode) {
             IoUringRegisterOp::IORING_REGISTER_PBUF_RING
@@ -39,10 +40,10 @@ impl Kernel {
                 }
                 match IoUringRegisterOp(opcode) {
                     IoUringRegisterOp::IORING_REGISTER_PBUF_RING => {
-                        self.register_pbuf_ring(caller, ctx, arg).await
+                        self.register_pbuf_ring(caller, ctx, arg, retired).await
                     }
                     IoUringRegisterOp::IORING_UNREGISTER_PBUF_RING => {
-                        self.unregister_pbuf_ring(caller, ctx, arg).await
+                        self.unregister_pbuf_ring(caller, ctx, arg, retired).await
                     }
                     _ => self.pbuf_status(caller, ctx, arg).await,
                 }
@@ -51,7 +52,7 @@ impl Kernel {
                 if arg == 0 {
                     return Err(Errno::EFAULT.into());
                 }
-                self.register_buffers(caller, ctx, u64::from(arg), nr_args, 0)
+                self.register_buffers(caller, ctx, u64::from(arg), nr_args, 0, retired)
                     .await
             }
             IoUringRegisterOp::IORING_REGISTER_FILES2
@@ -69,10 +70,10 @@ impl Kernel {
                     return Err(Errno::EINVAL.into());
                 }
                 if opcode == IoUringRegisterOp::IORING_REGISTER_FILES2.0 {
-                    self.register_files_tagged(caller, ctx, rr.data, rr.nr, rr.tags)
+                    self.register_files_tagged(caller, ctx, rr.data, rr.nr, rr.tags, retired)
                         .await
                 } else {
-                    self.register_buffers(caller, ctx, rr.data, rr.nr, rr.tags)
+                    self.register_buffers(caller, ctx, rr.data, rr.nr, rr.tags, retired)
                         .await
                 }
             }
@@ -88,6 +89,7 @@ impl Kernel {
                     ctx,
                     up,
                     opcode == IoUringRegisterOp::IORING_REGISTER_BUFFERS_UPDATE.0,
+                    retired,
                 )
                 .await
             }
@@ -102,22 +104,25 @@ impl Kernel {
                     return Err(Errno::EINVAL.into());
                 }
                 let buffers = ctx.state.lock_or_recover().buffers.take();
-                drop(buffers.ok_or(Errno::ENXIO)?);
+                retired
+                    .buffer_tables
+                    .push(Some(buffers.ok_or(Errno::ENXIO)?));
                 Ok(0)
             }
             IoUringRegisterOp::IORING_REGISTER_FILES => {
-                self.register_files(caller, ctx, arg, nr_args).await
+                self.register_files(caller, ctx, arg, nr_args, retired)
+                    .await
             }
             IoUringRegisterOp::IORING_UNREGISTER_FILES => {
                 if arg != 0 || nr_args != 0 {
                     return Err(Errno::EINVAL.into());
                 }
                 let files = ctx.state.lock_or_recover().files.take();
-                files.ok_or(Errno::ENXIO)?;
+                retired.file_tables.push(Some(files.ok_or(Errno::ENXIO)?));
                 Ok(0)
             }
             IoUringRegisterOp::IORING_REGISTER_FILES_UPDATE => {
-                self.update_files(caller, ctx, arg, nr_args).await
+                self.update_files(caller, ctx, arg, nr_args, retired).await
             }
             IoUringRegisterOp::IORING_REGISTER_EVENTFD
             | IoUringRegisterOp::IORING_REGISTER_EVENTFD_ASYNC => {
@@ -128,13 +133,16 @@ impl Kernel {
                 if ctx.state.lock_or_recover().eventfd.is_some() {
                     return Err(Errno::EBUSY.into());
                 }
-                let eventfd = self.eventfd_ctx_fdget(caller, Fd(fd))?;
+                let eventfd = retired.open_files.len();
+                retired
+                    .open_files
+                    .push(Some(self.eventfd_ctx_fdget(caller, Fd(fd))?));
                 let only_async = opcode == IoUringRegisterOp::IORING_REGISTER_EVENTFD_ASYNC.0;
                 let mut state = ctx.state.lock_or_recover();
                 if state.eventfd.is_some() {
                     return Err(Errno::EBUSY.into());
                 }
-                state.eventfd = Some((eventfd, only_async));
+                state.eventfd = Some((retired.open_files[eventfd].take().unwrap(), only_async));
                 Ok(0)
             }
             IoUringRegisterOp::IORING_UNREGISTER_EVENTFD => {
@@ -142,7 +150,9 @@ impl Kernel {
                     return Err(Errno::EINVAL.into());
                 }
                 let eventfd = ctx.state.lock_or_recover().eventfd.take();
-                eventfd.ok_or(Errno::ENXIO)?;
+                retired
+                    .open_files
+                    .push(Some(eventfd.ok_or(Errno::ENXIO)?.0));
                 Ok(0)
             }
             IoUringRegisterOp::IORING_REGISTER_PROBE => {
@@ -201,8 +211,9 @@ impl Kernel {
         ctx: &Ctx,
         arg: u32,
         nr_args: u32,
+        retired: &mut Resources,
     ) -> SysResult<i32> {
-        self.register_files_tagged(caller, ctx, u64::from(arg), nr_args, 0)
+        self.register_files_tagged(caller, ctx, u64::from(arg), nr_args, 0, retired)
             .await
     }
 
@@ -213,6 +224,7 @@ impl Kernel {
         arg: u64,
         nr_args: u32,
         tags: u64,
+        retired: &mut Resources,
     ) -> SysResult<i32> {
         if ctx.state.lock_or_recover().files.is_some() {
             return Err(Errno::EBUSY.into());
@@ -224,7 +236,10 @@ impl Kernel {
         if nr_args > MAX_FIXED_FILES || nr_args as usize > nofile {
             return Err(Errno::EMFILE.into());
         }
-        let mut files = Vec::with_capacity(nr_args as usize);
+        let candidate = retired.file_builders.len();
+        retired
+            .file_builders
+            .push(Vec::with_capacity(nr_args as usize));
         for i in 0..nr_args {
             let tag = read_tag(caller, tags, i).await?;
             let fd = match arg {
@@ -237,16 +252,16 @@ impl Kernel {
             if file.is_none() && tag != 0 {
                 return Err(Errno::EINVAL.into());
             }
-            files.push((file, tag));
+            retired.file_builders[candidate].push((file, tag));
         }
         let mut state = ctx.state.lock_or_recover();
         if state.files.is_some() {
             return Err(Errno::EBUSY.into());
         }
         state.files = Some(
-            files
+            std::mem::take(&mut retired.file_builders[candidate])
                 .into_iter()
-                .map(|(file, tag)| file.map(|f| Node::new(ctx, f, tag)))
+                .map(|(file, tag)| file.map(|file| Node::new(ctx, file, tag)))
                 .collect(),
         );
         state.file_alloc_start = 0;
@@ -280,6 +295,7 @@ impl Kernel {
         ctx: &Ctx,
         arg: u32,
         nr_args: u32,
+        retired: &mut Resources,
     ) -> SysResult<i32> {
         if nr_args == 0 {
             return Err(Errno::EINVAL.into());
@@ -292,7 +308,7 @@ impl Kernel {
             nr: nr_args,
             ..IoUringRsrcUpdate2::ZERO
         };
-        self.update_resources(caller, ctx, up, false).await
+        self.update_resources(caller, ctx, up, false, retired).await
     }
 
     async fn register_buffers(
@@ -302,6 +318,7 @@ impl Kernel {
         arg: u64,
         nr: u32,
         tags: u64,
+        retired: &mut Resources,
     ) -> SysResult<i32> {
         if ctx.state.lock_or_recover().buffers.is_some() {
             return Err(Errno::EBUSY.into());
@@ -309,7 +326,10 @@ impl Kernel {
         if nr == 0 || nr > MAX_REG_BUFFERS {
             return Err(Errno::EINVAL.into());
         }
-        let mut buffers = Vec::with_capacity(nr as usize);
+        let candidate = retired.buffer_builders.len();
+        retired
+            .buffer_builders
+            .push(Vec::with_capacity(nr as usize));
         for i in 0..nr {
             let iov = if arg == 0 {
                 Iovec::ZERO
@@ -326,19 +346,22 @@ impl Kernel {
                 return Err(Errno::EINVAL.into());
             }
             let buffer = match buffer {
-                Some(iov) => Some(self.retain_pages(caller, iov.iov_base, iov.iov_len).await?),
+                Some(iov) => Some(
+                    self.retain_pages_in(caller, iov.iov_base, iov.iov_len, &mut retired.memory)
+                        .await?,
+                ),
                 None => None,
             };
-            buffers.push((buffer, tag));
+            retired.buffer_builders[candidate].push((buffer, tag));
         }
         let mut state = ctx.state.lock_or_recover();
         if state.buffers.is_some() {
             return Err(Errno::EBUSY.into());
         }
         state.buffers = Some(
-            buffers
+            std::mem::take(&mut retired.buffer_builders[candidate])
                 .into_iter()
-                .map(|(buffer, tag)| buffer.map(|b| Node::new(ctx, b, tag)))
+                .map(|(buffer, tag)| buffer.map(|buffer| Node::new(ctx, buffer, tag)))
                 .collect(),
         );
         Ok(0)

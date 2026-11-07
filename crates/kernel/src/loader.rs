@@ -110,7 +110,9 @@ impl LoaderControl for Kernel {
                     .mm
                     .clone()
             };
-            let memory = mm.foreign().ok_or(Errno::EOPNOTSUPP)?;
+            let mut retired = crate::mm::MemoryRetirement::default();
+            let mut reservation;
+            let memory = retired.memory(mm.foreign().ok_or(Errno::EOPNOTSUPP)?);
             let _op = mm.op.lock().await;
             {
                 let state = self.state.read_or_recover();
@@ -119,26 +121,30 @@ impl LoaderControl for Kernel {
                     return Err(Errno::ESTALE.into());
                 }
             }
-            let range = self.allocate_host_range(caller, &mm, &memory, len).await?;
+            let range = self.allocate_host_range(caller, &mm, memory, len).await?;
             let start = u32::try_from(range.start()).map_err(|_| Errno::ENOMEM)?;
-            // SAFETY: original mm.op is held; HostRange exclusively owns this exact
-            // private logical range, registered before backend replacement/publication.
-            let pin = unsafe { memory.pin_private_host_range(start, range.len()) }?;
-            if pin.len() != range.len() {
-                return Err(Errno::EOPNOTSUPP.into());
-            }
             let address = (range.start() + u64::from(alignment - 1)) & !u64::from(alignment - 1);
             let offset = usize::try_from(address - range.start()).map_err(|_| Errno::ENOMEM)?;
-            let mut reservation = Box::new(HostReservation {
-                pin: Some(pin),
+            // The ACTUAL candidate, including any opaque pin returned next,
+            // lives in an outer slot before later fallible metadata/publication.
+            reservation = Some(Box::new(HostReservation {
+                pin: None,
                 range,
-                _memory: memory,
+                memory: Some(memory.clone()),
+                detach: Default::default(),
                 address: address as u32,
                 bytes,
                 offset,
-            });
-            reservation.range.publish();
-            Ok(reservation as Box<dyn wasixv2_syscalls::HostMemoryLease>)
+            }));
+            let candidate = reservation.as_mut().unwrap();
+            // SAFETY: original mm.op owns this exact fresh private logical range.
+            candidate.pin =
+                Some(unsafe { memory.pin_private_host_range(start, candidate.range.len()) }?);
+            if candidate.pin.as_ref().unwrap().len() != candidate.range.len() {
+                return Err(Errno::EOPNOTSUPP.into());
+            }
+            candidate.range.publish();
+            Ok(reservation.take().unwrap() as Box<dyn wasixv2_syscalls::HostMemoryLease>)
         })
     }
 
@@ -284,11 +290,13 @@ async fn release(
     start: u32,
     len: u32,
 ) {
+    let mut retired = crate::mm::MemoryRetirement::default();
     let _op = mm.op.lock().await;
     mm.release_range(
         &*memory,
         u64::from(start),
         u64::from(start) + u64::from(len),
+        &mut retired,
     )
     .await;
 }
@@ -332,7 +340,8 @@ struct HostReservation {
     // Physical exclusion must end BEFORE logical pages are made available again.
     pin: Option<Box<dyn wasixv2_syscalls::HostMemoryPin>>,
     range: crate::mm::HostRange,
-    _memory: Arc<dyn wasixv2_syscalls::UserMemory + Send + Sync>,
+    memory: Option<Arc<dyn wasixv2_syscalls::UserMemory + Send + Sync>>,
+    detach: crate::mm::HostDetach,
     address: u32,
     bytes: u32,
     offset: usize,
@@ -359,19 +368,38 @@ unsafe impl wasixv2_syscalls::HostMemoryLease for HostReservation {
     }
     fn release(self: Box<Self>) -> LocalFuture<'static, ()> {
         Box::pin(async move {
-            let mm = self.range.mm().clone();
+            let mut reservation = self;
+            let mm = reservation.range.mm().clone();
             let _op = mm.op.lock().await;
-            drop(self);
+            reservation.detach();
+            drop(_op);
+            drop(reservation);
         })
+    }
+}
+impl HostReservation {
+    fn detach(&mut self) {
+        if self.range.published() && !self.detach.complete {
+            self.range.detach_retained(
+                &**self.pin.as_ref().expect("published range owns its pin"),
+                &mut self.detach,
+            );
+        }
     }
 }
 impl Drop for HostReservation {
     fn drop(&mut self) {
-        if let Some(pin) = self.pin.take() {
-            // Existing GUP consumers must own their old bytes before physical
-            // exclusion ends. The exact original foreign handle remains alive.
-            self.range.detach_retained(&*pin);
-            drop(pin);
+        let mut errors = crate::sync::DropErrors::new();
+        // Finite metadata/copy panic leaves exact pin, progress and range owned;
+        // retry completes unfinished work, never repeats a committed copy.
+        while self.range.published() && !self.detach.complete {
+            errors.run(|| self.detach());
         }
+        errors.run(|| drop(self.pin.take()));
+        let retired = std::mem::take(&mut self.detach);
+        errors.run(|| drop(retired));
+        errors.run(|| drop(self.memory.take()));
+        // Range release follows the actual pin Drop, including during unwind.
+        errors.finish();
     }
 }

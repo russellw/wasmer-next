@@ -937,14 +937,17 @@ impl Kernel {
 /// A new open file goes either into the process table or into an io_uring table.
 /// Linux io_uring/openclose.c:io_openat2 and net.c:io_accept skip ordinary fd
 /// reservation for a direct descriptor, installing it after the operation succeeds.
-#[derive(Clone, Copy)]
 pub(crate) enum FileDest<'a> {
     Table,
-    Direct(&'a crate::io_uring::Ctx, u32),
+    Direct(
+        &'a crate::io_uring::Ctx,
+        u32,
+        &'a mut crate::io_uring::Resources,
+    ),
 }
 
 impl<'a> FileDest<'a> {
-    pub(crate) fn is_direct(self) -> bool {
+    pub(crate) fn is_direct(&self) -> bool {
         matches!(self, Self::Direct(..))
     }
 
@@ -959,21 +962,27 @@ impl<'a> FileDest<'a> {
                 let [slot] = kernel.reserve_fds(caller, cloexec)?;
                 Ok(FileSlot::Table(slot))
             }
-            Self::Direct(ctx, index) => Ok(FileSlot::Direct(ctx, index)),
+            Self::Direct(ctx, index, retired) => Ok(FileSlot::Direct(ctx, index, retired)),
         }
     }
 }
 
 pub(crate) enum FileSlot<'a> {
     Table(FdReservation),
-    Direct(&'a crate::io_uring::Ctx, u32),
+    Direct(
+        &'a crate::io_uring::Ctx,
+        u32,
+        &'a mut crate::io_uring::Resources,
+    ),
 }
 
 impl FileSlot<'_> {
     pub(crate) fn install(self, file: Arc<OpenFile>) -> SysResult<Fd> {
         match self {
             Self::Table(slot) => Ok(slot.install(file)),
-            Self::Direct(ctx, index) => Ok(Fd(ctx.install_direct(file, index)?)),
+            Self::Direct(ctx, index, retired) => {
+                Ok(Fd(ctx.install_direct_in(file, index, retired)?))
+            }
         }
     }
 }

@@ -303,6 +303,8 @@ struct HostPinAllocation {
 struct HostPinMemory {
     allocation: Mutex<HostPinAllocation>,
     next_size: Mutex<Option<futures::channel::oneshot::Receiver<()>>>,
+    pin_drop: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    pin_metadata_panic: std::sync::atomic::AtomicBool,
     next_grow: Mutex<Option<futures::channel::oneshot::Receiver<()>>>,
     next_force_read: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
@@ -316,6 +318,8 @@ impl HostPinMemory {
                 pins: 0,
             }),
             next_size: Mutex::new(None),
+            pin_drop: Mutex::new(None),
+            pin_metadata_panic: Default::default(),
             next_grow: Mutex::new(None),
             next_force_read: Mutex::new(None),
         })
@@ -339,11 +343,19 @@ struct HostPinnedMemory(Arc<HostPinMemory>);
 struct TestHostPin {
     memory: Arc<HostPinMemory>,
     range: std::ops::Range<usize>,
+    drop: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 // SAFETY: the exact Vec<UnsafeCell<u8>> allocation is retained by Arc; its mutex
 // excludes all relocation while pins > 0. No Rust references to its bytes escape.
 unsafe impl wasixv2_syscalls::HostMemoryPin for TestHostPin {
     fn as_ptr(&self) -> *mut u8 {
+        assert!(
+            !self
+                .memory
+                .pin_metadata_panic
+                .swap(false, std::sync::atomic::Ordering::SeqCst),
+            "original pin metadata failure"
+        );
         let allocation = self.memory.allocation.lock().unwrap();
         // SAFETY: this exact range was checked at admission and growth is excluded.
         unsafe {
@@ -362,6 +374,9 @@ unsafe impl wasixv2_syscalls::HostMemoryPin for TestHostPin {
 impl Drop for TestHostPin {
     fn drop(&mut self) {
         self.memory.allocation.lock().unwrap().pins -= 1;
+        if let Some(drop) = self.drop.get_mut().unwrap().take() {
+            drop();
+        }
     }
 }
 impl UserMemory for HostPinnedMemory {
@@ -470,6 +485,7 @@ impl UserMemory for HostPinnedMemory {
         Ok(Box::new(TestHostPin {
             memory: self.0.clone(),
             range,
+            drop: Mutex::new(self.0.pin_drop.lock().unwrap().take()),
         }))
     }
 }
@@ -948,4 +964,65 @@ fn foreign_snapshot_loader_pin_and_published_record_keep_original_backing() {
     drop(next);
     assert_eq!(second.0.pins(), 0);
     drop(held);
+}
+
+#[test]
+fn host_retirement_actual_pin_owner_drops_outside_op_and_recovers_partial_metadata_panic() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for mode in 0..3 {
+        let (kernel, task, _) = setup(b"");
+        let memory = Arc::new(HostPinnedMemory(HostPinMemory::new(16)));
+        let mm = kernel.mm(task);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let observed = drops.clone();
+        let check_mm = mm.clone();
+        *memory.0.pin_drop.lock().unwrap() = Some(Box::new(move || {
+            assert!(
+                check_mm.op.try_lock().is_some(),
+                "actual independent pin owner dropped outside operation gate"
+            );
+            observed.fetch_add(1, Ordering::SeqCst);
+        }));
+        kernel.attach_memory(task, memory.clone());
+        let caller = Caller::new(task, &*memory);
+        let lease = block_on(kernel.loader_reserve_host(&caller, 32, 64)).unwrap();
+        let address = lease.address();
+        unsafe {
+            lease.as_ptr().write(91);
+        }
+        let held = block_on(kernel.retain_pages(&caller, address, 1)).unwrap();
+        if mode == 2 {
+            memory.0.pin_metadata_panic.store(true, Ordering::SeqCst);
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if mode == 0 {
+                drop(lease);
+            } else {
+                block_on(lease.release());
+            }
+        }));
+        if mode == 2 {
+            let panic = result.unwrap_err();
+            let message = panic
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| panic.downcast_ref::<String>().map(String::as_str));
+            assert_eq!(message, Some("original pin metadata failure"));
+        } else {
+            result.unwrap();
+        }
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(memory.0.pins(), 0);
+        let mut byte = [0];
+        held.read_sync(0, &mut byte).unwrap();
+        assert_eq!(byte, [91]);
+        let next = block_on(kernel.loader_reserve_host(&caller, 32, 64)).unwrap();
+        assert_eq!(
+            next.address(),
+            address,
+            "exact range releases only after independent pin Drop"
+        );
+        assert_eq!(unsafe { next.as_ptr().read() }, 0);
+        drop(next);
+    }
 }
