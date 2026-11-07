@@ -934,7 +934,7 @@ impl StoreRef {
         }
     }
 
-    #[cfg(feature = "sys")]
+    #[cfg(all(feature = "sys", test))]
     pub(crate) fn register_cleanup_fence(
         &self,
         fence: Box<dyn Fn() -> bool>,

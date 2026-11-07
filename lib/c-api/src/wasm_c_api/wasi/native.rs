@@ -214,8 +214,6 @@ impl NativeWasi {
         let local =
             wasixv2_exec::local_cleanup_runner(&asynchronous, environment.loader_cleanup().clone())
                 .ok_or_else(|| anyhow::anyhow!("native loader cleanup runner is missing"))?;
-        let settlement = environment.loader_cleanup().settlement();
-        store.register_cleanup_fence(Box::new(move || settlement.is_ready()))?;
         let retiring_env = environment.clone();
         let retiring_store = asynchronous.store();
         // Keep this initial fallback lazy. A committed handoff replaces it
