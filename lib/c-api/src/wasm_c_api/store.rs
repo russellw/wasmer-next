@@ -29,6 +29,9 @@ struct ManagedStore {
     owner: wasmer_api::sys::NativeCleanupOwner,
     driver: RefCell<Option<Rc<Driver>>>,
     ledger: Rc<RetirementLedger>,
+    scopes: Rc<DriverScopes>,
+    seal: Option<wasmer_api::sys::NativeCleanupSeal>,
+    finalization: RefCell<Weak<NativeStoreFinalizationHandoff>>,
     #[cfg(feature = "wasi")]
     endpoints: RefCell<Vec<Weak<dyn ContinuationEndpoint>>>,
 }
@@ -38,9 +41,114 @@ pub(crate) struct Driver {
     runtime: std::sync::Arc<tokio::runtime::Runtime>,
     local: tokio::task::LocalSet,
     active: std::cell::Cell<bool>,
+    scopes: Rc<DriverScopes>,
     owner: wasmer_api::sys::NativeCleanupOwner,
     ledger: Rc<RetirementLedger>,
     wake: std::sync::Arc<DriverWake>,
+}
+
+// Metadata only. Counts exact lexical receipts, never Rc::strong_count policy.
+// It outlives each actual Rc/entered guard so the release wake cannot precede
+// destruction of a wrapper's real Driver reference.
+#[cfg(feature = "sys")]
+#[derive(Default)]
+struct DriverScopes {
+    entered: std::cell::Cell<usize>,
+    users: std::cell::Cell<usize>,
+    finalization: RefCell<Weak<NativeStoreFinalizationHandoff>>,
+}
+#[cfg(feature = "sys")]
+impl DriverScopes {
+    fn released(&self) {
+        if self.entered.get() == 0 && self.users.get() == 0 {
+            let handoff = self.finalization.borrow().upgrade();
+            if let Some(handoff) = handoff
+                && handoff.blocked.replace(false)
+            {
+                handoff.notify();
+            }
+        }
+    }
+}
+#[cfg(feature = "sys")]
+struct DriverUseReceipt(Rc<DriverScopes>);
+#[cfg(feature = "sys")]
+impl DriverUseReceipt {
+    fn new(scopes: Rc<DriverScopes>) -> Self {
+        scopes.users.set(scopes.users.get() + 1);
+        Self(scopes)
+    }
+}
+#[cfg(feature = "sys")]
+impl Drop for DriverUseReceipt {
+    fn drop(&mut self) {
+        self.0.users.set(self.0.users.get() - 1);
+        self.0.released();
+    }
+}
+#[cfg(feature = "sys")]
+struct DriverUse {
+    driver: Option<Rc<Driver>>,
+    lease: Option<DriverUseReceipt>,
+    exit: Option<wasmer_api::sys::NativeCleanupExitBoundary>,
+}
+#[cfg(feature = "sys")]
+impl DriverUse {
+    fn acquire(native: &ManagedStore) -> Result<Self, RuntimeError> {
+        let exit = native.owner.enter_exit_boundary();
+        let lease = DriverUseReceipt::new(native.scopes.clone());
+        let driver = native.driver()?;
+        Ok(Self {
+            driver: Some(driver),
+            lease: Some(lease),
+            exit: Some(exit),
+        })
+    }
+    fn capture(owner: &CleanupRetirement) -> Self {
+        let exit = owner.owner.enter_exit_boundary();
+        let lease = DriverUseReceipt::new(owner.driver.scopes.clone());
+        Self {
+            driver: Some(owner.driver.clone()),
+            lease: Some(lease),
+            exit: Some(exit),
+        }
+    }
+    fn driver(&self) -> &Rc<Driver> {
+        self.driver.as_ref().unwrap()
+    }
+}
+#[cfg(feature = "sys")]
+impl std::ops::Deref for DriverUse {
+    type Target = Rc<Driver>;
+    fn deref(&self) -> &Self::Target {
+        self.driver()
+    }
+}
+#[cfg(feature = "sys")]
+impl Drop for DriverUse {
+    fn drop(&mut self) {
+        let unwinding = std::thread::panicking();
+        let mut first = None;
+        attempt_retirement(&mut first, || drop(self.driver.take()));
+        attempt_retirement(&mut first, || drop(self.lease.take()));
+        attempt_retirement(&mut first, || drop(self.exit.take()));
+        if let Some(first) = first {
+            if unwinding {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(first)));
+            } else {
+                std::panic::resume_unwind(first);
+            }
+        }
+    }
+}
+#[cfg(feature = "sys")]
+struct DriverEntered<'a>(&'a DriverScopes);
+#[cfg(feature = "sys")]
+impl Drop for DriverEntered<'_> {
+    fn drop(&mut self) {
+        self.0.entered.set(self.0.entered.get() - 1);
+        self.0.released();
+    }
 }
 
 // The shared wake path carries only Send metadata. All local executor and
@@ -227,10 +335,40 @@ impl Drop for LocalContinuation {
 
 /// Captured before admission; owns only the existing local executor and cleanup pump.
 #[cfg(feature = "sys")]
-#[derive(Clone)]
 pub(crate) struct CleanupRetirement {
-    driver: Rc<Driver>,
+    driver: Rc<Driver>, // drops BEFORE its final lexical lease
     owner: wasmer_api::sys::NativeCleanupOwner,
+    _use_receipt: DriverUseReceipt,
+}
+#[cfg(feature = "sys")]
+impl Clone for CleanupRetirement {
+    fn clone(&self) -> Self {
+        let lease = DriverUseReceipt::new(self.driver.scopes.clone());
+        Self {
+            driver: self.driver.clone(),
+            owner: self.owner.clone(),
+            _use_receipt: lease,
+        }
+    }
+}
+#[cfg(feature = "sys")]
+struct RetainedDriverFuture {
+    future: std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>,
+    receipt: CleanupRetirement, // future and actual Driver Rc drop before lease
+}
+#[cfg(feature = "sys")]
+impl std::future::Future for RetainedDriverFuture {
+    type Output = ();
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        let this = &mut *self;
+        let _entered = this.receipt.driver.entered();
+        let _runtime = this.receipt.driver.runtime.enter();
+        let _local = this.receipt.driver.local.enter();
+        this.future.as_mut().poll(cx)
+    }
 }
 #[cfg(feature = "sys")]
 impl CleanupRetirement {
@@ -243,41 +381,32 @@ impl CleanupRetirement {
         let wake = std::task::Waker::from(self.driver.wake.clone());
         // The terminal flag/result are already published. Dispatch after the
         // native pump releases its running guard, outside every metadata lock.
-        self.owner.after_pump(Box::new(move || wake.wake()));
+        self.owner
+            .after_pump_existing(Box::new(move || wake.wake()));
     }
     #[cfg(feature = "wasi")]
     pub(crate) fn notify_retirement(&self, failure: RetirementFailure) {
         let wake = std::task::Waker::from(self.driver.wake.clone());
-        self.owner.after_pump(Box::new(move || {
+        self.owner.after_pump_existing(Box::new(move || {
             failure.attempt(|| wake.wake_by_ref());
             failure.attempt(|| drop(wake));
         }));
     }
-    pub(crate) fn retain(
-        &self,
-        mut future: std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>,
-    ) {
-        let driver = self.driver.clone();
-        self.owner
-            .transfer_existing(Box::pin(std::future::poll_fn(move |cx| {
-                let _runtime = driver.runtime.enter();
-                let _local = driver.local.enter();
-                future.as_mut().poll(cx)
-            })));
+    pub(crate) fn retain(&self, future: std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>) {
+        self.owner.transfer_existing(RetainedDriverFuture {
+            future,
+            receipt: self.clone(),
+        });
     }
     #[cfg(feature = "wasi")]
     pub(crate) fn retain_receipt(
         self,
-        mut future: std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>,
+        future: std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>,
     ) {
-        // Consume the caller's Driver Rc BEFORE admission can synchronously
-        // finish a task and run its after_pump release callback.
-        let Self { driver, owner } = self;
-        owner.transfer_existing(Box::pin(std::future::poll_fn(move |cx| {
-            let _runtime = driver.runtime.enter();
-            let _local = driver.local.enter();
-            future.as_mut().poll(cx)
-        })));
+        self.owner.clone().transfer_existing(RetainedDriverFuture {
+            future,
+            receipt: self,
+        });
     }
 }
 
@@ -538,7 +667,7 @@ impl Drop for RetirementRegistration {
                 && !self.state.publishing.get()
                 && !self.state.receipt_queued.get()
                 && self.state.delivery_ack.get()
-                && self.state.failure.is_empty()
+                && self.state.delivery_empty()
             {
                 self.state.ledger.remove(&self.state);
             } else {
@@ -566,6 +695,9 @@ pub(crate) struct NativeRetirementState {
     #[cfg(feature = "wasi")]
     receipt_queued: std::cell::Cell<bool>,
     pub(crate) failure: RetirementFailure,
+    // At most ONE return from this state's unique live tail; the SAME receipt
+    // retains both slots if either event cannot be ordered after exhaustion.
+    returned: RefCell<Option<RetirementEvent>>,
     #[cfg(feature = "wasi")]
     release_waiter: RefCell<Option<std::sync::Arc<std::task::Waker>>>,
 }
@@ -574,14 +706,49 @@ impl NativeRetirementState {
     fn physically_ready(&self) -> bool {
         self.terminal_done.get() && self.tail_receipt_released.get()
     }
+    fn delivery_empty(&self) -> bool {
+        self.failure.is_empty() && self.returned.borrow().is_none()
+    }
+    fn has_unstamped_event(&self) -> bool {
+        self.failure.has_unstamped_event()
+            || self
+                .returned
+                .borrow()
+                .as_ref()
+                .is_some_and(|event| event.order.is_none())
+    }
+    fn move_delivery_into(&self, destination: &RetirementFailure) -> bool {
+        loop {
+            if self.has_unstamped_event() || destination.has_unstamped_event() {
+                return false;
+            }
+            if !self.failure.move_into(destination) {
+                return false;
+            }
+            let returned = self.returned.borrow_mut().take();
+            if let Some(event) = returned {
+                if let Err(event) = destination.accept_event(event) {
+                    let previous = self.returned.borrow_mut().replace(event);
+                    assert!(previous.is_none(), "one return per unique native tail");
+                    return false;
+                }
+            }
+            if self.delivery_empty() {
+                return true;
+            }
+        }
+    }
     fn claim(&self, first: &mut Option<RetirementPanic>) -> bool {
-        if self.failure.has_unstamped_event() {
+        let owned = RetirementFailure::default();
+        owned
+            .bind_clock(&self.ledger.clock)
+            .expect("fresh claim carrier");
+        if !self.move_delivery_into(&owned) {
             return false;
         }
-        if let Some(panic) = self.failure.take() {
+        if let Some(panic) = owned.take() {
             remember_retirement_panic(first, panic);
         }
-        // The explicit consumer owns the value BEFORE acknowledging it.
         self.delivery_ack.set(true);
         true
     }
@@ -618,10 +785,13 @@ struct DeliveryReceipt {
 impl std::future::Future for DeliveryReceipt {
     type Output = ();
     fn poll(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        if self.state.has_unstamped_event() {
+            return std::task::Poll::Pending;
+        }
         if !self.state.physically_ready() {
             return std::task::Poll::Pending;
         }
-        if self.state.failure.is_empty() {
+        if self.state.delivery_empty() {
             self.state.delivery_ack.set(true);
         }
         if !self.state.delivery_ack.get() {
@@ -647,7 +817,7 @@ pub(crate) struct TailRelease {
 #[cfg(all(feature = "sys", feature = "wasi"))]
 impl TailRelease {
     pub(crate) fn release(self) {
-        self.owner.clone().after_pump(Box::new(move || {
+        self.owner.clone().after_pump_existing(Box::new(move || {
             assert!(
                 self.state.terminal_done.get(),
                 "unfinished native retirement"
@@ -673,7 +843,7 @@ impl TailRelease {
             // value and retire that task before a later notify callback fails.
             // Recheck the exact state after each finite synchronous admission.
             while !self.state.receipt_queued.get() {
-                if self.state.failure.is_empty() && self.state.delivery_ack.get() {
+                if self.state.delivery_empty() && self.state.delivery_ack.get() {
                     break;
                 }
                 self.state.receipt_queued.set(true);
@@ -701,10 +871,14 @@ struct NativeRetirementTail {
     _store: WeakStoreRef,
     base: Option<wasmer_api::StoreAsync>,
     owner: Option<CleanupRetirement>,
-    cleanup: wasmer_api::sys::NativeCleanupOwner,
+    cleanup: Option<wasmer_api::sys::NativeCleanupOwner>,
     release: Option<TailRelease>,
     state: Rc<NativeRetirementState>,
     registration: Option<RetirementRegistration>,
+    first: RetirementFailure, // invocation-local; NEVER the shared cleanup carrier
+    finalization_subscription: Option<DriverSubscription>,
+    finalization: Rc<NativeStoreFinalizationHandoff>,
+    exit: Option<wasmer_api::sys::NativeCleanupExitBoundary>, // LAST incl implicit fields
 }
 #[cfg(all(feature = "sys", feature = "wasi"))]
 impl NativeRetirementTail {
@@ -718,6 +892,103 @@ impl NativeRetirementTail {
             self.state.failure.attempt(|| release.release());
         }
     }
+    fn subscribe_finalization(&mut self, cx: &mut std::task::Context<'_>) {
+        let subscription = self.finalization_subscription.get_or_insert_with(|| {
+            DriverSubscription::new(
+                self.finalization.wake.clone(),
+                self.finalization.owner.clone(),
+            )
+        });
+        // Preterminal observer errors belong to THIS invocation even if the
+        // public target is still alive and no Store finalizer is published.
+        self.state
+            .failure
+            .attempt(|| subscription.with_context(cx, |_| ()));
+    }
+    fn claim_own(&self) -> bool {
+        if !self.state.move_delivery_into(&self.first) {
+            return false;
+        }
+        self.state.delivery_ack.set(true); // exact value owned by THIS tail first
+        true
+    }
+    fn return_cancelled(&mut self) {
+        let state = self.state.clone();
+        let owner = self.finalization.owner.clone();
+        if self.finalization.ledger.final_done.get() {
+            self.claim_own();
+            if let Some(registration) = self.registration.take() {
+                registration.delivered();
+            }
+            state.ledger.remove(&state);
+            if let Some(first) = self.first.take() {
+                self.exit
+                    .as_ref()
+                    .unwrap()
+                    .defer(Box::new(move || Some(first)));
+            }
+            return;
+        }
+        // There is no owner-thread callback/disposal between valid seal and
+        // final_done; runtime panic payload disposal is deferred until Done.
+        assert!(
+            !owner.is_sealed(),
+            "cancellation entered the sealed runtime transition"
+        );
+        drop(self.registration.take()); // Cancelled BEFORE every callback below
+        let publishing = state.publishing.replace(true);
+        loop {
+            let need_receipt =
+                !state.delivery_empty() || !state.delivery_ack.get() || !state.physically_ready();
+            if need_receipt && !state.receipt_queued.get() {
+                state.ledger.enroll(&state); // this frame already owns exact strong custody
+                state.receipt_queued.set(true);
+                let receipt = DeliveryReceipt {
+                    state: state.clone(),
+                    ledger: state.ledger.clone(),
+                };
+                state.failure.attempt(|| owner.transfer_existing(receipt));
+            }
+            // Real surviving original caller(s) are the producer after Driver
+            // extraction; notification still uses the SAME existing fanout.
+            let wake = std::task::Waker::from(self.finalization.wake.clone());
+            state.failure.attempt(|| wake.wake_by_ref());
+            state.failure.attempt(|| drop(wake));
+            if state.receipt_queued.get() || (state.delivery_empty() && state.delivery_ack.get()) {
+                break;
+            }
+        }
+        state.publishing.set(publishing);
+        if !state.receipt_queued.get() && state.delivery_empty() && state.delivery_ack.get() {
+            state.ledger.remove(&state);
+        }
+        // This last wake follows our OWN publication lease. A wake failure can
+        // reopen exact delivery, so repair that same receipt before field Drop.
+        if !publishing {
+            let wake = std::task::Waker::from(self.finalization.wake.clone());
+            state.failure.attempt(|| wake.wake_by_ref());
+            state.failure.attempt(|| drop(wake));
+            if self.finalization.ledger.final_done.get() {
+                self.claim_own();
+                state.ledger.remove(&state);
+                if let Some(first) = self.first.take() {
+                    self.exit
+                        .as_ref()
+                        .unwrap()
+                        .defer(Box::new(move || Some(first)));
+                }
+            } else if !state.delivery_empty() && !state.receipt_queued.get() {
+                state.ledger.enroll(&state);
+                state.receipt_queued.set(true);
+                state.failure.attempt(|| {
+                    owner.transfer_existing(DeliveryReceipt {
+                        state: state.clone(),
+                        ledger: state.ledger.clone(),
+                    })
+                });
+            }
+        }
+    }
 }
 #[cfg(all(feature = "sys", feature = "wasi"))]
 impl std::future::Future for NativeRetirementTail {
@@ -727,46 +998,80 @@ impl std::future::Future for NativeRetirementTail {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<()> {
         let this = self.get_mut();
-        if let Some(owner) = &this.owner
-            && this
+        this.subscribe_finalization(cx);
+        if let Some(owner) = &this.owner {
+            let driver = DriverUse::capture(owner);
+            if this
                 .state
                 .failure
                 .attempt(|| {
                     this.subscription
                         .as_ref()
                         .unwrap()
-                        .with_context(cx, |cx| owner.driver.poll_retirement(cx));
+                        .with_context(cx, |cx| driver.poll_retirement(cx))
                 })
                 .is_none()
-        {
-            this.state.failure.attempt(|| cx.waker().wake_by_ref());
+            {
+                this.state.failure.attempt(|| cx.waker().wake_by_ref());
+            }
         }
         if !this.state.terminal_done.get() {
             return std::task::Poll::Pending;
         }
-        // Preserve a real caller wake even if after_pump is already dispatching
-        // another callback. Subscription/Driver receipt Drop cannot stand in
-        // for the actual release acknowledgement.
         if !this.state.tail_receipt_released.get() {
             if !this.state.register_release_waker(cx.waker()) {
                 this.state.failure.attempt(|| cx.waker().wake_by_ref());
             }
             this.release_receipts();
         }
-        if !this.state.tail_receipt_released.get() {
+        // Actual publication/pump callbacks must finish before resource teardown.
+        if !this.state.physically_ready() || this.state.publishing.get() {
             return std::task::Poll::Pending;
         }
         this.state.clear_release_waker();
-        let mut first = None;
-        if !this.state.claim(&mut first) {
+        if !this.claim_own() {
             return std::task::Poll::Pending;
         }
-        attempt_retirement(&mut first, || this.cleanup.notify());
+        this.state
+            .failure
+            .attempt(|| this.finalization.owner.notify());
+        if !this.claim_own() {
+            return std::task::Poll::Pending;
+        }
+        let poll = this
+            .finalization_subscription
+            .as_ref()
+            .unwrap()
+            .with_context(cx, |cx| this.finalization.poll(cx));
+        if poll.is_pending() {
+            return poll;
+        }
+        // A caller Waker Drop may publish the last Store finalizer. Consume the
+        // actual metadata first, then recheck publication and keep a real wake.
+        this.state
+            .failure
+            .attempt(|| drop(this.finalization_subscription.take()));
+        this.state.failure.attempt(|| drop(this.cleanup.take()));
+        if !this.claim_own() {
+            return std::task::Poll::Pending;
+        }
+        if !this.finalization.complete.get()
+            && (this.finalization.pending.borrow().is_some() || this.finalization.polling.get())
+        {
+            this.subscribe_finalization(cx);
+            this.state.failure.attempt(|| cx.waker().wake_by_ref());
+            return std::task::Poll::Pending;
+        }
+        // Only here does this invocation legitimately own the Store-cleanup
+        // outcome. Other live invocation carriers are never stolen into it.
+        if !this.finalization.failure.move_into(&this.first) {
+            return std::task::Poll::Pending;
+        }
         if let Some(registration) = this.registration.take() {
             registration.delivered();
         }
-        if let Some(panic) = first {
-            std::panic::resume_unwind(panic);
+        if let Some(first) = this.first.take() {
+            std::panic::resume_unwind(first);
         }
         std::task::Poll::Ready(())
     }
@@ -774,31 +1079,40 @@ impl std::future::Future for NativeRetirementTail {
 #[cfg(all(feature = "sys", feature = "wasi"))]
 impl Drop for NativeRetirementTail {
     fn drop(&mut self) {
-        drop(self.registration.take()); // exact disposition BEFORE callbacks
+        self.exit = Some(self.finalization.owner.enter_exit_boundary());
+        self.state.disposition.set(DeliveryDisposition::Cancelled);
+        let own = self.first.0.borrow_mut().take();
+        if let Some(own) = own {
+            let previous = self.state.returned.borrow_mut().replace(own);
+            assert!(previous.is_none(), "one return per unique native tail");
+            self.state.delivery_ack.set(false);
+        }
         self.state.clear_release_waker();
         self.state
             .failure
             .attempt(|| drop(self.subscription.take()));
+        self.state
+            .failure
+            .attempt(|| drop(self.finalization_subscription.take()));
         if self.state.terminal_done.get() {
             self.release_receipts();
-            return; // metadata receipt, never this Drop stack, owns delivery
+        } else if let Some(owner) = self.owner.take() {
+            let state = self.state.clone();
+            let mut base = self.base.take();
+            let mut release = self.release.take();
+            owner.retain_receipt(Box::pin(std::future::poll_fn(move |_| {
+                if !state.terminal_done.get() {
+                    return std::task::Poll::Pending;
+                }
+                state.failure.attempt(|| drop(base.take()));
+                if let Some(release) = release.take() {
+                    state.failure.attempt(|| release.release());
+                }
+                std::task::Poll::Ready(())
+            })));
         }
-        let owner = self.owner.take().unwrap();
-        let state = self.state.clone();
-        let mut base = self.base.take();
-        let mut release = self.release.take();
-        owner.retain_receipt(Box::pin(std::future::poll_fn(move |_| {
-            if !state.terminal_done.get() {
-                return std::task::Poll::Pending;
-            }
-            state.failure.attempt(|| drop(base.take()));
-            if let Some(release) = release.take() {
-                state.failure.attempt(|| release.release());
-            }
-            // No resume_unwind here: the queue can be pumped inside Tokio's
-            // detached ScopedJob completion. The carrier survives for drive().
-            std::task::Poll::Ready(())
-        })));
+        self.state.failure.attempt(|| drop(self.cleanup.take()));
+        self.return_cancelled();
     }
 }
 
@@ -862,7 +1176,9 @@ impl StoreRef {
         #[cfg(feature = "sys")]
         if store.engine().is_sys() {
             let ledger = RetirementLedger::new();
+            let scopes = Rc::new(DriverScopes::default());
             let owner = wasmer_api::sys::NativeCleanupOwner::new_store_bound();
+            let seal = owner.take_store_seal()?;
             let generation = wasmer_api::sys::NativeInvocationScope::bind_with_cleanup(
                 &mut store,
                 Some(owner.clone()),
@@ -881,6 +1197,9 @@ impl StoreRef {
                         owner,
                         driver: RefCell::new(None),
                         ledger,
+                        scopes,
+                        seal: Some(seal),
+                        finalization: RefCell::default(),
                         #[cfg(feature = "wasi")]
                         endpoints: RefCell::default(),
                     }),
@@ -950,7 +1269,7 @@ impl StoreRef {
                 current.parked(|| match &self.inner.mode {
                     #[cfg(feature = "sys")]
                     StoreMode::Native(native) => {
-                        let driver = native.driver()?;
+                        let driver = DriverUse::acquire(native)?;
                         wasmer_api::sys::call_native_descendant(
                             function,
                             native.store.as_ref().unwrap(),
@@ -984,7 +1303,7 @@ impl StoreRef {
         function: &Function,
         args: Vec<Value>,
     ) -> Result<Box<[Value]>, RuntimeError> {
-        let driver = native.driver()?;
+        let driver = DriverUse::acquire(native)?;
         let owner = Rc::new(CallOwner {
             driver: driver.clone(),
             #[cfg(feature = "wasi")]
@@ -1160,7 +1479,7 @@ impl StoreRef {
         future: impl std::future::Future<Output = R>,
     ) -> Result<R, RuntimeError> {
         match &self.inner.mode {
-            StoreMode::Native(native) => native.driver()?.run(future),
+            StoreMode::Native(native) => DriverUse::acquire(native)?.run(future),
             StoreMode::Plain(_) => Err(RuntimeError::new(
                 "Store is not managed by the native driver",
             )),
@@ -1201,9 +1520,11 @@ impl StoreRef {
         let StoreMode::Native(native) = &self.inner.mode else {
             return Err(RuntimeError::new("Store has no native cleanup owner"));
         };
+        let lease = DriverUseReceipt::new(native.scopes.clone());
         Ok(CleanupRetirement {
             driver: native.driver()?,
             owner: native.owner.clone(),
+            _use_receipt: lease,
         })
     }
 
@@ -1313,6 +1634,7 @@ impl StoreRef {
             publishing: std::cell::Cell::new(false),
             receipt_queued: std::cell::Cell::new(false),
             failure,
+            returned: RefCell::default(),
             release_waiter: RefCell::default(),
         });
         let registration = RetirementRegistration { state, armed: true };
@@ -1373,20 +1695,60 @@ impl StoreRef {
         let state = registration.state();
         state.disposition.set(DeliveryDisposition::LiveTail);
         let release = self.retirement_release(state.clone())?;
+        let finalization = self.finalization_handoff(&owner);
+        let first = self.retirement_failure()?;
         let tail = Box::pin(NativeRetirementTail {
             subscription: Some(owner.subscribe()),
             _store: self.downgrade(),
             base: Some(self.async_store()?),
-            cleanup: owner.owner.clone(),
+            cleanup: Some(owner.owner.clone()),
             owner: Some(owner),
             release: Some(release),
             state,
             registration: Some(registration),
+            first,
+            finalization_subscription: None,
+            finalization,
+            exit: None,
         });
         if let Err(tail) = wasmer_api::sys::enroll_native_ancestry_tail(tail) {
             drop(tail);
         }
         Ok(())
+    }
+    #[cfg(all(feature = "sys", feature = "wasi"))]
+    fn finalization_handoff(
+        &self,
+        owner: &CleanupRetirement,
+    ) -> Rc<NativeStoreFinalizationHandoff> {
+        let StoreMode::Native(native) = &self.inner.mode else {
+            unreachable!()
+        };
+        let handoff = native.finalization.borrow().upgrade().unwrap_or_else(|| {
+            let failure = RetirementFailure::default();
+            failure
+                .bind_clock(&native.ledger.clock)
+                .expect("new cleanup carrier");
+            Rc::new(NativeStoreFinalizationHandoff {
+                pending: RefCell::default(),
+                failure,
+                wake: owner.driver.wake.clone(),
+                ledger: native.ledger.clone(),
+                polling: std::cell::Cell::new(false),
+                blocked: std::cell::Cell::new(false),
+                complete: std::cell::Cell::new(false),
+                owner: owner.owner.clone(),
+                exit: None,
+            })
+        });
+        *native.finalization.borrow_mut() = Rc::downgrade(&handoff);
+        *native.scopes.finalization.borrow_mut() = Rc::downgrade(&handoff);
+        handoff
+    }
+
+    #[cfg(all(test, feature = "sys", feature = "wasi"))]
+    pub(crate) fn strong_handles_for_test(&self) -> usize {
+        Rc::strong_count(&self.inner)
     }
 
     #[cfg(all(test, feature = "sys", feature = "wasi"))]
@@ -1419,6 +1781,7 @@ impl ManagedStore {
             runtime: std::sync::Arc::new(runtime),
             local: tokio::task::LocalSet::new(),
             active: std::cell::Cell::new(false),
+            scopes: self.scopes.clone(),
             owner: self.owner.clone(),
             ledger: self.ledger.clone(),
             wake: Default::default(),
@@ -1430,27 +1793,35 @@ impl ManagedStore {
 
 #[cfg(feature = "sys")]
 impl Driver {
+    fn entered(&self) -> DriverEntered<'_> {
+        self.scopes.entered.set(self.scopes.entered.get() + 1);
+        DriverEntered(&self.scopes)
+    }
     fn subscribe(&self) -> DriverSubscription {
+        DriverSubscription::new(self.wake.clone(), self.owner.clone())
+    }
+}
+#[cfg(feature = "sys")]
+impl DriverSubscription {
+    fn new(wake: std::sync::Arc<DriverWake>, owner: wasmer_api::sys::NativeCleanupOwner) -> Self {
         let token = {
-            let mut state = self.wake.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut state = wake.state.lock().unwrap_or_else(|e| e.into_inner());
             let token = state.next;
             state.next = token.checked_add(1).expect("native wake token exhausted");
             state.subscribers.insert(token, None);
             token
         };
-        DriverSubscription {
-            wake: self.wake.clone(),
-            owner: self.owner.clone(),
-            token,
-        }
+        Self { wake, owner, token }
     }
-
+}
+#[cfg(feature = "sys")]
+impl Driver {
     fn retirement_snapshot(&self) -> Vec<Rc<NativeRetirementState>> {
         self.ledger.snapshot()
     }
     fn retirements_pending(&self) -> bool {
         self.retirement_snapshot().iter().any(|state| {
-            !state.physically_ready() || state.failure.has_unstamped_event() || {
+            !state.physically_ready() || state.has_unstamped_event() || {
                 #[cfg(feature = "wasi")]
                 {
                     state.publishing.get()
@@ -1482,15 +1853,12 @@ impl Driver {
             if state.publishing.get() {
                 continue;
             }
-            if state.failure.has_unstamped_event() {
+            if state.has_unstamped_event() {
                 continue;
             }
-            if let Some(event) = state.failure.take_event() {
-                merged.accept_event(event).unwrap_or_else(|_| {
-                    unreachable!("only ordered events enter the fresh common carrier")
-                });
+            if state.move_delivery_into(&merged) {
+                state.delivery_ack.set(true);
             }
-            state.delivery_ack.set(true);
         }
         if let Some(panic) = merged.take() {
             remember_retirement_panic(first, panic);
@@ -1538,6 +1906,7 @@ impl Driver {
     }
 
     async fn run_descendant<R>(&self, future: impl std::future::Future<Output = R>) -> R {
+        let _entered = self.entered();
         let observer = self.subscribe();
         if self.active.get() {
             // An ancestor's LocalSet already has an outer poller. Enter only
@@ -1582,6 +1951,7 @@ impl Driver {
 
     #[cfg(feature = "wasi")]
     async fn run_local<R>(&self, future: impl std::future::Future<Output = R>) -> R {
+        let _entered = self.entered();
         let observer = self.subscribe();
         assert!(!self.active.replace(true), "recursive native LocalSet poll");
         struct Reset<'a>(&'a std::cell::Cell<bool>);
@@ -1603,6 +1973,7 @@ impl Driver {
 
     #[cfg(feature = "wasi")]
     fn poll_retirement(&self, cx: &mut std::task::Context<'_>) {
+        let _entered = self.entered();
         let _runtime = self.runtime.enter();
         if !self.active.get() {
             self.active.set(true);
@@ -1623,6 +1994,7 @@ impl Driver {
     }
 
     fn run<R>(&self, future: impl std::future::Future<Output = R>) -> Result<R, RuntimeError> {
+        let _entered = self.entered();
         // This blocking boundary is not a Tokio task. A callback with an exact
         // parked loan takes the synchronous path before reaching the driver.
         if tokio::runtime::Handle::try_current().is_ok() {
@@ -1689,182 +2061,462 @@ async fn catch_retirement_future<F: std::future::Future>(
 }
 
 #[cfg(feature = "sys")]
-impl Drop for ManagedStore {
-    fn drop(&mut self) {
-        let Some(mut generation) = self.generation.take() else {
-            return;
+struct NativeStoreFinalizationHandoff {
+    pending: RefCell<Option<NativeStoreFinalization>>,
+    failure: RetirementFailure,
+    wake: std::sync::Arc<DriverWake>, // SAME original final-caller notification metadata
+    ledger: Rc<RetirementLedger>,
+    polling: std::cell::Cell<bool>,
+    blocked: std::cell::Cell<bool>,
+    complete: std::cell::Cell<bool>,
+    owner: wasmer_api::sys::NativeCleanupOwner,
+    exit: Option<wasmer_api::sys::NativeCleanupExitBoundary>, // LAST
+}
+#[cfg(feature = "sys")]
+impl NativeStoreFinalizationHandoff {
+    fn notify(&self) {
+        let wake = std::task::Waker::from(self.wake.clone());
+        self.failure.attempt(|| wake.wake_by_ref());
+        self.failure.attempt(|| drop(wake));
+    }
+    fn poll(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        let _exit = self.owner.enter_exit_boundary();
+        if self.complete.get() {
+            return std::task::Poll::Ready(());
+        }
+        if self.polling.replace(true) {
+            return std::task::Poll::Pending;
+        }
+        struct Reset<'a>(&'a std::cell::Cell<bool>);
+        impl Drop for Reset<'_> {
+            fn drop(&mut self) {
+                self.0.set(false);
+            }
+        }
+        let _reset = Reset(&self.polling);
+        let actual = self.pending.borrow_mut().take();
+        let Some(mut actual) = actual else {
+            return std::task::Poll::Ready(());
         };
-        let store = self.store.take();
-        let driver = self.driver.get_mut().take();
-        let owner = self.owner.clone();
-        self.owner.transfer_existing(Box::pin(async move {
+        match self.failure.attempt(|| actual.poll(cx)) {
+            Some(std::task::Poll::Ready(())) => {
+                // Actual resource/runtime fields are gone before final callers
+                // can reenter. A reentrant caller may finish while polling is
+                // still true: complete is the truthful resource certificate.
+                assert!(self.ledger.final_done.get());
+                self.complete.set(true);
+                self.notify();
+                std::task::Poll::Ready(())
+            }
+            outcome => {
+                *self.pending.borrow_mut() = Some(actual);
+                if outcome.is_none() {
+                    self.failure.attempt(|| cx.waker().wake_by_ref());
+                }
+                std::task::Poll::Pending
+            }
+        }
+    }
+}
+#[cfg(feature = "sys")]
+impl Drop for NativeStoreFinalizationHandoff {
+    fn drop(&mut self) {
+        self.exit = Some(self.owner.enter_exit_boundary());
+        if let Some(actual) = self.pending.get_mut().take() {
+            self.exit
+                .as_ref()
+                .unwrap()
+                .defer(Box::new(move || actual.finish_blocking()));
+        } else if let Some(first) = self.failure.take() {
+            self.exit
+                .as_ref()
+                .unwrap()
+                .defer(Box::new(move || Some(first)));
+        }
+    }
+}
+#[cfg(feature = "sys")]
+#[derive(Clone, Copy)]
+enum StoreFinalizationPhase {
+    Quiescence,
+    Drain,
+    Local,
+    LocalDrain,
+    Store,
+    StoreDestruction,
+    StoreDrain,
+    Observers,
+    ObserverDrain,
+    Seal,
+    Runtime,
+    Done,
+}
+#[cfg(feature = "sys")]
+type StoreQuiescence =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Option<wasmer_api::StoreAsync>>>>;
+#[cfg(feature = "sys")]
+struct NativeStoreFinalization {
+    phase: StoreFinalizationPhase,
+    quiescence: Option<StoreQuiescence>,
+    store: Option<wasmer_api::StoreAsync>,
+    destruction: wasmer_api::sys::NativeStoreDestruction,
+    destruction_observer: Option<wasmer_api::sys::NativeStoreDestructionObserver>,
+    driver: Option<Rc<Driver>>,
+    runtime: Option<std::sync::Arc<tokio::runtime::Runtime>>,
+    ledger: Rc<RetirementLedger>,
+    scopes: Rc<DriverScopes>,
+    seal: wasmer_api::sys::NativeCleanupSeal,
+    owner: wasmer_api::sys::NativeCleanupOwner,
+    failure: RetirementFailure,
+    poisoned: bool,
+}
+#[cfg(feature = "sys")]
+impl RetirementLedger {
+    fn resources_ready(&self) -> bool {
+        self.snapshot().iter().all(|state| {
+            state.physically_ready() && !state.has_unstamped_event() && {
+                #[cfg(feature = "wasi")]
+                {
+                    !state.publishing.get()
+                }
+                #[cfg(not(feature = "wasi"))]
+                {
+                    true
+                }
+            }
+        })
+    }
+    fn collect_into(&self, destination: &RetirementFailure) {
+        if destination.has_unstamped_event() {
+            return;
+        }
+        for state in self.snapshot() {
+            if !matches!(
+                state.disposition.get(),
+                DeliveryDisposition::Cancelled | DeliveryDisposition::Relinquished
+            ) || !state.physically_ready()
+            {
+                continue;
+            }
+            #[cfg(feature = "wasi")]
+            if state.publishing.get() {
+                continue;
+            }
+            if state.move_delivery_into(destination) {
+                state.delivery_ack.set(true);
+            }
+        }
+    }
+}
+#[cfg(feature = "sys")]
+impl RetirementFailure {
+    fn move_into(&self, destination: &Self) -> bool {
+        if self.has_unstamped_event() || destination.has_unstamped_event() {
+            return false;
+        }
+        while let Some(event) = self.take_event() {
+            if let Err(event) = destination.accept_event(event) {
+                // Same carrier restoration; no stamp or identity is changed.
+                let restored = self.accept_event(event);
+                assert!(
+                    restored.is_ok(),
+                    "ordered retirement event lost its receiver"
+                );
+                return false;
+            }
+            if self.has_unstamped_event() {
+                return false;
+            }
+        }
+        true
+    }
+}
+#[cfg(feature = "sys")]
+impl NativeStoreFinalization {
+    fn new(
+        mut generation: wasmer_api::sys::NativeInvocationScope,
+        store: Option<wasmer_api::StoreAsync>,
+        driver: Option<Rc<Driver>>,
+        ledger: Rc<RetirementLedger>,
+        scopes: Rc<DriverScopes>,
+        seal: wasmer_api::sys::NativeCleanupSeal,
+        owner: wasmer_api::sys::NativeCleanupOwner,
+        failure: RetirementFailure,
+    ) -> Self {
+        let runtime = driver.as_ref().map(|driver| driver.runtime.clone());
+        let destruction = generation.store_destruction();
+        let destruction_observer = Some(destruction.observer());
+        let observe_failure = failure.clone();
+        let quiescence = Box::pin(async move {
             use wasmer_api::AsStoreAsync;
-            let mut first_panic = None;
-            // Commit concrete resource custody before close can pump a callback.
-            // Recreate interrupted observers without dropping the Store/driver.
+            // These two observers are canonical and may be recreated after a
+            // notification panic. No arbitrary consumed async frame is replayed.
             loop {
                 match catch_retirement_future(generation.close_and_wait_for_cleanup()).await {
                     Ok(()) => break,
-                    Err(panic) => remember_retirement_panic(&mut first_panic, panic),
+                    Err(panic) => observe_failure.record(panic),
                 }
             }
-            // Physical root settlement is notified before its original guard
-            // unlocks. Fence the actual Store before any post-pump retirement.
             if let Some(store) = &store {
                 loop {
                     match catch_retirement_future(async { drop(store.write_lock().await) }).await {
                         Ok(()) => break,
-                        Err(panic) => remember_retirement_panic(&mut first_panic, panic),
+                        Err(panic) => observe_failure.record(panic),
                     }
                 }
             }
-            // The same per-call entries used by Driver::drive also fence final
-            // Store retirement. In particular, terminal_done alone does not
-            // release a retained task's Driver Rc or BASE Store receipt.
-            if let Some(driver) = &driver {
-                std::future::poll_fn(|_| {
-                    if driver.retirements_pending() {
-                        std::task::Poll::Pending
-                    } else {
-                        std::task::Poll::Ready(())
+            observe_failure.attempt(|| drop(generation));
+            store
+        });
+        Self {
+            phase: StoreFinalizationPhase::Quiescence,
+            quiescence: Some(quiescence),
+            store: None,
+            destruction,
+            destruction_observer,
+            driver,
+            runtime,
+            ledger,
+            scopes,
+            seal,
+            owner,
+            failure,
+            poisoned: false,
+        }
+    }
+    fn drain(&mut self, cx: &mut std::task::Context<'_>) -> bool {
+        use std::future::Future;
+        let _exit = self.owner.enter_exit_boundary();
+        let _entered = self.driver.as_ref().map(|driver| driver.entered());
+        let _runtime = self.runtime.as_ref().map(|runtime| runtime.enter());
+        if let Some(driver) = &self.driver
+            && !driver.active.get()
+        {
+            driver.active.set(true);
+            struct Reset<'a>(&'a std::cell::Cell<bool>);
+            impl Drop for Reset<'_> {
+                fn drop(&mut self) {
+                    self.0.set(false);
+                }
+            }
+            let _reset = Reset(&driver.active);
+            let local = driver.local.run_until(std::future::pending::<()>());
+            let _ = std::pin::pin!(local).as_mut().poll(cx);
+        }
+        let _local = self.driver.as_ref().map(|driver| driver.local.enter());
+        // This SAME receiver continues after Driver extraction. Only explicitly
+        // cancelled/relinquished invocations may contribute to cleanup delivery.
+        self.ledger.collect_into(&self.failure);
+        let idle = self.owner.poll_quiescent(cx).is_ready();
+        // notify can publish/retire exact receipts; collect before the next pass.
+        self.ledger.collect_into(&self.failure);
+        idle && self.ledger.resources_ready() && !self.failure.has_unstamped_event()
+    }
+    fn poll(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        use std::{future::Future, task::Poll};
+        if self.poisoned {
+            return Poll::Pending;
+        }
+        loop {
+            match self.phase {
+                StoreFinalizationPhase::Quiescence => {
+                    let poll = {
+                        let _exit = self.owner.enter_exit_boundary();
+                        let _runtime = self.runtime.as_ref().map(|runtime| runtime.enter());
+                        self.quiescence.as_mut().unwrap().as_mut().poll(cx)
+                    };
+                    let Poll::Ready(store) = poll else {
+                        return Poll::Pending;
+                    };
+                    self.store = store;
+                    self.phase = StoreFinalizationPhase::Drain;
+                    self.failure.attempt(|| drop(self.quiescence.take()));
+                }
+                StoreFinalizationPhase::Drain => {
+                    if !self.drain(cx) {
+                        return Poll::Pending;
                     }
-                })
-                .await;
+                    if self.scopes.entered.get() != 0 || self.scopes.users.get() != 0 {
+                        if let Some(handoff) = self.scopes.finalization.borrow().upgrade() {
+                            handoff.blocked.set(true);
+                        }
+                        // Register/check closes synchronous release reentry.
+                        if self.scopes.entered.get() != 0 || self.scopes.users.get() != 0 {
+                            return Poll::Pending;
+                        }
+                    }
+                    self.phase = StoreFinalizationPhase::Local;
+                }
+                StoreFinalizationPhase::Local => {
+                    if let Some(driver) = self.driver.take() {
+                        let driver = match Rc::try_unwrap(driver) {
+                            Ok(driver) => driver,
+                            Err(driver) => {
+                                self.driver = Some(driver);
+                                self.poisoned = true;
+                                self.failure
+                                    .record(Box::new("native Driver survived real receipt fences"));
+                                return Poll::Pending; // invariant custody only, never a completion proof
+                            }
+                        };
+                        let Driver { local, .. } = driver;
+                        let _exit = self.owner.enter_exit_boundary();
+                        let _runtime = self.runtime.as_ref().map(|runtime| runtime.enter());
+                        self.failure.attempt(|| drop(local));
+                    }
+                    self.phase = StoreFinalizationPhase::LocalDrain;
+                }
+                StoreFinalizationPhase::LocalDrain => {
+                    if !self.drain(cx) {
+                        return Poll::Pending;
+                    }
+                    self.phase = StoreFinalizationPhase::Store;
+                }
+                StoreFinalizationPhase::Store => {
+                    self.phase = StoreFinalizationPhase::StoreDestruction;
+                    let _exit = self.owner.enter_exit_boundary();
+                    let _runtime = self.runtime.as_ref().map(|runtime| runtime.enter());
+                    self.failure.attempt(|| drop(self.store.take()));
+                }
+                StoreFinalizationPhase::StoreDestruction => {
+                    let _exit = self.owner.enter_exit_boundary();
+                    let _runtime = self.runtime.as_ref().map(|runtime| runtime.enter());
+                    let poll = self.destruction_observer.as_mut().unwrap();
+                    let ready = self.failure.attempt(|| std::pin::Pin::new(poll).poll(cx));
+                    if !matches!(ready, Some(Poll::Ready(()))) {
+                        return Poll::Pending;
+                    }
+                    assert!(self.destruction.is_complete());
+                    self.phase = StoreFinalizationPhase::StoreDrain;
+                    self.failure
+                        .attempt(|| drop(self.destruction_observer.take()));
+                }
+                StoreFinalizationPhase::StoreDrain => {
+                    if !self.drain(cx) {
+                        return Poll::Pending;
+                    }
+                    self.phase = StoreFinalizationPhase::Observers;
+                }
+                StoreFinalizationPhase::Observers => {
+                    self.phase = StoreFinalizationPhase::ObserverDrain;
+                    let _exit = self.owner.enter_exit_boundary();
+                    let _runtime = self.runtime.as_ref().map(|runtime| runtime.enter());
+                    self.failure
+                        .attempt(|| self.owner.dispose_resource_observers());
+                }
+                StoreFinalizationPhase::ObserverDrain => {
+                    if !self.drain(cx) {
+                        return Poll::Pending;
+                    }
+                    self.phase = StoreFinalizationPhase::Seal;
+                }
+                StoreFinalizationPhase::Seal => {
+                    // All resource/receipt callbacks and actual VM field Drop
+                    // have returned. The check/commit invokes no user callback.
+                    if !self.destruction.is_complete()
+                        || !self.ledger.resources_ready()
+                        || !self.owner.is_quiescent()
+                    {
+                        self.phase = StoreFinalizationPhase::StoreDrain;
+                        continue;
+                    }
+                    self.failure.attempt(|| self.owner.clear_idle_waker());
+                    if !self.seal.try_seal() {
+                        self.phase = StoreFinalizationPhase::Observers;
+                        continue;
+                    }
+                    self.phase = StoreFinalizationPhase::Runtime;
+                }
+                StoreFinalizationPhase::Runtime => {
+                    // No callback-bearing owner-thread disposal between valid
+                    // seal and final_done. Hold a shutdown panic until Done,
+                    // since disposing a secondary payload may cancel a caller.
+                    let shutdown = self
+                        .runtime
+                        .take()
+                        .and_then(|runtime| std::thread::spawn(move || drop(runtime)).join().err());
+                    self.phase = StoreFinalizationPhase::Done;
+                    self.ledger.final_done.set(true);
+                    if let Some(panic) = shutdown {
+                        self.failure.record(panic);
+                    }
+                }
+                StoreFinalizationPhase::Done => return Poll::Ready(()),
             }
-            if let Some(driver) = &driver {
-                driver.collect_retirement_failures(&mut first_panic);
-                // This task is INSIDE notify: request another pump pass, never
-                // await owner-idle and self-join. after_pump drains ack receipts.
-                attempt_retirement(&mut first_panic, || owner.notify());
+        }
+    }
+    fn finish_blocking(mut self) -> Option<RetirementPanic> {
+        use std::{
+            sync::{Arc, Condvar, Mutex},
+            task::{Context, Wake, Waker},
+        };
+        #[derive(Default)]
+        struct Signal(Mutex<bool>, Condvar);
+        impl Wake for Signal {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
             }
-            let final_owner = owner.clone();
-            owner.after_pump(Box::new(move || {
-                retire_store(store, driver, final_owner, first_panic);
-            }));
-        }));
-    }
-}
-
-#[cfg(feature = "sys")]
-fn retire_store(
-    store: Option<wasmer_api::StoreAsync>,
-    driver: Option<Rc<Driver>>,
-    owner: wasmer_api::sys::NativeCleanupOwner,
-    mut first_panic: Option<RetirementPanic>,
-) {
-    use std::{
-        future::Future,
-        sync::{Arc, Condvar, Mutex},
-        task::{Context, Wake, Waker},
-    };
-    #[derive(Default)]
-    struct WakeSignal(Mutex<bool>, Condvar);
-    impl Wake for WakeSignal {
-        fn wake(self: Arc<Self>) {
-            self.wake_by_ref();
+            fn wake_by_ref(self: &Arc<Self>) {
+                *self.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+                self.1.notify_one();
+            }
         }
-        fn wake_by_ref(self: &Arc<Self>) {
-            *self.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
-            self.1.notify_one();
-        }
-    }
-    struct ClearWake(wasmer_api::sys::NativeCleanupOwner);
-    impl Drop for ClearWake {
-        fn drop(&mut self) {
-            self.0.clear_idle_waker();
-        }
-    }
-    let _clear = ClearWake(owner.clone());
-    let signal = Arc::new(WakeSignal::default());
-    let runtime = driver.as_ref().map(|driver| driver.runtime.clone());
-    let waker = Waker::from(signal.clone());
-    let mut cx = Context::from_waker(&waker);
-    let mut drain = |driver: Option<&Driver>,
-                     require_fences: bool,
-                     first: &mut Option<RetirementPanic>| {
+        let signal = Arc::new(Signal::default());
+        let wake = Waker::from(signal.clone());
+        let mut cx = Context::from_waker(&wake);
         loop {
             *signal.0.lock().unwrap_or_else(|e| e.into_inner()) = false;
-            let idle = {
-                // Also enter after LocalSet cancellation and VM Store drop:
-                // those destructors can retain finite timer/IO cleanup.
-                let _enter = runtime.as_ref().map(|runtime| runtime.enter());
-                if let Some(driver) = driver {
-                    let local = driver.local.run_until(std::future::pending::<()>());
-                    let _ = std::pin::pin!(local).as_mut().poll(&mut cx);
-                }
-                let _local = driver.map(|driver| driver.local.enter());
-                // Publication can finish AFTER the outer collector was queued.
-                // Claim its settled late value BEFORE an unacked receipt can block
-                // owner-idle/enrollment removal or put this drain to sleep.
-                if let Some(driver) = driver
-                    && !driver.retirements_pending()
-                {
-                    driver.collect_retirement_failures(first);
-                }
-                // Install our real signal in every retained continuation.
-                owner.poll_idle(&mut cx).is_ready()
-                    && (!require_fences
-                        || (owner.poll_cleanup_fences(&mut cx).is_ready()
-                            && driver
-                                .is_none_or(|driver| driver.ledger.enrolled.borrow().is_empty())))
-            };
-            if idle {
-                break;
+            let failure = self.failure.clone();
+            match failure.attempt(|| self.poll(&mut cx)) {
+                Some(std::task::Poll::Ready(())) => return self.failure.take(),
+                None => continue,
+                Some(std::task::Poll::Pending) => (),
             }
-            // No runtime or LocalSet context is held across this blocking wait.
             let mut ready = signal.0.lock().unwrap_or_else(|e| e.into_inner());
             while !*ready {
                 ready = signal.1.wait(ready).unwrap_or_else(|e| e.into_inner());
             }
         }
-    };
-    // Keep the concrete Store, driver and runtime outside every fallible poll.
-    // Native cleanup transfers interrupted custody before propagating a panic;
-    // repoll that replacement work before advancing to resource destruction.
-    while let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        drain(driver.as_deref(), true, &mut first_panic)
-    })) {
-        remember_retirement_panic(&mut first_panic, panic);
     }
-    if let Some(driver) = driver {
-        // Cleanup continuations may retain the driver until their fences settle.
-        // Public calls retain StoreRef, so no other execution survives this point.
-        let driver = Rc::try_unwrap(driver)
-            .ok()
-            .expect("native driver survived its Store owner");
-        let Driver { local, .. } = driver;
-        {
-            let _enter = runtime.as_ref().map(|runtime| runtime.enter());
-            // Loader/native obligations have settled. Cancel unrelated local work,
-            // including tasks that would otherwise stay pending forever.
-            attempt_retirement(&mut first_panic, || drop(local));
+}
+#[cfg(feature = "sys")]
+impl Drop for ManagedStore {
+    fn drop(&mut self) {
+        let Some(generation) = self.generation.take() else {
+            return;
+        };
+        let exit = self.owner.enter_exit_boundary();
+        let handoff = self.finalization.get_mut().upgrade();
+        let failure = handoff
+            .as_ref()
+            .map(|handoff| handoff.failure.clone())
+            .unwrap_or_else(|| {
+                let failure = RetirementFailure::default();
+                failure
+                    .bind_clock(&self.ledger.clock)
+                    .expect("new finalizer carrier");
+                failure
+            });
+        let actual = NativeStoreFinalization::new(
+            generation,
+            self.store.take(),
+            self.driver.get_mut().take(),
+            self.ledger.clone(),
+            self.scopes.clone(),
+            self.seal.take().unwrap(),
+            self.owner.clone(),
+            failure,
+        );
+        if let Some(handoff) = handoff {
+            assert!(!handoff.complete.get());
+            assert!(handoff.pending.borrow().is_none());
+            *handoff.pending.borrow_mut() = Some(actual);
+            handoff.notify();
+        } else {
+            // No producer is inferred. Direct active-R deletion WITHOUT an
+            // enrolled tail remains MANDATORY OPEN pending producer classification.
+            exit.defer(Box::new(move || actual.finish_blocking()));
         }
-    }
-    while let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        drain(None, false, &mut first_panic)
-    })) {
-        remember_retirement_panic(&mut first_panic, panic);
-    }
-    {
-        let _enter = runtime.as_ref().map(|runtime| runtime.enter());
-        attempt_retirement(&mut first_panic, || drop(store));
-    }
-    while let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        drain(None, false, &mut first_panic)
-    })) {
-        remember_retirement_panic(&mut first_panic, panic);
-    }
-    drop(_clear);
-    // Runtime destruction can block and is illegal in a foreign Tokio callback.
-    // Only the Send runtime moves; all Store/LocalSet custody stayed on this thread.
-    if let Some(runtime) = runtime {
-        let shutdown = std::thread::spawn(move || drop(runtime)).join();
-        if let Err(panic) = shutdown {
-            remember_retirement_panic(&mut first_panic, panic);
-        }
-    }
-    if let Some(panic) = first_panic {
-        std::panic::resume_unwind(panic);
     }
 }
 
@@ -1984,8 +2636,8 @@ mod tests {
         state.failure.record(payload);
         assert_eq!(clock.get(), u64::MAX);
         assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 0);
-        assert!(!state.failure.is_empty());
-        assert!(state.failure.has_unstamped_event());
+        assert!(!state.delivery_empty());
+        assert!(state.has_unstamped_event());
         assert!(state.failure.take_event().is_none());
         let stored = state.failure.0.borrow();
         assert_eq!(
@@ -2144,14 +2796,18 @@ mod tests {
                 _store: store.downgrade(),
                 base: Some(store.async_store().unwrap()),
                 owner: Some(owner.clone()),
-                cleanup: owner.owner.clone(),
+                cleanup: Some(owner.owner.clone()),
                 release: Some(store.retirement_release(state.clone()).unwrap()),
                 state,
                 registration: Some(registration),
+                first: store.retirement_failure().unwrap(),
+                finalization_subscription: None,
+                finalization: store.finalization_handoff(&owner),
+                exit: None,
             })));
             let first = tail.clone();
             let terminal_owner = owner.clone();
-            owner.owner.after_pump(Box::new(move || {
+            owner.owner.after_pump_existing(Box::new(move || {
                 terminal_owner.retain(Box::pin(async move {
                     done.set(true);
                 }));
@@ -2177,6 +2833,105 @@ mod tests {
             );
             assert!(owner.driver.ledger.snapshot().is_empty());
         }
+    }
+
+    #[cfg(feature = "wasi")]
+    #[test]
+    fn cancelled_tail_returns_its_ordered_event_to_the_same_already_queued_unstamped_receipt() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct Payload(Arc<AtomicUsize>);
+        impl Drop for Payload {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let store = StoreRef::new(Store::default()).unwrap();
+        let owner = store.retirement_owner().unwrap();
+        let registration = store
+            .register_owned_retirement(
+                Rc::new(std::cell::Cell::new(true)),
+                RetirementFailure::default(),
+            )
+            .unwrap();
+        registration.commit();
+        let state = registration.state();
+        state.disposition.set(DeliveryDisposition::LiveTail);
+        let first = store.retirement_failure().unwrap();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let ordered = Box::new(Payload(drops.clone()));
+        let ordered_address = (&*ordered) as *const Payload;
+        first.record(ordered);
+        state.ledger.clock.set(u64::MAX);
+        let unstamped = Box::new(Payload(drops.clone()));
+        let unstamped_address = (&*unstamped) as *const Payload;
+        state.failure.record(unstamped);
+        store.retain_delivery(state.clone()).unwrap();
+        assert!(state.receipt_queued.get());
+        let ledger = state.ledger.clone();
+        let tail = NativeRetirementTail {
+            subscription: Some(owner.subscribe()),
+            _store: store.downgrade(),
+            base: Some(store.async_store().unwrap()),
+            owner: Some(owner.clone()),
+            cleanup: Some(owner.owner.clone()),
+            release: Some(store.retirement_release(state.clone()).unwrap()),
+            state: state.clone(),
+            registration: Some(registration),
+            first,
+            finalization_subscription: None,
+            finalization: store.finalization_handoff(&owner),
+            exit: None,
+        };
+        drop(tail); // actual tail Drop returns BEFORE its callback-bearing fields
+        assert!(state.physically_ready());
+        assert!(
+            state.receipt_queued.get(),
+            "retain the SAME existing receipt"
+        );
+        assert!(!state.delivery_ack.get());
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        let queued = ledger.snapshot();
+        assert_eq!(queued.len(), 1);
+        assert!(Rc::ptr_eq(&queued[0], &state));
+        let returned_guard = state.returned.borrow();
+        let returned = returned_guard.as_ref().unwrap();
+        assert!(returned.order.is_some());
+        assert_eq!(
+            returned.payload.downcast_ref::<Payload>().unwrap() as *const _,
+            ordered_address
+        );
+        let unresolved_guard = state.failure.0.borrow();
+        let unresolved = unresolved_guard.as_ref().unwrap();
+        assert!(unresolved.order.is_none());
+        assert_eq!(
+            unresolved.payload.downcast_ref::<Payload>().unwrap() as *const _,
+            unstamped_address
+        );
+        drop(unresolved_guard);
+        drop(returned_guard);
+        let destination = store.retirement_failure().unwrap();
+        ledger.collect_into(&destination);
+        assert!(destination.is_empty());
+        assert!(!state.delivery_ack.get());
+        owner.owner.notify();
+        assert!(state.receipt_queued.get());
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        // This primitive exhaustion control has no legal ordered completion.
+        // Explicitly dispose its two owned test values only after proving custody.
+        let unresolved = state.failure.0.borrow_mut().take();
+        let returned = state.returned.borrow_mut().take();
+        drop(unresolved);
+        drop(returned);
+        owner.owner.notify();
+        assert!(state.delivery_ack.get());
+        assert!(!state.receipt_queued.get());
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+        assert!(ledger.snapshot().is_empty());
+        drop(queued);
+        drop(owner);
     }
 
     #[cfg(feature = "wasi")]
@@ -2795,8 +3550,12 @@ mod tests {
             _store: store.downgrade(),
             base: Some(store.async_store().unwrap()),
             owner: Some(owner.clone()),
-            cleanup: owner.owner.clone(),
+            cleanup: Some(owner.owner.clone()),
             release: Some(store.retirement_release(state.clone()).unwrap()),
+            first: store.retirement_failure().unwrap(),
+            finalization_subscription: None,
+            finalization: store.finalization_handoff(&owner),
+            exit: None,
             state: state.clone(),
             registration: Some({
                 state.disposition.set(DeliveryDisposition::LiveTail);
@@ -2811,7 +3570,7 @@ mod tests {
         let first = tail.clone();
         let first_waker = waker.clone();
         let release = state.clone();
-        owner.owner.after_pump(Box::new(move || {
+        owner.owner.after_pump_existing(Box::new(move || {
             let mut cx = std::task::Context::from_waker(&first_waker);
             assert!(first.borrow_mut().as_mut().poll(&mut cx).is_pending());
             assert!(
@@ -2891,8 +3650,12 @@ mod tests {
             _store: store.downgrade(),
             base: Some(store.async_store().unwrap()),
             owner: Some(owner.clone()),
-            cleanup: owner.owner.clone(),
+            cleanup: Some(owner.owner.clone()),
             release: Some(store.retirement_release(state.clone()).unwrap()),
+            first: store.retirement_failure().unwrap(),
+            finalization_subscription: None,
+            finalization: store.finalization_handoff(&owner),
+            exit: None,
             state: state.clone(),
             registration: Some({
                 state.disposition.set(DeliveryDisposition::LiveTail);
@@ -2907,7 +3670,7 @@ mod tests {
         let observation = ready.clone();
         let target = store.clone();
         let release = state.clone();
-        owner.owner.after_pump(Box::new(move || {
+        owner.owner.after_pump_existing(Box::new(move || {
             let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
             assert!(first.borrow_mut().as_mut().poll(&mut cx).is_pending());
             assert!(!release.tail_receipt_released.get());
@@ -2988,7 +3751,7 @@ mod tests {
                 // Queue legal outer finalization BEFORE the publisher sees the
                 // late error. Its initial physical join is still Pending.
                 let last = remaining.take().unwrap();
-                owner.after_pump(Box::new(move || drop(last)));
+                owner.after_pump_existing(Box::new(move || drop(last)));
                 assert!(weak_store.upgrade().is_none());
             }
             let result =
@@ -3071,7 +3834,7 @@ mod tests {
                     // First poll precedes re-admission. Its actual retain/notify
                     // later polls this observer before the new receipt, permitting
                     // reentrant acknowledgement and same-pump receipt retirement.
-                    if !state.receipt_queued.get() || state.failure.is_empty() {
+                    if !state.receipt_queued.get() || state.delivery_empty() {
                         return std::task::Poll::Pending;
                     }
                     assert!(state.physically_ready());
