@@ -15,6 +15,10 @@ the legacy runtime and will be deleted with it. No format replacement is planned
 The remaining non-journal consumers must preserve their required behavior before
 retirement. A successful Cargo check alone does not establish that behavior.
 
+Intel macOS support is excluded at the user's request. Its private V8 package
+producer is removed; no Intel package or runtime acceptance gate remains.
+Linux and macOS ARM64 support remain required.
+
 ## Crate map
 
 | Retained legacy crate | Existing responsibility and consumers | V2 implementation and current evidence | Removal gate |
