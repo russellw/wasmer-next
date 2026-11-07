@@ -1,0 +1,452 @@
+name: NAPI Darwin native v2 (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_ref:
+        description: Candidate branch or commit to test
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  macos-arm64:
+    name: NAPI native arm64 on macOS 15 (deployment target 13)
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        timeout-minutes: 3
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ inputs.candidate_ref }}
+          path: candidate
+          submodules: true
+          persist-credentials: false
+      - name: Create task-local build context and disk guard
+        shell: bash
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          cargo_home="$RUNNER_TEMP/napi-cargo-home"
+          rustup_home="$RUNNER_TEMP/napi-rustup-home"
+          target_dir="$RUNNER_TEMP/napi-target"
+          cargo_context="$RUNNER_TEMP/napi-cargo-context"
+          evidence="$RUNNER_TEMP/napi-evidence"
+          mkdir -p "$cargo_home/bin" "$rustup_home" "$target_dir" "$cargo_context" "$evidence" "$RUNNER_TEMP/napi-disk-baselines"
+          chmod 700 "$cargo_home" "$rustup_home" "$cargo_context" "$evidence"
+          test ! -e "$cargo_home/config"
+          test ! -e "$cargo_home/config.toml"
+          cat > "$RUNNER_TEMP/napi-disk-guard.py" <<'PY'
+          import os
+          import sys
+          from pathlib import Path
+
+          if len(sys.argv) != 4 or sys.argv[1] not in {"before", "after"}:
+              raise SystemExit("usage: disk-guard.py before|after PHASE MAX_GROWTH_BYTES")
+          mode, phase, raw_limit = sys.argv[1:]
+          limit = int(raw_limit)
+          reserve = 2 * 1024**3
+          stats = os.statvfs(os.environ["RUNNER_TEMP"])
+          available = stats.f_bavail * stats.f_frsize
+          marker = Path(os.environ["RUNNER_TEMP"]) / "napi-disk-baselines" / f"{phase}.bytes"
+          if mode == "before":
+              required = limit + reserve
+              print(f"disk_phase={phase} available={available} max_growth={limit} reserve={reserve} required={required}")
+              if available < required:
+                  raise SystemExit(88)
+              marker.write_text(str(available))
+          else:
+              if not marker.exists():
+                  raise SystemExit(f"missing disk baseline for {phase}")
+              initial = int(marker.read_text())
+              growth = max(0, initial - available)
+              print(f"disk_phase={phase} initial={initial} available={available} growth={growth} max_growth={limit} reserve={reserve}")
+              marker.unlink()
+              if growth > limit or available < reserve:
+                  raise SystemExit(88)
+          PY
+          printf 'CARGO_HOME=%s\nRUSTUP_HOME=%s\nCARGO_TARGET_DIR=%s\nCANDIDATE_DIR=%s\nNAPI_CARGO_CONTEXT=%s\nNAPI_EVIDENCE=%s\n' \
+            "$cargo_home" "$rustup_home" "$target_dir" "$GITHUB_WORKSPACE/candidate" "$cargo_context" "$evidence" >> "$GITHUB_ENV"
+      - name: Install the repository Rust toolchain under RUNNER_TEMP
+        shell: bash
+        working-directory: ${{ runner.temp }}/napi-cargo-context
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          toolchain="$(python3 - "$CANDIDATE_DIR/rust-toolchain.toml" <<'PY'
+          import sys, tomllib
+          with open(sys.argv[1], "rb") as source:
+              print(tomllib.load(source)["toolchain"]["channel"])
+          PY
+          )"
+          rustup_bin="$(command -v rustup)"
+          test -x "$rustup_bin"
+          python3 "$RUNNER_TEMP/napi-disk-guard.py" before rustup 1073741824
+          rustup toolchain install "$toolchain" --profile minimal --component rustfmt --component clippy --no-self-update
+          for proxy in cargo rustc rustdoc rustfmt clippy-driver cargo-clippy; do
+            ln -sfn "$rustup_bin" "$CARGO_HOME/bin/$proxy"
+          done
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+          printf 'RUSTUP_TOOLCHAIN=%s\n' "$toolchain" >> "$GITHUB_ENV"
+          python3 "$RUNNER_TEMP/napi-disk-guard.py" after rustup 1073741824
+          rustc -Vv | tee "$NAPI_EVIDENCE/rust-toolchain.txt"
+      - name: Record candidate, pinned WLK lock, runner, and preinstalled LLVM 18
+        shell: bash
+        working-directory: ${{ runner.temp }}/napi-cargo-context
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          {
+            printf 'candidate_sha=%s\n' "$(git -C "$CANDIDATE_DIR" rev-parse HEAD)"
+            sw_vers -productVersion
+            uname -m
+            xcrun --sdk macosx --show-sdk-version
+          } | tee "$NAPI_EVIDENCE/runner-and-candidate.txt"
+          python3 - "$CANDIDATE_DIR/Cargo.lock" "$NAPI_EVIDENCE/wlk-lock.txt" <<'PY'
+          import sys, tomllib
+          expected = "git+https://github.com/wasmerio/wlk?branch=main#8ec0fc67017353513321617103f85739b07556b9"
+          with open(sys.argv[1], "rb") as source:
+              packages = tomllib.load(source)["package"]
+          wlk = [p for p in packages if p.get("source", "").startswith("git+https://github.com/wasmerio/wlk?")]
+          if len(wlk) != 21 or any(p.get("source") != expected for p in wlk):
+              raise SystemExit(f"expected 21 WLK packages at the reviewed revision; found {len(wlk)}")
+          lines = [f"{p['name']} {p['version']} {p['source']}" for p in sorted(wlk, key=lambda p: p["name"])]
+          open(sys.argv[2], "w").write("\n".join(lines) + "\n")
+          print("verified_wlk_packages=21 revision=8ec0fc67017353513321617103f85739b07556b9")
+          print("\n".join(lines))
+          PY
+          llvm_bin="$(brew --prefix llvm@18)/bin"
+          for tool in llvm-objcopy llvm-nm llvm-ar; do
+            test -x "$llvm_bin/$tool"
+            version="$("$llvm_bin/$tool" --version)"
+            printf '%s\n%s\n' "$tool" "$version" | tee -a "$NAPI_EVIDENCE/llvm-tools.txt"
+            printf '%s\n' "$version" | grep -Eq 'LLVM version 18\.'
+          done
+          {
+            printf 'OBJCOPY=%s/llvm-objcopy\n' "$llvm_bin"
+            printf 'NM=%s/llvm-nm\n' "$llvm_bin"
+            printf 'AR=%s/llvm-ar\n' "$llvm_bin"
+          } >> "$GITHUB_ENV"
+          printf '%s\n' "$llvm_bin" >> "$GITHUB_PATH"
+      - name: Fetch locked private WLK dependency graph
+        env:
+          WLK_CI_READ_SSH_KEY: ${{ secrets.WLK_CI_READ_SSH_KEY }}
+        shell: bash
+        working-directory: ${{ runner.temp }}/napi-cargo-context
+        timeout-minutes: 7
+        run: |
+          set -euo pipefail
+          # Cargo config discovery follows this task-local cwd, not the candidate manifest path.
+          umask 077
+          test -n "${WLK_CI_READ_SSH_KEY:-}"
+          python3 "$RUNNER_TEMP/napi-disk-guard.py" before cargo-fetch 4294967296
+          key_file="$RUNNER_TEMP/napi-wlk-readonly-key"
+          known_hosts="$RUNNER_TEMP/napi-wlk-known-hosts"
+          git_config="$RUNNER_TEMP/napi-gitconfig"
+          trap 'rm -f -- "$key_file" "$known_hosts" "$git_config"' EXIT
+          printf '%s\n' "$WLK_CI_READ_SSH_KEY" > "$key_file"
+          unset WLK_CI_READ_SSH_KEY
+          chmod 600 "$key_file"
+          curl --fail --silent --show-error --proto '=https' --tlsv1.2 \
+            https://api.github.com/meta | python3 -c '
+          import json, sys
+          keys = json.load(sys.stdin)["ssh_keys"]
+          if not keys:
+              raise SystemExit("GitHub meta returned no SSH host keys")
+          for key in keys:
+              print("github.com " + key)
+              print("ssh.github.com " + key)
+              print("[ssh.github.com]:443 " + key)
+          ' > "$known_hosts"
+          chmod 600 "$known_hosts"
+          git config --file "$git_config" \
+            'url.ssh://git@ssh.github.com:443/wasmerio/wlk.insteadOf' \
+            https://github.com/wasmerio/wlk
+          export GIT_CONFIG_GLOBAL="$git_config"
+          export GIT_CONFIG_NOSYSTEM=1
+          export CARGO_NET_GIT_FETCH_WITH_CLI=true
+          export GIT_SSH_COMMAND="ssh -F /dev/null -i \"$key_file\" -p 443 -o IdentitiesOnly=yes -o IdentityAgent=none -o BatchMode=yes -o StrictHostKeyChecking=yes -o GlobalKnownHostsFile=/dev/null -o UserKnownHostsFile=\"$known_hosts\" -o UpdateHostKeys=no"
+          set +e
+          cargo fetch --manifest-path "$CANDIDATE_DIR/lib/napi/Cargo.toml" --locked --target aarch64-apple-darwin > "$NAPI_EVIDENCE/cargo-fetch.log" 2>&1
+          status=$?
+          set -e
+          cat "$NAPI_EVIDENCE/cargo-fetch.log"
+          python3 "$RUNNER_TEMP/napi-disk-guard.py" after cargo-fetch 4294967296
+          exit "$status"
+      - name: Remove WLK credentials after fetch, including failed or canceled fetches
+        if: always()
+        shell: bash
+        timeout-minutes: 1
+        run: |
+          rm -f -- "$RUNNER_TEMP/napi-wlk-readonly-key" "$RUNNER_TEMP/napi-wlk-known-hosts" "$RUNNER_TEMP/napi-gitconfig"
+      - name: Check disk budget for native build and V8 archive fetch
+        shell: bash
+        timeout-minutes: 1
+        run: python3 "$RUNNER_TEMP/napi-disk-guard.py" before native-build 8589934592
+      - name: Build the native library (includes pinned V8 fetch and extraction)
+        shell: bash
+        working-directory: ${{ runner.temp }}/napi-cargo-context
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          # Cargo --offline blocks Cargo's network access; napi build.rs still fetches its pinned V8 archive through ureq.
+          cargo check --manifest-path "$CANDIDATE_DIR/Cargo.toml" --offline --locked \
+            -p wasmer-napi --features cli,native-stack-diagnostics --lib \
+            > "$NAPI_EVIDENCE/native-check.log" 2>&1 || { cat "$NAPI_EVIDENCE/native-check.log"; exit 1; }
+          cat "$NAPI_EVIDENCE/native-check.log"
+      - name: Verify disk growth and 2 GiB reserve after native build
+        if: always()
+        shell: bash
+        timeout-minutes: 1
+        run: python3 "$RUNNER_TEMP/napi-disk-guard.py" after native-build 8589934592
+      - name: Check disk budget for native test binaries and runtime suite
+        shell: bash
+        timeout-minutes: 1
+        run: python3 "$RUNNER_TEMP/napi-disk-guard.py" before native-tests 6442450944
+      - name: Run exact SDK, native callback, facade, lease, pending, CLI, and JSPI gates
+        shell: bash
+        working-directory: ${{ runner.temp }}/napi-cargo-context
+        timeout-minutes: 35
+        run: |
+          set -euo pipefail
+          run_logged() {
+            name="$1"
+            shift
+            if "$@" > "$NAPI_EVIDENCE/$name.log" 2>&1; then
+              cat "$NAPI_EVIDENCE/$name.log"
+            else
+              status=$?
+              cat "$NAPI_EVIDENCE/$name.log"
+              return "$status"
+            fi
+          }
+          require_one_test() {
+            test_name="$1"
+            listing="$2"
+            matches="$(grep -Fxc "$test_name: test" "$listing" || true)"
+            if [ "$matches" != 1 ]; then
+              echo "expected exactly one listed test: $test_name; found $matches" >&2
+              return 1
+            fi
+          }
+          require_target_tests() {
+            target="$1"
+            shift
+            run_logged "$target-test-list" cargo test --manifest-path "$CANDIDATE_DIR/Cargo.toml" \
+              --offline --locked -p wasmer-napi --features cli,native-stack-diagnostics \
+              --test "$target" -- --list
+            for expected in "$@"; do
+              require_one_test "$expected" "$NAPI_EVIDENCE/$target-test-list.log"
+            done
+          }
+          require_target_tests wasix_facade \
+            facade_native_napi_refills_leases_and_retires_session \
+            facade_native_default_machine_denies_unaccounted_refill_and_accountant_charge \
+            leased_heap_bootstraps_when_refill_is_unavailable \
+            facade_native_vfork_exec_creates_a_new_napi_session \
+            facade_native_shared_thread_gets_its_own_napi_session \
+            facade_native_dso_import_gets_its_own_napi_session \
+            facade_native_late_dso_import_gets_its_own_napi_session \
+            facade_native_optional_napi_hook_preserves_contexts_without_napi_imports \
+            facade_native_napi_context_switches_preserve_refilled_provider
+          require_target_tests wasix_leases \
+            native_arraybuffer_backing_is_an_exact_protected_kernel_lease
+          require_target_tests wasix_pending \
+            napi_hook_suspends_advisory_refill_and_drops_allocator_pending_in_no_yield \
+            dropping_the_caller_cancels_a_permanently_pending_napi_refill
+          require_target_tests cli_facade_mounts \
+            public_cli_runner_charges_a_refilled_arraybuffer_once \
+            public_runner_preserves_root_layer_precedence_cow_and_writable_mounts
+          manifest="$CANDIDATE_DIR/Cargo.toml"
+          sdk_test='backend::sys::async_runtime::tests::paused_native_used_ranges_survive_yield_and_forced_unwind'
+          run_logged sdk-test-list cargo test --manifest-path "$manifest" --offline --locked -p wasmer \
+            --features cranelift,experimental-async --lib -- --list
+          require_one_test "$sdk_test" "$NAPI_EVIDENCE/sdk-test-list.log"
+          run_logged sdk-forced-unwind cargo test --manifest-path "$manifest" --offline --locked -p wasmer \
+            --features cranelift,experimental-async --lib "$sdk_test" -- --exact --test-threads=1
+
+          run_logged napi-library cargo test --manifest-path "$manifest" --offline --locked -p wasmer-napi \
+            --features cli,native-stack-diagnostics --lib -- --test-threads=1
+          run_logged wasix-facade cargo test --manifest-path "$manifest" --offline --locked -p wasmer-napi \
+            --features cli,native-stack-diagnostics --test wasix_facade -- --test-threads=1
+          run_logged wasix-leases cargo test --manifest-path "$manifest" --offline --locked -p wasmer-napi \
+            --features cli,native-stack-diagnostics --test wasix_leases -- --test-threads=1
+          run_logged wasix-pending cargo test --manifest-path "$manifest" --offline --locked -p wasmer-napi \
+            --features cli,native-stack-diagnostics --test wasix_pending -- --test-threads=1
+
+          run_logged callback-test-list cargo test --manifest-path "$manifest" --offline --locked -p wasmer-napi \
+            --features cli,native-stack-diagnostics --test callback_control -- --list
+          for test in \
+            native_frame_tests::native_cpp_without_coroutine_allows_ready_and_refuses_pending \
+            native_frame_tests::native_cpp_callback_cannot_switch_the_callers_context \
+            native_frame_tests::native_cpp_relocates_and_restores_the_configured_stack_limit \
+            native_frame_tests::native_cpp_zero_stack_budget_retires_failed_creation \
+            native_frame_tests::native_cpp_preserves_same_stack_nested_js_roots_and_exceptions \
+            native_frame_tests::native_cpp_refuses_same_isolate_host_body_reentry_across_stacks \
+            native_frame_tests::scanner_proofs::allocation_gc_preserves_current_register_os_and_live_js_roots \
+            native_frame_tests::scanner_proofs::independent_gc_scans_the_retained_native_ancestor; do
+            require_one_test "$test" "$NAPI_EVIDENCE/callback-test-list.log"
+          done
+          run_logged callback-control cargo test --manifest-path "$manifest" --offline --locked -p wasmer-napi \
+            --features cli,native-stack-diagnostics --test callback_control -- --test-threads=1
+          run_logged cli-facade-mounts cargo test --manifest-path "$manifest" --offline --locked -p wasmer-napi \
+            --features cli,native-stack-diagnostics --test cli_facade_mounts -- --test-threads=1
+
+          jspi_test='native_v8_jspi_suspension_survives_a_second_root_on_a_disjoint_stack'
+          run_logged jspi-test-list cargo test --manifest-path "$manifest" --offline --locked -p wasmer-napi \
+            --features cli,native-stack-diagnostics --test native_jspi -- --list
+          require_one_test "$jspi_test" "$NAPI_EVIDENCE/jspi-test-list.log"
+          run_logged native-jspi cargo test --manifest-path "$manifest" --offline --locked -p wasmer-napi \
+            --features cli,native-stack-diagnostics --test native_jspi -- \
+            --exact "$jspi_test" --test-threads=1
+      - name: Verify disk growth and 2 GiB reserve after runtime gates
+        if: always()
+        shell: bash
+        timeout-minutes: 1
+        run: python3 "$RUNNER_TEMP/napi-disk-guard.py" after native-tests 6442450944
+      - name: Audit linked symbols, deployment target, and every adapted V8 archive member
+        if: always()
+        shell: bash
+        working-directory: ${{ runner.temp }}/napi-cargo-context
+        timeout-minutes: 4
+        run: |
+          set -euo pipefail
+          python3 - "$CARGO_TARGET_DIR" "$NAPI_EVIDENCE" <<'PY'
+          import hashlib, os, subprocess, sys
+          from pathlib import Path
+
+          target = Path(sys.argv[1])
+          evidence = Path(sys.argv[2])
+          expected_archive_sha = "b2d1b99e8d6177b35e90ee2ea58d02dd5de37a6a33dd673d5f1afedf6a5eeb87"
+          outs = sorted((target / "debug/build").glob("wasmer-napi-*/out"))
+          archives = []
+          adapted = []
+          for out in outs:
+              source = out / "v8-prebuilt/11.9.7/darwin-arm64/lib/libv8.a"
+              result = out / "v8-native-stack-darwin/libv8_snapi_stack.a"
+              if source.is_file():
+                  archives.append(source)
+              if result.is_file():
+                  adapted.append(result)
+          if not archives or not adapted:
+              raise SystemExit("pinned Darwin V8 input/adapted archive missing; prebuilt adaptation did not run")
+          if len(archives) != 1 or len(adapted) != 1:
+              raise SystemExit(f"expected one fresh NAPI V8 output, found {len(archives)} input and {len(adapted)} adapted archives")
+          def digest(path):
+              h = hashlib.sha256()
+              with path.open("rb") as stream:
+                  for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+          with (evidence / "v8-archive-files.sha256").open("w") as report:
+              for path in archives + adapted:
+                  value = digest(path)
+                  print(f"{value}  {path}", file=report)
+                  print(f"{value}  {path}")
+                  if path.name == "libv8.a" and value != expected_archive_sha:
+                      raise SystemExit("pinned source V8 archive hash mismatch")
+          with (evidence / "v8-adapter-files.sha256").open("w") as report:
+              for path in sorted(adapted[0].parent.iterdir()):
+                  if path.is_file():
+                      print(f"{digest(path)}  {path}", file=report)
+          result = adapted[-1]
+          data = result.read_bytes()
+          if not data.startswith(b"!<arch>\n"):
+              raise SystemExit("adapted archive is not an ar archive")
+          offset = 8
+          rows = []
+          while offset < len(data):
+              header = data[offset:offset + 60]
+              if len(header) != 60 or header[58:60] != b"`\n":
+                  raise SystemExit("invalid adapted archive header")
+              name_field = header[:16].decode("ascii").rstrip(" ")
+              size_field = header[48:58].decode("ascii").strip()
+              if not size_field.isdigit():
+                  raise SystemExit("invalid adapted archive member size")
+              size = int(size_field)
+              start = offset + 60
+              end = start + size
+              record = data[start:end]
+              if name_field.startswith("#1/"):
+                  name_size = int(name_field[3:])
+                  name_bytes = record[:name_size]
+                  name = name_bytes.split(b"\0", 1)[0].decode("ascii")
+                  payload = record[name_size:]
+              else:
+                  name = name_field.rstrip("/")
+                  payload = record
+              rows.append((name, len(payload), hashlib.sha256(payload).hexdigest()))
+              offset = end + (size % 2)
+          if offset != len(data) or len(rows) != 1769 or rows[0][0] != "__.SYMDEF":
+              raise SystemExit(f"unexpected adapted archive membership: {len(rows)} entries")
+          with (evidence / "v8-adapted-members.tsv").open("w") as report:
+              report.write("ordinal\tmember\tpayload_bytes\tsha256\n")
+              for ordinal, (name, size, value) in enumerate(rows[1:]):
+                  report.write(f"{ordinal}\t{name}\t{size}\t{value}\n")
+          llvm_nm = os.environ["NM"]
+          with (evidence / "v8-adapted-symbols.txt").open("w") as report:
+              subprocess.run([llvm_nm, "-g", str(result)], check=True, stdout=report)
+          required_symbols = [
+              "_snapi_original_v8_get_stack_start",
+              "_snapi_original_v8_get_stack_start_unchecked",
+              "_snapi_original_v8_stack_guard_init_thread",
+              "_snapi_original_v8_stack_iterate_pointers_until_marker",
+          ]
+          symbols = (evidence / "v8-adapted-symbols.txt").read_text()
+          if any(symbol not in symbols for symbol in required_symbols):
+              raise SystemExit("adapted V8 archive missing an expected renamed symbol")
+          test_names = ["wasmer", "wasix_facade", "wasix_leases", "wasix_pending", "callback_control", "cli_facade_mounts", "native_jspi"]
+          deps = target / "debug/deps"
+          binaries = []
+          for name in test_names:
+              choices = [p for p in deps.glob(name + "-*" ) if p.is_file() and os.access(p, os.X_OK)]
+              if not choices:
+                  raise SystemExit(f"missing linked test binary for {name}")
+              binaries.append(max(choices, key=lambda p: p.stat().st_mtime))
+          with (evidence / "linked-binary-builds.txt").open("w") as report:
+              for binary in binaries:
+                  file_output = subprocess.check_output(["file", str(binary)], text=True).strip()
+                  if "arm64" not in file_output:
+                      raise SystemExit(f"non-arm64 test binary: {file_output}")
+                  build = subprocess.check_output(["xcrun", "vtool", "-show-build", str(binary)], text=True)
+                  if not any(line.strip() == "minos 13.0" for line in build.splitlines()):
+                      raise SystemExit(f"binary does not declare macOS minimum 13.0: {binary}")
+                  report.write(file_output + "\n" + build + "\n")
+              print("audited 7 arm64 test binaries with minos 13.0")
+          for name in ["callback_control", "native_jspi"]:
+              binary = max((p for p in deps.glob(name + "-*") if p.is_file() and os.access(p, os.X_OK)), key=lambda p: p.stat().st_mtime)
+              with (evidence / f"{name}-symbols.txt").open("w") as report:
+                  subprocess.run(["nm", "-gU", str(binary)], check=True, stdout=report)
+          callback_symbols = (evidence / "callback_control-symbols.txt").read_text()
+          for symbol in ["_snapi_bridge_native_current_stack_context", "_snapi_bridge_native_probe_begin", "_snapi_bridge_native_probe_end"]:
+              if symbol not in callback_symbols:
+                  raise SystemExit(f"callback binary missing expected native symbol {symbol}")
+          PY
+      - name: Upload bounded native evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        timeout-minutes: 3
+        with:
+          name: napi-macos-arm64-native-v2-evidence
+          path: ${{ runner.temp }}/napi-evidence
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Remove task-local credentials and build state
+        if: always()
+        shell: bash
+        timeout-minutes: 2
+        run: |
+          rm -f -- "$RUNNER_TEMP/napi-wlk-readonly-key" "$RUNNER_TEMP/napi-wlk-known-hosts" "$RUNNER_TEMP/napi-gitconfig"
+          rm -rf -- "$RUNNER_TEMP/napi-cargo-home" "$RUNNER_TEMP/napi-rustup-home" \
+            "$RUNNER_TEMP/napi-target" "$RUNNER_TEMP/napi-cargo-context" \
+            "$RUNNER_TEMP/napi-disk-baselines" "$RUNNER_TEMP/napi-disk-guard.py"
