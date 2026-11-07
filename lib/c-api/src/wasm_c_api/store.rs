@@ -552,7 +552,13 @@ impl RetirementFailure {
     fn take(&self) -> Option<RetirementPanic> {
         self.take_event().map(|event| event.payload)
     }
-    #[cfg(feature = "wasi")]
+    // Exceptional delivery at the LAST owned, physically complete Rust
+    // boundary only. This neither orders nor acknowledges an unstamped event;
+    // ordinary callers must continue using take_event/move_into and stay Pending.
+    fn take_terminal_payload(&self) -> Option<RetirementPanic> {
+        self.0.borrow_mut().take().map(|event| event.payload)
+    }
+    // Used by sys-only physical finalization as well as WASI delivery.
     pub(crate) fn is_empty(&self) -> bool {
         self.0.borrow().is_none()
     }
@@ -738,6 +744,7 @@ impl NativeRetirementState {
             }
         }
     }
+    #[cfg(test)]
     fn claim(&self, first: &mut Option<RetirementPanic>) -> bool {
         let owned = RetirementFailure::default();
         owned
@@ -2127,11 +2134,24 @@ impl Drop for NativeStoreFinalizationHandoff {
                 .as_ref()
                 .unwrap()
                 .defer(Box::new(move || actual.finish_blocking()));
-        } else if let Some(first) = self.failure.take() {
-            self.exit
-                .as_ref()
-                .unwrap()
-                .defer(Box::new(move || Some(first)));
+        } else if self.complete.get() && self.ledger.final_done.get() {
+            // pending=None alone is not a resource certificate: another poll
+            // can temporarily own the phase. Only actual completed resources
+            // permit LAST-owned exceptional delivery, including exhaustion.
+            let first = self.failure.take_terminal_payload();
+            if let Some(first) = first {
+                self.exit
+                    .as_ref()
+                    .unwrap()
+                    .defer(Box::new(move || Some(first)));
+            }
+        } else {
+            // A never-published handoff has admitted no cleanup error. Its
+            // preterminal observer errors belong to each invocation's state.
+            assert!(
+                self.failure.is_empty(),
+                "unpublished finalizer owns a cleanup event"
+            );
         }
     }
 }
@@ -2468,7 +2488,13 @@ impl NativeStoreFinalization {
             *signal.0.lock().unwrap_or_else(|e| e.into_inner()) = false;
             let failure = self.failure.clone();
             match failure.attempt(|| self.poll(&mut cx)) {
-                Some(std::task::Poll::Ready(())) => return self.failure.take(),
+                Some(std::task::Poll::Ready(())) => {
+                    assert!(matches!(self.phase, StoreFinalizationPhase::Done));
+                    assert!(self.ledger.final_done.get());
+                    // Return the exact terminal payload to the owning lexical
+                    // panic boundary. None must mean EMPTY, never unstamped.
+                    return self.failure.take_terminal_payload();
+                }
                 None => continue,
                 Some(std::task::Poll::Pending) => (),
             }
@@ -2833,6 +2859,85 @@ mod tests {
             );
             assert!(owner.driver.ledger.snapshot().is_empty());
         }
+    }
+
+    #[cfg(feature = "wasi")]
+    fn terminal_cleanup_exhaustion_at_actual_done(blocking: bool) {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct Payload(Arc<AtomicUsize>);
+        impl Drop for Payload {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let store = StoreRef::new(Store::default()).unwrap();
+        let owner = store.retirement_owner().unwrap();
+        let handoff = store.finalization_handoff(&owner);
+        let failure = handoff.failure.clone();
+        let ledger = handoff.ledger.clone();
+        drop(owner); // actual Driver receipt disappears BEFORE public Store
+        drop(store);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let payload = Box::new(Payload(drops.clone()));
+        let address = (&*payload) as *const Payload;
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let terminal = if blocking {
+            // Drive the SAME actual resources to Done before injecting the
+            // shutdown-error exhaustion profile; no physical bits are faked.
+            let mut actual = handoff.pending.borrow_mut().take().unwrap();
+            assert!(actual.poll(&mut cx).is_ready());
+            assert!(matches!(actual.phase, StoreFinalizationPhase::Done));
+            assert!(actual.destruction.is_complete());
+            assert!(ledger.final_done.get());
+            ledger.clock.set(u64::MAX);
+            failure.record(payload);
+            assert!(failure.take_event().is_none());
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+            let exact = actual
+                .finish_blocking()
+                .expect("terminal error is not empty");
+            // The shared handoff is only empty metadata after exact transfer.
+            drop(handoff);
+            exact
+        } else {
+            assert!(handoff.poll(&mut cx).is_ready());
+            assert!(handoff.complete.get());
+            assert!(ledger.final_done.get());
+            assert!(handoff.pending.borrow().is_none());
+            ledger.clock.set(u64::MAX);
+            failure.record(payload);
+            assert!(failure.take_event().is_none());
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(handoff)))
+                .expect_err("LAST completed handoff must deliver its exact terminal error")
+        };
+        assert_eq!(
+            terminal.downcast_ref::<Payload>().unwrap() as *const _,
+            address
+        );
+        assert!(failure.is_empty());
+        assert!(
+            !failure.1.get(),
+            "exceptional delivery is not an ordered acknowledgement"
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(terminal);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "wasi")]
+    #[test]
+    fn last_completed_handoff_delivers_exact_unstamped_cleanup_payload() {
+        terminal_cleanup_exhaustion_at_actual_done(false);
+    }
+
+    #[cfg(feature = "wasi")]
+    #[test]
+    fn blocking_actual_done_returns_exact_unstamped_cleanup_payload() {
+        terminal_cleanup_exhaustion_at_actual_done(true);
     }
 
     #[cfg(feature = "wasi")]
