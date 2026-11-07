@@ -154,10 +154,11 @@ impl<'a> Walk<'a> {
         } else {
             start.clone()
         };
-        if !path.is_empty() && path.iter().all(|&byte| byte == b'/') {
-            if let Some(fallback) = root_fallback(vfs, &current, flags)? {
-                current = fallback;
-            }
+        if !path.is_empty()
+            && path.iter().all(|&byte| byte == b'/')
+            && let Some(fallback) = root_fallback(vfs, &current, flags)?
+        {
+            current = fallback;
         }
         Ok(Self {
             vfs,
@@ -303,10 +304,8 @@ impl<'a> Walk<'a> {
             return Ok(self.path.clone());
         };
         let parent = parent.clone();
-        if *literal_root {
-            if let Some(fallback) = root_fallback(self.vfs, &parent, self.flags)? {
-                return Ok(fallback);
-            }
+        if *literal_root && let Some(fallback) = root_fallback(self.vfs, &parent, self.flags)? {
+            return Ok(fallback);
         }
         Ok(parent)
     }
@@ -360,10 +359,10 @@ impl<'a> Walk<'a> {
                 .split(|&byte| byte == b'/')
                 .filter(|component| !component.is_empty())
                 .collect();
-            if components.is_empty() || components.as_slice() == [b".".as_slice()] {
-                if let Some(fallback) = root_fallback(self.vfs, &self.path, self.flags)? {
-                    self.path = fallback;
-                }
+            if (components.is_empty() || components.as_slice() == [b".".as_slice()])
+                && let Some(fallback) = root_fallback(self.vfs, &self.path, self.flags)?
+            {
+                self.path = fallback;
             }
         }
         while self.stack.last().is_some_and(|s| s.comps.is_empty()) {

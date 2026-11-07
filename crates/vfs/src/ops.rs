@@ -1114,7 +1114,7 @@ impl Vfs {
             }
             Ok(target) => Some(target),
             Err(PathError::Errno(Errno::ENOENT)) if mode != RenameMode::Exchange => None,
-            Err(errno) => return Err(errno.into()),
+            Err(errno) => return Err(errno),
         };
         if cross_dir {
             // `lock_rename`'s trap: the child of one parent that is an ancestor of the other.
@@ -1676,7 +1676,7 @@ impl Vfs {
             prefix.extend_from_slice(comp);
             match self.mkdir(cx, &root, &prefix, 0o755).await {
                 Ok(()) | Err(PathError::Errno(Errno::EEXIST)) => {}
-                Err(errno) => return Err(errno.into()),
+                Err(errno) => return Err(errno),
             }
         }
         Ok(())

@@ -104,7 +104,6 @@ impl Vfs {
                 root_node
                     .fallback
                     .set(Arc::downgrade(&anchor.dentry))
-                    .ok()
                     .expect("one root fallback");
             }
             paths.push(copied.root_path());
