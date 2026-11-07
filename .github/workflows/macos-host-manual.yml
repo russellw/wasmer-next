@@ -158,6 +158,14 @@ jobs:
           if not re.search(r"test result: ok\. 1 passed; 0 failed; 0 ignored;", text):
               raise RuntimeError("Mac guest-memory gate did not execute exactly once")
           tests["kernel-macos"] = 1
+          name = "tests::landlock::macos_name_observations_landlock_exact_write_only_file_keeps_its_rule_identity"
+          listing = run("kernel-landlock-list", command("test", "-p", packages[3], "--lib", name, "--", "--list"), 300, 1024**3)
+          if listing.splitlines().count(name + ": test") != 1:
+              raise RuntimeError("expected exactly one Mac Landlock identity test")
+          text = run("kernel-landlock", command("test", "-p", packages[3], "--lib", name, "--", "--exact", "--nocapture"), 300, 1024**3)
+          if not re.search(r"test result: ok\. 1 passed; 0 failed; 0 ignored;", text):
+              raise RuntimeError("Mac Landlock identity gate did not execute exactly once")
+          tests["kernel-landlock"] = 1
           (evidence / "tests.json").write_text(json.dumps(tests, indent=2))
           if fingerprint() != source_hash:
               raise RuntimeError("final candidate source fingerprint changed")
@@ -176,7 +184,7 @@ jobs:
           output = root / "upload"
           output.mkdir(parents=True, exist_ok=True)
           phases = ["toolchain", "check", "clippy", "wasixv2-vfs", "wasixv2-vfs-overlay",
-                    "wasixv2-vfs-host", "kernel-list", "kernel-macos"]
+                    "wasixv2-vfs-host", "kernel-list", "kernel-macos", "kernel-landlock-list", "kernel-landlock"]
           names = [p + ".log" for p in phases] + ["source.json", "runs.json", "rust.txt", "tests.json"]
           for name in names:
               path = source / name
