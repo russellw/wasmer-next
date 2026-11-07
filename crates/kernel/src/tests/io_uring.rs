@@ -5094,3 +5094,102 @@ fn foreign_retirement_partial_registration_error_cancel_and_panic_unlock_first()
         );
     }
 }
+
+/// A copied shared-file mapping has its own OpenFile identity. Cancellation
+/// during its sync must leave that ACTUAL source in the submit caller's owner,
+/// rather than dropping an inner helper's mappings while submit is held.
+#[test]
+fn foreign_retirement_file_sync_cancellation_keeps_actual_mapping_until_submit_unlock() {
+    use crate::fs::io::At;
+    use futures::FutureExt as _;
+    use std::cell::Cell;
+    use wasixv2_abi::RwfFlags;
+    struct CopiedMemory<'a> {
+        memory: &'a dyn UserMemory,
+        stop: Cell<Option<u32>>,
+    }
+    impl UserMemory for CopiedMemory<'_> {
+        fn read<'a>(&'a self, addr: u32, out: &'a mut [u8]) -> LocalFuture<'a, Result<(), Fault>> {
+            Box::pin(async move {
+                if self.stop.get() == Some(addr) {
+                    std::future::pending::<()>().await;
+                }
+                self.memory.read(addr, out).await
+            })
+        }
+        fn write<'a>(&'a self, addr: u32, data: &'a [u8]) -> LocalFuture<'a, Result<(), Fault>> {
+            self.memory.write(addr, data)
+        }
+        fn size(&self) -> LocalFuture<'_, u64> {
+            self.memory.size()
+        }
+        fn grow(&self, pages: u32) -> LocalFuture<'_, Option<u64>> {
+            self.memory.grow(pages)
+        }
+        // The default map_shared rejects native mapping, selecting the existing
+        // Source::Shared copy path rather than changing the host or resolver.
+    }
+    let m = Machine::new();
+    let ring = m.ring(8, 0);
+    let memory = CopiedMemory {
+        memory: &m.memory,
+        stop: Cell::new(None),
+    };
+    let caller = Caller::new(m.task, &memory);
+    let first_fd = m.file("/retired-sync", b"mapping");
+    let first = m.kernel.caller_file(&m.caller(), first_fd).unwrap();
+    let original = Arc::downgrade(&first);
+    let mapped = block_on(m.kernel.mmap(
+        &caller,
+        0,
+        crate::mm::PAGE_SIZE as u32,
+        ProtFlags(3),
+        MapFlags::MAP_SHARED,
+        first_fd,
+        0,
+    ))
+    .unwrap();
+    let second_fd = m.file("/retired-sync", b"mapping");
+    let second = m.kernel.caller_file(&m.caller(), second_fd).unwrap();
+    assert!(
+        !Arc::ptr_eq(&first, &second),
+        "different opens of the same inode"
+    );
+    assert_eq!(block_on(m.kernel.close(&m.caller(), first_fd)), Ok(0));
+    drop(first);
+    assert!(
+        original.upgrade().is_some(),
+        "actual mapping owns the original open"
+    );
+    memory.stop.set(Some(mapped));
+    let ctx =
+        crate::io_uring::ring_of(&m.kernel.caller_file(&m.caller(), ring.fd).unwrap()).unwrap();
+    let mut retired = crate::mm::MemoryRetirement::default();
+    let submit = block_on(ctx.hold_submit());
+    let iovecs = [Iovec {
+        iov_base: BUF,
+        iov_len: 1,
+    }];
+    let mut read = Box::pin(m.kernel.read_into_iovecs_flags_in(
+        &caller,
+        &second,
+        &iovecs,
+        At::Offset(0),
+        RwfFlags::RWF_NOWAIT,
+        &mut retired,
+    ));
+    assert!(
+        read.as_mut().now_or_never().is_none(),
+        "real mapping sync is pending under submit"
+    );
+    drop(read);
+    assert!(
+        original.upgrade().is_some(),
+        "cancellation transfers the actual Mapping/Source, not a backing clone"
+    );
+    drop(submit);
+    drop(retired);
+    assert!(original.upgrade().is_none());
+    assert!(ctx.test_retirement_unlocked());
+    assert_eq!(ring.submit(0), Ok(0));
+}

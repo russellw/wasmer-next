@@ -966,7 +966,7 @@ impl Kernel {
             IoUringOp::IORING_OP_WAITID => self.op_waitid(caller, ctx, req).await,
             IoUringOp::IORING_OP_MSG_RING => self.op_msg_ring(caller, ctx, req, retired),
             IoUringOp::IORING_OP_SPLICE | IoUringOp::IORING_OP_TEE => {
-                self.op_splice(caller, ctx, req).await
+                self.op_splice(caller, ctx, req, retired).await
             }
             IoUringOp::IORING_OP_NOP | IoUringOp::IORING_OP_NOP128 => self.op_nop(caller, ctx, req),
             IoUringOp::IORING_OP_FILES_UPDATE => {
@@ -1126,7 +1126,9 @@ impl Kernel {
                 if file.flags().contains(OpenFlags::O_PATH) {
                     return Err(Errno::EBADF);
                 }
-                let done = self.fallocate_file(caller, &file, alloc, offset, len).await;
+                let done = self
+                    .fallocate_file_in(caller, &file, alloc, offset, len, &mut retired.memory)
+                    .await;
                 Ok(Outcome::of(done))
             }
             IoUringOp::IORING_OP_OPENAT | IoUringOp::IORING_OP_OPENAT2 => {
@@ -1336,6 +1338,7 @@ impl Kernel {
         caller: &Caller<'_>,
         ctx: &Ctx,
         req: &mut Req,
+        retired: &mut Resources,
     ) -> Result<Outcome, Errno> {
         use wasixv2_abi::SpliceFlags;
         let s = req.sqe;
@@ -1374,9 +1377,18 @@ impl Kernel {
         } else {
             let in_at = (s.addr != u64::MAX).then_some(s.addr as i64);
             let out_at = (s.off != u64::MAX).then_some(s.off as i64);
-            self.splice_files(caller, &input, &output, in_at, out_at, s.len, flags)
-                .await
-                .map(|(n, _, _)| n)
+            self.splice_files_in(
+                caller,
+                &input,
+                &output,
+                in_at,
+                out_at,
+                s.len,
+                flags,
+                &mut retired.memory,
+            )
+            .await
+            .map(|(n, _, _)| n)
         };
         match result {
             Err(SysErr::Errno(Errno::EAGAIN)) if !user_nonblock => Ok(Outcome::AgainOn(vec![
@@ -1528,7 +1540,8 @@ impl Kernel {
                 if file.flags().contains(OpenFlags::O_PATH) {
                     return Err(Errno::EBADF);
                 }
-                self.truncate_file(caller, &file, s.off as i64).await
+                self.truncate_file_in(caller, &file, s.off as i64, &mut retired.memory)
+                    .await
             }
             IoUringOp::IORING_OP_FGETXATTR
             | IoUringOp::IORING_OP_FSETXATTR
@@ -1894,12 +1907,26 @@ impl Kernel {
         let io_caller = redirected.as_ref().unwrap_or(caller);
         let done = match write {
             true => {
-                self.write_from_iovecs(io_caller, &file, &iovecs, at, nowait)
-                    .await
+                self.write_from_iovecs_in(
+                    io_caller,
+                    &file,
+                    &iovecs,
+                    at,
+                    nowait,
+                    &mut retired.memory,
+                )
+                .await
             }
             false => {
-                self.read_into_iovecs_flags(io_caller, &file, &iovecs, at, nowait)
-                    .await
+                self.read_into_iovecs_flags_in(
+                    io_caller,
+                    &file,
+                    &iovecs,
+                    at,
+                    nowait,
+                    &mut retired.memory,
+                )
+                .await
             }
         };
         let events = match write {

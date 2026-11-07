@@ -87,10 +87,35 @@ impl Kernel {
         caller: &Caller<'_>,
         input: &OpenFile,
         output: &OpenFile,
+        in_at: Option<i64>,
+        out_at: Option<i64>,
+        len: u32,
+        flags: SpliceFlags,
+    ) -> SysResult<(i32, Option<i64>, Option<i64>)> {
+        let mut retired = crate::mm::MemoryRetirement::default();
+        self.splice_files_in(
+            caller,
+            input,
+            output,
+            in_at,
+            out_at,
+            len,
+            flags,
+            &mut retired,
+        )
+        .await
+    }
+
+    pub(crate) async fn splice_files_in(
+        &self,
+        caller: &Caller<'_>,
+        input: &OpenFile,
+        output: &OpenFile,
         mut in_at: Option<i64>,
         mut out_at: Option<i64>,
         len: u32,
         flags: SpliceFlags,
+        retired: &mut crate::mm::MemoryRetirement,
     ) -> SysResult<(i32, Option<i64>, Option<i64>)> {
         if len == 0 {
             return Ok((0, in_at, out_at));
@@ -134,7 +159,7 @@ impl Kernel {
                 let _pos = self.lock_file_pos(output, out_at).await;
                 let mut at = Offset::new(output, out_at, len)?;
                 let spliced = self
-                    .splice_from_pipe(caller, &ipipe, output, &mut at, len, nonblock)
+                    .splice_from_pipe(caller, &ipipe, output, &mut at, len, nonblock, retired)
                     .await?;
                 if out_at.is_some() {
                     out_at = Some(at.pos as i64);
@@ -150,7 +175,7 @@ impl Kernel {
                 let _pos = self.lock_file_pos(input, in_at).await;
                 let mut at = Offset::new(input, in_at, len)?;
                 let spliced = self
-                    .splice_to_pipe(caller, input, &opipe, &mut at, len, nonblock)
+                    .splice_to_pipe(caller, input, &opipe, &mut at, len, nonblock, retired)
                     .await?;
                 if in_at.is_some() {
                     in_at = Some(at.pos as i64);
@@ -358,6 +383,7 @@ impl Kernel {
         at: &mut Offset,
         len: usize,
         nonblock: bool,
+        retired: &mut crate::mm::MemoryRetirement,
     ) -> SysResult<usize> {
         // FUSE takes a complete reply before validation; generic splice_write
         // instead leaves bytes queued on failure (fs/fuse/dev.c:fuse_dev_splice_write).
@@ -375,7 +401,7 @@ impl Kernel {
         let broken = Cell::new(false);
         self.pre_content_permission(caller, output, Some(at.pos), len as u64)
             .await?;
-        self.sync_file_mappings(caller, output).await;
+        self.sync_file_mappings(caller, output, retired).await;
         let guard = match &output.backing {
             Backing::Inode(file) if file.limits_file_size() => Some(file.write_guard().await?),
             _ => None,
@@ -401,7 +427,7 @@ impl Kernel {
             .consume(nonblock, &*interrupt, &mut buf, &mut out, false)
             .await;
         drop(guard);
-        self.sync_file_mappings(caller, output).await;
+        self.sync_file_mappings(caller, output, retired).await;
         self.epipe(caller, output, spliced, broken.get())
     }
 
@@ -415,6 +441,7 @@ impl Kernel {
         at: &mut Offset,
         len: usize,
         nonblock: bool,
+        retired: &mut crate::mm::MemoryRetirement,
     ) -> SysResult<usize> {
         let interrupt = self.interrupt(caller);
         loop {
@@ -436,7 +463,7 @@ impl Kernel {
             self.pre_content_permission(caller, input, Some(at.pos), len as u64)
                 .await?;
             self.access_permission(caller, input).await?;
-            self.sync_file_mappings(caller, input).await;
+            self.sync_file_mappings(caller, input, retired).await;
             let n = match (inode, positional) {
                 (Some(file), _) => file.read_at(&mut buf, at.pos).await?,
                 (None, true) => input.read_at(caller.task(), &mut buf, at.pos).await?,

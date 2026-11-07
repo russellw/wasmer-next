@@ -344,8 +344,22 @@ impl Kernel {
         at: At,
         flags: RwfFlags,
     ) -> SysResult<u32> {
+        let mut retired = crate::mm::MemoryRetirement::default();
+        self.read_into_iovecs_flags_in(caller, file, iovecs, at, flags, &mut retired)
+            .await
+    }
+
+    pub(crate) async fn read_into_iovecs_flags_in(
+        &self,
+        caller: &Caller<'_>,
+        file: &OpenFile,
+        iovecs: &[Iovec],
+        at: At,
+        flags: RwfFlags,
+        retired: &mut crate::mm::MemoryRetirement,
+    ) -> SysResult<u32> {
         let ret = self
-            .read_iovecs_unaccounted(caller, file, iovecs, at, flags)
+            .read_iovecs_unaccounted(caller, file, iovecs, at, flags, retired)
             .await;
         // `inc_syscr` and `add_rchar`.
         let read = *ret.as_ref().unwrap_or(&0);
@@ -360,6 +374,7 @@ impl Kernel {
         iovecs: &[Iovec],
         at: At,
         flags: RwfFlags,
+        retired: &mut crate::mm::MemoryRetirement,
     ) -> SysResult<u32> {
         // fanotify's events come with descriptors, which only the kernel can make.
         if let Some(group) = file.downcast::<super::fanotify::FanotifyFile>() {
@@ -399,7 +414,7 @@ impl Kernel {
             memory: caller.memory(),
         };
         let mut done = 0;
-        self.sync_file_mappings(caller, file).await;
+        self.sync_file_mappings(caller, file, retired).await;
         loop {
             let want = (total - done).min(buf.len());
             let copied = match target.read_to(&mut buf[..want], done, &mut to).await {
@@ -433,8 +448,22 @@ impl Kernel {
         at: At,
         flags: RwfFlags,
     ) -> SysResult<u32> {
+        let mut retired = crate::mm::MemoryRetirement::default();
+        self.write_from_iovecs_in(caller, file, iovecs, at, flags, &mut retired)
+            .await
+    }
+
+    pub(crate) async fn write_from_iovecs_in(
+        &self,
+        caller: &Caller<'_>,
+        file: &OpenFile,
+        iovecs: &[Iovec],
+        at: At,
+        flags: RwfFlags,
+        retired: &mut crate::mm::MemoryRetirement,
+    ) -> SysResult<u32> {
         let ret = self
-            .write_iovecs_unaccounted(caller, file, iovecs, at, flags)
+            .write_iovecs_unaccounted(caller, file, iovecs, at, flags, retired)
             .await;
         // `inc_syscw` and `add_wchar`.
         let written = *ret.as_ref().unwrap_or(&0);
@@ -449,10 +478,11 @@ impl Kernel {
         iovecs: &[Iovec],
         at: At,
         flags: RwfFlags,
+        retired: &mut crate::mm::MemoryRetirement,
     ) -> SysResult<u32> {
         let broken = Cell::new(false);
         let ret = self
-            .write_steps(caller, file, iovecs, at, flags, &broken)
+            .write_steps(caller, file, iovecs, at, flags, &broken, retired)
             .await;
         self.epipe(caller, file, ret, broken.get())
     }
@@ -465,6 +495,7 @@ impl Kernel {
         at: At,
         flags: RwfFlags,
         broken: &Cell<bool>,
+        retired: &mut crate::mm::MemoryRetirement,
     ) -> SysResult<u32> {
         let mut total: usize = iovecs.iter().map(|iov| iov.iov_len as usize).sum();
         let messages = file.messages();
@@ -501,7 +532,7 @@ impl Kernel {
         };
         self.pre_content_permission(caller, file, Some(target.start), total as u64)
             .await?;
-        self.sync_file_mappings(caller, file).await;
+        self.sync_file_mappings(caller, file, retired).await;
         let guard = match &file.backing {
             Backing::Inode(inner) if inner.limits_file_size() => Some(inner.write_guard().await?),
             _ => None,
@@ -536,7 +567,7 @@ impl Kernel {
             }
         }
         drop(guard);
-        self.sync_file_mappings(caller, file).await;
+        self.sync_file_mappings(caller, file, retired).await;
         if flags.intersects(RwfFlags::RWF_DSYNC | RwfFlags::RWF_SYNC)
             && let Backing::Inode(inner) = &file.backing
         {
@@ -801,6 +832,7 @@ impl Kernel {
         count: u32,
         broken: &Cell<bool>,
     ) -> SysResult<i32> {
+        let mut retired = crate::mm::MemoryRetirement::default();
         let stream = input.check_seekable().is_err();
         let mut pos = match offset.is_null() {
             true => input.pos(),
@@ -814,8 +846,8 @@ impl Kernel {
         self.access_permission(caller, input).await?;
         self.pre_content_permission(caller, output, Some(output.pos()), u64::from(count))
             .await?;
-        self.sync_file_mappings(caller, input).await;
-        self.sync_file_mappings(caller, output).await;
+        self.sync_file_mappings(caller, input, &mut retired).await;
+        self.sync_file_mappings(caller, output, &mut retired).await;
         let _output_pos = match &output.backing {
             Backing::Inode(_) => Some(output.lock_pos().await),
             _ => None,
@@ -884,7 +916,7 @@ impl Kernel {
             }
         }
         drop(guard);
-        self.sync_file_mappings(caller, output).await;
+        self.sync_file_mappings(caller, output, &mut retired).await;
         if !offset.is_null() {
             write_value(caller.memory(), offset, &(pos as i64)).await?;
         } else if !stream {
@@ -905,6 +937,7 @@ impl Kernel {
         len: u32,
         flags: u32,
     ) -> SysResult<i32> {
+        let mut retired = crate::mm::MemoryRetirement::default();
         if flags != 0 {
             return Err(Errno::EINVAL.into());
         }
@@ -941,8 +974,8 @@ impl Kernel {
         self.access_permission(caller, &input).await?;
         self.pre_content_permission(caller, &output, Some(pos_out), len)
             .await?;
-        self.sync_file_mappings(caller, &input).await;
-        self.sync_file_mappings(caller, &output).await;
+        self.sync_file_mappings(caller, &input, &mut retired).await;
+        self.sync_file_mappings(caller, &output, &mut retired).await;
         let guard = if dst.limits_file_size() {
             Some(dst.write_guard().await?)
         } else {
@@ -1003,7 +1036,7 @@ impl Kernel {
             }
         }
         drop(guard);
-        self.sync_file_mappings(caller, &output).await;
+        self.sync_file_mappings(caller, &output, &mut retired).await;
         if off_in.is_null() {
             input.set_pos(pos_in);
         } else {
@@ -1121,6 +1154,20 @@ impl Kernel {
         offset: i64,
         len: i64,
     ) -> SysResult<i32> {
+        let mut retired = crate::mm::MemoryRetirement::default();
+        self.fallocate_file_in(caller, file, alloc, offset, len, &mut retired)
+            .await
+    }
+
+    pub(crate) async fn fallocate_file_in(
+        &self,
+        caller: &Caller<'_>,
+        file: &OpenFile,
+        alloc: AllocMode,
+        offset: i64,
+        len: i64,
+        retired: &mut crate::mm::MemoryRetirement,
+    ) -> SysResult<i32> {
         file.check_writable()?;
         let Backing::Inode(inner) = &file.backing else {
             return Err(Errno::ESPIPE.into());
@@ -1139,13 +1186,13 @@ impl Kernel {
         }
         // Linux refuses all but plain allocation on an append-only inode (`IS_APPEND`, from
         // `chattr +a`), which no filesystem here has; an `O_APPEND` descriptor is no such thing.
-        self.sync_file_mappings(caller, file).await;
+        self.sync_file_mappings(caller, file, retired).await;
         self.pre_content_permission(caller, file, Some(offset as u64), len as u64)
             .await?;
         let allocated = inner
             .allocate_as(alloc, offset as u64, len as u64, &self.env(caller).cred)
             .await;
-        self.sync_file_mappings(caller, file).await;
+        self.sync_file_mappings(caller, file, retired).await;
         allocated?;
         Ok(0)
     }
@@ -1170,6 +1217,18 @@ impl Kernel {
         file: &OpenFile,
         length: i64,
     ) -> SysResult<i32> {
+        let mut retired = crate::mm::MemoryRetirement::default();
+        self.truncate_file_in(caller, file, length, &mut retired)
+            .await
+    }
+
+    pub(crate) async fn truncate_file_in(
+        &self,
+        caller: &Caller<'_>,
+        file: &OpenFile,
+        length: i64,
+        retired: &mut crate::mm::MemoryRetirement,
+    ) -> SysResult<i32> {
         if length < 0 {
             return Err(Errno::EINVAL.into());
         }
@@ -1183,7 +1242,7 @@ impl Kernel {
         if !file.landlock_allows(crate::landlock::TRUNCATE) {
             return Err(Errno::EACCES.into());
         }
-        self.sync_file_mappings(caller, file).await;
+        self.sync_file_mappings(caller, file, retired).await;
         self.pre_content_permission(caller, file, Some(length as u64), 0)
             .await?;
         let resized = inner
@@ -1194,7 +1253,7 @@ impl Kernel {
                 Ok(())
             })
             .await;
-        self.sync_file_mappings(caller, file).await;
+        self.sync_file_mappings(caller, file, retired).await;
         resized?;
         Ok(0)
     }

@@ -3321,7 +3321,12 @@ impl Kernel {
     /// Makes the caller's shared mappings of `file`'s inode agree with it. Data syscalls on a
     /// file call it before they read or write it and after they wrote, so the process sees one
     /// copy of the file whichever way it looks.
-    pub(crate) async fn sync_file_mappings(&self, caller: &Caller<'_>, file: &OpenFile) {
+    pub(crate) async fn sync_file_mappings(
+        &self,
+        caller: &Caller<'_>,
+        file: &OpenFile,
+        retired: &mut crate::mm::MemoryRetirement,
+    ) {
         let mm = self.mm(caller.task());
         if !mm.shared.load(Ordering::Acquire) {
             return;
@@ -3335,12 +3340,13 @@ impl Kernel {
             file.and_then(|file| file.inode().ok())
                 .is_some_and(|inode| inode.lock_key() == key)
         };
-        self.sync_where(caller, of_file).await;
+        self.sync_where(caller, of_file, retired).await;
     }
 
     /// Synchronises every attachment of a SysV segment in the caller's address space; see
     /// `ipc::shm` for when.
     pub(crate) async fn sync_segments(&self, caller: &Caller<'_>) {
+        let mut retired = MemoryRetirement::default();
         let mm = self.mm(caller.task());
         if !mm.shared.load(Ordering::Acquire) {
             return;
@@ -3350,11 +3356,15 @@ impl Kernel {
                 .shared()
                 .is_some_and(|shared| matches!(shared.object, Object::Segment(_)))
         };
-        self.sync_where(caller, is_segment).await;
+        self.sync_where(caller, is_segment, &mut retired).await;
     }
 
-    async fn sync_where(&self, caller: &Caller<'_>, pick: impl FnMut(&Mapping) -> bool) {
-        let mut retired = MemoryRetirement::default();
+    async fn sync_where(
+        &self,
+        caller: &Caller<'_>,
+        pick: impl FnMut(&Mapping) -> bool,
+        retired: &mut crate::mm::MemoryRetirement,
+    ) {
         let mm = self.mm(caller.task());
         let _op = mm.op.lock().await;
         let slot = retired.mappings.groups.len();
