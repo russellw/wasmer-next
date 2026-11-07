@@ -91,14 +91,17 @@ jobs:
           rustup_bin="$(command -v rustup)"
           test -x "$rustup_bin"
           python3 "$RUNNER_TEMP/napi-disk-guard.py" before rustup 1073741824
-          rustup toolchain install "$toolchain" --profile minimal --component rustfmt --component clippy --no-self-update
-          for proxy in cargo rustc rustdoc rustfmt clippy-driver cargo-clippy; do
-            ln -sfn "$rustup_bin" "$CARGO_HOME/bin/$proxy"
+          "$rustup_bin" toolchain install "$toolchain" --profile minimal --component rustfmt --component clippy --no-self-update
+          cargo_bin="$("$rustup_bin" which --toolchain "$toolchain" cargo)"
+          toolchain_bin="$(dirname "$cargo_bin")"
+          for tool in cargo rustc rustdoc rustfmt clippy-driver cargo-clippy; do
+            test -x "$toolchain_bin/$tool"
           done
-          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+          echo "$toolchain_bin" >> "$GITHUB_PATH"
           printf 'RUSTUP_TOOLCHAIN=%s\n' "$toolchain" >> "$GITHUB_ENV"
           python3 "$RUNNER_TEMP/napi-disk-guard.py" after rustup 1073741824
-          rustc -Vv | tee "$NAPI_EVIDENCE/rust-toolchain.txt"
+          "$toolchain_bin/rustc" -Vv | tee "$NAPI_EVIDENCE/rust-toolchain.txt"
+          "$cargo_bin" -V | tee -a "$NAPI_EVIDENCE/rust-toolchain.txt"
       - name: Record candidate, pinned WLK lock, runner, and preinstalled LLVM 18
         shell: bash
         working-directory: ${{ runner.temp }}/napi-cargo-context
