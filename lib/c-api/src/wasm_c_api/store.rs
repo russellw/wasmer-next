@@ -3709,6 +3709,170 @@ mod tests {
         drop(original);
     }
 
+    #[cfg(feature = "wasi")]
+    #[test]
+    fn finite_secondary_payload_chain_reenters_source_without_replacing_owned_or_active_primary() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct Reenter {
+            owner: wasmer_api::sys::NativeCleanupOwner,
+            jobs: Rc<std::cell::Cell<usize>>,
+        }
+        unsafe extern "C" fn admit(
+            data: *mut std::ffi::c_void,
+            _: &wasm_val_vec_t,
+            _: &mut wasm_val_vec_t,
+        ) -> Option<Box<wasm_trap_t>> {
+            let control = unsafe { &*data.cast::<Reenter>() };
+            let jobs = control.jobs.clone();
+            control
+                .owner
+                .try_retain(async move {
+                    jobs.set(jobs.get() + 1);
+                })
+                .unwrap_or_else(|_| panic!("pre-seal secondary destructor work refused"));
+            None
+        }
+        unsafe extern "C" fn release(data: *mut std::ffi::c_void) {
+            drop(unsafe { Box::from_raw(data.cast::<Reenter>()) });
+        }
+        struct Chain {
+            remaining: usize,
+            drops: Arc<AtomicUsize>,
+            owner: std::thread::ThreadId,
+            source: WeakStoreRef,
+            callback: Function,
+        }
+        impl Drop for Chain {
+            fn drop(&mut self) {
+                // SAME existing legal Send transport as the actual caller-Waker
+                // fixtures. Rc owner state stays ONLY in SOURCE's C userdata.
+                assert_eq!(self.owner, std::thread::current().id());
+                let source = self.source.upgrade().unwrap();
+                let output = source
+                    .with_mut(|store| self.callback.call(store, &[]))
+                    .unwrap()
+                    .unwrap();
+                assert!(output.is_empty());
+                self.drops.fetch_add(1, Ordering::SeqCst);
+                if self.remaining != 0 {
+                    std::panic::resume_unwind(Box::new(Chain {
+                        remaining: self.remaining - 1,
+                        drops: self.drops.clone(),
+                        owner: self.owner,
+                        source: self.source.clone(),
+                        callback: self.callback.clone(),
+                    }));
+                }
+            }
+        }
+        struct Primary(u64);
+        struct DuringUnwind {
+            failure: RetirementFailure,
+            chain: Option<Chain>,
+        }
+        impl Drop for DuringUnwind {
+            fn drop(&mut self) {
+                let chain = self.chain.take().unwrap();
+                self.failure
+                    .attempt(|| std::panic::resume_unwind(Box::new(chain)));
+            }
+        }
+        for active in [false, true] {
+            let target = StoreRef::new(Store::default()).unwrap();
+            let StoreMode::Native(native) = &target.inner.mode else {
+                unreachable!()
+            };
+            let owner = native.owner.clone();
+            let failure = native.cleanup_failure.clone();
+            let weak_ledger = Rc::downgrade(&native.ledger);
+            let exit = owner.enter_exit_boundary();
+            let primary = Box::new(Primary(0x1234_5678_9abc_def0));
+            let address = (&*primary) as *const Primary;
+            owner
+                .try_retain(async move { std::panic::resume_unwind(primary) })
+                .unwrap_or_else(|_| panic!("first cleanup value refused"));
+            let source = StoreRef::new(Store::default()).unwrap();
+            let jobs = Rc::new(std::cell::Cell::new(0));
+            let control = Box::into_raw(Box::new(Reenter {
+                owner: owner.clone(),
+                jobs: jobs.clone(),
+            }));
+            let mut public = wasm_store_t {
+                inner: source.clone(),
+            };
+            let ty = wasm_functype_t::new(wasmer_api::FunctionType::new([], []));
+            let function = unsafe {
+                wasm_func_new_with_env(
+                    Some(&mut public),
+                    Some(&ty),
+                    Some(admit),
+                    control.cast(),
+                    Some(release),
+                )
+            }
+            .unwrap();
+            let visits = Arc::new(AtomicUsize::new(0));
+            let chain = Chain {
+                remaining: 3,
+                drops: visits.clone(),
+                owner: std::thread::current().id(),
+                source: source.downgrade(),
+                callback: function.extern_.function(),
+            };
+            if active {
+                let original = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _during = DuringUnwind {
+                        failure: failure.clone(),
+                        chain: Some(chain),
+                    };
+                    std::panic::panic_any("original active Rust value");
+                }))
+                .unwrap_err();
+                assert_eq!(
+                    original.downcast_ref::<&str>(),
+                    Some(&"original active Rust value")
+                );
+            } else {
+                failure.record(Box::new(chain));
+            }
+            assert_eq!(
+                visits.load(Ordering::SeqCst),
+                4,
+                "each finite caught payload is actually destroyed"
+            );
+            assert_eq!(
+                jobs.get(),
+                4,
+                "each actual SOURCE reentry admits and finishes real work"
+            );
+            let exact = failure.take().unwrap();
+            assert_eq!(
+                exact.downcast_ref::<Primary>().unwrap() as *const _,
+                address
+            );
+            assert_eq!(
+                exact.downcast_ref::<Primary>().unwrap().0,
+                0x1234_5678_9abc_def0
+            );
+            assert!(failure.is_empty());
+            drop(exact);
+            drop(exit);
+            drop(target);
+            drop(failure);
+            drop(owner);
+            assert!(
+                weak_ledger.upgrade().is_none(),
+                "SOURCE may retain owner metadata without retaining its receiver/Store"
+            );
+            drop(function);
+            drop(public);
+            drop(source);
+        }
+    }
+
     #[test]
     fn final_store_retirement_waits_for_a_bare_stores_actual_unlock() {
         use std::{future::Future, task::Context};
