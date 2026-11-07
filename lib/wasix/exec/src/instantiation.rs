@@ -506,7 +506,7 @@ impl Drop for AttachmentGuard {
             });
             match &self.local_cleanup {
                 Some(local) if self.transferred => {
-                    if let Err(future) = local.retain(future) {
+                    if let Err(future) = local.retain_existing(future) {
                         // Closed scopes cannot admit managed work. Preserve the
                         // existing trusted-host path for a late unmanaged owner.
                         self.scope.spawn(future);

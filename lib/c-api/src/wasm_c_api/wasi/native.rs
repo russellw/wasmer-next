@@ -214,10 +214,6 @@ impl NativeWasi {
         let local =
             wasixv2_exec::local_cleanup_runner(&asynchronous, environment.loader_cleanup().clone())
                 .ok_or_else(|| anyhow::anyhow!("native loader cleanup runner is missing"))?;
-        let scope = Arc::downgrade(environment.loader_cleanup());
-        store.register_cleanup_fence(Box::new(move || {
-            scope.upgrade().is_none_or(|scope| !scope.is_open())
-        }))?;
         let retiring_env = environment.clone();
         let retiring_store = asynchronous.store();
         // Keep this initial fallback lazy. A committed handoff replaces it
@@ -1641,7 +1637,8 @@ mod tests {
                 deleting_at.set(Some(Instant::now()));
                 wasi_env_delete(Some(environment));
                 deleted.set(deleted.get() + 1);
-            }));
+            }))
+            .unwrap_or_else(|_| panic!("test cleanup admission was refused"));
         let checked = observed.clone();
         let observer_syscalls = syscalls.clone();
         let observer_capture = capture.clone();
@@ -2167,7 +2164,8 @@ mod tests {
                         // Rc stays on the existing local cleanup owner. The Send loader
                         // callback only signals when old-image cleanup reaches this point.
                         drop(finalizer);
-                    }));
+                    }))
+                    .unwrap_or_else(|_| panic!("test cleanup admission was refused"));
                 assert!(
                     local
                         .submit(Box::new(move |_| {

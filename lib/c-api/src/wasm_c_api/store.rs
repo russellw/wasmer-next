@@ -28,7 +28,6 @@ struct ManagedStore {
     generation: Option<wasmer_api::sys::NativeInvocationScope>,
     owner: wasmer_api::sys::NativeCleanupOwner,
     driver: RefCell<Option<Rc<Driver>>>,
-    cleanup_fences: RefCell<Vec<Box<dyn Fn() -> bool>>>,
     #[cfg(feature = "wasi")]
     endpoints: RefCell<Vec<Weak<dyn ContinuationEndpoint>>>,
 }
@@ -258,11 +257,12 @@ impl CleanupRetirement {
         mut future: std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>,
     ) {
         let driver = self.driver.clone();
-        self.owner.retain(Box::pin(std::future::poll_fn(move |cx| {
-            let _runtime = driver.runtime.enter();
-            let _local = driver.local.enter();
-            future.as_mut().poll(cx)
-        })));
+        self.owner
+            .transfer_existing(Box::pin(std::future::poll_fn(move |cx| {
+                let _runtime = driver.runtime.enter();
+                let _local = driver.local.enter();
+                future.as_mut().poll(cx)
+            })));
     }
     #[cfg(feature = "wasi")]
     pub(crate) fn retain_receipt(
@@ -272,7 +272,7 @@ impl CleanupRetirement {
         // Consume the caller's Driver Rc BEFORE admission can synchronously
         // finish a task and run its after_pump release callback.
         let Self { driver, owner } = self;
-        owner.retain(Box::pin(std::future::poll_fn(move |cx| {
+        owner.transfer_existing(Box::pin(std::future::poll_fn(move |cx| {
             let _runtime = driver.runtime.enter();
             let _local = driver.local.enter();
             future.as_mut().poll(cx)
@@ -454,7 +454,7 @@ impl TailRelease {
                 }
                 self.state.receipt_queued.set(true);
                 self.state.failure.attempt(|| {
-                    self.owner.retain(Box::pin(DeliveryReceipt {
+                    self.owner.transfer_existing(Box::pin(DeliveryReceipt {
                         state: self.state.clone(),
                         driver: self.driver.clone(),
                     }))
@@ -630,7 +630,7 @@ impl StoreRef {
         let id = store.id();
         #[cfg(feature = "sys")]
         if store.engine().is_sys() {
-            let owner = wasmer_api::sys::NativeCleanupOwner::new();
+            let owner = wasmer_api::sys::NativeCleanupOwner::new_store_bound();
             let generation = wasmer_api::sys::NativeInvocationScope::bind_with_cleanup(
                 &mut store,
                 Some(owner.clone()),
@@ -648,7 +648,6 @@ impl StoreRef {
                         generation: Some(generation),
                         owner,
                         driver: RefCell::new(None),
-                        cleanup_fences: RefCell::default(),
                         #[cfg(feature = "wasi")]
                         endpoints: RefCell::default(),
                     }),
@@ -935,14 +934,19 @@ impl StoreRef {
         }
     }
 
-    #[cfg(feature = "sys")]
+    #[cfg(all(feature = "sys", test))]
     pub(crate) fn register_cleanup_fence(
         &self,
         fence: Box<dyn Fn() -> bool>,
     ) -> Result<(), RuntimeError> {
         match &self.inner.mode {
             StoreMode::Native(native) => {
-                native.cleanup_fences.borrow_mut().push(fence);
+                native
+                    .owner
+                    .bind_store_cleanup_fence(wasmer_api::sys::NativeCleanupFence::new(
+                        Rc::new(|_| wasmer_api::sys::NativeCleanupFenceObservation::Passive),
+                        Rc::from(fence),
+                    ));
                 Ok(())
             }
             StoreMode::Plain(_) => Err(RuntimeError::new("Store has no native cleanup owner")),
@@ -1080,7 +1084,7 @@ impl StoreRef {
             !state.receipt_queued.replace(true),
             "one exact delivery receipt"
         );
-        owner.owner.retain(Box::pin(DeliveryReceipt {
+        owner.owner.transfer_existing(Box::pin(DeliveryReceipt {
             state,
             driver: Rc::downgrade(&owner.driver),
         }));
@@ -1400,9 +1404,8 @@ impl Drop for ManagedStore {
         };
         let store = self.store.take();
         let driver = self.driver.get_mut().take();
-        let fences = std::mem::take(self.cleanup_fences.get_mut());
         let owner = self.owner.clone();
-        self.owner.retain(Box::pin(async move {
+        self.owner.transfer_existing(Box::pin(async move {
             use wasmer_api::AsStoreAsync;
             let mut first_panic = None;
             // Commit concrete resource custody before close can pump a callback.
@@ -1444,7 +1447,7 @@ impl Drop for ManagedStore {
             }
             let final_owner = owner.clone();
             owner.after_pump(Box::new(move || {
-                retire_store(store, driver, fences, final_owner, first_panic);
+                retire_store(store, driver, final_owner, first_panic);
             }));
         }));
     }
@@ -1454,7 +1457,6 @@ impl Drop for ManagedStore {
 fn retire_store(
     store: Option<wasmer_api::StoreAsync>,
     driver: Option<Rc<Driver>>,
-    fences: Vec<Box<dyn Fn() -> bool>>,
     owner: wasmer_api::sys::NativeCleanupOwner,
     mut first_panic: Option<RetirementPanic>,
 ) {
@@ -1509,7 +1511,7 @@ fn retire_store(
                     // Install our real signal in every retained continuation.
                     owner.poll_idle(&mut cx).is_ready()
                         && (!require_fences
-                            || (fences.iter().all(|closed| closed())
+                            || (owner.poll_cleanup_fences(&mut cx).is_ready()
                                 && driver.is_none_or(|driver| driver.enrolled.borrow().is_empty())))
                 };
                 if idle {
@@ -1725,13 +1727,15 @@ mod tests {
         impl Drop for TimerOnDrop {
             fn drop(&mut self) {
                 let complete = self.complete.clone();
-                self.owner.retain(Box::pin(async move {
-                    // Construct the timer on a later retained poll, after the
-                    // cancellation/finalizer's own runtime guard has ended.
-                    tokio::task::yield_now().await;
-                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                    complete.set(true);
-                }));
+                self.owner
+                    .retain(Box::pin(async move {
+                        // Construct the timer on a later retained poll, after the
+                        // cancellation/finalizer's own runtime guard has ended.
+                        tokio::task::yield_now().await;
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                        complete.set(true);
+                    }))
+                    .unwrap_or_else(|_| panic!("test cleanup admission was refused"));
             }
         }
         unsafe extern "C" fn callback(
@@ -1817,12 +1821,14 @@ mod tests {
             ),
             StoreMode::Plain(_) => unreachable!(),
         };
-        owner.retain(Box::pin(async {
-            for _ in 0..16 {
-                tokio::task::yield_now().await;
-            }
-            panic!("retirement panic sentinel");
-        }));
+        owner
+            .retain(Box::pin(async {
+                for _ in 0..16 {
+                    tokio::task::yield_now().await;
+                }
+                panic!("retirement panic sentinel");
+            }))
+            .unwrap_or_else(|_| panic!("test cleanup admission was refused"));
         let foreign = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1883,18 +1889,20 @@ mod tests {
         let (send, receive) = tokio::sync::oneshot::channel();
         let owner_gate = gate.clone();
         let owner_waiter = waiter.clone();
-        owner.retain(Box::pin(async move {
-            std::future::poll_fn(|cx| {
-                if owner_gate.get() {
-                    std::task::Poll::Ready(())
-                } else {
-                    *owner_waiter.borrow_mut() = Some(cx.waker().clone());
-                    std::task::Poll::Pending
-                }
-            })
-            .await;
-            send.send(()).unwrap();
-        }));
+        owner
+            .retain(Box::pin(async move {
+                std::future::poll_fn(|cx| {
+                    if owner_gate.get() {
+                        std::task::Poll::Ready(())
+                    } else {
+                        *owner_waiter.borrow_mut() = Some(cx.waker().clone());
+                        std::task::Poll::Pending
+                    }
+                })
+                .await;
+                send.send(()).unwrap();
+            }))
+            .unwrap_or_else(|_| panic!("test cleanup admission was refused"));
         let completed = Rc::new(std::cell::Cell::new(false));
         let fence = completed.clone();
         store
@@ -2469,7 +2477,8 @@ mod tests {
                     *first.borrow_mut() = owned;
                     claims.set(claims.get() + 1);
                     std::task::Poll::Ready(())
-                })));
+                })))
+                .unwrap_or_else(|_| panic!("test cleanup admission was refused"));
             None
         }
         unsafe extern "C" fn delete_observer(data: *mut std::ffi::c_void) {
