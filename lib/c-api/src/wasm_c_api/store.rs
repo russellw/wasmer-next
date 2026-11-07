@@ -2663,26 +2663,26 @@ impl NativeStoreFinalization {
             // These two observers are canonical and may be recreated after a
             // notification panic. No arbitrary consumed async frame is replayed.
             loop {
-                match catch_retirement_future(
+                if catch_retirement_future(
                     generation.close_and_wait_for_cleanup(),
                     &observe_failure,
                 )
                 .await
+                .is_ok()
                 {
-                    Ok(()) => break,
-                    Err(()) => (),
+                    break;
                 }
             }
             if let Some(store) = &store {
                 loop {
-                    match catch_retirement_future(
+                    if catch_retirement_future(
                         async { drop(store.write_lock().await) },
                         &observe_failure,
                     )
                     .await
+                    .is_ok()
                     {
-                        Ok(()) => break,
-                        Err(()) => (),
+                        break;
                     }
                 }
             }
