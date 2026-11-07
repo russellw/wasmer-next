@@ -1894,6 +1894,10 @@ mod tests {
                 !completed.get(),
                 "retention itself does not claim completion"
             );
+            assert_eq!(
+                Rc::strong_count(&target.inner), 1,
+                "PENDING retained cleanup must not own a C API StoreRef; the old completion cycle added a second strong reference"
+            );
             // Explicitly retain the existing async driver after cancellation.
             // It, rather than a new executor/task, is the actual poll producer.
             driver.run_local(async {}).await;

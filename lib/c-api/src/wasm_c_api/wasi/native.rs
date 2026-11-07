@@ -510,6 +510,43 @@ enum TerminalPhase {
     Done,
 }
 
+#[derive(Default)]
+struct FenceProgress {
+    acquired: Cell<bool>,
+    deactivation_consumed: Cell<bool>,
+}
+
+/// Actual fence/deactivation progress is separate from its opaque async frame.
+/// A pre-acquisition panic keeps that exact frame and base receipt owned, but
+/// never repolls it or opens the predecessor barrier as if it returned Ready.
+struct TerminalFence {
+    future: LocalFuture<'static, ()>,
+    progress: Rc<FenceProgress>,
+    failure: RetirementFailure,
+    poisoned: bool,
+}
+impl Future for TerminalFence {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = self.get_mut();
+        if this.poisoned {
+            return Poll::Pending;
+        }
+        match this.failure.attempt(|| this.future.as_mut().poll(cx)) {
+            Some(Poll::Pending) => Poll::Pending,
+            Some(Poll::Ready(())) | None
+                if this.progress.acquired.get() && this.progress.deactivation_consumed.get() =>
+            {
+                Poll::Ready(())
+            }
+            Some(Poll::Ready(())) | None => {
+                this.poisoned = true;
+                Poll::Pending
+            }
+        }
+    }
+}
+
 struct TerminalState {
     phase: TerminalPhase,
     store: Option<wasmer_api::StoreAsync>,
@@ -517,7 +554,7 @@ struct TerminalState {
     endpoint: Option<Rc<Endpoint>>,
     process: Option<EmbeddingProcess>,
     handoff: HostCallHandoff,
-    fence: Option<LocalFuture<'static, ()>>,
+    fence: Option<TerminalFence>,
     predecessor: Option<tokio::sync::oneshot::Sender<()>>,
     admission: Option<tokio::sync::oneshot::Receiver<Admission>>,
     waiter: Option<Pin<Box<OwnedEntryWaiter>>>,
@@ -543,12 +580,10 @@ impl Future for TerminalRetirement {
             match state.phase {
                 TerminalPhase::Fence => {
                     if let Some(fence) = state.fence.as_mut() {
-                        match state.failure.attempt(|| fence.as_mut().poll(cx)) {
-                            Some(Poll::Pending) => return Poll::Pending,
-                            Some(Poll::Ready(())) | None => {
-                                state.failure.attempt(|| drop(state.fence.take()));
-                            }
+                        if Pin::new(fence).poll(cx).is_pending() {
+                            return Poll::Pending;
                         }
+                        state.failure.attempt(|| drop(state.fence.take()));
                     }
                     state.phase = TerminalPhase::ReleaseInputs;
                 }
@@ -608,12 +643,10 @@ impl Future for TerminalRetirement {
                                 state.failure.attempt(|| drop(state.retire.take()));
                             }
                             None => {
-                                // Bounded finite teardown panics are emitted
-                                // only after the exec companion commits Retired.
-                                // An unknown opaque observation panic MUST NOT
-                                // become a fabricated physical settlement or a
-                                // repoll of that panicked future.
-                                state.retired = state.handoff.is_retired();
+                                // Existing retire() holds unknown opaque
+                                // failure internally and emits finite teardown
+                                // panic ONLY after exact Retired commitment.
+                                state.retired = true;
                                 state.failure.attempt(|| drop(state.retire.take()));
                             }
                         }
@@ -731,13 +764,46 @@ impl Endpoint {
         let fence_env = terminal_env.clone();
         let terminal_store = asynchronous.store();
         let fence_store = terminal_store.store();
-        let fence = Box::pin(async move {
-            let mut guard = fence_store.write_lock().await;
-            if !terminal_deactivated.get() {
-                fence_env.deactivate(&mut guard.as_store_mut());
-                terminal_deactivated.set(true);
-            }
-        });
+        let progress = Rc::new(FenceProgress::default());
+        let fence_progress = progress.clone();
+        let fence_failure = failure.clone();
+        let fence = TerminalFence {
+            progress,
+            failure: failure.clone(),
+            poisoned: false,
+            future: Box::pin(async move {
+                let mut actual = Box::pin(fence_store.write_lock());
+                let mut failed = false;
+                let mut guard = std::future::poll_fn(|cx| {
+                    if failed {
+                        return Poll::Pending;
+                    }
+                    match fence_failure.attempt(|| actual.as_mut().poll(cx)) {
+                        Some(Poll::Ready(guard)) => {
+                            fence_progress.acquired.set(true);
+                            Poll::Ready(guard)
+                        }
+                        Some(Poll::Pending) => Poll::Pending,
+                        None => {
+                            // Catch INSIDE the owning frame, before an unwind
+                            // could drop the actual canonical lock future.
+                            // It remains owned but must never be polled again.
+                            failed = true;
+                            Poll::Pending
+                        }
+                    }
+                })
+                .await;
+                fence_failure.attempt(|| drop(actual));
+                if !terminal_deactivated.get() {
+                    // deactivate panic-completes actual owning options. Record
+                    // its finite failure only AFTER the real guard exists.
+                    fence_failure.attempt(|| fence_env.deactivate(&mut guard.as_store_mut()));
+                    terminal_deactivated.set(true);
+                }
+                fence_progress.deactivation_consumed.set(true);
+            }),
+        };
         let terminal = Box::pin(TerminalRetirement {
             owner: owner.clone(),
             state: Some(TerminalState {
@@ -2293,6 +2359,90 @@ mod tests {
             drop(t);
             drop(directory);
         }
+    }
+
+    #[test]
+    fn terminal_preacquisition_panic_keeps_the_actual_fence_and_predecessor_barrier_closed() {
+        struct BeforeAcquire {
+            _actual: LocalFuture<'static, ()>,
+            polls: Rc<Cell<usize>>,
+            drops: Rc<Cell<usize>>,
+        }
+        impl Future for BeforeAcquire {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+                self.polls.set(self.polls.get() + 1);
+                panic!("before actual terminal Store acquisition");
+            }
+        }
+        impl Drop for BeforeAcquire {
+            fn drop(&mut self) {
+                self.drops.set(self.drops.get() + 1);
+            }
+        }
+        let engine = wasm_engine_new();
+        let store = unsafe { wasm_store_new(Some(&engine)) }.unwrap();
+        let base = store.inner.async_store().unwrap();
+        let mut held_future = Box::pin(base.write_lock());
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let Poll::Ready(held) = held_future.as_mut().poll(&mut cx) else {
+            panic!("initial actual Store guard");
+        };
+        let exact_base = base.store();
+        let progress = Rc::new(FenceProgress::default());
+        let polls = Rc::new(Cell::new(0));
+        let drops = Rc::new(Cell::new(0));
+        let failure = RetirementFailure::default();
+        let fence = TerminalFence {
+            future: Box::pin(BeforeAcquire {
+                _actual: Box::pin(async move {
+                    drop(exact_base.write_lock().await);
+                }),
+                polls: polls.clone(),
+                drops: drops.clone(),
+            }),
+            progress: progress.clone(),
+            failure: failure.clone(),
+            poisoned: false,
+        };
+        let (predecessor, mut waiting) = tokio::sync::oneshot::channel();
+        let mut continuation = Box::pin(async move {
+            fence.await;
+            let _ = predecessor.send(());
+        });
+        assert!(continuation.as_mut().poll(&mut cx).is_pending());
+        assert!(continuation.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(
+            polls.get(),
+            1,
+            "never repoll the poisoned pre-acquisition frame"
+        );
+        assert_eq!(
+            drops.get(),
+            0,
+            "keep the SAME actual canonical fence receipt owned"
+        );
+        assert!(!progress.acquired.get());
+        assert!(!progress.deactivation_consumed.get());
+        assert!(
+            matches!(
+                waiting.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "no false predecessor barrier publication"
+        );
+        assert_eq!(
+            failure.0.borrow().as_ref().unwrap().downcast_ref::<&str>(),
+            Some(&"before actual terminal Store acquisition")
+        );
+        // Unknown pre-acquisition panic progress is unproved. Dispose the mock
+        // final owner at this legal outer boundary; production TerminalRetirement
+        // transfers its SAME pending state to its existing cleanup owner on Drop.
+        drop(continuation);
+        assert_eq!(drops.get(), 1);
+        drop(held);
+        drop(held_future);
+        drop(base);
     }
 
     #[test]

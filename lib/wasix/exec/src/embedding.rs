@@ -491,18 +491,6 @@ impl HostCallHandoff {
         self.handoff.wait().await
     }
 
-    /// Whether exact handoff retirement has committed its terminal disposition.
-    #[doc(hidden)]
-    pub fn is_retired(&self) -> bool {
-        matches!(
-            *self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-            HostCallState::Retired
-        )
-    }
-
     /// Called by the retained old-thread owner only after its physical/loader
     /// drain. Accepted workers keep terminal authority; all other paths fault
     /// and release exactly once here, including starters that never ran.
@@ -536,19 +524,34 @@ impl HostCallHandoff {
         };
         let mut failure = None;
         if let Some(terminal) = terminal {
-            let mut retiring = self
-                .spawner
-                .retire_committed(terminal.clone(), self.handoff.clone());
+            let mut opaque_failure = None;
+            let mut retiring = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.spawner
+                    .retire_committed(terminal.clone(), self.handoff.clone())
+            })) {
+                Ok(retiring) => Some(retiring),
+                Err(panic) => {
+                    opaque_failure = Some(panic);
+                    None
+                }
+            };
             failure = std::future::poll_fn(|cx| {
+                if opaque_failure.is_some() {
+                    return std::task::Poll::Pending;
+                }
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    retiring.as_mut().poll(cx)
+                    retiring.as_mut().unwrap().as_mut().poll(cx)
                 })) {
                     Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
                     Ok(std::task::Poll::Ready(())) => std::task::Poll::Ready(None),
                     Err(panic) if terminal.is_finished() => std::task::Poll::Ready(Some(panic)),
-                    // Generic Control gives no retry contract for an opaque
-                    // panicked observation. Never relabel it as settlement.
-                    Err(panic) => std::panic::resume_unwind(panic),
+                    // Keep the SAME unfinished retirement future/entry and
+                    // panic inside this caller-owned continuation. No generic
+                    // opaque-future retry, unwind, or fake completion is legal.
+                    Err(panic) => {
+                        opaque_failure = Some(panic);
+                        std::task::Poll::Pending
+                    }
                 }
             })
             .await;
@@ -577,6 +580,59 @@ impl HostCallHandoff {
 mod selection_tests {
     use super::*;
     use crate::process::tests::{NoThreads, Recorder};
+
+    #[test]
+    fn existing_retire_commits_its_exact_state_before_delivering_fallback_drop_panic() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Lease(Arc<AtomicUsize>);
+        impl crate::ExecProcessLease for Lease {}
+        impl Drop for Lease {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                panic!("retired handoff lease destructor");
+            }
+        }
+        let store = wasmer::Store::default();
+        let control = Arc::new(Recorder::default());
+        let drops = Arc::new(AtomicUsize::new(0));
+        let task = wasixv2_syscalls::TaskId(79);
+        let terminal = crate::PreinstalledTerminalCustody::new(
+            task,
+            process::ExecImage::new(
+                wasixv2_syscalls::Image::copied(Vec::new()),
+                Some(Box::new(Lease(drops.clone()))),
+            ),
+        );
+        terminal.cancel();
+        let handoff = HostCallHandoff {
+            handoff: Arc::default(),
+            spawner: process::spawner(
+                store.engine().clone(),
+                control.clone(),
+                Arc::new(NoThreads),
+                Arc::new(Abis::wasixv2()),
+            ),
+            state: Arc::new(std::sync::Mutex::new(HostCallState::Exec(terminal.clone()))),
+        };
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            futures::executor::block_on(handoff.retire());
+        }))
+        .unwrap_err();
+        assert_eq!(
+            panic.downcast_ref::<&str>(),
+            Some(&"retired handoff lease destructor")
+        );
+        assert!(terminal.is_finished());
+        assert!(matches!(
+            *handoff.state.lock().unwrap(),
+            HostCallState::Retired
+        ));
+        assert_eq!(*control.released.lock().unwrap(), [task]);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        futures::executor::block_on(handoff.retire());
+        assert_eq!(*control.released.lock().unwrap(), [task]);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn rejected_host_selection_never_recreates_an_expired_attachment() {
