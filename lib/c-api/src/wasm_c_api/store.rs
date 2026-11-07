@@ -732,12 +732,12 @@ impl NativeRetirementState {
                 return false;
             }
             let returned = self.returned.borrow_mut().take();
-            if let Some(event) = returned {
-                if let Err(event) = destination.accept_event(event) {
-                    let previous = self.returned.borrow_mut().replace(event);
-                    assert!(previous.is_none(), "one return per unique native tail");
-                    return false;
-                }
+            if let Some(event) = returned
+                && let Err(event) = destination.accept_event(event)
+            {
+                let previous = self.returned.borrow_mut().replace(event);
+                assert!(previous.is_none(), "one return per unique native tail");
+                return false;
             }
             if self.delivery_empty() {
                 return true;
@@ -2253,6 +2253,10 @@ impl RetirementFailure {
 }
 #[cfg(feature = "sys")]
 impl NativeStoreFinalization {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Keep each actual resource custody and its independent metadata fence explicit at finalization transfer"
+    )]
     fn new(
         mut generation: wasmer_api::sys::NativeInvocationScope,
         store: Option<wasmer_api::StoreAsync>,
