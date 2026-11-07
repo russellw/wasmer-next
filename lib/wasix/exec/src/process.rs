@@ -520,9 +520,8 @@ impl<S: Control + 'static> Future for CommittedRetirement<S> {
                 }
                 RetirementPhase::Actions => {
                     // take_pending runs kernel vfork/ptrace/exit work, not just
-                    // an exit-code read. Consume each returned action once and
-                    // drop it outside any retained-state borrow before asking
-                    // for the next, even when that action's destructor panics.
+                    // an exit-code read. Consume each Copy action once before
+                    // asking for the next, preserving the original work drain.
                     let mut action = None;
                     if !this.attempt(|this| {
                         action = this.syscalls.take_pending(this.terminal.task());
@@ -530,8 +529,7 @@ impl<S: Control + 'static> Future for CommittedRetirement<S> {
                         this.opaque_panicked = true;
                         return Poll::Pending;
                     }
-                    if let Some(action) = action {
-                        this.attempt(|_| drop(action));
+                    if action.is_some() {
                         continue;
                     }
                     this.phase = RetirementPhase::Group;
