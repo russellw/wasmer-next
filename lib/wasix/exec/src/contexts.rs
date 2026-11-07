@@ -377,7 +377,7 @@ impl<S: Send + Sync + 'static> Drop for Driver<S> {
             });
             match &self.local_cleanup {
                 Some(local) if self.transferred => {
-                    if let Err(future) = local.retain(future) {
+                    if let Err(future) = local.retain_existing(future) {
                         // Closed scopes cannot admit managed work. Preserve the
                         // existing trusted-host path for a late unmanaged owner.
                         self.cleanup.spawn(future);
@@ -820,12 +820,14 @@ mod tests {
             transferred: true,
         };
         let notified_group = group.clone();
-        owner.retain(Box::pin(poll_fn(move |_| {
-            if notified_group.current() == 1 {
-                panic!("activation unlock proof");
-            }
-            Poll::Pending
-        })));
+        owner
+            .retain(Box::pin(poll_fn(move |_| {
+                if notified_group.current() == 1 {
+                    panic!("activation unlock proof");
+                }
+                Poll::Pending
+            })))
+            .unwrap_or_else(|_| panic!("test cleanup admission was refused"));
         let panic = catch_unwind(AssertUnwindSafe(|| {
             futures::executor::block_on(driver.activate(1))
         }))
