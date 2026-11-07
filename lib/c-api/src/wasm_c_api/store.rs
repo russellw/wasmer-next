@@ -282,11 +282,17 @@ impl CleanupRetirement {
 
 #[cfg(feature = "sys")]
 #[derive(Clone, Default)]
-pub(crate) struct RetirementFailure(Rc<RefCell<Option<RetirementPanic>>>);
+pub(crate) struct RetirementFailure(
+    Rc<RefCell<Option<RetirementPanic>>>,
+    #[cfg(feature = "wasi")] Rc<std::cell::Cell<bool>>,
+);
 #[cfg(feature = "sys")]
 impl RetirementFailure {
     #[cfg(feature = "wasi")]
     pub(crate) fn record(&self, panic: RetirementPanic) {
+        // A consumer can have acknowledged an earlier value reentrantly while
+        // publication is still protected. A late value reopens exact delivery.
+        self.1.set(false);
         let first = self.0.borrow_mut().take();
         if let Some(first) = first {
             *self.0.borrow_mut() = Some(first);
@@ -327,7 +333,11 @@ impl RetirementFailure {
 pub(crate) struct NativeRetirementState {
     terminal_done: Rc<std::cell::Cell<bool>>,
     tail_receipt_released: std::cell::Cell<bool>,
-    delivery_ack: std::cell::Cell<bool>,
+    delivery_ack: Rc<std::cell::Cell<bool>>,
+    #[cfg(feature = "wasi")]
+    publishing: std::cell::Cell<bool>,
+    #[cfg(feature = "wasi")]
+    receipt_queued: std::cell::Cell<bool>,
     pub(crate) failure: RetirementFailure,
     #[cfg(feature = "wasi")]
     release_waiter: RefCell<Option<std::sync::Arc<std::task::Waker>>>,
@@ -343,6 +353,17 @@ impl NativeRetirementState {
         }
         // The explicit consumer owns the value BEFORE acknowledging it.
         self.delivery_ack.set(true);
+    }
+    #[cfg(feature = "wasi")]
+    fn remove_enrollment(self: &Rc<Self>, driver: &Weak<Driver>) {
+        let driver = driver.upgrade();
+        if let Some(driver) = driver.as_ref() {
+            driver
+                .enrolled
+                .borrow_mut()
+                .retain(|entry| !entry.ptr_eq(&Rc::downgrade(self)));
+        }
+        drop(driver);
     }
     #[cfg(feature = "wasi")]
     fn register_release_waker(&self, waker: &std::task::Waker) -> bool {
@@ -382,14 +403,12 @@ impl std::future::Future for DeliveryReceipt {
         if !self.state.delivery_ack.get() {
             return std::task::Poll::Pending;
         }
-        let driver = self.driver.upgrade();
-        if let Some(driver) = driver.as_ref() {
-            driver
-                .enrolled
-                .borrow_mut()
-                .retain(|entry| !entry.ptr_eq(&Rc::downgrade(&self.state)));
+        self.state.receipt_queued.set(false);
+        // The task may retire here, but the publisher retains exact enrollment
+        // and the carrier until ALL fallible notification has finished.
+        if !self.state.publishing.get() {
+            self.state.remove_enrollment(&self.driver);
         }
-        drop(driver);
         std::task::Poll::Ready(())
     }
 }
@@ -397,6 +416,7 @@ impl std::future::Future for DeliveryReceipt {
 #[cfg(all(feature = "sys", feature = "wasi"))]
 pub(crate) struct TailRelease {
     state: Rc<NativeRetirementState>,
+    driver: Weak<Driver>,
     owner: wasmer_api::sys::NativeCleanupOwner,
     wake: std::sync::Arc<DriverWake>,
 }
@@ -408,8 +428,11 @@ impl TailRelease {
                 self.state.terminal_done.get(),
                 "unfinished native retirement"
             );
-            // Record callback/Waker failures as VALUES, never throw them from
-            // a fire-and-forget task's Completion::drop -> owner.notify stack.
+            self.state.publishing.set(true);
+            // Publish actual readiness BEFORE callbacks may reenter and poll
+            // the live tail. They must never observe a false bit and strand a
+            // replacement waiter with no later wake.
+            self.state.tail_receipt_released.set(true);
             let waiter = self.state.release_waiter.borrow_mut().take();
             if let Some(waiter) = waiter {
                 self.state.failure.attempt(|| waiter.wake_by_ref());
@@ -418,8 +441,26 @@ impl TailRelease {
             let wake = std::task::Waker::from(self.wake);
             self.state.failure.attempt(|| wake.wake_by_ref());
             self.state.failure.attempt(|| drop(wake));
-            self.state.tail_receipt_released.set(true);
-            self.owner.notify();
+            // This can retire an empty receipt and THEN panic in the idle
+            // waker. Publication still owns carrier+enrollment throughout it.
+            self.state.failure.attempt(|| self.owner.notify());
+            self.state.publishing.set(false);
+            if !self.state.receipt_queued.get() {
+                if self.state.failure.is_empty() && self.state.delivery_ack.get() {
+                    self.state.remove_enrollment(&self.driver);
+                } else {
+                    // The late value reopened delivery after an earlier empty
+                    // receipt retired. Reuse the SAME queue/state/enrollment;
+                    // no new registry or poll producer is introduced.
+                    self.state.receipt_queued.set(true);
+                    self.state.failure.attempt(|| {
+                        self.owner.retain(Box::pin(DeliveryReceipt {
+                            state: self.state.clone(),
+                            driver: self.driver.clone(),
+                        }))
+                    });
+                }
+            }
         }));
     }
 }
@@ -1006,10 +1047,13 @@ impl StoreRef {
         failure: RetirementFailure,
     ) -> Result<Rc<NativeRetirementState>, RuntimeError> {
         let owner = self.retirement_owner()?;
+        let delivery_ack = failure.1.clone();
         let state = Rc::new(NativeRetirementState {
             terminal_done: completed,
             tail_receipt_released: std::cell::Cell::new(false),
-            delivery_ack: std::cell::Cell::new(false),
+            delivery_ack,
+            publishing: std::cell::Cell::new(false),
+            receipt_queued: std::cell::Cell::new(false),
             failure,
             release_waiter: RefCell::default(),
         });
@@ -1027,6 +1071,10 @@ impl StoreRef {
         state: Rc<NativeRetirementState>,
     ) -> Result<(), RuntimeError> {
         let owner = self.retirement_owner()?;
+        assert!(
+            !state.receipt_queued.replace(true),
+            "one exact delivery receipt"
+        );
         owner.owner.retain(Box::pin(DeliveryReceipt {
             state,
             driver: Rc::downgrade(&owner.driver),
@@ -1042,6 +1090,7 @@ impl StoreRef {
         let owner = self.retirement_owner()?;
         Ok(TailRelease {
             state,
+            driver: Rc::downgrade(&owner.driver),
             owner: owner.owner.clone(),
             wake: owner.driver.wake.clone(),
         })
@@ -1431,38 +1480,51 @@ fn retire_store(
     let runtime = driver.as_ref().map(|driver| driver.runtime.clone());
     let waker = Waker::from(signal.clone());
     let mut cx = Context::from_waker(&waker);
-    let mut drain = |driver: Option<&Driver>, require_fences: bool| {
-        loop {
-            *signal.0.lock().unwrap_or_else(|e| e.into_inner()) = false;
-            let idle = {
-                // Also enter after LocalSet cancellation and VM Store drop:
-                // those destructors can retain finite timer/IO cleanup.
-                let _enter = runtime.as_ref().map(|runtime| runtime.enter());
-                if let Some(driver) = driver {
-                    let local = driver.local.run_until(std::future::pending::<()>());
-                    let _ = std::pin::pin!(local).as_mut().poll(&mut cx);
+    let mut drain =
+        |driver: Option<&Driver>, require_fences: bool, first: &mut Option<RetirementPanic>| {
+            loop {
+                *signal.0.lock().unwrap_or_else(|e| e.into_inner()) = false;
+                let idle = {
+                    // Also enter after LocalSet cancellation and VM Store drop:
+                    // those destructors can retain finite timer/IO cleanup.
+                    let _enter = runtime.as_ref().map(|runtime| runtime.enter());
+                    if let Some(driver) = driver {
+                        let local = driver.local.run_until(std::future::pending::<()>());
+                        let _ = std::pin::pin!(local).as_mut().poll(&mut cx);
+                    }
+                    let _local = driver.map(|driver| driver.local.enter());
+                    // Publication can finish AFTER the outer collector was queued.
+                    // Claim its settled late value BEFORE an unacked receipt can block
+                    // owner-idle/enrollment removal or put this drain to sleep.
+                    if let Some(driver) = driver
+                        && !driver.retirements_pending()
+                    {
+                        driver.collect_retirement_failures(first);
+                    }
+                    // Install our real signal in every retained continuation.
+                    owner.poll_idle(&mut cx).is_ready()
+                        && (!require_fences
+                            || (fences.iter().all(|closed| closed())
+                                && driver.is_none_or(|driver| driver.enrolled.borrow().is_empty())))
+                };
+                if idle {
+                    break;
                 }
-                let _local = driver.map(|driver| driver.local.enter());
-                // Install our real signal in every retained continuation.
-                owner.poll_idle(&mut cx).is_ready()
-                    && (!require_fences
-                        || (fences.iter().all(|closed| closed())
-                            && driver.is_none_or(|driver| driver.enrolled.borrow().is_empty())))
-            };
-            if idle {
-                break;
+                // No runtime or LocalSet context is held across this blocking wait.
+                let mut ready = signal.0.lock().unwrap_or_else(|e| e.into_inner());
+                while !*ready {
+                    ready = signal.1.wait(ready).unwrap_or_else(|e| e.into_inner());
+                }
             }
-            // No runtime or LocalSet context is held across this blocking wait.
-            let mut ready = signal.0.lock().unwrap_or_else(|e| e.into_inner());
-            while !*ready {
-                ready = signal.1.wait(ready).unwrap_or_else(|e| e.into_inner());
-            }
-        }
-    };
+        };
     // Keep the concrete Store, driver and runtime outside every fallible poll.
     // Native cleanup transfers interrupted custody before propagating a panic;
     // repoll that replacement work before advancing to resource destruction.
-    while !attempt_retirement(&mut first_panic, || drain(driver.as_deref(), true)) {}
+    while let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drain(driver.as_deref(), true, &mut first_panic)
+    })) {
+        remember_retirement_panic(&mut first_panic, panic);
+    }
     if let Some(driver) = driver {
         // Cleanup continuations may retain the driver until their fences settle.
         // Public calls retain StoreRef, so no other execution survives this point.
@@ -1477,12 +1539,20 @@ fn retire_store(
             attempt_retirement(&mut first_panic, || drop(local));
         }
     }
-    while !attempt_retirement(&mut first_panic, || drain(None, false)) {}
+    while let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drain(None, false, &mut first_panic)
+    })) {
+        remember_retirement_panic(&mut first_panic, panic);
+    }
     {
         let _enter = runtime.as_ref().map(|runtime| runtime.enter());
         attempt_retirement(&mut first_panic, || drop(store));
     }
-    while !attempt_retirement(&mut first_panic, || drain(None, false)) {}
+    while let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drain(None, false, &mut first_panic)
+    })) {
+        remember_retirement_panic(&mut first_panic, panic);
+    }
     drop(_clear);
     // Runtime destruction can block and is illegal in a foreign Tokio callback.
     // Only the Send runtime moves; all Store/LocalSet custody stayed on this thread.
@@ -2153,6 +2223,211 @@ mod tests {
         assert!(store.retirement_states_for_test().is_empty());
         drop(tail);
         drop(owner); // Never escape a private Driver Rc through last Store drop.
+    }
+
+    #[cfg(feature = "wasi")]
+    #[test]
+    fn release_wake_reentrantly_polls_the_live_tail_after_readiness_publication() {
+        struct PollLive {
+            tail: Rc<RefCell<std::pin::Pin<Box<NativeRetirementTail>>>>,
+            ready: Rc<std::cell::Cell<Option<bool>>>,
+        }
+        unsafe extern "C" fn poll_live(
+            data: *mut std::ffi::c_void,
+            _: &wasm_val_vec_t,
+            _: &mut wasm_val_vec_t,
+        ) -> Option<Box<wasm_trap_t>> {
+            let control = unsafe { &*data.cast::<PollLive>() };
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            let ready = control.tail.borrow_mut().as_mut().poll(&mut cx).is_ready();
+            control.ready.set(Some(ready));
+            None
+        }
+        unsafe extern "C" fn delete_control(data: *mut std::ffi::c_void) {
+            drop(unsafe { Box::from_raw(data.cast::<PollLive>()) });
+        }
+        struct Reentrant {
+            owner: std::thread::ThreadId,
+            store: WeakStoreRef,
+            callback: Function,
+        }
+        impl std::task::Wake for Reentrant {
+            fn wake(self: std::sync::Arc<Self>) {
+                self.wake_by_ref();
+            }
+            fn wake_by_ref(self: &std::sync::Arc<Self>) {
+                // Waker carries only existing Send handles. Rc test state stays
+                // behind the ordinary C callback environment on its owner thread.
+                assert_eq!(std::thread::current().id(), self.owner);
+                let store = self.store.upgrade().unwrap();
+                let values = store
+                    .with_mut(|store| self.callback.call(store, &[]))
+                    .unwrap()
+                    .unwrap();
+                assert!(values.is_empty());
+            }
+        }
+        let store = StoreRef::new(Store::default()).unwrap();
+        let owner = store.retirement_owner().unwrap();
+        let state = store
+            .register_retirement(
+                Rc::new(std::cell::Cell::new(true)),
+                RetirementFailure::default(),
+            )
+            .unwrap();
+        store.retain_delivery(state.clone()).unwrap();
+        let tail = Rc::new(RefCell::new(Box::pin(NativeRetirementTail {
+            subscription: Some(owner.subscribe()),
+            _store: store.downgrade(),
+            base: Some(store.async_store().unwrap()),
+            owner: Some(owner.clone()),
+            cleanup: owner.owner.clone(),
+            release: Some(store.retirement_release(state.clone()).unwrap()),
+            state: state.clone(),
+        })));
+        let ready = Rc::new(std::cell::Cell::new(None));
+        let first = tail.clone();
+        let observation = ready.clone();
+        let target = store.clone();
+        let release = state.clone();
+        owner.owner.after_pump(Box::new(move || {
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(first.borrow_mut().as_mut().poll(&mut cx).is_pending());
+            assert!(!release.tail_receipt_released.get());
+            // Create the callback ONLY after the tail released base/Driver
+            // receipts: its Store-owned environment cannot pin its own Store.
+            let data = Box::into_raw(Box::new(PollLive {
+                tail: first,
+                ready: observation,
+            }));
+            let mut public = wasm_store_t {
+                inner: target.clone(),
+            };
+            let ty = wasm_functype_t::new(wasmer_api::FunctionType::new([], []));
+            let function = unsafe {
+                wasm_func_new_with_env(
+                    Some(&mut public),
+                    Some(&ty),
+                    Some(poll_live),
+                    data.cast(),
+                    Some(delete_control),
+                )
+            }
+            .unwrap();
+            let wake = std::task::Waker::from(std::sync::Arc::new(Reentrant {
+                owner: std::thread::current().id(),
+                store: target.downgrade(),
+                callback: function.extern_.function(),
+            }));
+            assert!(release.register_release_waker(&wake));
+            drop(wake);
+            drop(function);
+        }));
+        assert_eq!(
+            ready.get(),
+            Some(true),
+            "the actual wake must re-poll the LIVE tail with receipt readiness already published"
+        );
+        assert!(state.tail_receipt_released.get());
+        assert!(store.retirement_states_for_test().is_empty());
+        drop(tail);
+        drop(owner);
+    }
+
+    #[cfg(feature = "wasi")]
+    #[test]
+    fn late_release_notify_panic_keeps_exact_delivery_for_driver_or_legal_outer_shutdown() {
+        struct IdlePanic(std::sync::atomic::AtomicUsize);
+        impl std::task::Wake for IdlePanic {
+            fn wake(self: std::sync::Arc<Self>) {
+                self.wake_by_ref();
+            }
+            fn wake_by_ref(self: &std::sync::Arc<Self>) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                panic!("late release idle waker failure");
+            }
+        }
+        for final_store in [false, true] {
+            let store = StoreRef::new(Store::default()).unwrap();
+            let weak_store = store.downgrade();
+            let owner = store.cleanup_owner().unwrap();
+            let state = store
+                .register_retirement(
+                    Rc::new(std::cell::Cell::new(true)),
+                    RetirementFailure::default(),
+                )
+                .unwrap();
+            store.retain_delivery(state.clone()).unwrap();
+            let release = store.retirement_release(state.clone()).unwrap();
+            let idle = std::sync::Arc::new(IdlePanic(std::sync::atomic::AtomicUsize::new(0)));
+            let waker = std::task::Waker::from(idle.clone());
+            assert!(
+                owner
+                    .poll_idle(&mut std::task::Context::from_waker(&waker))
+                    .is_pending()
+            );
+            let mut remaining = Some(store);
+            if final_store {
+                // Queue legal outer finalization BEFORE the publisher sees the
+                // late error. Its initial physical join is still Pending.
+                let last = remaining.take().unwrap();
+                owner.after_pump(Box::new(move || drop(last)));
+                assert!(weak_store.upgrade().is_none());
+            }
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| release.release()));
+            if final_store {
+                // The publisher captures the value; existing retire_store then
+                // recollects it inside its drain BEFORE owner-idle/sleep/drop.
+                let panic = result.unwrap_err();
+                assert_eq!(
+                    panic.downcast_ref::<&str>(),
+                    Some(&"late release idle waker failure")
+                );
+                assert!(owner.is_idle());
+                assert!(!state.receipt_queued.get());
+            } else {
+                assert!(
+                    result.is_ok(),
+                    "known notification error cannot escape the publisher into a detached task boundary"
+                );
+                let store = remaining.as_ref().unwrap();
+                assert_eq!(
+                    state.failure.inspect_message().as_deref(),
+                    Some("late release idle waker failure")
+                );
+                assert!(
+                    !state.delivery_ack.get(),
+                    "late value reopens an earlier empty acknowledgement"
+                );
+                assert!(state.receipt_queued.get());
+                assert_eq!(
+                    store.retirement_states_for_test().len(),
+                    1,
+                    "same exact enrollment survives receipt retirement and late notify panic"
+                );
+                let sibling = store
+                    .with_mut(|store| Function::new_typed(store, || 42i32))
+                    .unwrap();
+                let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    store.call(&sibling, Vec::new())
+                }))
+                .unwrap_err();
+                assert_eq!(
+                    panic.downcast_ref::<&str>(),
+                    Some(&"late release idle waker failure")
+                );
+                assert_eq!(store.call(&sibling, Vec::new()).unwrap()[0].i32(), Some(42));
+                assert!(store.retirement_states_for_test().is_empty());
+                drop(remaining);
+                assert!(weak_store.upgrade().is_none());
+            }
+            assert_eq!(
+                idle.0.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "late notification value is delivered once, not replayed"
+            );
+        }
     }
 
     #[cfg(feature = "wasi")]
