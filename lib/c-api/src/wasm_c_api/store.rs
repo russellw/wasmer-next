@@ -104,6 +104,7 @@ impl DriverUse {
             exit: Some(exit),
         })
     }
+    #[cfg(feature = "wasi")]
     fn capture(owner: &CleanupRetirement) -> Self {
         let exit = owner.owner.enter_exit_boundary();
         let lease = DriverUseReceipt::new(owner.driver.scopes.clone());
@@ -334,13 +335,13 @@ impl Drop for LocalContinuation {
 }
 
 /// Captured before admission; owns only the existing local executor and cleanup pump.
-#[cfg(feature = "sys")]
+#[cfg(all(feature = "sys", feature = "wasi"))]
 pub(crate) struct CleanupRetirement {
     driver: Rc<Driver>, // drops BEFORE its final lexical lease
     owner: wasmer_api::sys::NativeCleanupOwner,
     _use_receipt: DriverUseReceipt,
 }
-#[cfg(feature = "sys")]
+#[cfg(all(feature = "sys", feature = "wasi"))]
 impl Clone for CleanupRetirement {
     fn clone(&self) -> Self {
         let lease = DriverUseReceipt::new(self.driver.scopes.clone());
@@ -351,12 +352,12 @@ impl Clone for CleanupRetirement {
         }
     }
 }
-#[cfg(feature = "sys")]
+#[cfg(all(feature = "sys", feature = "wasi"))]
 struct RetainedDriverFuture {
     future: std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>,
     receipt: CleanupRetirement, // future and actual Driver Rc drop before lease
 }
-#[cfg(feature = "sys")]
+#[cfg(all(feature = "sys", feature = "wasi"))]
 impl std::future::Future for RetainedDriverFuture {
     type Output = ();
     fn poll(
@@ -370,7 +371,7 @@ impl std::future::Future for RetainedDriverFuture {
         this.future.as_mut().poll(cx)
     }
 }
-#[cfg(feature = "sys")]
+#[cfg(all(feature = "sys", feature = "wasi"))]
 impl CleanupRetirement {
     #[cfg(feature = "wasi")]
     pub(crate) fn subscribe(&self) -> DriverSubscription {
@@ -616,6 +617,13 @@ impl RetirementLedger {
 
 #[cfg(feature = "sys")]
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(feature = "wasi"),
+    allow(
+        dead_code,
+        reason = "Shared sys drain predicates read this metadata, but only WASI enrollment constructs invocation dispositions"
+    )
+)]
 enum DeliveryDisposition {
     LiveTail,
     AdmittedContinuation,
@@ -689,6 +697,7 @@ impl Drop for RetirementRegistration {
 
 #[cfg(feature = "sys")]
 pub(crate) struct NativeRetirementState {
+    #[cfg(feature = "wasi")]
     ledger: Rc<RetirementLedger>,
     disposition: std::cell::Cell<DeliveryDisposition>,
     #[cfg(feature = "wasi")]
@@ -744,7 +753,7 @@ impl NativeRetirementState {
             }
         }
     }
-    #[cfg(test)]
+    #[cfg(all(test, feature = "wasi"))]
     fn claim(&self, first: &mut Option<RetirementPanic>) -> bool {
         let owned = RetirementFailure::default();
         owned
@@ -1461,6 +1470,7 @@ impl StoreRef {
         value.ok_or_else(|| RuntimeError::new("native instantiation did not settle"))
     }
 
+    #[cfg(feature = "wasi")]
     pub(crate) fn is_native(&self) -> bool {
         match &self.inner.mode {
             #[cfg(feature = "sys")]
@@ -1469,7 +1479,7 @@ impl StoreRef {
         }
     }
 
-    #[cfg(feature = "sys")]
+    #[cfg(all(feature = "sys", any(feature = "wasi", test)))]
     pub(crate) fn async_store(&self) -> Result<wasmer_api::StoreAsync, RuntimeError> {
         use wasmer_api::AsStoreAsync;
         match &self.inner.mode {
@@ -1480,7 +1490,7 @@ impl StoreRef {
         }
     }
 
-    #[cfg(feature = "sys")]
+    #[cfg(all(feature = "sys", any(feature = "wasi", test)))]
     pub(crate) fn run_host<R>(
         &self,
         future: impl std::future::Future<Output = R>,
@@ -1512,7 +1522,7 @@ impl StoreRef {
         }
     }
 
-    #[cfg(feature = "sys")]
+    #[cfg(all(feature = "sys", any(feature = "wasi", test)))]
     pub(crate) fn cleanup_owner(
         &self,
     ) -> Result<wasmer_api::sys::NativeCleanupOwner, RuntimeError> {
@@ -1522,7 +1532,7 @@ impl StoreRef {
         }
     }
 
-    #[cfg(feature = "sys")]
+    #[cfg(all(feature = "sys", feature = "wasi"))]
     pub(crate) fn retirement_owner(&self) -> Result<CleanupRetirement, RuntimeError> {
         let StoreMode::Native(native) = &self.inner.mode else {
             return Err(RuntimeError::new("Store has no native cleanup owner"));
@@ -1535,7 +1545,7 @@ impl StoreRef {
         })
     }
 
-    #[cfg(feature = "sys")]
+    #[cfg(all(feature = "sys", feature = "wasi"))]
     pub(crate) fn cleanup_retirement(
         &self,
         future: std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>,
@@ -2073,6 +2083,7 @@ struct NativeStoreFinalizationHandoff {
     failure: RetirementFailure,
     wake: std::sync::Arc<DriverWake>, // SAME original final-caller notification metadata
     ledger: Rc<RetirementLedger>,
+    #[cfg(feature = "wasi")]
     polling: std::cell::Cell<bool>,
     blocked: std::cell::Cell<bool>,
     complete: std::cell::Cell<bool>,
@@ -2086,6 +2097,7 @@ impl NativeStoreFinalizationHandoff {
         self.failure.attempt(|| wake.wake_by_ref());
         self.failure.attempt(|| drop(wake));
     }
+    #[cfg(feature = "wasi")]
     fn poll(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
         let _exit = self.owner.enter_exit_boundary();
         if self.complete.get() {
