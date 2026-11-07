@@ -444,22 +444,28 @@ impl TailRelease {
             // This can retire an empty receipt and THEN panic in the idle
             // waker. Publication still owns carrier+enrollment throughout it.
             self.state.failure.attempt(|| self.owner.notify());
+            // retain() synchronously notifies too. Keep publication leased
+            // across EVERY such admission: a reentrant consumer can ack its
+            // value and retire that task before a later notify callback fails.
+            // Recheck the exact state after each finite synchronous admission.
+            while !self.state.receipt_queued.get() {
+                if self.state.failure.is_empty() && self.state.delivery_ack.get() {
+                    break;
+                }
+                self.state.receipt_queued.set(true);
+                self.state.failure.attempt(|| {
+                    self.owner.retain(Box::pin(DeliveryReceipt {
+                        state: self.state.clone(),
+                        driver: self.driver.clone(),
+                    }))
+                });
+            }
+            // No fallible publication remains after releasing this lease.
+            // A queued receipt owns any unacknowledged late value; otherwise
+            // exact empty/acknowledged enrollment can now be removed.
             self.state.publishing.set(false);
             if !self.state.receipt_queued.get() {
-                if self.state.failure.is_empty() && self.state.delivery_ack.get() {
-                    self.state.remove_enrollment(&self.driver);
-                } else {
-                    // The late value reopened delivery after an earlier empty
-                    // receipt retired. Reuse the SAME queue/state/enrollment;
-                    // no new registry or poll producer is introduced.
-                    self.state.receipt_queued.set(true);
-                    self.state.failure.attempt(|| {
-                        self.owner.retain(Box::pin(DeliveryReceipt {
-                            state: self.state.clone(),
-                            driver: self.driver.clone(),
-                        }))
-                    });
-                }
+                self.state.remove_enrollment(&self.driver);
             }
         }));
     }
@@ -2428,6 +2434,168 @@ mod tests {
                 "late notification value is delivered once, not replayed"
             );
         }
+    }
+
+    #[cfg(feature = "wasi")]
+    #[test]
+    fn re_admission_retains_a_followup_notify_error_after_reentrant_acknowledgement() {
+        struct Observe {
+            state: Rc<NativeRetirementState>,
+            owner: wasmer_api::sys::NativeCleanupOwner,
+            first: Rc<RefCell<Option<RetirementPanic>>>,
+            claims: Rc<std::cell::Cell<usize>>,
+        }
+        unsafe extern "C" fn enqueue_observer(
+            data: *mut std::ffi::c_void,
+            _: &wasm_val_vec_t,
+            _: &mut wasm_val_vec_t,
+        ) -> Option<Box<wasm_trap_t>> {
+            let observe = unsafe { &*data.cast::<Observe>() };
+            let state = observe.state.clone();
+            let first = observe.first.clone();
+            let claims = observe.claims.clone();
+            observe
+                .owner
+                .retain(Box::pin(std::future::poll_fn(move |_| {
+                    // First poll precedes re-admission. Its actual retain/notify
+                    // later polls this observer before the new receipt, permitting
+                    // reentrant acknowledgement and same-pump receipt retirement.
+                    if !state.receipt_queued.get() || state.failure.is_empty() {
+                        return std::task::Poll::Pending;
+                    }
+                    assert!(state.physically_ready());
+                    let mut owned = None;
+                    state.claim(&mut owned);
+                    assert!(first.borrow().is_none());
+                    *first.borrow_mut() = owned;
+                    claims.set(claims.get() + 1);
+                    std::task::Poll::Ready(())
+                })));
+            None
+        }
+        unsafe extern "C" fn delete_observer(data: *mut std::ffi::c_void) {
+            drop(unsafe { Box::from_raw(data.cast::<Observe>()) });
+        }
+        struct NotifyTwice {
+            thread: std::thread::ThreadId,
+            store: WeakStoreRef,
+            callback: Function,
+            wakes: std::sync::atomic::AtomicUsize,
+        }
+        impl std::task::Wake for NotifyTwice {
+            fn wake(self: std::sync::Arc<Self>) {
+                self.wake_by_ref();
+            }
+            fn wake_by_ref(self: &std::sync::Arc<Self>) {
+                assert_eq!(self.thread, std::thread::current().id());
+                match self.wakes.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                    0 => {
+                        let store = self.store.upgrade().unwrap();
+                        let values = store
+                            .with_mut(|store| self.callback.call(store, &[]))
+                            .unwrap()
+                            .unwrap();
+                        assert!(values.is_empty());
+                        panic!("first publication notify error");
+                    }
+                    1 => panic!("followup re-admission notify error"),
+                    _ => panic!("notification unexpectedly replayed"),
+                }
+            }
+        }
+        let store = StoreRef::new(Store::default()).unwrap();
+        let owner = store.cleanup_owner().unwrap();
+        let state = store
+            .register_retirement(
+                Rc::new(std::cell::Cell::new(true)),
+                RetirementFailure::default(),
+            )
+            .unwrap();
+        store.retain_delivery(state.clone()).unwrap();
+        let first = Rc::new(RefCell::new(None));
+        let claims = Rc::new(std::cell::Cell::new(0));
+        let data = Box::into_raw(Box::new(Observe {
+            state: state.clone(),
+            owner: owner.clone(),
+            first: first.clone(),
+            claims: claims.clone(),
+        }));
+        let mut public = wasm_store_t {
+            inner: store.clone(),
+        };
+        let ty = wasm_functype_t::new(wasmer_api::FunctionType::new([], []));
+        let function = unsafe {
+            wasm_func_new_with_env(
+                Some(&mut public),
+                Some(&ty),
+                Some(enqueue_observer),
+                data.cast(),
+                Some(delete_observer),
+            )
+        }
+        .unwrap();
+        let wake = std::sync::Arc::new(NotifyTwice {
+            thread: std::thread::current().id(),
+            store: store.downgrade(),
+            callback: function.extern_.function(),
+            wakes: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let waker = std::task::Waker::from(wake.clone());
+        assert!(
+            owner
+                .poll_idle(&mut std::task::Context::from_waker(&waker))
+                .is_pending()
+        );
+        let release = store.retirement_release(state.clone()).unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| release.release()));
+        assert!(
+            result.is_ok(),
+            "both notification errors remain owned values, never escaped detached-task panics"
+        );
+        assert_eq!(
+            claims.get(),
+            1,
+            "actual reentrant consumer acknowledged the first value during retain/notify"
+        );
+        assert_eq!(
+            first.borrow().as_ref().unwrap().downcast_ref::<&str>(),
+            Some(&"first publication notify error")
+        );
+        assert_eq!(
+            state.failure.inspect_message().as_deref(),
+            Some("followup re-admission notify error")
+        );
+        assert!(!state.publishing.get());
+        assert!(!state.delivery_ack.get());
+        assert!(
+            state.receipt_queued.get(),
+            "followup error needs a rechecked, owned delivery receipt"
+        );
+        assert_eq!(
+            store.retirement_states_for_test().len(),
+            1,
+            "the SAME enrollment survives the entire fallible re-admission"
+        );
+        let sibling = store
+            .with_mut(|store| Function::new_typed(store, || 42i32))
+            .unwrap();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            store.call(&sibling, Vec::new())
+        }))
+        .unwrap_err();
+        assert_eq!(
+            panic.downcast_ref::<&str>(),
+            Some(&"followup re-admission notify error")
+        );
+        assert_eq!(store.call(&sibling, Vec::new()).unwrap()[0].i32(), Some(42));
+        assert!(store.retirement_states_for_test().is_empty());
+        assert_eq!(wake.wakes.load(std::sync::atomic::Ordering::SeqCst), 2);
+        // The first observation remains intact; the later error was delivered
+        // at the NEXT boundary, never retroactively substituted or replayed.
+        assert_eq!(
+            first.borrow().as_ref().unwrap().downcast_ref::<&str>(),
+            Some(&"first publication notify error")
+        );
     }
 
     #[cfg(feature = "wasi")]
