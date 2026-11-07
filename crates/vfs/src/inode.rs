@@ -289,15 +289,11 @@ impl Drop for Inode {
 }
 
 impl Superblock {
-    /// The VFS inode for `node` (`iget`): the live one with its inode number, else a new one.
-    pub(crate) fn iget(self: &Arc<Self>, node: Arc<dyn Node>) -> Arc<Inode> {
-        let ino = node.ino();
-        let mut inodes = self.inodes.lock().unwrap();
-        if let Some(inode) = inodes.get(&ino).and_then(Weak::upgrade) {
-            return inode;
-        }
+    /// A provisional inode for a genuine opened capability, before policy approval. It is
+    /// not entered in the canonical cache and must never wrap a name observation.
+    pub(crate) fn uncached_inode(self: &Arc<Self>, node: Arc<dyn Node>) -> Arc<Inode> {
         let sealable = self.info.magic == TMPFS_MAGIC && node.file_type() == FileType::Regular;
-        let inode = Arc::new(Inode {
+        Arc::new(Inode {
             node,
             sb: self.clone(),
             lock: Arc::default(),
@@ -307,7 +303,17 @@ impl Superblock {
             mmap_writable: AtomicI32::new(0),
             writecount: AtomicI32::new(0),
             readcount: AtomicI32::new(0),
-        });
+        })
+    }
+
+    /// The VFS inode for `node` (`iget`): the live one with its inode number, else a new one.
+    pub(crate) fn iget(self: &Arc<Self>, node: Arc<dyn Node>) -> Arc<Inode> {
+        let ino = node.ino();
+        let mut inodes = self.inodes.lock().unwrap();
+        if let Some(inode) = inodes.get(&ino).and_then(Weak::upgrade) {
+            return inode;
+        }
+        let inode = self.uncached_inode(node);
         inodes.insert(ino, Arc::downgrade(&inode));
         inode
     }

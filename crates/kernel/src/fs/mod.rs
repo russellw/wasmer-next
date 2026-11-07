@@ -360,6 +360,36 @@ impl Kernel {
             .map_err(|error| env.error(error))
     }
 
+    /// Pathname-only consumers can use a terminal observation. Empty descriptor paths
+    /// retain their existing pinned object semantics.
+    pub(crate) async fn resolve_entry_at(
+        &self,
+        caller: &Caller<'_>,
+        env: &Env,
+        dfd: Fd,
+        path: &[u8],
+        flags: AtFlags,
+        follow_default: bool,
+    ) -> SysResult<wasixv2_vfs::ResolvedEntry> {
+        let empty = flags.contains(AtFlags::AT_EMPTY_PATH);
+        if path.is_empty() && empty {
+            return self
+                .start_or_fd(caller, env, dfd)
+                .map(wasixv2_vfs::ResolvedEntry::Pinned)
+                .map_err(Into::into);
+        }
+        let start = self.start(caller, env, dfd, path)?;
+        let lookup = LookupFlags {
+            follow: follow_default && !flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW),
+            empty,
+            ..LookupFlags::default()
+        };
+        self.vfs
+            .lookup_entry(&env.cx(), &start, path, lookup)
+            .await
+            .map_err(|error| env.error(error))
+    }
+
     /// `dfd` itself, for an empty path or a walk rooted there: the working directory for
     /// `AT_FDCWD`.
     fn start_or_fd(&self, caller: &Caller<'_>, env: &Env, dfd: Fd) -> Result<Path, Errno> {

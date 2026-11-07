@@ -5,6 +5,10 @@
 //! order. A non-directory hides everything below it, directories with the same name merge until
 //! one is opaque, and a whiteout hides the name in every layer below. Changing anything that only
 //! exists in a lower layer first copies it, and every directory above it, up to the upper layer.
+//! Selection requires genuine layer capabilities and readable private metadata. Operation-scoped
+//! name observations cannot establish whiteout, protection or opacity state, so those entries
+//! fail with `EACCES` instead of exposing a guessed composition. Metadata inspection errors
+//! propagate; definitive absence and a driver without xattr support remain distinct negatives.
 //!
 //! On-disk format, compatible with Linux's for a host upper directory:
 //! - A whiteout is a 0/0 character device. Where the upper driver cannot create one (a host
@@ -33,8 +37,8 @@ use futures::lock::Mutex as AsyncMutex;
 use wasixv2_abi::{Errno, FsInodeFlags as Fl, FsXflags as X};
 use wasixv2_vfs::{
     AllocMode, Attr, Device, DirEntry, DirSink, FileKattr, FileType, Filesystem, FsInfo, FsResult,
-    Handle, NewKind, NewNode, Node, OpenOptions, RenameMode, SeekHole, SetAttr, SharedContents,
-    StatFs, TimeSet, XattrSet,
+    Handle, LookupEntry, NewKind, NewNode, Node, OpenOptions, RenameMode, SeekHole, SetAttr,
+    SharedContents, StatFs, TimeSet, XattrSet,
 };
 
 /// `OVERLAYFS_SUPER_MAGIC`.
@@ -395,19 +399,20 @@ impl OverlayNode {
 
     /// Upper protection xattrs are loaded before the VFS checks inode flags (it obtains
     /// getattr first). The root is created synchronously, so it shares this lazy path.
-    async fn load_protattr(&self) {
+    async fn load_protattr(&self) -> FsResult<()> {
         if self.protattr_loaded.load(Ordering::Acquire) {
-            return;
+            return Ok(());
         }
         let _copy = self.copy_lock.lock().await;
         if !self.protattr_loaded.load(Ordering::Relaxed) {
             let flags = match self.upper_node() {
-                Some(upper) => read_protattr(&upper).await,
+                Some(upper) => read_protattr(&upper).await?,
                 None => 0,
             };
             self.protattr.store(flags, Ordering::Release);
             self.protattr_loaded.store(true, Ordering::Release);
         }
+        Ok(())
     }
 
     fn is_dir(&self) -> bool {
@@ -462,7 +467,7 @@ impl OverlayNode {
     async fn find(&self, name: &[u8]) -> FsResult<Vec<Real>> {
         let mut found: Vec<Real> = Vec::new();
         for dir in self.layers() {
-            let child = match dir.node.lookup(name).await {
+            let child = match pinned_entry(&dir.node, name).await {
                 Ok(child) => child,
                 Err(Errno::ENOENT | Errno::ENAMETOOLONG) => continue,
                 Err(err) => return Err(err),
@@ -475,7 +480,7 @@ impl OverlayNode {
                 break;
             }
             let (opaque, xwhiteouts) = match is_dir {
-                true => dir_flags(&child).await,
+                true => dir_flags(&child).await?,
                 false => (false, false),
             };
             found.push(Real {
@@ -494,7 +499,7 @@ impl OverlayNode {
     async fn lower_positive(&self, name: &[u8]) -> FsResult<bool> {
         let lowers = self.state.lock().unwrap().lowers.clone();
         for dir in lowers {
-            match dir.node.lookup(name).await {
+            match pinned_entry(&dir.node, name).await {
                 Ok(child) => return Ok(!is_whiteout(&child, dir.xwhiteouts).await?),
                 Err(Errno::ENOENT | Errno::ENAMETOOLONG) => {}
                 Err(err) => return Err(err),
@@ -517,7 +522,9 @@ impl OverlayNode {
                 let maybe_whiteout = file_type == FileType::CharDevice
                     || (file_type == FileType::Regular && dir.xwhiteouts);
                 if maybe_whiteout {
-                    match dir.node.lookup(&name).await {
+                    // Only marker classification requires an extra inode capability;
+                    // ordinary listing entries do not authorize access or mutation.
+                    match pinned_entry(&dir.node, &name).await {
                         Ok(child) if is_whiteout(&child, dir.xwhiteouts).await? => continue,
                         Ok(_) => {}
                         Err(Errno::ENOENT) => continue,
@@ -702,7 +709,7 @@ impl OverlayNode {
         let upper = copy.node;
         // Preserve lower protections in the live overlay inode, including Linux's
         // best-effort case when upper cannot store overlay.protattr.
-        let protection = self.inode_flags() & PROT_FLAGS | read_protattr(&upper).await;
+        let protection = self.inode_flags() & PROT_FLAGS | read_protattr(&upper).await?;
         self.protattr.store(protection, Ordering::Release);
         self.protattr_loaded.store(true, Ordering::Release);
         let (parent, name, unlinked) = {
@@ -820,7 +827,7 @@ impl OverlayNode {
     /// Removes a whiteout at `name` in upper directory `upper`; whether there was one.
     async fn clear_whiteout(&self, upper: &Arc<dyn Node>, name: &[u8]) -> FsResult<bool> {
         let xwhiteouts = self.upper().is_some_and(|real| real.xwhiteouts);
-        match upper.lookup(name).await {
+        match pinned_entry(upper, name).await {
             Ok(child) if is_whiteout(&child, xwhiteouts).await? => {
                 upper.unlink(name).await?;
                 Ok(true)
@@ -838,7 +845,7 @@ impl OverlayNode {
             return Ok(());
         };
         for (name, _, _) in read_all(&upper.node).await? {
-            let child = upper.node.lookup(&name).await?;
+            let child = pinned_entry(&upper.node, &name).await?;
             if !is_whiteout(&child, upper.xwhiteouts).await? {
                 return Err(Errno::ENOTEMPTY);
             }
@@ -932,7 +939,7 @@ impl Node for OverlayNode {
     }
 
     async fn getattr(&self) -> FsResult<Attr> {
-        self.load_protattr().await;
+        self.load_protattr().await?;
         let attr = self.real().getattr().await?;
         Ok(self.fix_attr(attr))
     }
@@ -1016,8 +1023,8 @@ impl Node for OverlayNode {
         if top.node.file_type() == FileType::Directory {
             return Err(Errno::EISDIR);
         }
-        let upper = self.arc().copy_up().await?;
         let positive = self.lower_positive(name).await?;
+        let upper = self.arc().copy_up().await?;
         match (top.layer == UPPER, positive) {
             (true, true) => {
                 let temp = self.prepare_whiteout(&upper).await?;
@@ -1048,8 +1055,8 @@ impl Node for OverlayNode {
         if !child.merged_entries().await?.is_empty() {
             return Err(Errno::ENOTEMPTY);
         }
-        let upper = self.arc().copy_up().await?;
         let positive = self.lower_positive(name).await?;
+        let upper = self.arc().copy_up().await?;
         if !in_upper {
             return match positive {
                 true => self.make_whiteout(&upper, name).await,
@@ -1125,6 +1132,9 @@ impl Node for OverlayNode {
                 }
             }
         }
+        // Resolve lower presence before copy-up or whiteout cleanup can change upper.
+        let source_positive = old_parent.lower_positive(name).await?;
+        let target_positive = new_parent.lower_positive(new_name).await?;
         let source_upper = source.copy_up().await?;
         let old_upper = old_parent.copy_up().await?;
         let new_upper = new_parent.copy_up().await?;
@@ -1142,8 +1152,6 @@ impl Node for OverlayNode {
             }
             Some(_) => {}
         }
-        let source_positive = old_parent.lower_positive(name).await?;
-        let target_positive = new_parent.lower_positive(new_name).await?;
         // The whiteout the source leaves exists before the source moves.
         let temp = match source_positive && mode != RenameMode::Exchange {
             true => Some(old_parent.prepare_whiteout(&old_upper).await?),
@@ -1217,7 +1225,7 @@ impl Node for OverlayNode {
     }
 
     async fn fileattr_get(&self) -> FsResult<FileKattr> {
-        self.load_protattr().await;
+        self.load_protattr().await?;
         let mut fa = self.real().fileattr_get().await?;
         let protection = FileKattr::from_flags(self.protattr.load(Ordering::Acquire));
         fa.flags |= protection.flags;
@@ -1371,22 +1379,22 @@ const COPY_XFLAGS: u32 = X::FS_XFLAG_SYNC.0 | X::FS_XFLAG_NOATIME.0;
 const PROT_FLAGS: u32 = Fl::FS_APPEND_FL.0 | Fl::FS_IMMUTABLE_FL.0;
 const PROT_XFLAGS: u32 = X::FS_XFLAG_APPEND.0 | X::FS_XFLAG_IMMUTABLE.0;
 
-async fn read_protattr(upper: &Arc<dyn Node>) -> u32 {
-    let Some(value) = get_overlay_xattr(upper, b"protattr").await else {
-        return 0;
+async fn read_protattr(upper: &Arc<dyn Node>) -> FsResult<u32> {
+    let PrivateXattr::Present(value) = get_overlay_xattr(upper, b"protattr").await? else {
+        return Ok(0);
     };
     if value.is_empty() || value.len() > 32 {
-        return 0;
+        return Ok(0);
     }
     let mut flags = 0;
     for byte in value {
         flags |= match byte {
             b'a' => Fl::FS_APPEND_FL.0,
             b'i' => Fl::FS_IMMUTABLE_FL.0,
-            _ => return 0,
+            _ => return Ok(0),
         };
     }
-    flags
+    Ok(flags)
 }
 
 /// fs/overlayfs/util.c: ovl_set_protattr stores protection without making upper
@@ -1412,11 +1420,13 @@ async fn set_protattr(upper: &Arc<dyn Node>, flags: u32) -> FsResult<()> {
     }
     for prefix in XATTR_PREFIXES {
         let name = [prefix, b"protattr"].concat();
-        if upper.getxattr(&name).await.is_ok() {
-            match upper.removexattr(&name).await {
+        match upper.getxattr(&name).await {
+            Ok(_) => match upper.removexattr(&name).await {
                 Ok(()) | Err(Errno::EOPNOTSUPP | Errno::ENODATA) => {}
                 Err(err) => return Err(err),
-            }
+            },
+            Err(Errno::ENODATA | Errno::EOPNOTSUPP) => {}
+            Err(err) => return Err(err),
         }
     }
     Ok(())
@@ -1452,13 +1462,36 @@ fn is_private(name: &[u8]) -> bool {
     XATTR_PREFIXES.iter().any(|prefix| name.starts_with(prefix))
 }
 
-async fn get_overlay_xattr(node: &Arc<dyn Node>, suffix: &[u8]) -> Option<Vec<u8>> {
+/// Private format inspection needs an actual layer capability. A name observation
+/// supplies neither xattrs nor proof that a marker/protection/opacity xattr is absent.
+async fn pinned_entry(directory: &Arc<dyn Node>, name: &[u8]) -> FsResult<Arc<dyn Node>> {
+    match directory.lookup_entry(name).await? {
+        LookupEntry::Pinned(node) => Ok(node),
+        LookupEntry::Observation(_) => Err(Errno::EACCES),
+    }
+}
+
+enum PrivateXattr {
+    Present(Vec<u8>),
+    Absent,
+    Unsupported,
+}
+
+async fn get_overlay_xattr(node: &Arc<dyn Node>, suffix: &[u8]) -> FsResult<PrivateXattr> {
+    let mut unsupported = true;
     for prefix in XATTR_PREFIXES {
-        if let Ok(value) = node.getxattr(&[prefix, suffix].concat()).await {
-            return Some(value);
+        match node.getxattr(&[prefix, suffix].concat()).await {
+            Ok(value) => return Ok(PrivateXattr::Present(value)),
+            Err(Errno::ENODATA) => unsupported = false,
+            Err(Errno::EOPNOTSUPP) => {}
+            Err(error) => return Err(error),
         }
     }
-    None
+    Ok(if unsupported {
+        PrivateXattr::Unsupported
+    } else {
+        PrivateXattr::Absent
+    })
 }
 
 /// Sets `overlay.<suffix>`: trusted if allowed, else user.
@@ -1477,19 +1510,23 @@ async fn set_overlay_xattr(node: &Arc<dyn Node>, suffix: &[u8], value: &[u8]) ->
 }
 
 /// `(opaque, may hold xattr whiteouts)` of a real directory.
-async fn dir_flags(dir: &Arc<dyn Node>) -> (bool, bool) {
-    match get_overlay_xattr(dir, OPAQUE).await.as_deref() {
-        Some(b"y") => (true, false),
-        Some(b"x") => (false, true),
+async fn dir_flags(dir: &Arc<dyn Node>) -> FsResult<(bool, bool)> {
+    Ok(match get_overlay_xattr(dir, OPAQUE).await? {
+        PrivateXattr::Present(value) if value == b"y" => (true, false),
+        PrivateXattr::Present(value) if value == b"x" => (false, true),
         _ => (false, false),
-    }
+    })
 }
 
 async fn is_whiteout(node: &Arc<dyn Node>, xwhiteouts: bool) -> FsResult<bool> {
     Ok(match node.file_type() {
         FileType::CharDevice => node.getattr().await?.rdev == Device::default(),
         FileType::Regular if xwhiteouts => {
-            node.getattr().await?.size == 0 && get_overlay_xattr(node, WHITEOUT).await.is_some()
+            node.getattr().await?.size == 0
+                && matches!(
+                    get_overlay_xattr(node, WHITEOUT).await?,
+                    PrivateXattr::Present(_)
+                )
         }
         _ => false,
     })

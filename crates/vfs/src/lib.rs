@@ -39,8 +39,8 @@ pub use cred::{
 };
 pub use dentry::Dentry;
 pub use driver::{
-    AppendOutcome, Filesystem, Handle, Link, MAX_DIR_COOKIE, NamespaceComponent, Node,
-    SharedContents,
+    AppendOutcome, Filesystem, Handle, Link, LookupEntry, MAX_DIR_COOKIE, NamespaceComponent, Node,
+    ObservedAttr, SharedContents,
 };
 pub use export::{HandleKind, MAX_HANDLE_SZ};
 pub use file::{DIR_POS_EOD, File, FileWriteGuard};
@@ -54,7 +54,7 @@ pub use locks::{
 };
 pub use mount::{MNT_UNIQUE_ID_OFFSET, MntNs, Mount, MountFlags, Path, Superblock};
 use mount::{Tree, TreeSeq};
-pub use namei::{Last, LookupFlags, MAX_SYMLINKS};
+pub use namei::{Last, LookupFlags, MAX_SYMLINKS, NameObservation, ResolvedEntry};
 pub use namespace::{MountAttr, MountInfo, MountOp, UmountFlags};
 pub use notify::{EventInfo, FsEvent, FsWatcher, MountEvent, Object as FsObject, Perm, PermAnswer};
 pub use ops::{Ctx, FMODE_EXEC, OpenHow, XATTR_NAME_MAX, XATTR_SIZE_MAX};
@@ -64,7 +64,7 @@ pub use posix_acl::{
 };
 pub use quota::QuotaOps;
 pub use seals::WRITE_SEALS;
-pub use security::Security;
+pub use security::{NameView, Security};
 use sync::MutexExt;
 pub use types::*;
 pub use wasixv2_abi::Errno;

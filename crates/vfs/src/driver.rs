@@ -137,6 +137,28 @@ pub enum NamespaceComponent {
     Fallback(Arc<crate::Dentry>),
 }
 
+/// A single lookup result. An observation is a one-operation attribute sample in the
+/// directory on which lookup was called; it is never an inode capability or a cache key.
+pub enum LookupEntry {
+    Pinned(Arc<dyn Node>),
+    Observation(ObservedAttr),
+}
+
+/// Permission-relevant metadata sampled without retaining the object.
+pub struct ObservedAttr {
+    pub attr: Attr,
+    pub inode_flags: u32,
+}
+
+impl From<Attr> for ObservedAttr {
+    fn from(attr: Attr) -> Self {
+        Self {
+            attr,
+            inode_flags: 0,
+        }
+    }
+}
+
 /// A filesystem object (Linux's `inode` plus its `inode_operations`).
 ///
 /// Directory methods default to `ENOTDIR` and are only called on directories; names are single
@@ -264,6 +286,43 @@ pub trait Node: Send + Sync + Any {
     /// The entry `name`; `ENOENT` if there is none.
     async fn lookup(&self, _name: &[u8]) -> FsResult<Arc<dyn Node>> {
         Err(Errno::ENOTDIR)
+    }
+
+    /// Metadata lookup without requiring an inode capability. The observation variant is
+    /// bound to this directory and this single name for the caller's current operation.
+    async fn lookup_entry(&self, name: &[u8]) -> FsResult<LookupEntry> {
+        self.lookup(name).await.map(LookupEntry::Pinned)
+    }
+
+    /// Permission check on a current-name sample; no inode identity or authorization cache
+    /// is created. Drivers observing ACL-bearing objects must implement their ACL policy.
+    async fn check_entry_permission(
+        &self,
+        _name: &[u8],
+        cred: &Cred,
+        _task: u32,
+        attr: &Attr,
+        mask: u32,
+    ) -> FsResult<()> {
+        crate::generic_permission(cred, attr, mask)
+    }
+
+    /// Acquires a persistent directory search capability, separate from directory reading.
+    async fn lookup_search(&self, name: &[u8]) -> FsResult<Arc<dyn Node>> {
+        self.lookup(name).await
+    }
+
+    /// Opens an existing entry relative to this directory. The returned node must describe
+    /// the object actually opened by the handle. Do not truncate, perform data I/O or assume
+    /// an earlier observation proved identity: the VFS validates this grant before use.
+    async fn open_existing(
+        &self,
+        name: &[u8],
+        options: OpenOptions,
+    ) -> FsResult<(Arc<dyn Node>, Box<dyn Handle>)> {
+        let node = self.lookup(name).await?;
+        let handle = node.open(options).await?;
+        Ok((node, handle))
     }
 
     /// Adds a new object under `name`; `EEXIST` if the name is taken.
@@ -394,6 +453,13 @@ pub trait Handle: Send + Sync {
     /// Compatibility drivers may use their open-time length for an append open.
     fn initial_position(&self, _append: bool) -> u64 {
         0
+    }
+
+    /// Completes a parent-relative grant after actual-object guest/mount/security checks,
+    /// inode accounting and leases, before user I/O. Overlays may now copy up; acquisition itself must
+    /// not read data or mutate it. Existing handles need no second phase.
+    async fn prepare_open(&self) -> FsResult<()> {
+        Ok(())
     }
 
     /// Some filesystems query userspace before the synchronous readiness sample.

@@ -555,3 +555,518 @@ fn persisted_file_protection_blocks_link_before_any_getattr() {
         );
     }
 }
+
+/// A layer whose ordinary lookup can retain objects, but whose entry API explicitly
+/// reports selected names as observations. Overlay must not bypass that distinction.
+struct InspectLayer {
+    backing: Arc<dyn Filesystem>,
+    state: Arc<Inspection>,
+}
+#[derive(Default)]
+struct Inspection {
+    observed: Mutex<HashSet<Vec<u8>>>,
+    fault_names: Mutex<HashSet<Vec<u8>>>,
+    fault: Mutex<Option<Errno>>,
+    fault_trusted_only: AtomicBool,
+    acquisitions: std::sync::atomic::AtomicUsize,
+}
+struct InspectNode {
+    inner: Arc<dyn Node>,
+    name: Vec<u8>,
+    state: Arc<Inspection>,
+}
+impl InspectLayer {
+    fn new(backing: Arc<dyn Filesystem>, names: &[&[u8]]) -> Arc<Self> {
+        let state = Arc::new(Inspection::default());
+        state
+            .observed
+            .lock()
+            .unwrap()
+            .extend(names.iter().map(|name| name.to_vec()));
+        Arc::new(Self { backing, state })
+    }
+    fn wrap(&self, inner: Arc<dyn Node>, name: &[u8]) -> Arc<dyn Node> {
+        Arc::new(InspectNode {
+            inner,
+            name: name.to_vec(),
+            state: self.state.clone(),
+        })
+    }
+}
+#[async_trait(?Send)]
+impl Filesystem for InspectLayer {
+    fn info(&self) -> FsInfo {
+        self.backing.info()
+    }
+    fn root(&self) -> Arc<dyn Node> {
+        self.wrap(self.backing.root(), b"/")
+    }
+    async fn statfs(&self) -> FsResult<StatFs> {
+        self.backing.statfs().await
+    }
+}
+impl InspectNode {
+    fn wrap(&self, inner: Arc<dyn Node>, name: &[u8]) -> Arc<dyn Node> {
+        Arc::new(Self {
+            inner,
+            name: name.to_vec(),
+            state: self.state.clone(),
+        })
+    }
+}
+#[async_trait(?Send)]
+impl Node for InspectNode {
+    fn ino(&self) -> u64 {
+        self.inner.ino()
+    }
+    fn file_type(&self) -> FileType {
+        self.inner.file_type()
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    async fn getattr(&self) -> FsResult<Attr> {
+        self.inner.getattr().await
+    }
+    async fn setattr(&self, attr: &SetAttr) -> FsResult<Attr> {
+        self.inner.setattr(attr).await
+    }
+    async fn lookup(&self, name: &[u8]) -> FsResult<Arc<dyn Node>> {
+        Ok(self.wrap(self.inner.lookup(name).await?, name))
+    }
+    async fn lookup_entry(&self, name: &[u8]) -> FsResult<LookupEntry> {
+        let node = self.lookup(name).await?;
+        let observed = self.state.observed.lock().unwrap().contains(name);
+        if observed {
+            Ok(LookupEntry::Observation(node.getattr().await?.into()))
+        } else {
+            Ok(LookupEntry::Pinned(node))
+        }
+    }
+    async fn check_entry_permission(
+        &self,
+        _: &[u8],
+        _: &wasixv2_vfs::Cred,
+        _: u32,
+        _: &Attr,
+        _: u32,
+    ) -> FsResult<()> {
+        Err(Errno::EPERM)
+    }
+    async fn open_existing(
+        &self,
+        name: &[u8],
+        options: OpenOptions,
+    ) -> FsResult<(Arc<dyn Node>, Box<dyn Handle>)> {
+        self.state.acquisitions.fetch_add(1, Ordering::SeqCst);
+        let node = self.lookup(name).await?;
+        let handle = node.open(options).await?;
+        Ok((node, handle))
+    }
+    async fn open(&self, options: OpenOptions) -> FsResult<Box<dyn Handle>> {
+        self.inner.open(options).await
+    }
+    async fn getxattr(&self, name: &[u8]) -> FsResult<Vec<u8>> {
+        if (!self.state.fault_trusted_only.load(Ordering::SeqCst) || name.starts_with(b"trusted."))
+            && self.state.fault_names.lock().unwrap().contains(&self.name)
+            && let Some(error) = *self.state.fault.lock().unwrap()
+        {
+            return Err(error);
+        }
+        self.inner.getxattr(name).await
+    }
+}
+
+#[test]
+fn unknown_private_metadata_refuses_selection_existence_listing_and_mutations() {
+    use wasixv2_abi::OpenFlags;
+    use wasixv2_vfs::{Cred, Ctx, LookupFlags, OpenHow, Vfs};
+    let upper = mem();
+    let root = upper.root();
+    let marker = write(&root, b"marker", b"");
+    block_on(marker.setxattr(b"trusted.overlay.whiteout", b"y", XattrSet::Any)).unwrap();
+    let plain = write(&root, b"plain", b"");
+    let protected = write(&root, b"protected", b"data");
+    block_on(protected.setxattr(b"trusted.overlay.protattr", b"i", XattrSet::Any)).unwrap();
+    let append = write(&root, b"append", b"append");
+    block_on(append.setxattr(b"trusted.overlay.protattr", b"a", XattrSet::Any)).unwrap();
+    write(&root, b"source", b"source");
+    let layer = InspectLayer::new(
+        upper.clone(),
+        &[b"marker", b"plain", b"protected", b"append"],
+    );
+    let lower = mem();
+    write(&lower.root(), b"marker", b"must not leak");
+    let overlay = OverlayFs::new(Some(layer.clone()), vec![lower]);
+    let vfs = Vfs::new(overlay.clone());
+    let at = vfs.root();
+    let cred = Cred::root();
+    let cx = Ctx {
+        cred: &cred,
+        root: &at,
+        umask: 0,
+        task: 0,
+        leases: None,
+    };
+    for name in [b"marker".as_slice(), b"plain", b"protected", b"append"] {
+        assert_eq!(
+            block_on(vfs.lookup_entry(&cx, &at, name, LookupFlags::follow()))
+                .map_err(wasixv2_vfs::PathError::errno)
+                .err(),
+            Some(Errno::EACCES)
+        );
+        assert_eq!(
+            block_on(vfs.unlink(&cx, &at, name)).map_err(wasixv2_vfs::PathError::errno),
+            Err(Errno::EACCES)
+        );
+        let how = OpenHow {
+            flags: OpenFlags::O_WRONLY | OpenFlags::O_TRUNC,
+            mode: 0,
+            lookup: LookupFlags::follow(),
+        };
+        assert_eq!(
+            block_on(vfs.open(&cx, &at, name, &how))
+                .map_err(wasixv2_vfs::PathError::errno)
+                .err(),
+            Some(Errno::EACCES)
+        );
+        let exclusive = OpenHow {
+            flags: OpenFlags::O_WRONLY | OpenFlags::O_CREAT | OpenFlags::O_EXCL,
+            ..how
+        };
+        assert_eq!(
+            block_on(vfs.open(&cx, &at, name, &exclusive))
+                .map_err(wasixv2_vfs::PathError::errno)
+                .err(),
+            Some(Errno::EACCES)
+        );
+        assert_eq!(
+            block_on(vfs.rename(&cx, &at, b"source", &at, name, RenameMode::Replace))
+                .map_err(wasixv2_vfs::PathError::errno),
+            Err(Errno::EACCES)
+        );
+    }
+    let handle = block_on(overlay.root().open(OpenOptions::default())).unwrap();
+    let mut sink = Names(Vec::new(), usize::MAX);
+    assert_eq!(block_on(handle.readdir(0, &mut sink)), Err(Errno::EACCES));
+    assert!(sink.0.is_empty());
+    assert_eq!(layer.state.acquisitions.load(Ordering::SeqCst), 0);
+    assert!(
+        overlay
+            .as_ref()
+            .root()
+            .as_any()
+            .downcast_ref::<OverlayNode>()
+            .unwrap()
+            .shared
+            .nodes
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(read(&protected), b"data");
+    assert_eq!(read(&append), b"append");
+    assert_eq!(block_on(plain.getattr()).unwrap().size, 0);
+    assert!(block_on(root.lookup(b"marker")).is_ok());
+    assert_eq!(read(&block_on(root.lookup(b"source")).unwrap()), b"source");
+}
+
+#[test]
+fn observed_upper_directory_never_hides_unproved_lower_contents_or_opacity() {
+    for (nonempty, opaque) in [(false, false), (true, false), (true, true)] {
+        let upper = mem();
+        let upper_dir = mkdir(&upper.root(), b"d");
+        if opaque {
+            block_on(upper_dir.setxattr(b"trusted.overlay.opaque", b"y", XattrSet::Any)).unwrap();
+        }
+        let lower = mem();
+        let lower_dir = mkdir(&lower.root(), b"d");
+        if nonempty {
+            write(&lower_dir, b"child", b"lower");
+        }
+        let layer = InspectLayer::new(upper.clone(), &[b"d"]);
+        let overlay = OverlayFs::new(Some(layer), vec![lower]);
+        assert_eq!(block_on(overlay.root().rmdir(b"d")), Err(Errno::EACCES));
+        assert_eq!(
+            block_on(overlay.root().lookup_search(b"d")).err(),
+            Some(Errno::EACCES)
+        );
+        assert!(block_on(upper.root().lookup(b"d")).is_ok());
+        if nonempty {
+            assert_eq!(
+                read(&block_on(lower_dir.lookup(b"child")).unwrap()),
+                b"lower"
+            );
+        }
+    }
+}
+
+#[test]
+fn mixed_observed_directory_rename_refuses_replace_and_exchange_before_copy_up() {
+    for mode in [RenameMode::Replace, RenameMode::Exchange] {
+        for source_directory in [false, true] {
+            let upper = mem();
+            if source_directory {
+                mkdir(&upper.root(), b"source");
+            } else {
+                write(&upper.root(), b"source", b"source");
+            }
+            let lower = mem();
+            let target = mkdir(&lower.root(), b"target");
+            write(&target, b"child", b"lower");
+            let lower_layer = InspectLayer::new(lower.clone(), &[b"target"]);
+            let overlay = OverlayFs::new(Some(upper.clone()), vec![lower_layer]);
+            let root = overlay.root();
+            assert_eq!(
+                block_on(root.rename(b"source", &root, b"target", mode)),
+                Err(Errno::EACCES)
+            );
+            assert!(block_on(upper.root().lookup(b"source")).is_ok());
+            assert_eq!(
+                block_on(upper.root().lookup(b"target")).err(),
+                Some(Errno::ENOENT)
+            );
+            assert_eq!(read(&block_on(target.lookup(b"child")).unwrap()), b"lower");
+        }
+    }
+}
+
+#[test]
+fn unknown_acquisition_never_publishes_a_partial_directory_composition() {
+    let upper = mem();
+    let upper_dir = mkdir(&upper.root(), b"d");
+    write(&upper_dir, b"upper", b"upper");
+    let lower = mem();
+    let lower_dir = mkdir(&lower.root(), b"d");
+    write(&lower_dir, b"lower", b"lower");
+    let layer = InspectLayer::new(upper, &[b"d"]);
+    let overlay = OverlayFs::new(Some(layer.clone()), vec![lower]);
+    let root = overlay.root();
+    assert_eq!(
+        block_on(root.open_existing(
+            b"d",
+            OpenOptions {
+                read: true,
+                ..Default::default()
+            }
+        ))
+        .err(),
+        Some(Errno::EACCES)
+    );
+    assert_eq!(layer.state.acquisitions.load(Ordering::SeqCst), 0);
+    assert!(
+        root.as_any()
+            .downcast_ref::<OverlayNode>()
+            .unwrap()
+            .shared
+            .nodes
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
+    layer.state.observed.lock().unwrap().clear();
+    let directory = lookup(&root, b"d").unwrap();
+    assert_eq!(list(&directory), vec![b"lower".to_vec(), b"upper".to_vec()]);
+    assert_eq!(read(&lookup(&directory, b"lower").unwrap()), b"lower");
+}
+
+#[test]
+fn unknown_lower_directory_after_a_pinned_upper_is_not_silently_omitted() {
+    let upper = mem();
+    mkdir(&upper.root(), b"d");
+    let lower = mem();
+    mkdir(&lower.root(), b"d");
+    let layer = InspectLayer::new(lower, &[b"d"]);
+    let overlay = OverlayFs::new(Some(upper), vec![layer]);
+    assert_eq!(lookup(&overlay.root(), b"d").err(), Some(Errno::EACCES));
+}
+
+#[test]
+fn private_metadata_errors_propagate_and_protection_loading_can_retry() {
+    for error in [Errno::EACCES, Errno::EPERM, Errno::EIO] {
+        let upper = mem();
+        let file = write(&upper.root(), b"protected", b"data");
+        block_on(file.setxattr(b"user.overlay.protattr", b"i", XattrSet::Any)).unwrap();
+        let layer = InspectLayer::new(upper, &[]);
+        layer.state.fault_trusted_only.store(true, Ordering::SeqCst);
+        layer
+            .state
+            .fault_names
+            .lock()
+            .unwrap()
+            .insert(b"protected".to_vec());
+        *layer.state.fault.lock().unwrap() = Some(error);
+        let overlay = OverlayFs::new(Some(layer.clone()), vec![]);
+        let node = lookup(&overlay.root(), b"protected").unwrap();
+        assert_eq!(block_on(node.getattr()).err(), Some(error));
+        let inode = node.as_any().downcast_ref::<OverlayNode>().unwrap();
+        assert!(!inode.protattr_loaded.load(Ordering::Acquire));
+        assert_eq!(inode.protattr.load(Ordering::Acquire), 0);
+        *layer.state.fault.lock().unwrap() = None;
+        assert!(block_on(node.getattr()).is_ok());
+        assert_ne!(node.inode_flags() & PROT_FLAGS, 0);
+    }
+}
+
+#[test]
+fn private_marker_and_opacity_errors_never_become_absence_or_lower_fallback() {
+    for error in [Errno::EACCES, Errno::EPERM, Errno::EIO] {
+        for directory in [false, true] {
+            let upper = mem();
+            if directory {
+                mkdir(&upper.root(), b"d");
+            } else {
+                write(&upper.root(), b"d", b"");
+            }
+            let lower = mem();
+            write(&lower.root(), b"d", b"hidden");
+            let layer = InspectLayer::new(upper.clone(), &[]);
+            layer
+                .state
+                .fault_names
+                .lock()
+                .unwrap()
+                .insert(b"d".to_vec());
+            *layer.state.fault.lock().unwrap() = Some(error);
+            let overlay = OverlayFs::new(Some(layer), vec![lower]);
+            assert_eq!(lookup(&overlay.root(), b"d").err(), Some(error));
+            assert_eq!(block_on(overlay.root().unlink(b"d")), Err(error));
+            assert!(block_on(upper.root().lookup(b"d")).is_ok());
+        }
+    }
+}
+
+#[test]
+fn definitive_absence_and_no_xattr_facility_remain_distinct_supported_results() {
+    for error in [Errno::ENODATA, Errno::EOPNOTSUPP] {
+        let upper = mem();
+        let directory = mkdir(&upper.root(), b"d");
+        write(&directory, b"file", b"data");
+        let layer = InspectLayer::new(upper, &[]);
+        layer
+            .state
+            .fault_names
+            .lock()
+            .unwrap()
+            .insert(b"d".to_vec());
+        *layer.state.fault.lock().unwrap() = Some(error);
+        let node = block_on(layer.root().lookup(b"d")).unwrap();
+        let value = block_on(get_overlay_xattr(&node, OPAQUE)).unwrap();
+        assert!(match error {
+            Errno::ENODATA => matches!(value, PrivateXattr::Absent),
+            _ => matches!(value, PrivateXattr::Unsupported),
+        });
+        let overlay = OverlayFs::new(Some(layer), vec![]);
+        assert_eq!(
+            read(&lookup(&lookup(&overlay.root(), b"d").unwrap(), b"file").unwrap()),
+            b"data"
+        );
+    }
+}
+
+#[test]
+fn unknown_lower_presence_and_whiteout_cleanup_fail_before_namespace_mutation() {
+    let upper = mem();
+    write(&upper.root(), b"f", b"upper");
+    let lower = mem();
+    write(&lower.root(), b"f", b"lower");
+    let observed_lower = InspectLayer::new(lower.clone(), &[b"f"]);
+    let overlay = OverlayFs::new(Some(upper.clone()), vec![observed_lower]);
+    assert_eq!(block_on(overlay.root().unlink(b"f")), Err(Errno::EACCES));
+    assert_eq!(read(&lookup(&upper.root(), b"f").unwrap()), b"upper");
+    assert_eq!(read(&lookup(&lower.root(), b"f").unwrap()), b"lower");
+
+    let upper = mem();
+    let marker = write(&upper.root(), b"marker", b"");
+    block_on(marker.setxattr(b"trusted.overlay.whiteout", b"y", XattrSet::Any)).unwrap();
+    let observed_upper = InspectLayer::new(upper.clone(), &[b"marker"]);
+    let overlay = OverlayFs::new(Some(observed_upper), vec![]);
+    let root = overlay.root();
+    let node = root.as_any().downcast_ref::<OverlayNode>().unwrap();
+    let native = node.upper_node().unwrap();
+    assert_eq!(
+        block_on(node.clear_whiteout(&native, b"marker")),
+        Err(Errno::EACCES)
+    );
+    assert_eq!(block_on(node.clear_upper_whiteouts()), Err(Errno::EACCES));
+    assert!(lookup(&upper.root(), b"marker").is_ok());
+}
+
+#[test]
+fn rename_preflights_unknown_lower_before_copy_up_or_destination_whiteout_removal() {
+    for whiteout_target in [false, true] {
+        let upper = mem();
+        let lower = mem();
+        if whiteout_target {
+            write(&upper.root(), b"source", b"source");
+            let marker = write(&upper.root(), b"target", b"");
+            block_on(marker.setxattr(b"trusted.overlay.whiteout", b"y", XattrSet::Any)).unwrap();
+        } else {
+            write(&lower.root(), b"source", b"source");
+            write(&upper.root(), b"target", b"target");
+        }
+        write(&lower.root(), b"target", b"hidden lower");
+        let before = list(&upper.root());
+        let layer = InspectLayer::new(lower.clone(), &[b"target"]);
+        let overlay = OverlayFs::new(Some(upper.clone()), vec![layer]);
+        let root = overlay.root();
+        assert_eq!(
+            block_on(root.rename(b"source", &root, b"target", RenameMode::Replace)),
+            Err(Errno::EACCES)
+        );
+        assert_eq!(list(&upper.root()), before);
+        let target = lookup(&upper.root(), b"target").unwrap();
+        if whiteout_target {
+            assert_eq!(read(&target), b"");
+            assert_eq!(
+                block_on(target.getxattr(b"trusted.overlay.whiteout")),
+                Ok(b"y".to_vec())
+            );
+            assert_eq!(read(&lookup(&upper.root(), b"source").unwrap()), b"source");
+        } else {
+            assert_eq!(read(&target), b"target");
+            assert_eq!(read(&lookup(&lower.root(), b"source").unwrap()), b"source");
+        }
+        assert_eq!(
+            read(&lookup(&lower.root(), b"target").unwrap()),
+            b"hidden lower"
+        );
+    }
+}
+
+#[test]
+fn ordinary_listing_entries_need_no_unrelated_inode_grant() {
+    let upper = mem();
+    let directory = mkdir(&upper.root(), b"d");
+    write(&directory, b"file", b"data");
+    let layer = InspectLayer::new(upper, &[b"file"]);
+    let overlay = OverlayFs::new(Some(layer), vec![]);
+    let directory = lookup(&overlay.root(), b"d").unwrap();
+    assert_eq!(list(&directory), vec![b"file".to_vec()]);
+    assert_eq!(lookup(&directory, b"file").err(), Some(Errno::EACCES));
+}
+
+#[test]
+fn private_metadata_prefix_precedence_preserves_definitive_negative_fallback() {
+    for negative in [Errno::ENODATA, Errno::EOPNOTSUPP] {
+        let upper = mem();
+        let directory = mkdir(&upper.root(), b"d");
+        block_on(directory.setxattr(b"user.overlay.opaque", b"y", XattrSet::Any)).unwrap();
+        let layer = InspectLayer::new(upper, &[]);
+        layer
+            .state
+            .fault_names
+            .lock()
+            .unwrap()
+            .insert(b"d".to_vec());
+        layer.state.fault_trusted_only.store(true, Ordering::SeqCst);
+        *layer.state.fault.lock().unwrap() = Some(negative);
+        let node = block_on(layer.root().lookup(b"d")).unwrap();
+        assert_eq!(block_on(dir_flags(&node)), Ok((true, false)));
+    }
+    let upper = mem();
+    let directory = mkdir(&upper.root(), b"d");
+    block_on(directory.setxattr(b"trusted.overlay.opaque", b"y", XattrSet::Any)).unwrap();
+    block_on(directory.setxattr(b"user.overlay.opaque", b"x", XattrSet::Any)).unwrap();
+    assert_eq!(block_on(dir_flags(&directory)), Ok((true, false)));
+}

@@ -14,7 +14,9 @@ use crate::{
     inode::{DirLock, OpenAccess},
     locks::{Break, LeaseWait, LockKey},
     mount::{Mount, Path},
-    namei::{Last, LookupFlags, Walk, WalkPurpose, lookup_one},
+    namei::{
+        Last, LookupFlags, NameObservation, ResolvedEntry, Walk, WalkPurpose, lookup_entry_one,
+    },
     notify::{FsEvent, Object, Perm},
     posix_acl::{AclKind, InitAcls},
     types::{
@@ -58,6 +60,20 @@ struct OpenMode<'a> {
     truncate: bool,
     /// `FMODE_NONOTIFY`: no permission or notification events, for the open or later.
     nonotify: bool,
+    /// A real parent-relative grant passed object and security policy before publication.
+    approved_grant: bool,
+}
+
+struct NameRename<'a> {
+    old_dir: &'a Path,
+    old_name: &'a [u8],
+    source: ResolvedEntry,
+    new_dir: &'a Path,
+    new_name: &'a [u8],
+    target: Option<ResolvedEntry>,
+    mode: RenameMode,
+    old_slash: bool,
+    new_slash: bool,
 }
 
 /// What to open (`struct open_how`, after `build_open_flags` validated it).
@@ -86,6 +102,160 @@ impl Vfs {
             return Ok(start.clone());
         }
         Walk::new(self, cx, start, path, flags)?.resolve().await
+    }
+
+    /// Resolves a terminal name without requiring a retained inode for metadata alone.
+    pub async fn lookup_entry(
+        &self,
+        cx: &Ctx<'_>,
+        start: &Path,
+        path: &[u8],
+        flags: LookupFlags,
+    ) -> PathResult<ResolvedEntry> {
+        if path.is_empty() && flags.empty {
+            return Ok(ResolvedEntry::Pinned(start.clone()));
+        }
+        Walk::new(self, cx, start, path, flags)?
+            .resolve_entry()
+            .await
+    }
+
+    pub async fn stat_entry(&self, entry: &ResolvedEntry) -> FsResult<Attr> {
+        let mut attr = entry.getattr().await?;
+        let sb = entry.mount().sb();
+        attr.dev = Some(match attr.dev {
+            None => sb.dev,
+            Some(dev) => self.sub_dev(sb, dev),
+        });
+        Ok(attr)
+    }
+
+    pub async fn access_entry(
+        &self,
+        cx: &Ctx<'_>,
+        entry: &ResolvedEntry,
+        mask: u32,
+    ) -> FsResult<()> {
+        match entry {
+            ResolvedEntry::Pinned(path) => self.access(cx, path, mask).await,
+            ResolvedEntry::Observation(observation) => {
+                if mask & MAY_WRITE != 0
+                    && observation.parent.mnt.is_read_only()
+                    && matches!(
+                        observation.attr.file_type,
+                        FileType::Regular | FileType::Directory | FileType::Symlink
+                    )
+                {
+                    return Err(Errno::EROFS);
+                }
+                if mask & MAY_WRITE != 0 && observation.inode_flags & crate::FS_IMMUTABLE_FL != 0 {
+                    return Err(Errno::EPERM);
+                }
+                observation
+                    .parent
+                    .dentry
+                    .node()
+                    .check_entry_permission(
+                        &observation.name,
+                        cx.cred,
+                        cx.task,
+                        &observation.attr,
+                        mask | 0x10,
+                    )
+                    .await
+            }
+        }
+    }
+
+    /// Approve the actually opened object on an uncached, real-capability view. An earlier
+    /// observation does not authorize this object and is never used as its identity.
+    async fn open_observation(
+        self: &Arc<Self>,
+        cx: &Ctx<'_>,
+        observation: NameObservation,
+        how: &OpenHow,
+        directory: bool,
+    ) -> FsResult<File> {
+        let NameObservation { parent, name, .. } = observation;
+        let flags = how.flags;
+        let access = flags & OpenFlags::O_ACCMODE;
+        let writable = access != OpenFlags::O_RDONLY;
+        let truncate = flags.contains(OpenFlags::O_TRUNC);
+        if (writable || truncate) && parent.mnt.is_read_only() {
+            return Err(Errno::EROFS);
+        }
+        let options = OpenOptions {
+            write: writable || truncate,
+            truncate,
+            ..open_options(flags, &parent, cx.task)
+        };
+        let (node, handle) = parent.dentry.node().open_existing(&name, options).await?;
+        let provisional = Path {
+            mnt: parent.mnt.clone(),
+            dentry: Dentry::provisional(&parent.dentry, &name, node.clone()),
+        };
+        let kind = node.file_type();
+        if flags.contains(OpenFlags::O_CREAT) && kind == FileType::Directory {
+            return Err(Errno::EISDIR);
+        }
+        if (directory || flags.contains(OpenFlags::O_DIRECTORY)) && kind != FileType::Directory {
+            return Err(Errno::ENOTDIR);
+        }
+        let mut mask = match access {
+            OpenFlags::O_RDONLY => MAY_READ,
+            OpenFlags::O_WRONLY => MAY_WRITE,
+            _ => MAY_READ | MAY_WRITE,
+        };
+        if flags.contains(FMODE_EXEC) {
+            mask = MAY_EXEC;
+        }
+        if truncate {
+            mask |= MAY_WRITE;
+        }
+        self.may_open(cx, &provisional, mask, flags).await?;
+        if flags.contains(OpenFlags::O_CREAT) {
+            self.may_create_in_sticky(cx, &parent, &provisional).await?;
+        }
+        if let Some(security) = cx.security() {
+            let requested = if flags.contains(FMODE_EXEC) {
+                MAY_EXEC
+            } else {
+                mask & (MAY_READ | MAY_WRITE)
+            };
+            security.file_open(&provisional, requested, truncate)?;
+        }
+        let exec = flags.contains(FMODE_EXEC);
+        self.permission_event(
+            cx,
+            &provisional,
+            if exec { Perm::OpenExec } else { Perm::Open },
+        )
+        .await?;
+        if truncate && provisional.dentry.sb().fs.allow_hsm() {
+            self.permission_event(
+                cx,
+                &provisional,
+                Perm::PreAccess {
+                    offset: Some(0),
+                    count: 0,
+                },
+            )
+            .await?;
+        }
+        // Publication follows every check above; only the actual pinned node is admitted.
+        let target = Path {
+            mnt: parent.mnt.clone(),
+            dentry: parent.dentry.child(&name, node),
+        };
+        let mode = OpenMode {
+            security_path: None,
+            flags,
+            writable,
+            truncate: truncate && kind == FileType::Regular,
+            nonotify: false,
+            approved_grant: true,
+        };
+        self.finish_open(cx, target, mode, Some(handle)).await
     }
 
     /// `inode_permission`: no writes to a read-only filesystem, then the node's own check for
@@ -191,8 +361,20 @@ impl Vfs {
             loop {
                 let last = walk.walk_parent().await?;
                 if !creating {
-                    if let Some(found) = walk.step_last(&last).await? {
-                        break found;
+                    if let Some(found) = walk.step_last_entry(&last).await? {
+                        match found {
+                            ResolvedEntry::Pinned(path) => break path,
+                            ResolvedEntry::Observation(observation) => {
+                                // The sample may have changed before this lock. Acquisition
+                                // selects its own object; hold the parent through its approval
+                                // and publication so guest name mutations cannot interleave.
+                                let _lock = observation.parent.dentry.inode().lock().await;
+                                return self
+                                    .open_observation(cx, observation, how, walk.flags.directory)
+                                    .await
+                                    .map_err(Into::into);
+                            }
+                        }
                     }
                     continue;
                 }
@@ -213,11 +395,43 @@ impl Vfs {
                 // `lookup_open`: the existing object, or a new one.
                 let found = loop {
                     walk.path = locked_parent.clone();
-                    if let Some(found) = walk.child_opt_locked(&name).await? {
+                    if let Some(found) = walk.child_entry_opt_locked(&name).await? {
                         if excl {
                             return Err(Errno::EEXIST.into());
                         }
-                        break found;
+                        match found {
+                            ResolvedEntry::Pinned(path) => break path,
+                            ResolvedEntry::Observation(observation) => {
+                                // Namespace fallback may select a different parent from
+                                // the directory the caller initially locked.
+                                let _selected_lock = if observation.parent != locked_parent {
+                                    Some(observation.parent.dentry.inode().lock().await)
+                                } else {
+                                    None
+                                };
+                                if observation.attr.file_type == FileType::Symlink
+                                    && walk.flags.follow
+                                {
+                                    let node = observation
+                                        .parent
+                                        .dentry
+                                        .node()
+                                        .lookup(&observation.name)
+                                        .await?;
+                                    break Path {
+                                        mnt: observation.parent.mnt.clone(),
+                                        dentry: observation
+                                            .parent
+                                            .dentry
+                                            .child(&observation.name, node),
+                                    };
+                                }
+                                return self
+                                    .open_observation(cx, observation, how, walk.flags.directory)
+                                    .await
+                                    .map_err(Into::into);
+                            }
+                        }
                     }
                     let dir = walk.creation_parent()?;
                     let _creation_lock = if locked_parent != dir {
@@ -290,6 +504,7 @@ impl Vfs {
             writable,
             truncate,
             nonotify: false,
+            approved_grant: false,
         };
         self.finish_open(cx, target, mode, created)
             .await
@@ -311,6 +526,7 @@ impl Vfs {
             writable,
             truncate,
             nonotify,
+            approved_grant,
         } = mode;
         let task = cx.task;
         let access = flags & OpenFlags::O_ACCMODE;
@@ -325,6 +541,11 @@ impl Vfs {
             true => Some(self.tree.get_write_access(&target.mnt)?),
             false => None,
         };
+        let _grant_truncate_write = if approved_grant && truncate && !writable {
+            Some(self.tree.get_write_access(&target.mnt)?)
+        } else {
+            None
+        };
         let inode = target.dentry.inode();
         let counted = match (write.is_some(), readable && !writable) {
             (true, _) => Some(OpenAccess::new(inode, true)?),
@@ -332,7 +553,7 @@ impl Vfs {
             (false, false) => None,
         };
         // fs/open.c do_dentry_open: FMODE_NONOTIFY skips events, never security_file_open.
-        if let Some(security) = cx.security() {
+        if let Some(security) = cx.security().filter(|_| !approved_grant) {
             let read = if readable { MAY_READ } else { 0 };
             let write = if writable { MAY_WRITE } else { 0 };
             security.file_open(security_path.unwrap_or(&target), read | write, truncate)?;
@@ -343,13 +564,13 @@ impl Vfs {
             None
         };
         // A file this open made has no leases.
-        if handle.is_none() && target.dentry.file_type() == FileType::Regular {
+        if (handle.is_none() || approved_grant) && target.dentry.file_type() == FileType::Regular {
             let nonblock = flags.contains(OpenFlags::O_NONBLOCK);
             self.break_lease(cx, Self::lock_key(&target.dentry), writable, nonblock)
                 .await?;
         }
         // `lookup_open` sets `FMODE_CREATED` when it made the file.
-        let created = handle.is_some();
+        let created = handle.is_some() && !approved_grant;
         let handle = match (handle, target.dentry.file_type()) {
             (Some(handle), _) => Some(handle),
             (None, FileType::Regular | FileType::Directory) => {
@@ -368,13 +589,18 @@ impl Vfs {
             // `may_open` refused it already.
             (None, FileType::Symlink) => return Err(Errno::ELOOP),
         };
+        if approved_grant && !truncate {
+            // Mount write access, real inode accounting and lease breaking are established
+            // before an overlay is allowed to copy data or create its upper representation.
+            handle.as_ref().ok_or(Errno::EBADF)?.prepare_open().await?;
+        }
         let exec = flags.contains(FMODE_EXEC);
-        if !nonotify {
+        if !nonotify && !approved_grant {
             let perm = if exec { Perm::OpenExec } else { Perm::Open };
             self.permission_event(cx, &target, perm).await?;
         }
         if truncate {
-            if !nonotify && target.dentry.sb().fs.allow_hsm() {
+            if !nonotify && !approved_grant && target.dentry.sb().fs.allow_hsm() {
                 self.permission_event(
                     cx,
                     &target,
@@ -391,7 +617,19 @@ impl Vfs {
                 ctime: Some(TimeSet::Now),
                 ..SetAttr::default()
             };
-            Self::notify_change(&target.dentry, &attr).await?;
+            if approved_grant {
+                let inode = target.dentry.inode();
+                let _lock = inode.lock().await;
+                inode.sealed_setattr(&attr).await?;
+                // Copy-up with the truncate hint may discard old data. Check seals first,
+                // under the same lock that protects the actual descriptor truncation.
+                handle.as_ref().ok_or(Errno::EBADF)?.prepare_open().await?;
+                handle.as_ref().ok_or(Errno::EBADF)?.set_size(0).await?;
+                let times = SetAttr { size: None, ..attr };
+                target.dentry.node().setattr(&times).await?;
+            } else {
+                Self::notify_change(&target.dentry, &attr).await?;
+            }
         }
         if !nonotify {
             let object = Self::object(&target.dentry);
@@ -432,6 +670,7 @@ impl Vfs {
             writable: access != OpenFlags::O_RDONLY,
             truncate: false,
             nonotify: true,
+            approved_grant: false,
         };
         self.finish_open(cx, path, mode, None).await
     }
@@ -572,6 +811,7 @@ impl Vfs {
             writable: true,
             truncate: false,
             nonotify: false,
+            approved_grant: false,
         };
         // `vfs_tmpfile` makes no name, so the file does not count as created (`FMODE_CREATED`).
         let mut file = self.finish_open(cx, target, mode, Some(handle)).await?;
@@ -759,7 +999,7 @@ impl Vfs {
         walk.path.dentry.node().namespace_mutation()?;
         let trailing_slash = walk.flags.directory;
         let lock = walk.path.dentry.inode().lock().await;
-        if walk.child_opt_locked(&name).await?.is_some() {
+        if walk.child_entry_opt_locked(&name).await?.is_some() {
             return Err(Errno::EEXIST.into());
         }
         if trailing_slash && !want_dir {
@@ -961,6 +1201,198 @@ impl Vfs {
         Ok(())
     }
 
+    async fn may_delete_entry(
+        &self,
+        cx: &Ctx<'_>,
+        dir: &Path,
+        entry: &ResolvedEntry,
+        is_dir: bool,
+    ) -> FsResult<()> {
+        let ResolvedEntry::Observation(observation) = entry else {
+            let ResolvedEntry::Pinned(path) = entry else {
+                unreachable!()
+            };
+            return self.may_delete(cx, dir, path, is_dir).await;
+        };
+        self.permission(cx, dir, MAY_WRITE | MAY_EXEC).await?;
+        let parent = dir.dentry.node().getattr().await?;
+        if append_only(&dir.dentry)
+            || sticky_denies(cx.cred, &parent, &observation.attr)
+            || observation.inode_flags & (crate::FS_APPEND_FL | crate::FS_IMMUTABLE_FL) != 0
+        {
+            return Err(Errno::EPERM);
+        }
+        match (is_dir, observation.attr.file_type == FileType::Directory) {
+            (true, false) => return Err(Errno::ENOTDIR),
+            (false, true) => return Err(Errno::EISDIR),
+            _ => {}
+        }
+        if dir.dentry.is_unlinked() {
+            return Err(Errno::ENOENT);
+        }
+        Ok(())
+    }
+
+    async fn remove_observation(
+        &self,
+        cx: &Ctx<'_>,
+        observation: NameObservation,
+        is_dir: bool,
+        trailing_slash: bool,
+    ) -> FsResult<()> {
+        if !is_dir && trailing_slash {
+            return Err(if observation.attr.file_type == FileType::Directory {
+                Errno::EISDIR
+            } else {
+                Errno::ENOTDIR
+            });
+        }
+        let entry = ResolvedEntry::Observation(observation);
+        let ResolvedEntry::Observation(observation) = &entry else {
+            unreachable!()
+        };
+        self.may_delete_entry(cx, &observation.parent, &entry, is_dir)
+            .await?;
+        if let Some(security) = cx.security() {
+            security.path_remove_observation(crate::NameView {
+                directory: &observation.parent,
+                name: &observation.name,
+                attr: &observation.attr,
+            })?;
+        }
+        let dir = &observation.parent;
+        if is_dir {
+            dir.dentry.node().rmdir(&observation.name).await?;
+        } else {
+            dir.dentry.node().unlink(&observation.name).await?;
+        }
+        dir.dentry.forget_name(&observation.name);
+        self.notify(FsEvent::Delete {
+            dir: Self::object(&dir.dentry),
+            name: &observation.name,
+            is_dir,
+            object: Object {
+                sb: dir.dentry.sb().id,
+                ino: observation.attr.ino,
+            },
+            gone: true,
+        });
+        Ok(())
+    }
+
+    async fn rename_observations(&self, cx: &Ctx<'_>, change: NameRename<'_>) -> FsResult<()> {
+        let NameRename {
+            old_dir,
+            old_name,
+            source,
+            new_dir,
+            new_name,
+            target,
+            mode,
+            old_slash,
+            new_slash,
+        } = change;
+        let source_attr = source.getattr().await?;
+        let target_attr = match &target {
+            Some(target) => Some(target.getattr().await?),
+            None => None,
+        };
+        let is_dir = source_attr.file_type == FileType::Directory;
+        let new_is_dir = target_attr
+            .as_ref()
+            .is_some_and(|attr| attr.file_type == FileType::Directory);
+        if !is_dir && (old_slash || (mode != RenameMode::Exchange && new_slash)) {
+            return Err(Errno::ENOTDIR);
+        }
+        if mode == RenameMode::Exchange && new_slash && !new_is_dir {
+            return Err(Errno::ENOTDIR);
+        }
+        self.may_delete_entry(cx, old_dir, &source, is_dir).await?;
+        if let Some(target) = &target {
+            self.may_delete_entry(
+                cx,
+                new_dir,
+                target,
+                if mode == RenameMode::Exchange {
+                    new_is_dir
+                } else {
+                    is_dir
+                },
+            )
+            .await?;
+        } else {
+            self.may_create(cx, new_dir).await?;
+        }
+        if !Arc::ptr_eq(old_dir.dentry.inode(), new_dir.dentry.inode()) {
+            if is_dir {
+                self.access_entry(cx, &source, MAY_WRITE).await?;
+            }
+            if mode == RenameMode::Exchange && new_is_dir {
+                self.access_entry(cx, target.as_ref().unwrap(), MAY_WRITE)
+                    .await?;
+            }
+        }
+        if let ResolvedEntry::Pinned(path) = &source
+            && self.is_local_mountpoint(path)
+        {
+            return Err(Errno::EBUSY);
+        }
+        if let Some(ResolvedEntry::Pinned(path)) = &target
+            && self.is_local_mountpoint(path)
+        {
+            return Err(Errno::EBUSY);
+        }
+        if let Some(security) = cx.security() {
+            security.path_rename_observations(
+                crate::NameView {
+                    directory: old_dir,
+                    name: old_name,
+                    attr: &source_attr,
+                },
+                new_dir,
+                new_name,
+                target_attr.as_ref().map(|attr| crate::NameView {
+                    directory: new_dir,
+                    name: new_name,
+                    attr,
+                }),
+                mode == RenameMode::Exchange,
+            )?;
+        }
+        // The driver must enforce atomic namespace type/emptiness/ancestry constraints for
+        // its observation path. Observations cannot supply inode locks or alias identity.
+        old_dir
+            .dentry
+            .node()
+            .rename(old_name, new_dir.dentry.node(), new_name, mode)
+            .await?;
+        old_dir.dentry.forget_name(old_name);
+        new_dir.dentry.forget_name(new_name);
+        if let ResolvedEntry::Pinned(source) = &source {
+            source.dentry.move_to(&new_dir.dentry, new_name);
+        }
+        if let Some(ResolvedEntry::Pinned(target)) = &target {
+            if mode == RenameMode::Exchange {
+                target.dentry.move_to(&old_dir.dentry, old_name);
+            } else {
+                target.dentry.detach();
+                self.detach_mounts(&target.dentry);
+            }
+        }
+        self.notify(FsEvent::Move {
+            from_dir: Self::object(&old_dir.dentry),
+            from_name: old_name,
+            to_dir: Self::object(&new_dir.dentry),
+            to_name: new_name,
+            is_dir,
+            object: Object {
+                sb: old_dir.dentry.sb().id,
+                ino: source_attr.ino,
+            },
+        });
+        Ok(())
+    }
+
     /// The parent walk shared by `unlink`, `rmdir` and `rename`: the parent path, the last
     /// component, and whether the path had a trailing slash.
     async fn parent_of(
@@ -991,7 +1423,15 @@ impl Vfs {
             return Err(Errno::EROFS.into());
         }
         let _lock = dir.dentry.inode().lock().await;
-        let victim = lookup_one(&dir, &name).await?;
+        let victim = match lookup_entry_one(&dir, &name).await? {
+            ResolvedEntry::Pinned(path) => path,
+            ResolvedEntry::Observation(observation) => {
+                return self
+                    .remove_observation(cx, observation, false, trailing_slash)
+                    .await
+                    .map_err(Into::into);
+            }
+        };
         if trailing_slash {
             return Err(if victim.dentry.is_dir() {
                 Errno::EISDIR
@@ -1039,7 +1479,15 @@ impl Vfs {
             return Err(Errno::EROFS.into());
         }
         let _lock = dir.dentry.inode().lock().await;
-        let victim = lookup_one(&dir, &name).await?;
+        let victim = match lookup_entry_one(&dir, &name).await? {
+            ResolvedEntry::Pinned(path) => path,
+            ResolvedEntry::Observation(observation) => {
+                return self
+                    .remove_observation(cx, observation, true, false)
+                    .await
+                    .map_err(Into::into);
+            }
+        };
         let _victim_lock = victim.dentry.inode().lock().await;
         if let Some(security) = cx.security() {
             security.path_remove(&dir, &victim.dentry)?;
@@ -1106,8 +1554,8 @@ impl Vfs {
         let _locks = lock_rename(&old_dir, &new_dir).await;
 
         // `__start_renaming`.
-        let source = lookup_one(&old_dir, &old_name).await?;
-        let target = match lookup_one(&new_dir, &new_name).await {
+        let source = lookup_entry_one(&old_dir, &old_name).await?;
+        let target = match lookup_entry_one(&new_dir, &new_name).await {
             Ok(target) if mode == RenameMode::NoReplace => {
                 drop(target);
                 return Err(Errno::EEXIST.into());
@@ -1116,6 +1564,36 @@ impl Vfs {
             Err(PathError::Errno(Errno::ENOENT)) if mode != RenameMode::Exchange => None,
             Err(errno) => return Err(errno),
         };
+        if matches!(&source, ResolvedEntry::Observation(_))
+            || target
+                .as_ref()
+                .is_some_and(|entry| matches!(entry, ResolvedEntry::Observation(_)))
+        {
+            return self
+                .rename_observations(
+                    cx,
+                    NameRename {
+                        old_dir: &old_dir,
+                        old_name: &old_name,
+                        source,
+                        new_dir: &new_dir,
+                        new_name: &new_name,
+                        target,
+                        mode,
+                        old_slash,
+                        new_slash,
+                    },
+                )
+                .await
+                .map_err(Into::into);
+        }
+        let ResolvedEntry::Pinned(source) = source else {
+            unreachable!()
+        };
+        let target = target.map(|entry| match entry {
+            ResolvedEntry::Pinned(path) => path,
+            _ => unreachable!(),
+        });
         if cross_dir {
             // `lock_rename`'s trap: the child of one parent that is an ancestor of the other.
             if source.dentry.is_ancestor_of(&new_dir.dentry) {

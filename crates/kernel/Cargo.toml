@@ -28,3 +28,7 @@ wasixv2-vfs-mem = { path = "../vfs-mem" }
 
 [target.'cfg(unix)'.dev-dependencies]
 libc = { workspace = true, features = ["std"] }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+wasixv2-vfs-host = { path = "../vfs-host" }
+tempfile.workspace = true

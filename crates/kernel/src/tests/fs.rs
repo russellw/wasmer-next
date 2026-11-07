@@ -3611,3 +3611,133 @@ fn tmpfile_creation_does_not_recheck_the_new_inode_mode() {
         t.close(fd);
     }
 }
+
+/// Drive real guest-memory syscalls against the Darwin provider, with native permission
+/// denial established independently of the kernel's own guest credentials.
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_name_observations_preserve_guest_stat_write_grants_and_parent_name_operations() {
+    use std::{fs, io, os::unix::fs::PermissionsExt};
+    use wasixv2_abi::{AtFlags, RenameFlags, Statx, StatxMask};
+    use wasixv2_syscalls::read_value;
+    use wasixv2_vfs::MountFlags;
+
+    let uid = unsafe { libc::geteuid() };
+    eprintln!("Darwin guest observation proof: effective host uid={uid}");
+    assert_ne!(
+        uid, 0,
+        "native permission proof requires an unprivileged host"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    for (name, mode) in [("zero", 0), ("write", 0o200), ("victim", 0)] {
+        let path = dir.path().join(name);
+        fs::write(&path, b"original").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+        assert!(fs::symlink_metadata(&path).is_ok());
+        assert_eq!(
+            fs::File::open(&path).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+    let search = dir.path().join("search");
+    fs::create_dir(&search).unwrap();
+    fs::write(search.join("file"), b"searchable").unwrap();
+    struct RestoreDirectory(std::path::PathBuf);
+    impl Drop for RestoreDirectory {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700));
+        }
+    }
+    let _restore = RestoreDirectory(search.clone());
+    fs::set_permissions(&search, fs::Permissions::from_mode(0o111)).unwrap();
+    assert_eq!(
+        fs::read_dir(&search).unwrap_err().kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    let (kernel, task, memory) = machine();
+    let host = wasixv2_vfs_host::open(dir.path(), Arc::new(TestHost), Default::default()).unwrap();
+    block_on(
+        kernel
+            .vfs()
+            .mount(b"/mac", host, MountFlags::default(), true),
+    )
+    .unwrap();
+    let t = T::new(&kernel, task, &memory);
+    let searched = t.open("/mac/search/file", OpenFlags::O_RDONLY).unwrap();
+    assert_eq!(t.read(searched, 10).unwrap(), b"searchable");
+    t.close(searched);
+    assert_eq!(
+        errno(t.open("/mac/search", OpenFlags::O_RDONLY | OpenFlags::O_DIRECTORY)),
+        Errno::EACCES
+    );
+    for (name, mode) in [("zero", 0), ("write", 0o200)] {
+        let at = t.path(&format!("/mac/{name}"));
+        assert_eq!(
+            block_on(kernel.statx(
+                &t.caller,
+                CWD,
+                at,
+                AtFlags(0),
+                StatxMask::STATX_BASIC_STATS,
+                GuestPtrMut::new(0x3000)
+            )),
+            Ok(0)
+        );
+        let stat: Statx = block_on(read_value(&memory, GuestPtr::new(0x3000))).unwrap();
+        assert_eq!(stat.stx_mode & 0o777, mode);
+        assert_eq!(stat.stx_size, 8);
+    }
+    assert_eq!(
+        errno(t.open("/mac/zero", OpenFlags::O_RDONLY)),
+        Errno::EACCES
+    );
+    assert_eq!(
+        errno(t.open("/mac/zero", OpenFlags::O_WRONLY)),
+        Errno::EACCES
+    );
+    let fd = t
+        .open("/mac/write", OpenFlags::O_WRONLY | OpenFlags::O_TRUNC)
+        .unwrap();
+    assert_eq!(fs::metadata(dir.path().join("write")).unwrap().len(), 0);
+    assert_eq!(t.write(fd, b"new"), Ok(3));
+    fs::set_permissions(dir.path().join("write"), fs::Permissions::from_mode(0)).unwrap();
+    assert_eq!(block_on(kernel.ftruncate64(&t.caller, fd, 1)), Ok(0));
+    assert_eq!(t.write(fd, b"!"), Ok(1));
+    assert_eq!(
+        block_on(kernel.utimensat_time64(
+            &t.caller,
+            fd,
+            GuestPtr::new(0),
+            GuestPtr::new(0),
+            AtFlags(0)
+        )),
+        Ok(0)
+    );
+    t.close(fd);
+
+    // Distinct guest strings must coexist in linear memory during rename.
+    put(&memory, 0x1400, b"/mac/renamed\0");
+    let old = t.path("/mac/zero");
+    assert_eq!(
+        block_on(kernel.renameat2(
+            &t.caller,
+            CWD,
+            old,
+            CWD,
+            GuestPtr::new(0x1400),
+            RenameFlags(0)
+        )),
+        Ok(0)
+    );
+    assert!(!dir.path().join("zero").exists());
+    assert!(fs::symlink_metadata(dir.path().join("renamed")).is_ok());
+    let victim = t.path("/mac/victim");
+    assert_eq!(
+        block_on(kernel.unlinkat(&t.caller, CWD, victim, AtFlags(0))),
+        Ok(0)
+    );
+    assert!(!dir.path().join("victim").exists());
+    for name in ["renamed", "write"] {
+        fs::set_permissions(dir.path().join(name), fs::Permissions::from_mode(0o600)).unwrap();
+    }
+}

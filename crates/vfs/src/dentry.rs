@@ -51,6 +51,15 @@ impl Dentry {
         Self::new(sb.iget(node), b"/".to_vec(), None)
     }
 
+    /// A policy view of an actual opened object, without inode/name-cache publication.
+    pub(crate) fn provisional(parent: &Arc<Self>, name: &[u8], node: Arc<dyn Node>) -> Arc<Self> {
+        Self::new(
+            parent.sb().uncached_inode(node),
+            name.to_vec(),
+            Some(parent.clone()),
+        )
+    }
+
     /// A dentry with no name, for an `O_TMPFILE` file.
     pub(crate) fn anonymous(sb: &Arc<Superblock>, node: Arc<dyn Node>) -> Arc<Self> {
         let dentry = Self::new(sb.iget(node), b"#".to_vec(), None);

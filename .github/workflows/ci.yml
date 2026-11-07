@@ -58,6 +58,26 @@ jobs:
       - name: Terminal profile Clippy
         run: cargo clippy --locked -p wasixv2-host --no-default-features --features terminal --all-targets -- -D clippy::all
 
+  macos-host:
+    name: macOS host filesystem
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96 --profile minimal --component clippy
+      - name: Check host filesystem
+        run: cargo check -p wasixv2-vfs -p wasixv2-vfs-overlay -p wasixv2-vfs-host -p wasixv2-kernel --all-targets --locked
+      - name: Lint host filesystem
+        run: cargo clippy -p wasixv2-vfs -p wasixv2-vfs-overlay -p wasixv2-vfs-host -p wasixv2-kernel --all-targets --locked -- -D clippy::all
+      - name: Test host filesystem containment, metadata, handles, and overlay
+        run: cargo test -p wasixv2-vfs -p wasixv2-vfs-overlay -p wasixv2-vfs-host --locked
+
+      - name: Guest-memory Darwin metadata and grant regression
+        run: cargo test -p wasixv2-kernel --locked --lib macos_name_observations -- --nocapture
+
   wasm:
     name: wasm32 feature profiles
     runs-on: ubuntu-24.04
