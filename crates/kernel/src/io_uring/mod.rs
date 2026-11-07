@@ -806,7 +806,7 @@ impl Kernel {
         // sq_off the SQEs. User pages stay retained independently of their guest address.
         let (rings_addr, sqes_addr) = (p.cq_off.user_addr, p.sq_off.user_addr);
         let (rings, sqes) = if has(IoringSetupFlags::IORING_SETUP_NO_MMAP) {
-            if self.mm(caller.task()).foreign().is_none() {
+            if !self.mm(caller.task()).has_foreign() {
                 return Err(Errno::EINVAL.into());
             }
             let rings = self

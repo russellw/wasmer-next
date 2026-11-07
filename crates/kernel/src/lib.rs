@@ -4825,15 +4825,20 @@ impl SharedMappings for Kernel {
         // Like mmget_not_zero (mm/memory.c:access_process_vm), an exited
         // image cannot acquire a new owner. Keep state held through attachment
         // so exit_mm cannot mark its final user left_mm between check and attach.
-        let state = self.state.read_or_recover();
-        if let Some(entry) = state.tasks.get(&task)
-            && state
-                .tasks
-                .values()
-                .any(|t| Arc::ptr_eq(&t.mm, &entry.mm) && !t.thread.left_mm())
-        {
-            entry.mm.attach_foreign(memory);
-        }
+        let rejected = {
+            let state = self.state.read_or_recover();
+            if let Some(entry) = state.tasks.get(&task)
+                && state
+                    .tasks
+                    .values()
+                    .any(|t| Arc::ptr_eq(&t.mm, &entry.mm) && !t.thread.left_mm())
+            {
+                entry.mm.attach_foreign(memory)
+            } else {
+                Some(memory)
+            }
+        };
+        drop(rejected);
     }
 }
 

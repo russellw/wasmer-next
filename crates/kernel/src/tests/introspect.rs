@@ -803,3 +803,304 @@ fn review_foreign_attach_keeps_first_handle_and_ignores_exited_memory() {
         "late instantiation must not resurrect an exited image"
     );
 }
+
+/// A selector resolves once; direct methods deliberately fault so accidental
+/// per-method use cannot make the operation proof pass.
+pub(super) struct ForeignSelector {
+    current: Mutex<Arc<dyn UserMemory + Send + Sync>>,
+    captures: std::sync::atomic::AtomicUsize,
+    next: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+impl ForeignSelector {
+    pub(super) fn new(current: Arc<dyn UserMemory + Send + Sync>) -> Arc<Self> {
+        Arc::new(Self {
+            current: Mutex::new(current),
+            captures: Default::default(),
+            next: Mutex::new(None),
+        })
+    }
+    pub(super) fn publish(&self, next: Arc<dyn UserMemory + Send + Sync>) {
+        let old = std::mem::replace(&mut *self.current.lock().unwrap(), next);
+        drop(old);
+    }
+    pub(super) fn captures(&self) -> usize {
+        self.captures.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn after_capture(&self, callback: impl FnOnce() + Send + 'static) {
+        assert!(
+            self.next
+                .lock()
+                .unwrap()
+                .replace(Box::new(callback))
+                .is_none()
+        );
+    }
+}
+impl UserMemory for ForeignSelector {
+    fn foreign_snapshot(&self) -> Option<Arc<dyn UserMemory + Send + Sync>> {
+        let memory = { self.current.lock().unwrap().clone() };
+        self.captures
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let callback = { self.next.lock().unwrap().take() };
+        if let Some(callback) = callback {
+            callback();
+        }
+        Some(memory)
+    }
+    fn read<'a>(&'a self, _: u32, _: &'a mut [u8]) -> LocalFuture<'a, Result<(), Fault>> {
+        Box::pin(async { Err(Fault) })
+    }
+    fn write<'a>(&'a self, _: u32, _: &'a [u8]) -> LocalFuture<'a, Result<(), Fault>> {
+        Box::pin(async { Err(Fault) })
+    }
+    fn size(&self) -> LocalFuture<'_, u64> {
+        Box::pin(async { 0 })
+    }
+    fn grow(&self, _: u32) -> LocalFuture<'_, Option<u64>> {
+        Box::pin(async { None })
+    }
+}
+
+#[test]
+fn foreign_snapshot_keeps_remote_copy_and_reaper_on_the_captured_backing() {
+    for reap in [false, true] {
+        let (kernel, parent, _) = setup(b"");
+        let parent_memory = memory();
+        let caller = Caller::new(parent, &parent_memory);
+        let task = if reap {
+            fork_child(&kernel, &caller)
+        } else {
+            parent
+        };
+        let page = crate::mm::PAGE_SIZE as u32;
+        let first = SyncMemory::new(2 * page as usize, 0);
+        let second = SyncMemory::new(2 * page as usize, 0);
+        first.put(page - 2, b"old!");
+        second.put(page - 2, b"new!");
+        assert!(
+            first.foreign_snapshot().is_none(),
+            "ordinary memories stay concrete"
+        );
+        let selector = ForeignSelector::new(first.clone());
+        kernel.attach_memory(task, selector.clone());
+        let mm = kernel.mm(task);
+        assert!(mm.has_foreign());
+        assert!(!mm.loader_fresh());
+        assert_eq!(
+            selector.captures(),
+            0,
+            "presence checks do not select memory"
+        );
+        let publish = Arc::downgrade(&selector);
+        let next = second.clone();
+        let checked_mm = Arc::downgrade(&mm);
+        selector.after_capture(move || {
+            // This reacquires the slot: the snapshot hook must run outside it.
+            assert!(checked_mm.upgrade().unwrap().has_foreign());
+            publish.upgrade().unwrap().publish(next);
+        });
+        if reap {
+            let target = Caller::new(task, &*first);
+            block_on(kernel.mem_size(&target));
+            let pidfd = block_on(kernel.pidfd_open(&caller, task.0 as i32, 0)).unwrap();
+            kernel.do_group_exit(task, 0);
+            assert_eq!(block_on(kernel.process_mrelease(&caller, pidfd, 0)), Ok(0));
+            assert_eq!(first.get(page - 2, 4), b"\0\0\0\0");
+            assert_eq!(second.get(page - 2, 4), b"new!");
+            assert_eq!(selector.captures(), 1);
+            assert_eq!(block_on(kernel.process_mrelease(&caller, pidfd, 0)), Ok(0));
+            assert_eq!(second.get(page - 2, 4), b"\0\0\0\0");
+        } else {
+            let mut bytes = [0; 4];
+            assert_eq!(
+                block_on(crate::ptrace::access_remote_vm(
+                    &mm,
+                    page - 2,
+                    crate::ptrace::Access::Read(&mut bytes),
+                    true
+                )),
+                4
+            );
+            assert_eq!(&bytes, b"old!");
+            assert_eq!(selector.captures(), 1);
+            assert_eq!(
+                block_on(crate::ptrace::access_remote_vm(
+                    &mm,
+                    page - 2,
+                    crate::ptrace::Access::Read(&mut bytes),
+                    true
+                )),
+                4
+            );
+            assert_eq!(&bytes, b"new!");
+        }
+        assert_eq!(selector.captures(), 2);
+    }
+}
+
+#[test]
+fn foreign_snapshot_retained_new_pages_capture_once_and_keep_old_page_identity() {
+    let (kernel, task, _) = setup(b"");
+    let page = crate::mm::PAGE_SIZE as u32;
+    let local = FlatMemory(RefCell::new(vec![0; 3 * page as usize]));
+    let caller = Caller::new(task, &local);
+    let first = SyncMemory::new(3 * page as usize, 0);
+    let second = SyncMemory::new(3 * page as usize, 0);
+    for at in [0, page, 2 * page] {
+        first.put(at, b"A");
+        second.put(at, b"B");
+    }
+    let selector = ForeignSelector::new(first);
+    kernel.attach_memory(task, selector.clone());
+    let publish = Arc::downgrade(&selector);
+    selector.after_capture(move || publish.upgrade().unwrap().publish(second));
+    let held = block_on(kernel.retain_pages(&caller, 0, 2 * page)).unwrap();
+    assert_eq!(selector.captures(), 1);
+    let mut byte = [0];
+    held.read_sync(0, &mut byte).unwrap();
+    assert_eq!(&byte, b"A");
+    held.read_sync(page, &mut byte).unwrap();
+    assert_eq!(&byte, b"A");
+    let old = block_on(kernel.retain_pages(&caller, 0, 1)).unwrap();
+    old.read_sync(0, &mut byte).unwrap();
+    assert_eq!(&byte, b"A");
+    assert_eq!(
+        selector.captures(),
+        1,
+        "existing physical page never reselects"
+    );
+    let fresh = block_on(kernel.retain_pages(&caller, 2 * page, 1)).unwrap();
+    fresh.read_sync(0, &mut byte).unwrap();
+    assert_eq!(&byte, b"B");
+    assert_eq!(selector.captures(), 2);
+}
+
+#[test]
+fn foreign_snapshot_retained_fallback_caches_absence_across_concurrent_attach() {
+    let (kernel, task, _) = setup(b"");
+    let kernel = Arc::new(kernel);
+    let page = crate::mm::PAGE_SIZE as u32;
+    let local = FlatMemory(RefCell::new(vec![b'L'; 2 * page as usize]));
+    let caller = Caller::new(task, &local);
+    let remote = SyncMemory::new(2 * page as usize, 0);
+    remote.put(page, b"R");
+    let (prepared, resume) = kernel.mm(task).test_pause_retained_commit();
+    std::thread::scope(|scope| {
+        let attaching = kernel.clone();
+        let attach = scope.spawn(move || {
+            prepared.recv_timeout(Duration::from_secs(5)).unwrap();
+            attaching.attach_memory(task, remote);
+            resume.send(()).unwrap();
+        });
+        let held = block_on(kernel.retain_pages(&caller, 0, 2 * page)).unwrap();
+        attach.join().unwrap();
+        let mut byte = [0];
+        block_on(held.read(&local, page, &mut byte)).unwrap();
+        assert_eq!(
+            &byte, b"L",
+            "the second new page keeps the original absent fallback"
+        );
+    });
+}
+
+#[test]
+fn foreign_attachment_drop_runs_outside_task_slot_and_mm_operation_locks() {
+    struct DropMemory {
+        kernel: std::sync::Weak<Kernel>,
+        mm: std::sync::Weak<crate::mm::Mm>,
+        drops: Arc<std::sync::atomic::AtomicUsize>,
+        expect_attached: bool,
+    }
+    impl Drop for DropMemory {
+        fn drop(&mut self) {
+            let kernel = self.kernel.upgrade().unwrap();
+            let mm = self.mm.upgrade().unwrap();
+            assert!(
+                kernel.state.try_write().is_ok(),
+                "task state unlocked before backing Drop"
+            );
+            assert!(
+                mm.op.try_lock().is_some(),
+                "mm operation unlocked before backing Drop"
+            );
+            assert_eq!(mm.has_foreign(), self.expect_attached);
+            self.drops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    impl UserMemory for DropMemory {
+        fn read<'a>(&'a self, _: u32, _: &'a mut [u8]) -> LocalFuture<'a, Result<(), Fault>> {
+            Box::pin(async { Err(Fault) })
+        }
+        fn write<'a>(&'a self, _: u32, _: &'a [u8]) -> LocalFuture<'a, Result<(), Fault>> {
+            Box::pin(async { Err(Fault) })
+        }
+        fn size(&self) -> LocalFuture<'_, u64> {
+            Box::pin(async { 0 })
+        }
+        fn grow(&self, _: u32) -> LocalFuture<'_, Option<u64>> {
+            Box::pin(async { None })
+        }
+    }
+    for rejected in [false, true] {
+        let (kernel, task, _) = setup(b"");
+        let kernel = Arc::new(kernel);
+        let mm = kernel.mm(task);
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        if rejected {
+            kernel.attach_memory(task, SyncMemory::new(65536, 0));
+        }
+        kernel.attach_memory(
+            task,
+            Arc::new(DropMemory {
+                kernel: Arc::downgrade(&kernel),
+                mm: Arc::downgrade(&mm),
+                drops: drops.clone(),
+                expect_attached: rejected,
+            }),
+        );
+        assert_eq!(
+            drops.load(std::sync::atomic::Ordering::SeqCst),
+            usize::from(rejected)
+        );
+        let local = memory_flat();
+        block_on(kernel.exit_mm(&Caller::new(task, &local)));
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(!mm.has_foreign());
+    }
+}
+
+#[test]
+fn foreign_snapshot_issued_view_outlives_mm_exit_without_resurrecting_it() {
+    let (kernel, task, _) = setup(b"");
+    let memory = memory_flat();
+    let first = SyncMemory::new(65536, 0);
+    first.put(0x100, b"held");
+    let allocation = Arc::downgrade(&first);
+    let selector = ForeignSelector::new(first);
+    let registration = Arc::downgrade(&selector);
+    kernel.attach_memory(task, selector.clone());
+    let mm = kernel.mm(task);
+    let issued = mm.foreign().unwrap();
+    assert!(issued.foreign_snapshot().is_none());
+    drop(selector);
+    block_on(kernel.exit_mm(&Caller::new(task, &memory)));
+    assert!(
+        registration.upgrade().is_none(),
+        "no host/operation pins the selector"
+    );
+    assert!(!mm.has_foreign());
+    let mut bytes = [0; 4];
+    block_on(issued.read(0x100, &mut bytes)).unwrap();
+    assert_eq!(
+        &bytes, b"held",
+        "the issued concrete view keeps its full lifetime"
+    );
+    kernel.attach_memory(task, SyncMemory::new(65536, 0));
+    assert!(
+        !mm.has_foreign(),
+        "late attachment cannot resurrect an exited mm"
+    );
+    assert!(allocation.upgrade().is_some());
+    drop(issued);
+    assert!(allocation.upgrade().is_none());
+}

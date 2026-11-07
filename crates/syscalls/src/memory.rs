@@ -75,6 +75,15 @@ pub unsafe trait HostMemoryPin: Send + Sync {
 /// a copy that touches the low guard or a page its address space's [`PageAccess`] keeps from
 /// it faults. This is independent of the guest's own loads, which may read the low guard.
 pub trait UserMemory {
+    /// Captures the concrete backing for one foreign-memory operation.
+    /// `None` means this receiver is already concrete, not missing memory.
+    /// Selectors return a concrete receiver whose own hook stays `None`.
+    /// Capture is synchronous metadata only: it must not enter guest code,
+    /// poll async work, or reenter the caller's mm/registration operation lock.
+    fn foreign_snapshot(&self) -> Option<std::sync::Arc<dyn UserMemory + Send + Sync>> {
+        None
+    }
+
     /// Replaces a newly owned private range with fresh native backing and pins it.
     /// Unsupported backends fail without a substitute allocation or raw growth.
     ///

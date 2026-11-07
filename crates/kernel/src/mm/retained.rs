@@ -118,6 +118,11 @@ impl Kernel {
         addr: u32,
         len: u32,
     ) -> Result<Arc<Retained>, Errno> {
+        // Both fresh fallback memory and existing Page clones can become the
+        // last old-backing owner after rotation. They outlive the op guard on
+        // error/cancellation as well as successful publication.
+        let mut records = Vec::new();
+        let mut foreign_fallback = None;
         let mm = self.mm(caller.task());
         let _op = mm.op.lock().await;
         let end = u64::from(addr) + u64::from(len);
@@ -136,7 +141,8 @@ impl Kernel {
             .retain(|_, page| page.strong_count() != 0);
         let limit = self.lock_limit(caller);
         let uid = self.cred(caller).user.real;
-        let mut records = Vec::new();
+        // Cache even absence; only new ordinary pages need this fallback.
+        // Existing Page and published host-range identities remain authoritative.
         for base in (u64::from(addr) / PAGE_SIZE..end.div_ceil(PAGE_SIZE)).map(|p| p * PAGE_SIZE) {
             // pin_user_pages(FOLL_WRITE | FOLL_LONGTERM) validates access without
             // modifying user bytes (Linux mm/gup.c:check_vma_flags).
@@ -175,7 +181,10 @@ impl Kernel {
                         spare,
                     }
                 };
-                let foreign = mm.host_retention_foreign(base)?.or_else(|| mm.foreign());
+                let foreign = match mm.host_retention_foreign(base)? {
+                    Some(memory) => Some(memory),
+                    None => foreign_fallback.get_or_insert_with(|| mm.foreign()).clone(),
+                };
                 let kind = match foreign {
                     Some(memory) => PageKind::Foreign {
                         memory: Mutex::new(Some(memory)),
@@ -188,6 +197,8 @@ impl Kernel {
                     _charge: charge,
                 })
             };
+            records.push(page);
+            let page = records.last().unwrap();
             #[cfg(test)]
             {
                 let pause = mm.retained.1.lock_or_recover().take();
@@ -205,13 +216,12 @@ impl Kernel {
             let (replaced, admitted) = {
                 let mut table = mm.retained.0.lock_or_recover();
                 match mm.host_retention_admissible(addr, len) {
-                    Ok(()) => (table.insert(base, Arc::downgrade(&page)), Ok(())),
+                    Ok(()) => (table.insert(base, Arc::downgrade(page)), Ok(())),
                     Err(err) => (None, Err(err)),
                 }
             };
             drop(replaced);
             admitted?;
-            records.push(page);
         }
         Ok(Arc::new(Retained {
             addr,

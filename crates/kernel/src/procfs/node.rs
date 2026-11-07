@@ -1587,7 +1587,7 @@ impl MemHandle {
         buf: crate::ptrace::Access<'_>,
         len: usize,
     ) -> FsResult<usize> {
-        if len == 0 || self.mm.foreign().is_none() {
+        if len == 0 || !self.mm.has_foreign() {
             return Ok(0);
         }
         let addr = u32::try_from(offset).map_err(|_| Errno::EIO)?;

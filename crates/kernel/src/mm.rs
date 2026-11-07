@@ -371,18 +371,34 @@ impl Mm {
     }
 
     /// Holds `memory` as how other tasks reach the address space.
-    pub(crate) fn attach_foreign(&self, memory: Arc<dyn UserMemory + Send + Sync>) {
-        // First instantiation wins; threads/vfork cannot replace the image handle.
-        self.foreign.lock_or_recover().get_or_insert(memory);
+    pub(crate) fn attach_foreign(
+        &self,
+        memory: Arc<dyn UserMemory + Send + Sync>,
+    ) -> Option<Arc<dyn UserMemory + Send + Sync>> {
+        // First instantiation wins; return rejected ownership so its destructor
+        // runs outside both this slot and the caller's task-state lock.
+        let mut attached = self.foreign.lock_or_recover();
+        if attached.is_none() {
+            *attached = Some(memory);
+            None
+        } else {
+            Some(memory)
+        }
     }
 
     /// `get_task_mm` for memory access from outside: the memory while it is there, `None` for
     /// memory nobody else can reach or that its last user left.
     pub(crate) fn foreign(&self) -> Option<Arc<dyn UserMemory + Send + Sync>> {
-        self.foreign.lock_or_recover().clone()
+        let attached = { self.foreign.lock_or_recover().clone() }?;
+        // Provider capture and the attached Arc's last drop may run user code.
+        // Neither is allowed under the foreign-slot mutex.
+        Some(attached.foreign_snapshot().unwrap_or(attached))
+    }
+    pub(crate) fn has_foreign(&self) -> bool {
+        self.foreign.lock_or_recover().is_some()
     }
     pub(crate) fn loader_fresh(&self) -> bool {
-        self.loader.generation() == 0 && self.foreign().is_none() && self.space().base.is_none()
+        self.loader.generation() == 0 && !self.has_foreign() && self.space().base.is_none()
     }
 
     /// What the kernel's copies may do with each page of the address space.
@@ -2705,6 +2721,8 @@ impl Kernel {
                 .ok_or(Errno::ESRCH)?
         };
         let signals = self.interrupt(caller);
+        // An old selected backing can be owned only by this operation.
+        let foreign;
         let _op = wasixv2_wait::interruptible(mm.op.lock(), &signals.killable())
             .await
             .map_err(|_| Errno::EINTR)?;
@@ -2728,7 +2746,7 @@ impl Kernel {
                 }
             }
         }
-        let foreign = mm.foreign();
+        foreign = mm.foreign();
         let mine = self.mm(caller.task());
         let memory: &dyn UserMemory = if Arc::ptr_eq(&mm, &mine) {
             caller.memory()
@@ -3252,8 +3270,11 @@ impl Kernel {
             let _ = mapping.mark_write_time().await;
         }
         mm.shared.store(false, Ordering::Release);
-        // `mmput`: nobody reaches the memory any more.
-        mm.foreign.lock_or_recover().take();
+        // `mmput`: nobody reaches the memory any more. Backing destructors
+        // run only after both the slot and the completed mm operation unlock.
+        let attached = { mm.foreign.lock_or_recover().take() };
+        drop(_op);
+        drop(attached);
     }
 
     /// Maps a SysV segment attachment of `len` bytes at `addr`, or anywhere for 0, replacing

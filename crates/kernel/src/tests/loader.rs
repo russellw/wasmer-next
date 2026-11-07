@@ -901,3 +901,51 @@ fn host_retirement_rejects_a_registration_already_prepared_before_commit() {
     assert_eq!(unsafe { next.as_ptr().read() }, 0);
     drop(next);
 }
+
+#[test]
+fn foreign_snapshot_loader_pin_and_published_record_keep_original_backing() {
+    use super::introspect::ForeignSelector;
+    let (kernel, task, _) = setup(b"");
+    let first = Arc::new(HostPinnedMemory(HostPinMemory::new(16)));
+    let second = Arc::new(HostPinnedMemory(HostPinMemory::new(16)));
+    let selector = ForeignSelector::new(first.clone());
+    kernel.attach_memory(task, selector.clone());
+    let caller = Caller::new(task, &*first);
+    let lease = block_on(kernel.loader_reserve_host(&caller, WASM_PAGE_SIZE as u32, 64)).unwrap();
+    let address = lease.address();
+    assert_eq!(selector.captures(), 1);
+    // SAFETY: this exact lease owns the whole live private page.
+    unsafe { lease.as_ptr().write(7) };
+    selector.publish(second.clone());
+    let held = block_on(kernel.retain_pages(&caller, address, 1)).unwrap();
+    assert_eq!(
+        selector.captures(),
+        1,
+        "published host record wins without fallback capture"
+    );
+    block_on(second.write(address, &[42])).unwrap();
+    let mut byte = [0];
+    held.read_sync(0, &mut byte).unwrap();
+    assert_eq!(byte, [7], "registered IO still owns the first allocation");
+    assert_eq!(first.0.pins(), 1);
+    assert_eq!(second.0.pins(), 0);
+    drop(lease);
+    assert_eq!(first.0.pins(), 0);
+    held.read_sync(0, &mut byte).unwrap();
+    assert_eq!(byte, [7], "old bytes survive original pin retirement");
+    let next = block_on(kernel.loader_reserve_host(
+        &Caller::new(task, &*second),
+        WASM_PAGE_SIZE as u32,
+        64,
+    ))
+    .unwrap();
+    assert_eq!(selector.captures(), 2);
+    assert_eq!(next.address(), address);
+    assert_eq!(second.0.pins(), 1);
+    held.write_sync(0, &[9]).unwrap();
+    // SAFETY: the independent second lease owns the newly zeroed page.
+    assert_eq!(unsafe { next.as_ptr().read() }, 0);
+    drop(next);
+    assert_eq!(second.0.pins(), 0);
+    drop(held);
+}

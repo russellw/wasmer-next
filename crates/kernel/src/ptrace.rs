@@ -255,9 +255,13 @@ pub(crate) async fn access_remote_vm(
 ) -> usize {
     // mm/memory.c:__access_remote_vm holds mmap_read_lock across GUP/copy.
     // Serialize with unmap, replacement and protection changes in this mm.
+    // Rotation can make this operation the last owner of an old backing.
+    // Declare it before the guard so cancellation/return unlocks before Drop.
+    let memory;
     let _op = mm.op.lock().await;
-    let Some(memory) = mm.foreign() else {
-        return 0;
+    memory = match mm.foreign() {
+        Some(memory) => memory,
+        None => return 0,
     };
     let size = memory.size().await;
     let write = matches!(&buf, Access::Write(_));
