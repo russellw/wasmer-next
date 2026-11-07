@@ -1,0 +1,892 @@
+name: NAPI Darwin x64 V8 candidate producer (manual, uncertified)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: napi-darwin-x64-v8-candidate-producer
+  cancel-in-progress: false
+
+jobs:
+  candidate:
+    name: Exact V8 13.6.233.17 private x64 candidate
+    runs-on: macos-15-intel
+    timeout-minutes: 180
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      NAPI_PRODUCER_REPOSITORY_PRIVATE: ${{ toJSON(github.event.repository.private) }}
+      NAPI_PRODUCER_WORKFLOW_REF: ${{ github.ref }}
+    steps:
+      - name: Create isolated task and materialize the reviewed producer driver
+        shell: bash
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          task="$RUNNER_TEMP/napi-x64-producer-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          python3 - "$task" <<'PY'
+          import os, sys
+          from pathlib import Path
+          parent = Path(os.environ["RUNNER_TEMP"]).resolve()
+          task = Path(sys.argv[1])
+          if not os.environ["GITHUB_RUN_ID"].isdigit() or not os.environ["GITHUB_RUN_ATTEMPT"].isdigit():
+              raise SystemExit("invalid run identity")
+          if task.parent.resolve() != parent:
+              raise SystemExit("task escaped RUNNER_TEMP")
+          stats = os.statvfs(parent)
+          available = stats.f_bavail * stats.f_frsize
+          if available < 2 * 1024**3 + 1024**2:
+              raise SystemExit(f"insufficient initializer headroom: {available}")
+          task.mkdir(mode=0o700)
+          (task / "evidence").mkdir(mode=0o700)
+          PY
+          printf 'NAPI_X64_TASK=%s\n' "$task" >> "$GITHUB_ENV"
+          cat > "$task/driver.py" <<'PY'
+          #!/usr/bin/env python3
+          """Task-local candidate builder; artifact admission is a separate review."""
+          import difflib
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import shutil
+          import signal
+          import subprocess
+          import sys
+          import tarfile
+          import time
+
+          GIB = 1024**3
+          RESERVE = 2 * GIB
+          TASK = Path(os.environ['NAPI_X64_TASK'])
+          EVIDENCE = TASK / 'evidence'
+          PRODUCER = TASK / 'producer'
+          V8 = PRODUCER / 'v8'
+          DEPOT = TASK / 'depot_tools'
+          PRODUCER_SHA = '844d01dc10edaa0461715f484e06b004f1fd023e'
+          V8_SHA = 'b0a55a7dad7f536cce1f9aaddba89894c8533946'
+          DEPOT_SHA = 'f40ddcd8d51626fb7be3ab3c418b3f3be801623f'
+          V8_TAG = '13.6.233.17'
+          RECIPE_SHA = '8c0140c953f0eae74453facc5083cb209470c3f818833c9dd40411b772077875'
+          PATCHES = {
+              '0001-Add-ability-to-define-sharedness-of-memory.patch': 'fcca746140f65570036b34a6b7b64753f40b576734cb1a330957d7339b05cec4',
+              '0002-Add-support-for-tags-eh.patch': '35f07f131f9e1caab36e8438cb68236f63c8a4fabdb37904bff501ac00c7efc5',
+              '0003-Enable-exnrefs-by-default.patch': 'd2189919ff5a6055c1a4441d2f517472cccc53687071d48fa99d9db1a2c2ed75',
+              '0004-gn-fix.patch': 'f9cb942a2eeba7909718ed7dc2d64531940d4fa244bebd18af888c00cc1fff2a',
+              '0005-Add-v128-support-to-wasm-c-api.patch': '1ef4fbe65020669d914c0a61afccd1fafe43703955f6f7b7dcfa727abbaf8d00',
+              '0006-Use-wasm-null-for-C-API-funcref-tables.patch': '396c76e529eb5cee6c369d9db65b2dfd289b2122614c93aaa594d44a2492bc00',
+              '0007-shared-memory.patch': 'f09a3c97261ecd9257f441b68a4c6768b51d48fd20cfac55c00a5298d4a6d0ba',
+              '0008-Define-LIBWASM_STATIC-for-wee8.patch': '721594211d8dc498ff80c4804313bc567c35996343bc423e45487033653d972b',
+          }
+          SIGNAL_REQUEST = None
+
+
+          def validate_task():
+              run = os.environ['GITHUB_RUN_ID']
+              attempt = os.environ['GITHUB_RUN_ATTEMPT']
+              if not run.isdigit() or not attempt.isdigit():
+                  raise RuntimeError('invalid task run identity')
+              parent = Path(os.environ['RUNNER_TEMP'])
+              expected = parent / f'napi-x64-producer-{run}-{attempt}'
+              if TASK != expected or TASK.resolve() != parent.resolve() / expected.name:
+                  raise RuntimeError('task root identity changed or is a symlink')
+
+
+          def digest(path):
+              h = hashlib.sha256()
+              with Path(path).open('rb') as source:
+                  for chunk in iter(lambda: source.read(1024**2), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+
+          def available():
+              stat = os.statvfs(TASK)
+              return stat.f_bavail * stat.f_frsize
+
+
+          def command(*args, cwd=TASK, output=None):
+              print('+', repr(list(map(str, args))), 'cwd=', str(cwd), flush=True)
+              if output is None:
+                  subprocess.run(list(map(str, args)), cwd=cwd, check=True)
+              else:
+                  with Path(output).open('wb') as sink:
+                      subprocess.run(list(map(str, args)), cwd=cwd, stdout=sink,
+                                     stderr=subprocess.STDOUT, check=True)
+
+
+          def capture(*args, cwd=TASK):
+              # Only short version/revision output uses a pipe; build output goes to files.
+              result = subprocess.run(list(map(str, args)), cwd=cwd, stdout=subprocess.PIPE,
+                                      stderr=subprocess.STDOUT, check=True)
+              if len(result.stdout) > 1024**2:
+                  raise RuntimeError('unexpectedly large version/revision response')
+              text = result.stdout.decode('utf-8')
+              print(text, end='' if text.endswith('\n') else '\n', flush=True)
+              return text.strip()
+
+
+          def preflight():
+              if os.environ.get('NAPI_PRODUCER_REPOSITORY_PRIVATE') != 'true':
+                  raise RuntimeError('candidate artifacts require a private repository')
+              if os.environ.get('NAPI_PRODUCER_WORKFLOW_REF') != 'refs/heads/main':
+                  raise RuntimeError('producer must use its reviewed trusted-main workflow')
+              if sys.platform != 'darwin' or capture('uname', '-m') != 'x86_64':
+                  raise RuntimeError('candidate requires native Intel Darwin, no architecture fallback')
+              translated = capture('sysctl', '-in', 'sysctl.proc_translated')
+              if translated not in {'', '0'}:
+                  raise RuntimeError('Rosetta execution is not a native Intel producer')
+              # Unexpected inherited compiler settings must not silently alter the recipe.
+              for name in ('CC', 'CXX', 'AR', 'CFLAGS', 'CXXFLAGS', 'LDFLAGS',
+                           'GN_ARGS', 'GN_DEFINES', 'MACOSX_DEPLOYMENT_TARGET'):
+                  if os.environ.get(name):
+                      raise RuntimeError('unexpected compiler override: ' + name)
+              developer = Path('/Applications/Xcode_16.2.app/Contents/Developer')
+              if not developer.is_dir():
+                  raise RuntimeError('preinstalled Xcode16.2 missing; installation is not permitted')
+              os.environ['DEVELOPER_DIR'] = str(developer)
+              if capture('xcodebuild', '-version').splitlines()[0] != 'Xcode 16.2':
+                  raise RuntimeError('selected Xcode is not16.2')
+              if capture('xcrun', '--sdk', 'macosx', '--show-sdk-version') != '15.2':
+                  raise RuntimeError('selected SDK is not15.2')
+              for tool in ('git', 'curl', 'ninja', 'tar'):
+                  if shutil.which(tool) is None:
+                      raise RuntimeError('preinstalled tool missing: ' + tool)
+              cache = Path(os.environ['RUNNER_TOOL_CACHE']) / 'Python'
+              choices = []
+              for version in cache.iterdir():
+                  if re.fullmatch(r'3\.11\.[0-9]+', version.name):
+                      python = version / 'x64' / 'bin' / 'python3'
+                      if python.is_file() and os.access(python, os.X_OK):
+                          choices.append((tuple(map(int, version.name.split('.'))), python))
+              if not choices:
+                  raise RuntimeError('cached native Python3.11 missing; installation is not permitted')
+              python = max(choices)[1]
+              if capture(python, '-c', 'import platform; print(platform.machine()); print(platform.python_version())').splitlines()[0] != 'x86_64':
+                  raise RuntimeError('cached Python is not native x64')
+              if not capture(python, '--version').startswith('Python 3.11.'):
+                  raise RuntimeError('cached Python is not3.11')
+              # Standard Intel image's existing LLVM18; no package-manager invocation.
+              llvm_bin = Path('/usr/local/opt/llvm@18/bin')
+              for name in ('llvm-objcopy', 'llvm-nm', 'llvm-ar'):
+                  tool = llvm_bin / name
+                  if not tool.is_file() or not os.access(tool, os.X_OK):
+                      raise RuntimeError('existing LLVM18 adapter tool missing: ' + name)
+                  if re.search(r'LLVM version 18\.', capture(tool, '--version')) is None:
+                      raise RuntimeError('adapter tooling is not LLVM18: ' + name)
+              directories = ['tmp', 'git-cache', 'cipd-cache', 'vpython-root',
+                             'vpython-downloads', 'xdg-cache', 'pycache']
+              for name in directories:
+                  (TASK / name).mkdir(mode=0o700)
+              (TASK / 'gitconfig').write_text('')
+              (TASK / 'gitconfig').chmod(0o600)
+              environment = {
+                  'DEVELOPER_DIR': str(developer),
+                  'PATH': str(python.parent) + os.pathsep + str(DEPOT) + os.pathsep + os.environ['PATH'],
+                  'GIT_CONFIG_GLOBAL': str(TASK / 'gitconfig'),
+                  'GIT_CONFIG_NOSYSTEM': '1',
+                  'GIT_TERMINAL_PROMPT': '0',
+                  'GIT_CACHE_PATH': str(TASK / 'git-cache'),
+                  'CIPD_CACHE_DIR': str(TASK / 'cipd-cache'),
+                  'VPYTHON_VIRTUALENV_ROOT': str(TASK / 'vpython-root'),
+                  'VPYTHON_DOWNLOAD_DIR': str(TASK / 'vpython-downloads'),
+                  'XDG_CACHE_HOME': str(TASK / 'xdg-cache'),
+                  'PYTHONPYCACHEPREFIX': str(TASK / 'pycache'),
+                  'TMPDIR': str(TASK / 'tmp'),
+                  'DEPOT_TOOLS_UPDATE': '0',
+                  'DEPOT_TOOLS_METRICS': '0',
+                  'V8_TAG': V8_TAG,
+              }
+              # Existing LLVM18 is recorded for later auditing, never substituted for
+              # the V8 checkout's DEPS-pinned clang21 or GN archiver.
+              (TASK / 'environment.json').write_text(json.dumps(environment, indent=2) + '\n')
+              report = {
+                  'workflow_repository': os.environ['GITHUB_REPOSITORY'],
+                  'workflow_sha': os.environ['GITHUB_SHA'],
+                  'run_id': os.environ['GITHUB_RUN_ID'], 'run_attempt': os.environ['GITHUB_RUN_ATTEMPT'],
+                  'runner_image': os.environ.get('ImageVersion'),
+                  'os': capture('sw_vers'), 'architecture': 'x86_64', 'translated': translated,
+                  'cpus': capture('sysctl', '-n', 'hw.ncpu'),
+                  'ram_bytes': capture('sysctl', '-n', 'hw.memsize'),
+                  'python': str(python.resolve()), 'python_sha256': digest(python),
+                  'llvm18_tools': {name: str(llvm_bin / name) for name in ('llvm-objcopy', 'llvm-nm', 'llvm-ar')},
+                  'environment': environment, 'available_bytes': available(),
+                  'candidate_status': 'UNCERTIFIED; independent x64 archive/adapter audit required',
+              }
+              (EVIDENCE / 'preflight.json').write_text(json.dumps(report, indent=2) + '\n')
+              capture('git', '--version')
+              capture('ninja', '--version')
+
+
+          def git_checkout(directory, url, revision, tag=None):
+              directory.mkdir(mode=0o700)
+              command('git', 'init', str(directory))
+              command('git', '-C', directory, 'remote', 'add', 'origin', url)
+              ref = revision if tag is None else 'refs/tags/' + tag + ':refs/tags/' + tag
+              command('git', '-C', directory, 'fetch', '--no-tags', '--depth=1', 'origin', ref)
+              command('git', '-C', directory, 'checkout', '--detach', revision)
+              if capture('git', '-C', directory, 'rev-parse', 'HEAD') != revision:
+                  raise RuntimeError('pinned Git revision mismatch: ' + str(directory))
+
+
+          def source_phase():
+              git_checkout(PRODUCER, 'https://github.com/wasmerio/v8-custom-builds.git', PRODUCER_SHA)
+              recipe = PRODUCER / 'build.sh'
+              if digest(recipe) != RECIPE_SHA:
+                  raise RuntimeError('producer recipe SHA256 mismatch')
+              actual = sorted(p.name for p in (PRODUCER / 'patches').iterdir())
+              if actual != sorted(PATCHES):
+                  raise RuntimeError('producer patch membership changed')
+              for name, expected in PATCHES.items():
+                  if digest(PRODUCER / 'patches' / name) != expected:
+                      raise RuntimeError('producer patch SHA256 mismatch: ' + name)
+              git_checkout(DEPOT, 'https://chromium.googlesource.com/chromium/tools/depot_tools.git', DEPOT_SHA)
+              git_checkout(V8, 'https://chromium.googlesource.com/v8/v8.git', V8_SHA, V8_TAG)
+              if digest(V8 / 'DEPS') != '75967c8cdbf3d5c999a050ca2556019693a43067e0e31c68a8693be0f7dc94c7':
+                  raise RuntimeError('pinned V8 DEPS changed')
+              # No custom_deps or custom_vars discard target dependencies. This fixed,
+              # unmanaged root is already checked out at the exact producer V8 revision.
+              solution = {'name': 'v8', 'url': 'https://chromium.googlesource.com/v8/v8.git',
+                          'deps_file': 'DEPS', 'managed': False, 'custom_deps': {}, 'custom_vars': {}}
+              (PRODUCER / '.gclient').write_text('solutions = ' + repr([solution]) + '\ncache_dir = ' + repr(str(TASK / 'git-cache')) + '\n')
+              command(DEPOT / 'gclient', 'sync', '--with_branch_heads', '--with_tags', '--nohooks', '--no-history',
+                      '--output-json=' + str(EVIDENCE / 'gclient-sync.json'), cwd=PRODUCER)
+              command(DEPOT / 'gclient', 'revinfo', '--actual', '--output-json=' + str(EVIDENCE / 'gclient-revisions.json'), cwd=PRODUCER)
+              expected_repos = {
+                  V8: V8_SHA,
+                  V8 / 'build': '451ef881d77fff0b7a8bbfa61934f5e4a35b4c96',
+                  V8 / 'buildtools': '6f359296daa889aa726f3d05046b9f37be241169',
+                  V8 / 'third_party/depot_tools': DEPOT_SHA,
+                  V8 / 'third_party/icu': 'c9fb4b3a6fb54aa8c20a03bbcaa0a4a985ffd34b',
+              }
+              for directory, revision in expected_repos.items():
+                  if capture('git', '-C', directory, 'rev-parse', 'HEAD') != revision:
+                      raise RuntimeError('resolved DEPS revision mismatch: ' + str(directory))
+              clang = V8 / 'third_party/llvm-build/Release+Asserts/bin/clang'
+              version = capture(clang, '--version')
+              if re.search(r'clang version 21\.', version) is None or '52cd27e6' not in version:
+                  raise RuntimeError('checkout clang is not the pinned clang21 revision')
+              # This Mac Rust GCS dependency is unconditional for x64 in exact DEPS.
+              # Its compressed111168208 bytes and extracted footprint are part of source
+              # growth, even though wee8 itself is a C++ target. Never custom_deps it away.
+              rust = V8 / 'third_party/rust-toolchain/bin/rustc'
+              if not rust.is_file():
+                  raise RuntimeError('unconditional pinned Mac Rust dependency missing')
+              capture(rust, '--version')
+              (EVIDENCE / 'checkout-toolchain.txt').write_text(version + '\nclang_sha256=' + digest(clang) + '\n')
+              original = recipe.read_text()
+              changed = original
+              replacements = [
+                  ('DEPOT_TOOLS_DIR="/tmp/depot_tools"', 'DEPOT_TOOLS_DIR="${NAPI_X64_TASK}/depot_tools"'),
+                  ('gclient sync --with_branch_heads --with_tags --nohooks',
+                   'gclient sync --with_branch_heads --with_tags --nohooks --no-history'),
+                  ('ninja -C out/release wee8', 'ninja -C out/release -j2 wee8'),
+              ]
+              for old, new in replacements:
+                  if changed.count(old) != 1:
+                      raise RuntimeError('task-local recipe substitution is not unique')
+                  changed = changed.replace(old, new)
+              adapted = PRODUCER / 'build-tasklocal.sh'
+              adapted.write_text(changed)
+              adapted.chmod(0o700)
+              command('bash', '-n', adapted)
+              (EVIDENCE / 'producer-tasklocal.patch').write_text(''.join(difflib.unified_diff(
+                  original.splitlines(keepends=True), changed.splitlines(keepends=True),
+                  fromfile='producer/build.sh', tofile='producer/build-tasklocal.sh')))
+              provenance = {
+                  'producer': PRODUCER_SHA, 'v8_tag': V8_TAG, 'v8_commit': V8_SHA,
+                  'depot_tools': DEPOT_SHA, 'original_recipe_sha256': RECIPE_SHA,
+                  'tasklocal_recipe_sha256': digest(adapted), 'patches_sha256': PATCHES,
+                  'permitted_recipe_changes': 'task-local depot path; no-history resource bound; ninja-j2 resource bound',
+                  'gn_flags_or_target_dependencies_discarded': False, 'ninja_jobs': 2,
+                  'mac_rust_compressed_bytes': 111168208,
+                  'mac_rust_gcs_sha256': 'f5ad2fe26336a87713ffcad9e06ae4c1ecb4773ae496a33450a7091c5eec560c',
+              }
+              (EVIDENCE / 'producer-inputs.json').write_text(json.dumps(provenance, indent=2) + '\n')
+
+
+          def build_phase():
+              # The audited recipe itself retains both complete GN branches, all eight
+              # patches, LASTCHANGE, wee8, original header/wasm-C-API packaging and ls.
+              command('bash', PRODUCER / 'build-tasklocal.sh', 'x64', 'mac', cwd=PRODUCER)
+              if capture('git', '-C', V8, 'rev-parse', 'HEAD') != V8_SHA:
+                  raise RuntimeError('recipe changed the pinned V8 revision')
+              if capture('git', '-C', DEPOT, 'rev-parse', 'HEAD') != DEPOT_SHA:
+                  raise RuntimeError('depot_tools changed its pinned revision')
+              command('git', '-C', V8, 'diff', '--binary', output=EVIDENCE / 'v8-patched-source.diff')
+              command('gn', 'args', 'out/release', '--list', cwd=V8, output=EVIDENCE / 'gn-effective-args.txt')
+              command('ninja', '-C', 'out/release', '-t', 'commands', 'wee8', cwd=V8,
+                      output=EVIDENCE / 'ninja-commands.txt')
+              command(DEPOT / 'gclient', 'revinfo', '--actual', '--output-json=' + str(EVIDENCE / 'gclient-final-revisions.json'), cwd=PRODUCER)
+              shutil.copy2(V8 / 'out/release/args.gn', EVIDENCE / 'args.gn')
+              command('file', V8 / 'out/dist/lib/libv8.a')
+              # The producer can run on15 without raising its configured11.0 floor.
+              args = (EVIDENCE / 'gn-effective-args.txt').read_text()
+              for name, value in (('target_cpu', '"x64"'), ('v8_target_cpu', '"x64"'),
+                                  ('target_os', '"mac"'), ('mac_deployment_target', '"11.0"'),
+                                  ('mac_min_system_version', '"11.0"')):
+                  pattern = r'^' + re.escape(name) + r'\s*\n\s*Current value(?: \(from the default\))? = ' + re.escape(value) + r'\s*$'
+                  if re.search(pattern, args, re.MULTILINE) is None:
+                      raise RuntimeError('effective GN target/floor differs: ' + name)
+
+
+          def stage_phase():
+              stage = TASK / 'stage'
+              package = stage / 'package'
+              stage.mkdir(mode=0o700)
+              source = V8 / 'out/dist'
+              # Copy only the exact producer package, rejecting unexpected symlinks.
+              for path in source.rglob('*'):
+                  if path.is_symlink():
+                      raise RuntimeError('unexpected symlink in producer package: ' + str(path))
+              shutil.copytree(source, package)
+              if (package / 'lib/libv8.a').stat().st_size == 0:
+                  raise RuntimeError('producer library is empty')
+              if digest(package / 'lib/libv8.a') != digest(V8 / 'out/release/obj/libwee8.a'):
+                  raise RuntimeError('staged library is not the original wee8 output')
+              if not (package / 'include/wasm-c-api/wasm.h').is_file():
+                  raise RuntimeError('patched wasm C API header missing')
+              notices = package / 'licenses'
+              notices.mkdir()
+              total = 0
+              count = 0
+              for parent, dirs, files in os.walk(V8):
+                  dirs[:] = [name for name in dirs if name not in {'.git', 'out', '__pycache__'}]
+                  for name in files:
+                      if re.fullmatch(r'(license|copying|notice)(\..*)?', name, re.IGNORECASE) is None:
+                          continue
+                      path = Path(parent) / name
+                      if not path.resolve().is_relative_to(V8.resolve()):
+                          raise RuntimeError('license source escaped task-local V8')
+                      count += 1
+                      total += path.stat().st_size
+                      if count > 4096 or total > 32 * 1024**2:
+                          raise RuntimeError('bounded license staging allowance exceeded')
+                      destination = notices / path.relative_to(V8)
+                      destination.parent.mkdir(parents=True, exist_ok=True)
+                      destination.write_bytes(path.read_bytes())
+              if not (notices / 'LICENSE').is_file():
+                  raise RuntimeError('V8 license notice missing')
+              provenance = package / 'provenance'
+              provenance.mkdir()
+              for name in ('preflight.json', 'producer-inputs.json', 'producer-tasklocal.patch',
+                           'checkout-toolchain.txt', 'gclient-sync.json', 'gclient-revisions.json',
+                           'gclient-final-revisions.json', 'args.gn', 'gn-effective-args.txt',
+                           'ninja-commands.txt', 'v8-patched-source.diff'):
+                  shutil.copy2(EVIDENCE / name, provenance / name)
+              shutil.copy2(PRODUCER / 'build.sh', provenance / 'build.sh')
+              shutil.copy2(PRODUCER / 'build-tasklocal.sh', provenance / 'build-tasklocal.sh')
+              shutil.copytree(PRODUCER / 'patches', provenance / 'patches')
+              shutil.copy2(V8 / 'DEPS', provenance / 'DEPS')
+              shutil.copy2(TASK / 'driver.py', provenance / 'driver.py')
+              status = ('UNCERTIFIED Darwin x64 V8 candidate. Actual V8 version13.6.233.17.\n'
+                        'Private artifact only; independent full archive/symbol/scanner/adapter audit and\n'
+                        'actual native gates are required. A macOS15 build is not a macOS13 runtime proof.\n')
+              (package / 'UNCERTIFIED.txt').write_text(status)
+              manifest = {}
+              for path in sorted(package.rglob('*')):
+                  if path.is_file():
+                      manifest[str(path.relative_to(package))] = digest(path)
+              (package / 'SHA256SUMS').write_text(''.join(value + '  ' + name + '\n' for name, value in manifest.items()))
+              archive = stage / 'v8-darwin-x64-candidate.tar.xz'
+              with tarfile.open(archive, 'w:xz', preset=6) as tar:
+                  tar.add(package, arcname='package', recursive=True)
+              # Verify staged tar membership and each source byte before publication.
+              with tarfile.open(archive, 'r:xz') as tar:
+                  found = set()
+                  for member in tar:
+                      if member.isdir():
+                          continue
+                      if not member.isfile() or not member.name.startswith('package/'):
+                          raise RuntimeError('unexpected candidate tar member')
+                      name = member.name[len('package/'):]
+                      if name in found:
+                          raise RuntimeError('duplicate candidate tar file')
+                      found.add(name)
+                      stream = tar.extractfile(member)
+                      h = hashlib.sha256()
+                      for chunk in iter(lambda: stream.read(1024**2), b''):
+                          h.update(chunk)
+                      expected = digest(package / name) if name == 'SHA256SUMS' else manifest.get(name)
+                      if expected is None or h.hexdigest() != expected:
+                          raise RuntimeError('candidate tar payload mismatch: ' + name)
+                  if found != set(manifest) | {'SHA256SUMS'}:
+                      raise RuntimeError('candidate tar membership differs from stage')
+              candidate = TASK / 'candidate'
+              candidate.mkdir(mode=0o700)
+              archive.rename(candidate / archive.name)
+              value = digest(candidate / archive.name)
+              (candidate / 'SHA256SUMS').write_text(value + '  ' + archive.name + '\n')
+              (candidate / 'UNCERTIFIED.txt').write_text(status)
+              shutil.copy2(package / 'SHA256SUMS', EVIDENCE / 'package-files.sha256')
+              shutil.copy2(candidate / 'SHA256SUMS', EVIDENCE / 'candidate.sha256')
+              print('candidate_sha256=' + value, 'source_archive_sha256=' + manifest['lib/libv8.a'], flush=True)
+
+
+          def diagnostics_phase():
+              # Failure diagnostics are bounded; no candidate archive/source cache upload.
+              if (V8 / 'out/release/args.gn').is_file():
+                  shutil.copy2(V8 / 'out/release/args.gn', EVIDENCE / 'last-args.gn')
+              for name, path in (('producer', PRODUCER), ('v8', V8), ('depot', DEPOT)):
+                  if (path / '.git').exists():
+                      command('git', '-C', path, 'status', '--short', '--untracked-files=no',
+                              output=EVIDENCE / (name + '-status.txt'))
+              command('du', '-sk', TASK, output=EVIDENCE / 'task-size-kib.txt')
+
+
+          def evidence_phase():
+              # Upload a bounded snapshot; large logs retain honest head/tail excerpts.
+              # Complete candidate provenance remains separately inside the candidate tar.
+              destination = TASK / 'upload-evidence'
+              if destination.exists():
+                  shutil.rmtree(destination)  # Only a prior interrupted bounded snapshot.
+              destination.mkdir(mode=0o700)
+              total = 0
+              rows = []
+              for source in sorted(EVIDENCE.iterdir()):
+                  if source.name in {'phase-receipts.json', 'driver-result.json'}:
+                      continue  # Registered only after their authoritative final write.
+                  if not source.is_file() or source.is_symlink():
+                      raise RuntimeError('unexpected evidence entry')
+                  size = source.stat().st_size
+                  limit = 8 * 1024**2
+                  if total + min(size, limit) + 65536 > 192 * 1024**2:
+                      rows.append({'file': source.name, 'source_bytes': size, 'omitted': True})
+                      continue
+                  if size <= limit:
+                      target = destination / source.name
+                      shutil.copy2(source, target)
+                      truncated = False
+                  else:
+                      target = destination / (source.name + '.excerpt.txt')
+                      with source.open('rb') as original, target.open('wb') as output:
+                          output.write(f'BOUNDED EXCERPT; original_bytes={size}; not the complete source file\n'.encode())
+                          output.write(original.read(limit // 2 - 4096))
+                          output.write(b'\n[... middle omitted ...]\n')
+                          original.seek(size - limit // 2)
+                          output.write(original.read(limit // 2))
+                      truncated = True
+                  total += target.stat().st_size
+                  rows.append({'file': source.name, 'source_bytes': size, 'uploaded_file': target.name,
+                               'uploaded_bytes': target.stat().st_size, 'uploaded_sha256': digest(target),
+                               'truncated': truncated})
+              (destination / 'evidence-snapshot.json').write_text(json.dumps(rows, indent=2) + '\n')
+
+
+          def requested(signum, _frame):
+              global SIGNAL_REQUEST
+              SIGNAL_REQUEST = signum
+
+
+          def group_alive(pid):
+              try:
+                  os.killpg(pid, 0)
+                  return True
+              except ProcessLookupError:
+                  return False
+
+
+          def signal_group(pid, signum):
+              try:
+                  os.killpg(pid, signum)
+              except ProcessLookupError:
+                  pass
+
+
+          def stop_and_join(process, check_disk):
+              # Never let a secondary disk-stat failure skip physical child teardown.
+              watch_error = None
+              def sample():
+                  nonlocal watch_error
+                  try:
+                      return check_disk()
+                  except BaseException as error:
+                      watch_error = watch_error or error
+                      return False
+              if group_alive(process.pid):
+                  signal_group(process.pid, signal.SIGTERM)
+              deadline = time.monotonic() + 2
+              while time.monotonic() < deadline:
+                  okay = sample()
+                  process.poll()
+                  if not group_alive(process.pid) or not okay:
+                      break
+                  time.sleep(0.1)
+              if group_alive(process.pid):
+                  signal_group(process.pid, signal.SIGKILL)
+              deadline = time.monotonic() + 3
+              while process.poll() is None and time.monotonic() < deadline:
+                  sample()
+                  time.sleep(0.1)
+              if process.poll() is None:
+                  raise RuntimeError('owned child did not exit after KILL')
+              process.wait(timeout=0)  # Already observed exited; no unsampled blocking wait.
+              deadline = time.monotonic() + 2
+              while group_alive(process.pid) and time.monotonic() < deadline:
+                  sample()
+                  time.sleep(0.1)
+              sample()
+              if group_alive(process.pid):
+                  raise RuntimeError('owned process group still exists after termination/join')
+              if watch_error is not None:
+                  raise watch_error
+
+
+          def atomic_json(path, value):
+              temporary = path.with_name(path.name + '.next')
+              temporary.write_text(json.dumps(value, indent=2) + '\n')
+              temporary.replace(path)
+
+
+          def recover_failure_bulk():
+              # Called only AFTER every owned group is confirmed gone. Never delete raw
+              # evidence, driver or environment/phase receipts. An incomplete derived
+              # snapshot can be recreated from the untouched raw evidence.
+              if (TASK / 'active-group.json').exists():
+                  raise RuntimeError('refusing bulk recovery while an owned group is recorded')
+              for name in ('producer', 'depot_tools', 'git-cache', 'cipd-cache',
+                           'vpython-root', 'vpython-downloads', 'xdg-cache', 'pycache',
+                           'tmp', 'stage', 'candidate', 'upload-evidence'):
+                  path = TASK / name
+                  if path.is_symlink():
+                      path.unlink()
+                  elif path.exists():
+                      shutil.rmtree(path)
+              print('recovered only failed task-owned bulk; raw evidence and driver retained', flush=True)
+
+
+          def evidence_growth():
+              # The existing snapshot has a192MiB ceiling, but a refused pre-child phase
+              # may need only a few KiB. Admit its measured bounded copy, not192MiB blindly.
+              copies = sum(min(path.stat().st_size, 8 * 1024**2)
+                           for path in EVIDENCE.iterdir() if path.is_file())
+              return min(192 * 1024**2, copies + 131072)
+
+
+          def publish_final_metadata(payloads, staged):
+              for name, value in payloads.items():
+                  atomic_json(EVIDENCE / name, value)
+                  if staged:
+                      atomic_json(TASK / 'upload-evidence' / name, value)
+              if staged:
+                  destination = TASK / 'upload-evidence'
+                  snapshot = destination / 'evidence-snapshot.json'
+                  records = [row for row in json.loads(snapshot.read_text()) if row['file'] not in payloads]
+                  for name in payloads:
+                      path = destination / name
+                      records.append({'file': name, 'source_bytes': path.stat().st_size,
+                                      'uploaded_file': name, 'uploaded_bytes': path.stat().st_size,
+                                      'uploaded_sha256': digest(path), 'truncated': False})
+                  atomic_json(snapshot, records)
+                  # The snapshot reserved64KiB for final metadata/index; the payload limit
+                  # below is32KiB. Preserve the original192MiB total snapshot ceiling.
+                  if sum(path.stat().st_size for path in destination.iterdir()) > 192 * 1024**2:
+                      raise RuntimeError('finalized evidence exceeds the192MiB ceiling')
+
+
+          def parent_main(recovery_failure=None):
+              signal.signal(signal.SIGTERM, requested)
+              signal.signal(signal.SIGINT, requested)
+              started = time.monotonic()
+              recovery_only = recovery_failure is not None
+              work_deadline = started + 145 * 60
+              stage_deadline = started + 152 * 60
+              hard_deadline = started + (120 if recovery_only else 160 * 60)
+              rows = []
+              previous = EVIDENCE / 'phase-receipts.json'
+              if recovery_only and previous.is_file():
+                  rows = json.loads(previous.read_text())
+              owned = {}
+
+              def phase(name, growth, timeout, cleanup=False):
+                  begin = time.monotonic()
+                  before = available()
+                  peak = 0
+                  primary = None
+                  admitted = False
+                  row = {'phase': name}
+                  def disk_ok():
+                      nonlocal peak
+                      free = available()
+                      peak = max(peak, before - free)
+                      row.update(final_available=free, peak_observed_growth=peak,
+                                 elapsed_seconds=time.monotonic() - begin)
+                      return free >= RESERVE and peak <= growth
+                  try:
+                      if before < growth + RESERVE:
+                          raise RuntimeError(f'disk preflight {name}: available={before} growth={growth} reserve={RESERVE}')
+                      if SIGNAL_REQUEST is not None and not cleanup:
+                          raise RuntimeError(f'cancellation requested: signal{SIGNAL_REQUEST}')
+                      driver_limit = hard_deadline if cleanup else stage_deadline if name == 'stage' else work_deadline
+                      limit = min(time.monotonic() + timeout, driver_limit)
+                      if time.monotonic() >= limit:
+                          raise RuntimeError('driver deadline before phase: ' + name)
+                      log = EVIDENCE / (name + '.log')
+                      with log.open('wb') as sink:
+                          process = subprocess.Popen([sys.executable, str(TASK / 'driver.py'), name],
+                                                     cwd=TASK, stdin=subprocess.PIPE,
+                                                     stdout=sink, stderr=subprocess.STDOUT,
+                                                     env=os.environ.copy(), start_new_session=True)
+                          owned[process] = disk_ok
+                          try:
+                              # The child can only validate/read the gate until this
+                              # complete ownership row is atomically published.
+                              record = {'pid': process.pid, 'phase': name,
+                                        'initial_available': before, 'max_growth': growth,
+                                        'reserve': RESERVE}
+                              atomic_json(EVIDENCE / 'current-phase.json', record)
+                              atomic_json(TASK / 'active-group.json', record)
+                              process.stdin.write(b'1')
+                              process.stdin.close()
+                              admitted = True
+                              while True:
+                                  if not disk_ok():
+                                      raise RuntimeError(f'disk guard {name}: available={available()} growth={peak} max={growth}')
+                                  if log.stat().st_size > 256 * 1024**2:
+                                      raise RuntimeError('bounded phase log exceeded: ' + name)
+                                  if time.monotonic() >= limit:
+                                      raise RuntimeError('phase/driver deadline: ' + name)
+                                  if SIGNAL_REQUEST is not None and not cleanup:
+                                      raise RuntimeError(f'cancellation during{name}: signal{SIGNAL_REQUEST}')
+                                  status = process.poll()
+                                  if status is not None:
+                                      if status != 0:
+                                          raise RuntimeError(f'phase{name} failed: status={status}; see{name}.log')
+                                      break
+                                  time.sleep(0.2)
+                          except BaseException as error:
+                              primary = error
+                          finally:
+                              # Publication/send failure closes the gate: EOF means no work.
+                              try:
+                                  process.stdin.close()
+                              except BaseException as error:
+                                  primary = primary or error
+                              try:
+                                  stop_and_join(process, disk_ok)
+                                  del owned[process]
+                                  (TASK / 'active-group.json').unlink(missing_ok=True)
+                              except BaseException as error:
+                                  if primary is None:
+                                      primary = error
+                                  else:
+                                      print('secondary child cleanup failure:', repr(error), flush=True)
+                  except BaseException as error:
+                      primary = primary or error
+                  finally:
+                      measurement_error = None
+                      try:
+                          free = available()
+                          peak = max(peak, before - free)
+                      except OSError as error:
+                          free = None
+                          measurement_error = repr(error)
+                          print('secondary final disk measurement:', measurement_error, flush=True)
+                          primary = primary or error
+                      if admitted and free is not None and (free < RESERVE or peak > growth):
+                          primary = primary or RuntimeError('disk guard exceeded during child cleanup: ' + name)
+                      row.update(status='passed' if primary is None else 'failed',
+                                 admitted=admitted, failure=repr(primary) if primary else None,
+                                 elapsed_seconds=time.monotonic() - begin,
+                                 initial_available=before, final_available=free,
+                                 final_measurement_error=measurement_error, peak_observed_growth=peak, max_growth=growth, reserve=RESERVE)
+                      rows.append(row)  # The fallback predicate keeps this exact receipt current.
+                      if free is not None and free >= RESERVE + 131072:
+                          try:
+                              atomic_json(previous, rows)
+                          except BaseException as error:
+                              if primary is None:
+                                  primary = error
+                              else:
+                                  print('secondary phase receipt failure:', repr(error), flush=True)
+                              row.update(status='failed', failure=repr(primary))
+                      print(json.dumps(row), flush=True)
+                  if primary is not None:
+                      raise primary
+
+              failure = recovery_failure
+              evidence_staged = False
+              try:
+                  if not recovery_only:
+                      phase('preflight', 32 * 1024**2, 120)
+                      environment = json.loads((TASK / 'environment.json').read_text())
+                      os.environ.update(environment)
+                      phase('source', 8 * GIB, 45 * 60)
+                      phase('build', 4 * GIB, 130 * 60)
+                      phase('stage', 800 * 1024**2, 5 * 60)
+              except BaseException as error:
+                  failure = repr(error)
+                  print('producer failed:', failure, flush=True)
+              finally:
+                  for process, disk_ok in list(owned.items()):
+                      try:
+                          stop_and_join(process, disk_ok)  # Same phase predicate, including fallback.
+                          del owned[process]
+                          (TASK / 'active-group.json').unlink(missing_ok=True)
+                      except BaseException as error:
+                          print('final owned child cleanup failure:', repr(error), flush=True)
+                          failure = failure or 'child cleanup: ' + repr(error)
+                  if SIGNAL_REQUEST is not None:
+                      failure = failure or f'cancellation requested: signal{SIGNAL_REQUEST}'
+                  try:
+                      if owned:
+                          raise RuntimeError('cannot recover bulk or stage evidence before child teardown')
+                      if failure is not None:
+                          recover_failure_bulk()
+                      if not recovery_only:
+                          phase('diagnostics', 32 * 1024**2, 120, cleanup=True)
+                  except BaseException as error:
+                      print('failure recovery/diagnostics:', repr(error), flush=True)
+                      failure = failure or 'diagnostics: ' + repr(error)
+                  try:
+                      if owned:
+                          raise RuntimeError('cannot stage evidence before child teardown')
+                      if failure is not None:
+                          recover_failure_bulk()
+                      # Cancellation does NOT discard evidence custody. This short cleanup
+                      # phase uses the same publication gate and disk/deadline supervisor.
+                      phase('evidence', evidence_growth(), 60 if recovery_only else 120, cleanup=True)
+                      evidence_staged = True
+                  except BaseException as error:
+                      print('bounded evidence staging failed:', repr(error), flush=True)
+                      failure = failure or 'evidence: ' + repr(error)
+                  if SIGNAL_REQUEST is not None:
+                      failure = failure or f'late cancellation requested: signal{SIGNAL_REQUEST}'
+                  try:
+                      final_free = available()
+                  except OSError as error:
+                      final_free = None
+                      failure = failure or 'final disk measurement: ' + repr(error)
+                      print('final disk measurement unavailable:', repr(error), flush=True)
+                  if final_free is not None and final_free >= RESERVE + 131072:
+                      result = {'success': failure is None, 'failure': failure,
+                                'elapsed_seconds': time.monotonic() - started,
+                                'signal': SIGNAL_REQUEST, 'candidate_status': 'UNCERTIFIED'}
+                      payloads = {'phase-receipts.json': rows, 'driver-result.json': result}
+                      if sum(len(json.dumps(value).encode()) for value in payloads.values()) > 32768:
+                          raise RuntimeError('final metadata exceeded its32KiB allowance')
+                      publish_final_metadata(payloads, evidence_staged)
+                      # Recheck before readiness in case cancellation arrived while the
+                      # final metadata/index was being written; refresh its exact hashes.
+                      if SIGNAL_REQUEST is not None and result['success']:
+                          failure = f'late cancellation requested: signal{SIGNAL_REQUEST}'
+                          result.update(success=False, failure=failure, signal=SIGNAL_REQUEST)
+                          publish_final_metadata(payloads, evidence_staged)
+                      if evidence_staged and not owned:
+                          atomic_json(TASK / 'evidence-ready.json', {'complete': True})
+                  else:
+                      print('evidence not ready; retain raw logs and driver, do not delete task', flush=True)
+                      failure = failure or 'insufficient final evidence headroom'
+              return 0 if failure is None and SIGNAL_REQUEST is None else 1
+
+
+          def cleanup_phase():
+              # Handles a parent killed before its finally block; the token gate prevents
+              # unpublished children from touching bulk backing after the parent exits.
+              marker = TASK / 'active-group.json'
+              if marker.exists():
+                  row = json.loads(marker.read_text())
+                  pid = row['pid']
+                  if not isinstance(pid, int) or pid <= 1:
+                      raise RuntimeError('invalid owned process-group marker')
+                  def sample():
+                      try:
+                          free = available()
+                          return free >= RESERVE and row['initial_available'] - free <= row['max_growth']
+                      except OSError as error:
+                          print('cleanup disk-stat refusal:', repr(error), flush=True)
+                          return False  # Still KILL/wait; a stat error must not skip teardown.
+                  if group_alive(pid):
+                      signal_group(pid, signal.SIGTERM)
+                  deadline = time.monotonic() + 2
+                  while group_alive(pid) and time.monotonic() < deadline:
+                      if not sample():
+                          break
+                      time.sleep(0.1)
+                  if group_alive(pid):
+                      signal_group(pid, signal.SIGKILL)
+                  deadline = time.monotonic() + 5
+                  while group_alive(pid) and time.monotonic() < deadline:
+                      sample()
+                      time.sleep(0.1)
+                  sample()
+                  if group_alive(pid):
+                      raise RuntimeError('owned group remains: preserve task files and raw evidence')
+                  marker.unlink()
+              if (TASK / 'evidence-ready.json').is_file():
+                  return
+              old = EVIDENCE / 'driver-result.json'
+              reason = json.loads(old.read_text()).get('failure') if old.is_file() else None
+              parent_main(recovery_failure=reason or 'producer interrupted before final evidence')
+              if not (TASK / 'evidence-ready.json').is_file():
+                  raise RuntimeError('bounded evidence not ready: preserve raw logs and driver')
+
+
+          if __name__ == '__main__':
+              validate_task()
+              if len(sys.argv) == 1:
+                  raise SystemExit(parent_main())
+              if len(sys.argv) != 2 or sys.argv[1] not in {'preflight', 'source', 'build', 'stage', 'diagnostics', 'evidence', 'cleanup'}:
+                  raise SystemExit('invalid internal phase')
+              if sys.argv[1] != 'cleanup' and sys.stdin.buffer.read(1) != b'1':
+                  raise SystemExit(125)  # EOF/invalid gate token authorizes NO phase work.
+              {'preflight': preflight, 'source': source_phase, 'build': build_phase,
+               'stage': stage_phase, 'diagnostics': diagnostics_phase, 'evidence': evidence_phase, 'cleanup': cleanup_phase}[sys.argv[1]]()
+          PY
+      - name: Produce the pinned candidate under continuous phase guards
+        shell: bash
+        timeout-minutes: 165
+        run: |
+          set -euo pipefail
+          # Driver work <=145min; staging/termination/evidence <=160min.
+          # Job slack remains for always-run group cleanup and artifact uploads.
+          python3 "$NAPI_X64_TASK/driver.py"
+      - name: Finish owned process-group cleanup and retain failure evidence
+        if: always()
+        shell: bash
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          if [ -n "${NAPI_X64_TASK:-}" ] && [ -f "$NAPI_X64_TASK/driver.py" ]; then
+            python3 "$NAPI_X64_TASK/driver.py" cleanup
+          fi
+      - name: Upload the immutable private uncertified candidate
+        if: ${{ success() && github.event.repository.private }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        timeout-minutes: 4
+        with:
+          name: napi-darwin-x64-candidate-v8-13.6.233.17-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.NAPI_X64_TASK }}/candidate
+          if-no-files-found: error
+          retention-days: 7
+      - name: Upload bounded private producer evidence
+        id: evidence-upload
+        if: ${{ always() && github.event.repository.private }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        timeout-minutes: 4
+        with:
+          name: napi-darwin-x64-candidate-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.NAPI_X64_TASK }}/upload-evidence
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Remove only the owned task after bounded process cleanup
+        if: always()
+        shell: bash
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          if [ -z "${NAPI_X64_TASK:-}" ]; then
+            exit 0
+          fi
+          expected="$RUNNER_TEMP/napi-x64-producer-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          test "$NAPI_X64_TASK" = "$expected"
+          if [ -f "$NAPI_X64_TASK/driver.py" ]; then
+            python3 "$NAPI_X64_TASK/driver.py" cleanup
+          fi
+          # A refused/failed staging pass must never erase its referenced logs.
+          test -f "$NAPI_X64_TASK/evidence-ready.json"
+          test '${{ steps.evidence-upload.outcome }}' = success
+          rm -rf -- "$NAPI_X64_TASK"
