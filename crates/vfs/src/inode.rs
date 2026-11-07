@@ -391,6 +391,9 @@ mod tests {
         async fn setattr(&self, _: &SetAttr) -> FsResult<Attr> {
             Err(Errno::EOPNOTSUPP)
         }
+        async fn open(&self, _: crate::OpenOptions) -> FsResult<Box<dyn crate::Handle>> {
+            Err(Errno::EOPNOTSUPP)
+        }
     }
     struct DenyAfterWait {
         expected: Arc<Inode>,

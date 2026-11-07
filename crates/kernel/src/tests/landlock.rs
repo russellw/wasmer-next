@@ -654,6 +654,12 @@ impl wasixv2_vfs::Node for ObservedFilesRoot {
     ) -> wasixv2_vfs::FsResult<wasixv2_vfs::Attr> {
         self.inner.setattr(attr).await
     }
+    async fn open(
+        &self,
+        options: wasixv2_vfs::OpenOptions,
+    ) -> wasixv2_vfs::FsResult<Box<dyn wasixv2_vfs::Handle>> {
+        self.inner.open(options).await
+    }
     async fn lookup(&self, name: &[u8]) -> wasixv2_vfs::FsResult<Arc<dyn wasixv2_vfs::Node>> {
         if self.observe.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(Errno::EACCES);
