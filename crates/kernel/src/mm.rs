@@ -2616,6 +2616,7 @@ impl Kernel {
     /// whose memory already holds the old contents: parts past the new length are written back
     /// and dropped, mapped objects' pages move along, and a mapping that ended at the old end
     /// grows with more of its source. The caller holds `Mm::op`.
+    #[allow(clippy::too_many_arguments)]
     async fn move_mappings(
         &self,
         caller: &Caller<'_>,

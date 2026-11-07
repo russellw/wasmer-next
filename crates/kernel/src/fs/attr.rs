@@ -338,9 +338,8 @@ impl Kernel {
             return Err(Errno::EINVAL.into());
         }
         let path = super::read_path_maybe_null(caller.memory(), pathname, flags).await?;
-        Ok(self
-            .resolve_at(caller, env, dfd, &path, flags, follow)
-            .await?)
+        self.resolve_at(caller, env, dfd, &path, flags, follow)
+            .await
     }
 
     fn xattr_fd(&self, caller: &Caller<'_>, fd: Fd) -> SysResult<Path> {

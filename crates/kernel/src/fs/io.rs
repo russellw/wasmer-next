@@ -487,6 +487,7 @@ impl Kernel {
         self.epipe(caller, file, ret, broken.get())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn write_steps(
         &self,
         caller: &Caller<'_>,

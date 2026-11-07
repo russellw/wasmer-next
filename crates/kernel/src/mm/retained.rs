@@ -132,10 +132,8 @@ impl Drop for MappingRetirement {
                 mapping.retire(&mut errors);
             }
         }
-        for source in self.sources.drain(..) {
-            if let Some(source) = source {
-                source.retire(&mut errors);
-            }
+        for source in self.sources.drain(..).flatten() {
+            source.retire(&mut errors);
         }
         for pages in self.pages.drain(..) {
             errors.run(|| drop(pages));

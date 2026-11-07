@@ -106,6 +106,7 @@ impl Kernel {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn splice_files_in(
         &self,
         caller: &Caller<'_>,
@@ -375,6 +376,7 @@ impl Kernel {
 
     /// `do_splice_from`: what the pipe holds, up to `len` bytes, to `output` at `at` (a file)
     /// or as a write (a socket or device); only what `output` took leaves the pipe.
+    #[allow(clippy::too_many_arguments)]
     async fn splice_from_pipe(
         &self,
         caller: &Caller<'_>,
@@ -433,6 +435,7 @@ impl Kernel {
 
     /// `splice_file_to_pipe`: waits for room in the pipe, then reads at most what fits from
     /// `input` at `at` (a file or device) or as a read (a socket), once.
+    #[allow(clippy::too_many_arguments)]
     async fn splice_to_pipe(
         &self,
         caller: &Caller<'_>,

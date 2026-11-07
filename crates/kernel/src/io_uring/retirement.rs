@@ -23,6 +23,8 @@ pub(super) struct SubmissionRetirement {
 #[derive(Default)]
 pub(crate) struct Resources {
     pub(super) memory: MemoryRetirement,
+    // Preserve the actual request boxes moved from submission/queue owners.
+    #[allow(clippy::vec_box)]
     pub(super) requests: Vec<Box<Req>>,
     pub(super) ready: Vec<Option<Req>>,
     pub(super) timers: Vec<Option<crate::timer::Timer>>,

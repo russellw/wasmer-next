@@ -113,9 +113,8 @@ impl Kernel {
             false => read_path(caller.memory(), filename).await?,
         };
         let env = self.env(caller);
-        Ok(self
-            .resolve_at(caller, &env, dfd, &path, at_flags, true)
-            .await?)
+        self.resolve_at(caller, &env, dfd, &path, at_flags, true)
+            .await
     }
 
     /// `sys_file_getattr`.
