@@ -944,7 +944,7 @@ impl StoreRef {
                 native
                     .owner
                     .bind_store_cleanup_fence(wasmer_api::sys::NativeCleanupFence::new(
-                        Rc::new(|_| {}),
+                        Rc::new(|_| wasmer_api::sys::NativeCleanupFenceObservation::Passive),
                         Rc::from(fence),
                     ));
                 Ok(())

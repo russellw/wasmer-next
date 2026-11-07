@@ -39,7 +39,7 @@ struct LoaderFence {
 }
 #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
 impl LoaderFence {
-    fn observe(&self, waker: &std::task::Waker) {
+    fn observe(&self, waker: &std::task::Waker) -> wasmer::sys::NativeCleanupFenceObservation {
         // Registration clones/drops user Wakers. Reentry must not encounter a
         // borrowed observer, and unwind must restore the SAME registration.
         struct Restore<'a> {
@@ -53,16 +53,19 @@ impl LoaderFence {
         }
         let observer = self.observer.borrow_mut().take();
         let Some(observer) = observer else {
-            return;
+            return wasmer::sys::NativeCleanupFenceObservation::Unarmed;
         };
         let mut restore = Restore {
             slot: &self.observer,
             observer: Some(observer),
         };
-        let _ = std::future::Future::poll(
+        match std::future::Future::poll(
             std::pin::Pin::new(restore.observer.as_mut().unwrap()),
             &mut std::task::Context::from_waker(waker),
-        );
+        ) {
+            std::task::Poll::Ready(()) => wasmer::sys::NativeCleanupFenceObservation::Unarmed,
+            std::task::Poll::Pending => wasmer::sys::NativeCleanupFenceObservation::Armed,
+        }
     }
 }
 #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
@@ -258,5 +261,128 @@ mod tests {
             drop(asynchronous);
             drop(generation);
         }
+    }
+    #[test]
+    fn bound_scope_destruction_between_ready_observation_and_query_wakes_original_drain() {
+        use std::sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        };
+        struct GatedHost {
+            executor: EmptyHost,
+            entered: mpsc::Sender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+        }
+        impl wasixv2_host::Host for GatedHost {
+            fn realtime(&self) -> Duration {
+                Duration::ZERO
+            }
+            fn monotonic(&self) -> Duration {
+                Duration::ZERO
+            }
+            fn sleep(&self, _: Duration) -> wasixv2_host::LocalFuture<'_, ()> {
+                Box::pin(async {})
+            }
+            fn random(&self, _: &mut [u8]) {}
+            fn executor(&self) -> &dyn wasixv2_host::Executor {
+                &self.executor
+            }
+            fn report(&self, _: &str) {}
+        }
+        impl Drop for GatedHost {
+            fn drop(&mut self) {
+                self.entered.send(()).unwrap();
+                self.release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap();
+            }
+        }
+        struct DrainWake {
+            wakes: AtomicUsize,
+            notified: mpsc::Sender<()>,
+        }
+        impl std::task::Wake for DrainWake {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.wakes.fetch_add(1, Ordering::SeqCst);
+                let _ = self.notified.send(());
+            }
+        }
+        let owner = wasmer::sys::NativeCleanupOwner::new_store_bound();
+        let mut store = wasmer::Store::default();
+        let generation =
+            wasmer::sys::NativeInvocationScope::bind_with_cleanup(&mut store, Some(owner.clone()))
+                .unwrap();
+        let asynchronous = store.into_async();
+        let (entered, in_host_drop) = mpsc::channel();
+        let (release, host_release) = mpsc::channel();
+        let scope = LoaderCleanup::new(Arc::new(GatedHost {
+            executor: EmptyHost,
+            entered,
+            release: Mutex::new(host_release),
+        }));
+        let weak = Arc::downgrade(&scope);
+        let local = local_cleanup_runner(&asynchronous, scope.clone()).unwrap();
+        drop(local.run(std::future::pending::<()>())); // actual existing closer
+        drop(local);
+        let settlement = scope.settlement();
+        let fence = std::rc::Rc::new(LoaderFence {
+            observer: std::cell::RefCell::new(Some(settlement.observer())),
+            settlement,
+        });
+        let (start, begin_drop) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            begin_drop.recv_timeout(Duration::from_secs(2)).unwrap();
+            drop(scope); // last actual Arc; metadata fences retain no scope
+        });
+        let start = std::cell::RefCell::new(Some(start));
+        let observed = fence.clone();
+        owner.bind_store_cleanup_fence(wasmer::sys::NativeCleanupFence::new(
+            std::rc::Rc::new(move |waker| {
+                let status = observed.observe(waker); // REAL Ready unregisters
+                let start = start.borrow_mut().take();
+                if let Some(start) = start {
+                    assert!(matches!(
+                        status,
+                        wasmer::sys::NativeCleanupFenceObservation::Unarmed
+                    ));
+                    start.send(()).unwrap();
+                    // Force actual Host::drop to begin BEFORE observe returns
+                    // and before the owner's final pure readiness query.
+                    in_host_drop.recv_timeout(Duration::from_secs(2)).unwrap();
+                }
+                status
+            }),
+            std::rc::Rc::new(move || fence.settlement.is_ready()),
+        ));
+        let (notified, original_drain) = mpsc::channel();
+        let wake = Arc::new(DrainWake {
+            wakes: AtomicUsize::new(0),
+            notified,
+        });
+        let waker = Waker::from(wake.clone());
+        let mut cx = Context::from_waker(&waker);
+        // Only the loader/admission prerequisite is under test; the actual
+        // Store remains alive, and no full seal certificate is claimed.
+        assert!(owner.poll_quiescent(&mut cx).is_pending());
+        assert!(
+            weak.upgrade().is_none(),
+            "actual last-Arc destruction is in progress"
+        );
+        release.send(()).unwrap();
+        worker.join().unwrap();
+        original_drain
+            .recv_timeout(Duration::from_secs(2))
+            .expect("original drain was stranded in the Ready-to-Pending interval");
+        assert_eq!(wake.wakes.load(Ordering::SeqCst), 1);
+        assert!(owner.poll_quiescent(&mut cx).is_ready());
+        assert_eq!(wake.wakes.load(Ordering::SeqCst), 1);
+        drop(asynchronous);
+        drop(generation);
     }
 }
