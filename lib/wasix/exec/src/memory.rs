@@ -382,7 +382,12 @@ pub(crate) fn zero_pages(
         // the image's data again, so they are mapped from the file again with zeros over its
         // data ([`Base::clear`]). Past the image it is its own private anonymous mapping.
         let over_base = base.map_or(0, |base| {
-            (base.len().saturating_sub(u64::from(addr)) as usize).min(len)
+            #[cfg(target_os = "linux")]
+            {
+                (base.len().saturating_sub(u64::from(addr)) as usize).min(len)
+            }
+            #[cfg(not(target_os = "linux"))]
+            match *base {}
         });
         // SAFETY: the range lies inside the memory, outside the guard and every read-only view
         // (which stay so while `read_only` is held), and holds no shared object's pages, as the
