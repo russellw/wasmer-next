@@ -280,8 +280,6 @@ jobs:
 
           run_logged napi-library cargo test --manifest-path "$manifest" --offline --locked -p wasmer-napi \
             --features cli,native-stack-diagnostics --lib -- --test-threads=1
-          run_logged wasix-facade cargo test --manifest-path "$manifest" --offline --locked -p wasmer-napi \
-            --features cli,native-stack-diagnostics --test wasix_facade -- --test-threads=1
           run_logged wasix-leases cargo test --manifest-path "$manifest" --offline --locked -p wasmer-napi \
             --features cli,native-stack-diagnostics --test wasix_leases -- --test-threads=1
           run_logged wasix-pending cargo test --manifest-path "$manifest" --offline --locked -p wasmer-napi \
@@ -302,8 +300,6 @@ jobs:
           done
           run_logged callback-control cargo test --manifest-path "$manifest" --offline --locked -p wasmer-napi \
             --features cli,native-stack-diagnostics --test callback_control -- --test-threads=1
-          run_logged cli-facade-mounts cargo test --manifest-path "$manifest" --offline --locked -p wasmer-napi \
-            --features cli,native-stack-diagnostics --test cli_facade_mounts -- --test-threads=1
 
           jspi_test='native_v8_jspi_suspension_survives_a_second_root_on_a_disjoint_stack'
           run_logged jspi-test-list cargo test --manifest-path "$manifest" --offline --locked -p wasmer-napi \
@@ -312,6 +308,11 @@ jobs:
           run_logged native-jspi cargo test --manifest-path "$manifest" --offline --locked -p wasmer-napi \
             --features cli,native-stack-diagnostics --test native_jspi -- \
             --exact "$jspi_test" --test-threads=1
+
+          run_logged wasix-facade cargo test --manifest-path "$manifest" --offline --locked -p wasmer-napi \
+            --features cli,native-stack-diagnostics --test wasix_facade -- --test-threads=1
+          run_logged cli-facade-mounts cargo test --manifest-path "$manifest" --offline --locked -p wasmer-napi \
+            --features cli,native-stack-diagnostics --test cli_facade_mounts -- --test-threads=1
       - name: Verify disk growth and 2 GiB reserve after runtime gates
         if: always()
         shell: bash
