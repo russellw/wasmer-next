@@ -86,6 +86,37 @@ These are focused changed-path gates; the earlier complete suites were not rerun
 Default and N-API all-target SDK Clippy pass with `clippy::all` denied.
 Locked/offline metadata and the zero-legacy normal-tree audit pass.
 
+Public active-JavaScript cancellation now passes two Linux N-API tests: owning
+`Process.kill` and `Sandbox.close`. A new C fixture uses the unchanged producer
+and invokes its marker callback from iteration 100000 of the evaluated JS loop.
+Both cases keep another JS loop alive through primary cancellation and a finite
+original callback control, then independently cancel that sibling. Actual joins
+return 137, preserve accepted output and EOF, and retain cached waits through
+repeated close/client shutdown. Existing private context access observes cleanup
+only; all launch and cancellation operations use the public SDK.
+
+The default context's unlimited policy reserves zero V8 heap charge. Live session,
+isolate and Wasm charges are positive before cancellation; session/isolate counts
+and all tracked charge pools are zero after the actual owning wait. Native
+retirement releases isolate accounting after physical C++ destruction. The marker
+proves evaluation reached the loop; cancellation may arrive during the callback
+return or subsequent loop instructions. No production repair was needed. The
+feature-scoped all-target SDK Clippy gate passes with `clippy::all` denied.
+
+To produce the three required guests with the existing configured tools and run
+only this acceptance target:
+
+```sh
+export NAPI_WASIX_TEST_OUT_DIR="$PWD/target/napi-fixtures"
+for program in test_callback run_script_test test_sdk_js_active_loop; do
+  bash lib/napi/tests/build-test-wasix.sh "$program"
+done
+cargo test --locked -p wasmer-sdk --features napi-v8 --lib process::active_js_cancellation -- --test-threads=1
+```
+
+The infinite-loop fixture stays outside the native fixture manifest, whose runner
+has no cancellation owner. Missing produced guests fail this SDK gate explicitly.
+
 The integration preserves the Python compatibility fixes, root C API imports
 changes and WLK console/append policies already on main. Legacy
 support crates may remain for other consumers; root integration owns their final

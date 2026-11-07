@@ -689,3 +689,6 @@ mod close_escalation {
         .expect("explicit close escalation joined the shared actual completion")
     }
 }
+
+#[cfg(all(test, feature = "napi-v8", target_os = "linux"))]
+mod active_js_cancellation;
