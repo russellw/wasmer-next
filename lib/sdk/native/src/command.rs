@@ -20,6 +20,33 @@ use std::{
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use wasixv2::{ByteSink, ByteSource, LocalFuture, Machine, ProcessConfig};
 
+// Inspect original atom bytes, never the container or the instrumented module.
+// Parse the whole module before positively selecting the private entry profile.
+fn import_free_command(bytes: &[u8]) -> Result<bool> {
+    // Scripts and other interpreter inputs keep the existing spawn_file path.
+    if !bytes.starts_with(b"\0asm\x01\0\0\0") {
+        return Ok(false);
+    }
+    let mut import_free = true;
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        match payload.map_err(execution)? {
+            wasmparser::Payload::Version { encoding, .. }
+                if encoding != wasmparser::Encoding::Module =>
+            {
+                return Ok(false);
+            }
+            wasmparser::Payload::ImportSection(imports) => {
+                for import in imports.into_imports() {
+                    import.map_err(execution)?;
+                    import_free = false;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(import_free)
+}
+
 /// Live stdio configuration for [`Command::spawn`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Stdio {
@@ -257,6 +284,14 @@ impl Command {
     }
     async fn spawn_owned(self) -> Result<Process> {
         let (package, command_name, mut packages) = self.resolve()?;
+        let command = package
+            .inner
+            .binary
+            .get_command(&command_name)
+            .ok_or_else(|| Error::CommandNotFound {
+                command: command_name.clone(),
+            })?;
+        let initial_command = import_free_command(command.atom().as_ref())?;
         packages.retain(|other| !other.same_as(&package));
         packages.insert(0, package.clone());
         let limit = self
@@ -306,6 +341,7 @@ impl Command {
             .with_resolve_module_sync(move |bytes| resolver.compile_capi(&bytes));
         let (networking, network_scope) = self.sandbox.run_network();
         let mut builder = Machine::builder()
+            .wasix1_initial_command(initial_command)
             .network(networking)
             .loader(loader.clone())
             .instantiation_hook(Arc::new(capi));
@@ -449,11 +485,21 @@ impl Command {
                     config.env.push(entry);
                 }
             }
-            Ok::<_, Error>(config)
+            let initial_module = if initial_command {
+                Some(
+                    loader
+                        .compile(command.atom().as_ref())
+                        .await
+                        .map_err(execution)?,
+                )
+            } else {
+                None
+            };
+            Ok::<_, Error>((config, initial_module))
         }
         .await;
-        let config = match prepare {
-            Ok(config) => config,
+        let (config, initial_module) = match prepare {
+            Ok(prepared) => prepared,
             Err(error) => {
                 machine.shutdown().await;
                 drop(machine);
@@ -466,14 +512,18 @@ impl Command {
             }
         };
         let machine = Arc::new(machine);
-        let run = match wasixv2::spawn_file(
-            machine.clone(),
-            self.sandbox.inner.client.inner.engine.clone(),
-            format!("/bin/{command_name}"),
-            config,
-        )
-        .await
-        {
+        let started = if let Some((engine, module)) = initial_module {
+            wasixv2::spawn(machine.clone(), engine, module, config).await
+        } else {
+            wasixv2::spawn_file(
+                machine.clone(),
+                self.sandbox.inner.client.inner.engine.clone(),
+                format!("/bin/{command_name}"),
+                config,
+            )
+            .await
+        };
+        let run = match started {
             Ok(run) => run,
             Err(error) => {
                 machine.shutdown().await;
@@ -816,6 +866,27 @@ impl Output {
 #[cfg(test)]
 mod tests {
     use super::{CapturedOutput, ExitReason, ExitStatus, Output, deduplicate_environment};
+
+    #[test]
+    fn initial_command_classification_preserves_interpreter_and_imported_inputs() {
+        use super::import_free_command;
+        assert!(!import_free_command(b"#!/bin/sh\nexit 0\n").unwrap());
+        assert!(!import_free_command(b"\0asm\x0d\0\x01\0").unwrap());
+        let raw = wat::parse_str(
+            r#"(module (memory (export "memory") 1)
+            (func (export "_start")))"#,
+        )
+        .unwrap();
+        assert!(import_free_command(&raw).unwrap());
+        let imported = wat::parse_str(
+            r#"(module
+            (import "wasixv2-exec" "preempt" (func))
+            (memory (export "memory") 1) (func (export "_start")))"#,
+        )
+        .unwrap();
+        assert!(!import_free_command(&imported).unwrap());
+        assert!(import_free_command(b"\0asm\x01\0\0\0\x01\x80").is_err());
+    }
 
     #[tokio::test]
     async fn direct_output_sinks_retain_only_accepted_pipe_prefixes() {

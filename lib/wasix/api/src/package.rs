@@ -178,7 +178,7 @@ impl Package {
 pub async fn install_packages(machine: &mut Machine, packages: &[&Package]) -> io::Result<()> {
     let sources = packages
         .iter()
-        .map(|package| PackageInstallSource::Webc(*package))
+        .map(|package| PackageInstallSource::Webc(package))
         .collect::<Vec<_>>();
     install_package_sources(machine, &sources).await
 }
