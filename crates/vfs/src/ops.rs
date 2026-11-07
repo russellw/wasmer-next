@@ -216,25 +216,25 @@ impl Vfs {
         if flags.contains(OpenFlags::O_CREAT) {
             self.may_create_in_sticky(cx, &parent, &provisional).await?;
         }
+        let policy = Path {
+            mnt: provisional.mnt.clone(),
+            dentry: provisional.dentry.policy_view(),
+        };
         if let Some(security) = cx.security() {
             let requested = if flags.contains(FMODE_EXEC) {
                 MAY_EXEC
             } else {
                 mask & (MAY_READ | MAY_WRITE)
             };
-            security.file_open(&provisional, requested, truncate)?;
+            security.file_open(&policy, requested, truncate)?;
         }
         let exec = flags.contains(FMODE_EXEC);
-        self.permission_event(
-            cx,
-            &provisional,
-            if exec { Perm::OpenExec } else { Perm::Open },
-        )
-        .await?;
+        self.permission_event(cx, &policy, if exec { Perm::OpenExec } else { Perm::Open })
+            .await?;
         if truncate && provisional.dentry.sb().fs.allow_hsm() {
             self.permission_event(
                 cx,
-                &provisional,
+                &policy,
                 Perm::PreAccess {
                     offset: Some(0),
                     count: 0,

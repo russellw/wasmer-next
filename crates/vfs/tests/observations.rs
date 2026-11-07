@@ -855,9 +855,7 @@ fn acquired_replacement_uses_nonowner_acl_before_grant_completion() {
         .map(|(tag, perm, id)| AclEntry { tag, perm, id })
         .collect(),
     );
-    block_on(replacement.setxattr(XATTR_NAME_POSIX_ACL_ACCESS, &acl.to_stored(), XattrSet::Any))
-        .unwrap();
-    fs.root.replace_on_open.store(true, Ordering::SeqCst);
+    fs.root.observe.store(false, Ordering::SeqCst);
     let vfs = Vfs::new(fs.clone());
     let root = vfs.root();
     let cred = Cred::user(2, 2);
@@ -868,6 +866,20 @@ fn acquired_replacement_uses_nonowner_acl_before_grant_completion() {
         task: 0,
         leases: None,
     };
+    let retained = block_on(vfs.lookup(&cx, &root, b"replacement", LookupFlags::follow())).unwrap();
+    // Retain a canonical inode with an absent ACL cached before a host-side change.
+    assert_eq!(
+        block_on(vfs.permission(&cx, &retained, wasixv2_vfs::MAY_WRITE)),
+        Ok(())
+    );
+    block_on(replacement.setxattr(XATTR_NAME_POSIX_ACL_ACCESS, &acl.to_stored(), XattrSet::Any))
+        .unwrap();
+    assert_eq!(
+        block_on(vfs.permission(&cx, &retained, wasixv2_vfs::MAY_WRITE)),
+        Ok(())
+    );
+    fs.root.observe.store(true, Ordering::SeqCst);
+    fs.root.replace_on_open.store(true, Ordering::SeqCst);
     let how = OpenHow {
         flags: OpenFlags::O_WRONLY | OpenFlags::O_TRUNC,
         mode: 0,
