@@ -28,6 +28,7 @@ struct ManagedStore {
     generation: Option<wasmer_api::sys::NativeInvocationScope>,
     owner: wasmer_api::sys::NativeCleanupOwner,
     driver: RefCell<Option<Rc<Driver>>>,
+    ledger: Rc<RetirementLedger>,
     #[cfg(feature = "wasi")]
     endpoints: RefCell<Vec<Weak<dyn ContinuationEndpoint>>>,
 }
@@ -38,7 +39,7 @@ pub(crate) struct Driver {
     local: tokio::task::LocalSet,
     active: std::cell::Cell<bool>,
     owner: wasmer_api::sys::NativeCleanupOwner,
-    enrolled: RefCell<Vec<Weak<NativeRetirementState>>>,
+    ledger: Rc<RetirementLedger>,
     wake: std::sync::Arc<DriverWake>,
 }
 
@@ -281,27 +282,128 @@ impl CleanupRetirement {
 }
 
 #[cfg(feature = "sys")]
-#[derive(Clone, Default)]
+type RetirementClock = Rc<std::cell::Cell<u64>>;
+
+#[cfg(feature = "sys")]
+struct RetirementEvent {
+    order: Option<u64>,
+    clock: RetirementClock,
+    payload: RetirementPanic,
+}
+#[cfg(feature = "sys")]
+struct RetirementClockBinding {
+    clock: RetirementClock,
+    bound: bool,
+    history: bool,
+}
+#[cfg(feature = "sys")]
+#[derive(Clone)]
 pub(crate) struct RetirementFailure(
-    Rc<RefCell<Option<RetirementPanic>>>,
+    Rc<RefCell<Option<RetirementEvent>>>,
     #[cfg(feature = "wasi")] Rc<std::cell::Cell<bool>>,
+    Rc<RefCell<RetirementClockBinding>>,
 );
 #[cfg(feature = "sys")]
+impl Default for RetirementFailure {
+    fn default() -> Self {
+        Self(
+            Rc::default(),
+            #[cfg(feature = "wasi")]
+            Rc::default(),
+            Rc::new(RefCell::new(RetirementClockBinding {
+                clock: Rc::default(),
+                bound: false,
+                history: false,
+            })),
+        )
+    }
+}
+#[cfg(feature = "sys")]
 impl RetirementFailure {
-    #[cfg(feature = "wasi")]
-    pub(crate) fn record(&self, panic: RetirementPanic) {
-        // A consumer can have acknowledged an earlier value reentrantly while
-        // publication is still protected. A late value reopens exact delivery.
-        self.1.set(false);
-        let first = self.0.borrow_mut().take();
-        if let Some(first) = first {
-            *self.0.borrow_mut() = Some(first);
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(panic)));
-        } else {
-            *self.0.borrow_mut() = Some(panic);
+    fn binding(&self) -> &RefCell<RetirementClockBinding> {
+        #[cfg(feature = "wasi")]
+        {
+            &self.2
+        }
+        #[cfg(not(feature = "wasi"))]
+        {
+            &self.1
         }
     }
-    #[cfg(feature = "wasi")]
+    fn bind_clock(&self, clock: &RetirementClock) -> Result<(), RuntimeError> {
+        let mut binding = self.binding().borrow_mut();
+        if binding.bound {
+            return if Rc::ptr_eq(&binding.clock, clock) {
+                Ok(())
+            } else {
+                Err(RuntimeError::new(
+                    "retirement carrier belongs to another Store",
+                ))
+            };
+        }
+        if binding.history {
+            return Err(RuntimeError::new(
+                "retirement carrier recorded before Store binding",
+            ));
+        }
+        binding.clock = clock.clone();
+        binding.bound = true;
+        Ok(())
+    }
+    pub(crate) fn record(&self, payload: RetirementPanic) {
+        let clock = self.binding().borrow().clock.clone();
+        let order = clock.get().checked_add(1);
+        if let Some(order) = order {
+            clock.set(order);
+        }
+        // Exhaustion retains the exact first payload in THIS carrier, without
+        // fabricating an ordinal, panicking, or acknowledging delivery.
+        if let Err(secondary) = self.accept_event(RetirementEvent {
+            order,
+            clock,
+            payload,
+        }) {
+            // This record follows an already-owned first event in the SAME
+            // carrier. Preserve that earlier event; secondary Drop is guarded.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(secondary)));
+        }
+    }
+    fn accept_event(&self, event: RetirementEvent) -> Result<(), RetirementEvent> {
+        {
+            let mut binding = self.binding().borrow_mut();
+            assert!(
+                Rc::ptr_eq(&binding.clock, &event.clock),
+                "retirement event clock changed"
+            );
+            binding.history = true;
+        }
+        #[cfg(feature = "wasi")]
+        self.1.set(false);
+        let previous = self.0.borrow_mut().take();
+        let (first, secondary) = match previous {
+            Some(previous) if previous.order.is_none() || event.order.is_none() => {
+                // No ordering between unstamped distinct carriers is defined.
+                // A transfer returns exact custody to its caller, keeping the
+                // current first payload rather than replacing it with an error.
+                *self.0.borrow_mut() = Some(previous);
+                return Err(event);
+            }
+            Some(previous) if previous.order <= event.order => (previous, Some(event)),
+            Some(previous) => (event, Some(previous)),
+            None => (event, None),
+        };
+        *self.0.borrow_mut() = Some(first);
+        // Payload destruction can reenter. Publish the actual earlier value
+        // before disposing a secondary, and hold no carrier/binding borrow.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(secondary)));
+        Ok(())
+    }
+    fn has_unstamped_event(&self) -> bool {
+        self.0
+            .borrow()
+            .as_ref()
+            .is_some_and(|event| event.order.is_none())
+    }
     pub(crate) fn attempt<R>(&self, action: impl FnOnce() -> R) -> Option<R> {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(action)) {
             Ok(value) => Some(value),
@@ -311,8 +413,15 @@ impl RetirementFailure {
             }
         }
     }
+    fn take_event(&self) -> Option<RetirementEvent> {
+        let mut event = self.0.borrow_mut();
+        if event.as_ref().is_some_and(|event| event.order.is_none()) {
+            return None;
+        }
+        event.take()
+    }
     fn take(&self) -> Option<RetirementPanic> {
-        self.0.borrow_mut().take()
+        self.take_event().map(|event| event.payload)
     }
     #[cfg(feature = "wasi")]
     pub(crate) fn is_empty(&self) -> bool {
@@ -320,17 +429,120 @@ impl RetirementFailure {
     }
     #[cfg(all(test, feature = "wasi"))]
     pub(crate) fn inspect_message(&self) -> Option<String> {
-        self.0.borrow().as_ref().and_then(|panic| {
-            panic
+        self.0.borrow().as_ref().and_then(|event| {
+            event
+                .payload
                 .downcast_ref::<&str>()
                 .map(|message| (*message).to_owned())
-                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .or_else(|| event.payload.downcast_ref::<String>().cloned())
         })
     }
 }
 
 #[cfg(feature = "sys")]
+struct RetirementLedger {
+    // The SAME weak enrollment collection formerly stored in Driver.
+    enrolled: RefCell<Vec<Weak<NativeRetirementState>>>,
+    clock: RetirementClock,
+    final_done: std::cell::Cell<bool>,
+}
+#[cfg(feature = "sys")]
+impl RetirementLedger {
+    fn new() -> Rc<Self> {
+        Rc::new(Self {
+            enrolled: RefCell::default(),
+            clock: Rc::default(),
+            final_done: std::cell::Cell::new(false),
+        })
+    }
+    fn snapshot(&self) -> Vec<Rc<NativeRetirementState>> {
+        self.enrolled
+            .borrow()
+            .clone()
+            .into_iter()
+            .map(|entry| entry.upgrade().expect("native retirement custody vanished"))
+            .collect()
+    }
+    #[cfg(feature = "wasi")]
+    fn enroll(&self, state: &Rc<NativeRetirementState>) {
+        let identity = Rc::downgrade(state);
+        let mut entries = self.enrolled.borrow_mut();
+        if !entries.iter().any(|entry| entry.ptr_eq(&identity)) {
+            entries.push(identity);
+        }
+    }
+    #[cfg(feature = "wasi")]
+    fn remove(&self, state: &Rc<NativeRetirementState>) {
+        self.enrolled
+            .borrow_mut()
+            .retain(|entry| !entry.ptr_eq(&Rc::downgrade(state)));
+    }
+}
+
+#[cfg(feature = "sys")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeliveryDisposition {
+    LiveTail,
+    AdmittedContinuation,
+    Cancelled,
+    Relinquished,
+    Delivered,
+}
+
+// Installed inside registration, before any callback can observe membership.
+#[cfg(all(feature = "sys", feature = "wasi"))]
+pub(crate) struct RetirementRegistration {
+    state: Rc<NativeRetirementState>,
+    armed: bool,
+}
+#[cfg(all(feature = "sys", feature = "wasi"))]
+impl RetirementRegistration {
+    pub(crate) fn state(&self) -> Rc<NativeRetirementState> {
+        self.state.clone()
+    }
+    pub(crate) fn commit(&self) {
+        self.state.committed.set(true);
+    }
+    pub(crate) fn relinquish(mut self) {
+        self.state
+            .disposition
+            .set(DeliveryDisposition::Relinquished);
+        self.armed = false;
+    }
+    fn delivered(mut self) {
+        self.state
+            .disposition
+            .set(if self.state.ledger.final_done.get() {
+                DeliveryDisposition::Delivered
+            } else {
+                // Publication can still record a following event after a live
+                // public Store call returns; its common boundary owns that event.
+                DeliveryDisposition::Relinquished
+            });
+        self.armed = false;
+    }
+}
+#[cfg(all(feature = "sys", feature = "wasi"))]
+impl Drop for RetirementRegistration {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if self.state.committed.get() {
+            self.state.disposition.set(DeliveryDisposition::Cancelled);
+            self.state.ledger.enroll(&self.state);
+        } else {
+            self.state.ledger.remove(&self.state);
+        }
+    }
+}
+
+#[cfg(feature = "sys")]
 pub(crate) struct NativeRetirementState {
+    ledger: Rc<RetirementLedger>,
+    disposition: std::cell::Cell<DeliveryDisposition>,
+    #[cfg(feature = "wasi")]
+    committed: std::cell::Cell<bool>,
     terminal_done: Rc<std::cell::Cell<bool>>,
     tail_receipt_released: std::cell::Cell<bool>,
     delivery_ack: Rc<std::cell::Cell<bool>>,
@@ -347,23 +559,20 @@ impl NativeRetirementState {
     fn physically_ready(&self) -> bool {
         self.terminal_done.get() && self.tail_receipt_released.get()
     }
-    fn claim(&self, first: &mut Option<RetirementPanic>) {
+    fn claim(&self, first: &mut Option<RetirementPanic>) -> bool {
+        if self.failure.has_unstamped_event() {
+            return false;
+        }
         if let Some(panic) = self.failure.take() {
             remember_retirement_panic(first, panic);
         }
         // The explicit consumer owns the value BEFORE acknowledging it.
         self.delivery_ack.set(true);
+        true
     }
     #[cfg(feature = "wasi")]
-    fn remove_enrollment(self: &Rc<Self>, driver: &Weak<Driver>) {
-        let driver = driver.upgrade();
-        if let Some(driver) = driver.as_ref() {
-            driver
-                .enrolled
-                .borrow_mut()
-                .retain(|entry| !entry.ptr_eq(&Rc::downgrade(self)));
-        }
-        drop(driver);
+    fn remove_enrollment(self: &Rc<Self>) {
+        self.ledger.remove(self);
     }
     #[cfg(feature = "wasi")]
     fn register_release_waker(&self, waker: &std::task::Waker) -> bool {
@@ -388,7 +597,7 @@ impl NativeRetirementState {
 #[cfg(all(feature = "sys", feature = "wasi"))]
 struct DeliveryReceipt {
     state: Rc<NativeRetirementState>,
-    driver: Weak<Driver>,
+    ledger: Rc<RetirementLedger>,
 }
 #[cfg(all(feature = "sys", feature = "wasi"))]
 impl std::future::Future for DeliveryReceipt {
@@ -407,7 +616,7 @@ impl std::future::Future for DeliveryReceipt {
         // The task may retire here, but the publisher retains exact enrollment
         // and the carrier until ALL fallible notification has finished.
         if !self.state.publishing.get() {
-            self.state.remove_enrollment(&self.driver);
+            self.ledger.remove(&self.state);
         }
         std::task::Poll::Ready(())
     }
@@ -416,7 +625,7 @@ impl std::future::Future for DeliveryReceipt {
 #[cfg(all(feature = "sys", feature = "wasi"))]
 pub(crate) struct TailRelease {
     state: Rc<NativeRetirementState>,
-    driver: Weak<Driver>,
+    ledger: Rc<RetirementLedger>,
     owner: wasmer_api::sys::NativeCleanupOwner,
     wake: std::sync::Arc<DriverWake>,
 }
@@ -456,7 +665,7 @@ impl TailRelease {
                 self.state.failure.attempt(|| {
                     self.owner.transfer_existing(Box::pin(DeliveryReceipt {
                         state: self.state.clone(),
-                        driver: self.driver.clone(),
+                        ledger: self.ledger.clone(),
                     }))
                 });
             }
@@ -465,7 +674,7 @@ impl TailRelease {
             // exact empty/acknowledged enrollment can now be removed.
             self.state.publishing.set(false);
             if !self.state.receipt_queued.get() {
-                self.state.remove_enrollment(&self.driver);
+                self.state.remove_enrollment();
             }
         }));
     }
@@ -480,6 +689,7 @@ struct NativeRetirementTail {
     cleanup: wasmer_api::sys::NativeCleanupOwner,
     release: Option<TailRelease>,
     state: Rc<NativeRetirementState>,
+    registration: Option<RetirementRegistration>,
 }
 #[cfg(all(feature = "sys", feature = "wasi"))]
 impl NativeRetirementTail {
@@ -533,8 +743,13 @@ impl std::future::Future for NativeRetirementTail {
         }
         this.state.clear_release_waker();
         let mut first = None;
-        this.state.claim(&mut first);
+        if !this.state.claim(&mut first) {
+            return std::task::Poll::Pending;
+        }
         attempt_retirement(&mut first, || this.cleanup.notify());
+        if let Some(registration) = this.registration.take() {
+            registration.delivered();
+        }
         if let Some(panic) = first {
             std::panic::resume_unwind(panic);
         }
@@ -544,6 +759,7 @@ impl std::future::Future for NativeRetirementTail {
 #[cfg(all(feature = "sys", feature = "wasi"))]
 impl Drop for NativeRetirementTail {
     fn drop(&mut self) {
+        drop(self.registration.take()); // exact disposition BEFORE callbacks
         self.state.clear_release_waker();
         self.state
             .failure
@@ -630,6 +846,7 @@ impl StoreRef {
         let id = store.id();
         #[cfg(feature = "sys")]
         if store.engine().is_sys() {
+            let ledger = RetirementLedger::new();
             let owner = wasmer_api::sys::NativeCleanupOwner::new_store_bound();
             let generation = wasmer_api::sys::NativeInvocationScope::bind_with_cleanup(
                 &mut store,
@@ -648,6 +865,7 @@ impl StoreRef {
                         generation: Some(generation),
                         owner,
                         driver: RefCell::new(None),
+                        ledger,
                         #[cfg(feature = "wasi")]
                         endpoints: RefCell::default(),
                     }),
@@ -1043,21 +1261,37 @@ impl StoreRef {
         &self,
         completed: Rc<std::cell::Cell<bool>>,
     ) -> Result<Rc<NativeRetirementState>, RuntimeError> {
-        let state = self.register_retirement(completed, RetirementFailure::default())?;
+        let registration =
+            self.register_owned_retirement(completed, RetirementFailure::default())?;
+        let state = registration.state();
         self.retain_delivery(state.clone())?;
-        self.enroll_retirement_tail(state.clone())?;
+        self.enroll_owned_retirement_tail(registration)?;
         Ok(state)
     }
-
     #[cfg(all(feature = "sys", feature = "wasi"))]
-    pub(crate) fn register_retirement(
+    pub(crate) fn retirement_failure(&self) -> Result<RetirementFailure, RuntimeError> {
+        let StoreMode::Native(native) = &self.inner.mode else {
+            return Err(RuntimeError::new("Store has no native retirement ledger"));
+        };
+        let failure = RetirementFailure::default();
+        failure.bind_clock(&native.ledger.clock)?;
+        Ok(failure)
+    }
+    #[cfg(all(feature = "sys", feature = "wasi"))]
+    pub(crate) fn register_owned_retirement(
         &self,
         completed: Rc<std::cell::Cell<bool>>,
         failure: RetirementFailure,
-    ) -> Result<Rc<NativeRetirementState>, RuntimeError> {
-        let owner = self.retirement_owner()?;
+    ) -> Result<RetirementRegistration, RuntimeError> {
+        let StoreMode::Native(native) = &self.inner.mode else {
+            return Err(RuntimeError::new("Store has no native retirement ledger"));
+        };
+        failure.bind_clock(&native.ledger.clock)?;
         let delivery_ack = failure.1.clone();
         let state = Rc::new(NativeRetirementState {
+            ledger: native.ledger.clone(),
+            disposition: std::cell::Cell::new(DeliveryDisposition::AdmittedContinuation),
+            committed: std::cell::Cell::new(false),
             terminal_done: completed,
             tail_receipt_released: std::cell::Cell::new(false),
             delivery_ack,
@@ -1066,11 +1300,20 @@ impl StoreRef {
             failure,
             release_waiter: RefCell::default(),
         });
-        owner
-            .driver
-            .enrolled
-            .borrow_mut()
-            .push(Rc::downgrade(&state));
+        let registration = RetirementRegistration { state, armed: true };
+        native.ledger.enroll(&registration.state);
+        Ok(registration)
+    }
+    // Existing metadata-only fixtures explicitly model a relinquished receiver.
+    #[cfg(all(test, feature = "sys", feature = "wasi"))]
+    pub(crate) fn register_retirement(
+        &self,
+        completed: Rc<std::cell::Cell<bool>>,
+        failure: RetirementFailure,
+    ) -> Result<Rc<NativeRetirementState>, RuntimeError> {
+        let registration = self.register_owned_retirement(completed, failure)?;
+        let state = registration.state();
+        registration.relinquish();
         Ok(state)
     }
 
@@ -1084,9 +1327,10 @@ impl StoreRef {
             !state.receipt_queued.replace(true),
             "one exact delivery receipt"
         );
+        state.committed.set(true); // no callback/refusal before actual insertion
         owner.owner.transfer_existing(Box::pin(DeliveryReceipt {
             state,
-            driver: Rc::downgrade(&owner.driver),
+            ledger: owner.driver.ledger.clone(),
         }));
         Ok(())
     }
@@ -1099,18 +1343,20 @@ impl StoreRef {
         let owner = self.retirement_owner()?;
         Ok(TailRelease {
             state,
-            driver: Rc::downgrade(&owner.driver),
+            ledger: owner.driver.ledger.clone(),
             owner: owner.owner.clone(),
             wake: owner.driver.wake.clone(),
         })
     }
 
     #[cfg(all(feature = "sys", feature = "wasi"))]
-    pub(crate) fn enroll_retirement_tail(
+    pub(crate) fn enroll_owned_retirement_tail(
         &self,
-        state: Rc<NativeRetirementState>,
+        registration: RetirementRegistration,
     ) -> Result<(), RuntimeError> {
         let owner = self.retirement_owner()?;
+        let state = registration.state();
+        state.disposition.set(DeliveryDisposition::LiveTail);
         let release = self.retirement_release(state.clone())?;
         let tail = Box::pin(NativeRetirementTail {
             subscription: Some(owner.subscribe()),
@@ -1120,6 +1366,7 @@ impl StoreRef {
             owner: Some(owner),
             release: Some(release),
             state,
+            registration: Some(registration),
         });
         if let Err(tail) = wasmer_api::sys::enroll_native_ancestry_tail(tail) {
             drop(tail);
@@ -1158,7 +1405,7 @@ impl ManagedStore {
             local: tokio::task::LocalSet::new(),
             active: std::cell::Cell::new(false),
             owner: self.owner.clone(),
-            enrolled: RefCell::default(),
+            ledger: self.ledger.clone(),
             wake: Default::default(),
         });
         *self.driver.borrow_mut() = Some(driver.clone());
@@ -1184,24 +1431,54 @@ impl Driver {
     }
 
     fn retirement_snapshot(&self) -> Vec<Rc<NativeRetirementState>> {
-        let entries = self.enrolled.borrow().clone();
-        entries
-            .into_iter()
-            .map(|entry| entry.upgrade().expect("native retirement custody vanished"))
-            .collect()
+        self.ledger.snapshot()
     }
     fn retirements_pending(&self) -> bool {
-        self.retirement_snapshot()
-            .iter()
-            .any(|state| !state.physically_ready())
+        self.retirement_snapshot().iter().any(|state| {
+            !state.physically_ready() || state.failure.has_unstamped_event() || {
+                #[cfg(feature = "wasi")]
+                {
+                    state.publishing.get()
+                }
+                #[cfg(not(feature = "wasi"))]
+                {
+                    false
+                }
+            }
+        })
     }
     fn collect_retirement_failures(&self, first: &mut Option<RetirementPanic>) {
+        let merged = RetirementFailure::default();
+        merged
+            .bind_clock(&self.ledger.clock)
+            .expect("fresh common-boundary carrier");
         for state in self.retirement_snapshot() {
+            if !matches!(
+                state.disposition.get(),
+                DeliveryDisposition::Cancelled | DeliveryDisposition::Relinquished
+            ) {
+                continue;
+            }
             assert!(
                 state.physically_ready(),
                 "claim before actual retirement settlement"
             );
-            state.claim(first);
+            #[cfg(feature = "wasi")]
+            if state.publishing.get() {
+                continue;
+            }
+            if state.failure.has_unstamped_event() {
+                continue;
+            }
+            if let Some(event) = state.failure.take_event() {
+                merged.accept_event(event).unwrap_or_else(|_| {
+                    unreachable!("only ordered events enter the fresh common carrier")
+                });
+            }
+            state.delivery_ack.set(true);
+        }
+        if let Some(panic) = merged.take() {
+            remember_retirement_panic(first, panic);
         }
     }
 
@@ -1487,43 +1764,45 @@ fn retire_store(
     let runtime = driver.as_ref().map(|driver| driver.runtime.clone());
     let waker = Waker::from(signal.clone());
     let mut cx = Context::from_waker(&waker);
-    let mut drain =
-        |driver: Option<&Driver>, require_fences: bool, first: &mut Option<RetirementPanic>| {
-            loop {
-                *signal.0.lock().unwrap_or_else(|e| e.into_inner()) = false;
-                let idle = {
-                    // Also enter after LocalSet cancellation and VM Store drop:
-                    // those destructors can retain finite timer/IO cleanup.
-                    let _enter = runtime.as_ref().map(|runtime| runtime.enter());
-                    if let Some(driver) = driver {
-                        let local = driver.local.run_until(std::future::pending::<()>());
-                        let _ = std::pin::pin!(local).as_mut().poll(&mut cx);
-                    }
-                    let _local = driver.map(|driver| driver.local.enter());
-                    // Publication can finish AFTER the outer collector was queued.
-                    // Claim its settled late value BEFORE an unacked receipt can block
-                    // owner-idle/enrollment removal or put this drain to sleep.
-                    if let Some(driver) = driver
-                        && !driver.retirements_pending()
-                    {
-                        driver.collect_retirement_failures(first);
-                    }
-                    // Install our real signal in every retained continuation.
-                    owner.poll_idle(&mut cx).is_ready()
-                        && (!require_fences
-                            || (owner.poll_cleanup_fences(&mut cx).is_ready()
-                                && driver.is_none_or(|driver| driver.enrolled.borrow().is_empty())))
-                };
-                if idle {
-                    break;
+    let mut drain = |driver: Option<&Driver>,
+                     require_fences: bool,
+                     first: &mut Option<RetirementPanic>| {
+        loop {
+            *signal.0.lock().unwrap_or_else(|e| e.into_inner()) = false;
+            let idle = {
+                // Also enter after LocalSet cancellation and VM Store drop:
+                // those destructors can retain finite timer/IO cleanup.
+                let _enter = runtime.as_ref().map(|runtime| runtime.enter());
+                if let Some(driver) = driver {
+                    let local = driver.local.run_until(std::future::pending::<()>());
+                    let _ = std::pin::pin!(local).as_mut().poll(&mut cx);
                 }
-                // No runtime or LocalSet context is held across this blocking wait.
-                let mut ready = signal.0.lock().unwrap_or_else(|e| e.into_inner());
-                while !*ready {
-                    ready = signal.1.wait(ready).unwrap_or_else(|e| e.into_inner());
+                let _local = driver.map(|driver| driver.local.enter());
+                // Publication can finish AFTER the outer collector was queued.
+                // Claim its settled late value BEFORE an unacked receipt can block
+                // owner-idle/enrollment removal or put this drain to sleep.
+                if let Some(driver) = driver
+                    && !driver.retirements_pending()
+                {
+                    driver.collect_retirement_failures(first);
                 }
+                // Install our real signal in every retained continuation.
+                owner.poll_idle(&mut cx).is_ready()
+                    && (!require_fences
+                        || (owner.poll_cleanup_fences(&mut cx).is_ready()
+                            && driver
+                                .is_none_or(|driver| driver.ledger.enrolled.borrow().is_empty())))
+            };
+            if idle {
+                break;
             }
-        };
+            // No runtime or LocalSet context is held across this blocking wait.
+            let mut ready = signal.0.lock().unwrap_or_else(|e| e.into_inner());
+            while !*ready {
+                ready = signal.1.wait(ready).unwrap_or_else(|e| e.into_inner());
+            }
+        }
+    };
     // Keep the concrete Store, driver and runtime outside every fallible poll.
     // Native cleanup transfers interrupted custody before propagating a panic;
     // repoll that replacement work before advancing to resource destruction.
@@ -1633,6 +1912,187 @@ mod tests {
     };
 
     #[cfg(feature = "wasi")]
+    #[cfg(feature = "wasi")]
+    #[test]
+    fn retirement_clock_binding_keeps_history_and_exact_event_identity() {
+        let store = StoreRef::new(Store::default()).unwrap();
+        let failure = store.retirement_failure().unwrap();
+        failure.record(Box::new(String::from("original bound value")));
+        let event = failure.take_event().unwrap();
+        let order = event.order;
+        let clock = event.clock.clone();
+        // Same-owner binding is legal after record AND take; no restamping.
+        failure.bind_clock(&clock).unwrap();
+        assert!(failure.bind_clock(&Rc::default()).is_err());
+        assert!(failure.accept_event(event).is_ok());
+        let exact = failure.take_event().unwrap();
+        assert_eq!(exact.order, order);
+        assert!(Rc::ptr_eq(&exact.clock, &clock));
+        assert_eq!(
+            exact.payload.downcast_ref::<String>().map(String::as_str),
+            Some("original bound value")
+        );
+        let unbound = RetirementFailure::default();
+        unbound.record(Box::new("unbound value"));
+        assert!(unbound.bind_clock(&clock).is_err());
+        assert_eq!(
+            unbound.take().unwrap().downcast_ref::<&str>(),
+            Some(&"unbound value")
+        );
+    }
+
+    #[cfg(feature = "wasi")]
+    #[test]
+    fn retirement_ordinal_exhaustion_retains_exact_unstamped_payload_without_ack() {
+        struct Payload(Rc<std::cell::Cell<usize>>);
+        impl Drop for Payload {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+        let store = StoreRef::new(Store::default()).unwrap();
+        let registration = store
+            .register_owned_retirement(
+                Rc::new(std::cell::Cell::new(true)),
+                RetirementFailure::default(),
+            )
+            .unwrap();
+        let state = registration.state();
+        let clock = state.ledger.clock.clone();
+        let earlier = store.retirement_failure().unwrap();
+        earlier.record(Box::new("already owned earlier event"));
+        let owned = earlier.take_event().unwrap();
+        clock.set(u64::MAX);
+        let drops = Rc::new(std::cell::Cell::new(0));
+        let payload = Box::new(Payload(drops.clone()));
+        let address = (&*payload) as *const Payload;
+        state.failure.record(payload);
+        assert_eq!(clock.get(), u64::MAX);
+        assert_eq!(drops.get(), 0);
+        assert!(!state.failure.is_empty());
+        assert!(state.failure.has_unstamped_event());
+        assert!(state.failure.take_event().is_none());
+        let stored = state.failure.0.borrow();
+        assert_eq!(
+            stored
+                .as_ref()
+                .unwrap()
+                .payload
+                .downcast_ref::<Payload>()
+                .unwrap() as *const Payload,
+            address
+        );
+        drop(stored);
+        let mut claim = None;
+        assert!(!state.claim(&mut claim));
+        assert!(claim.is_none());
+        assert!(!state.delivery_ack.get());
+        let owned = state.failure.accept_event(owned).err().unwrap();
+        assert_eq!(
+            owned.payload.downcast_ref::<&str>(),
+            Some(&"already owned earlier event")
+        );
+        assert_eq!(drops.get(), 0);
+        // The unresolved value stays in its original carrier until real
+        // cancellation destroys that carrier; no ordered completion is faked.
+        drop(registration);
+        drop(state);
+        assert_eq!(drops.get(), 1);
+    }
+
+    #[cfg(feature = "wasi")]
+    #[test]
+    fn retirement_event_delivery_uses_catch_order_after_later_claims() {
+        use std::future::Future;
+        for close_first in [false, true] {
+            let store = StoreRef::new(Store::default()).unwrap();
+            let invocation = store.retirement_failure().unwrap();
+            let cleanup = store.retirement_failure().unwrap();
+            if close_first {
+                cleanup.record(Box::new("cleanup"));
+            }
+            let recording = invocation.clone();
+            let mut actual = Box::pin(std::future::poll_fn(move |_| {
+                recording.record(Box::new("inside actual poll"));
+                std::task::Poll::Ready(())
+            }));
+            assert!(
+                actual
+                    .as_mut()
+                    .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+                    .is_ready()
+            );
+            if !close_first {
+                cleanup.record(Box::new("cleanup"));
+            }
+            // Collector arrival order is deliberately opposite catch order.
+            let delivered = store.retirement_failure().unwrap();
+            assert!(
+                delivered
+                    .accept_event(cleanup.take_event().unwrap())
+                    .is_ok()
+            );
+            assert!(
+                delivered
+                    .accept_event(invocation.take_event().unwrap())
+                    .is_ok()
+            );
+            let value = delivered.take().unwrap();
+            assert_eq!(
+                value.downcast_ref::<&str>(),
+                Some(&if close_first {
+                    "cleanup"
+                } else {
+                    "inside actual poll"
+                })
+            );
+        }
+    }
+
+    #[cfg(feature = "wasi")]
+    #[test]
+    fn retirement_registration_rolls_back_only_uncommitted_metadata() {
+        let store = StoreRef::new(Store::default()).unwrap();
+        let registration = store
+            .register_owned_retirement(
+                Rc::new(std::cell::Cell::new(false)),
+                RetirementFailure::default(),
+            )
+            .unwrap();
+        let state = registration.state();
+        let ledger = state.ledger.clone();
+        drop(registration);
+        assert!(ledger.snapshot().is_empty());
+        assert!(!state.terminal_done.get());
+        assert!(!state.tail_receipt_released.get());
+        let registration = store
+            .register_owned_retirement(
+                Rc::new(std::cell::Cell::new(false)),
+                RetirementFailure::default(),
+            )
+            .unwrap();
+        let state = registration.state();
+        registration.commit();
+        state
+            .failure
+            .record(Box::new("committed setup cancellation"));
+        let original_order = state.failure.0.borrow().as_ref().unwrap().order;
+        drop(registration);
+        let retained = ledger.snapshot();
+        assert_eq!(retained.len(), 1);
+        assert!(Rc::ptr_eq(&retained[0], &state));
+        assert!(state.disposition.get() == DeliveryDisposition::Cancelled);
+        assert_eq!(
+            state.failure.0.borrow().as_ref().unwrap().order,
+            original_order
+        );
+        assert!(!state.terminal_done.get());
+        assert!(!state.tail_receipt_released.get());
+        // No real terminal was built in this primitive control; remove its
+        // metadata explicitly rather than inventing physical completion bits.
+        ledger.remove(&state);
+    }
+
     #[test]
     fn endpoint_reuse_prunes_dead_controls_and_preserves_live_matching_outside_registry_borrows() {
         struct Endpoint(Rc<std::cell::Cell<usize>>);
@@ -2148,7 +2608,7 @@ mod tests {
             StoreMode::Native(native) => Rc::downgrade(&native.driver().unwrap()),
             StoreMode::Plain(_) => unreachable!(),
         };
-        let failure = RetirementFailure::default();
+        let failure = store.retirement_failure().unwrap();
         failure.record(Box::new("legal last Store pending first error"));
         let state = store
             .register_retirement(Rc::new(std::cell::Cell::new(true)), failure)
@@ -2208,6 +2668,13 @@ mod tests {
             cleanup: owner.owner.clone(),
             release: Some(store.retirement_release(state.clone()).unwrap()),
             state: state.clone(),
+            registration: Some({
+                state.disposition.set(DeliveryDisposition::LiveTail);
+                RetirementRegistration {
+                    state: state.clone(),
+                    armed: true,
+                }
+            }),
         })));
         let counter = std::sync::Arc::new(Counter(std::sync::atomic::AtomicUsize::new(0)));
         let waker = std::task::Waker::from(counter.clone());
@@ -2297,6 +2764,13 @@ mod tests {
             cleanup: owner.owner.clone(),
             release: Some(store.retirement_release(state.clone()).unwrap()),
             state: state.clone(),
+            registration: Some({
+                state.disposition.set(DeliveryDisposition::LiveTail);
+                RetirementRegistration {
+                    state: state.clone(),
+                    armed: true,
+                }
+            }),
         })));
         let ready = Rc::new(std::cell::Cell::new(None));
         let first = tail.clone();

@@ -734,9 +734,10 @@ impl Endpoint {
         let terminal_deactivated = deactivated.clone();
         let completed = Rc::new(Cell::new(false));
         let failure = RetirementFailure::default();
-        let registration = store.register_retirement(completed.clone(), failure.clone())?;
+        let registration = store.register_owned_retirement(completed.clone(), failure.clone())?;
+        let registered = registration.state();
         let release = if admitted {
-            Some(store.retirement_release(registration.clone())?)
+            Some(store.retirement_release(registered.clone())?)
         } else {
             None
         };
@@ -784,6 +785,7 @@ impl Endpoint {
                 fence_progress.deactivation_consumed.set(true);
             }),
         };
+        registration.commit(); // actual terminal custody exists before any callback
         let terminal = Box::pin(TerminalRetirement {
             owner: Some(owner.clone()),
             state: Some(TerminalState {
@@ -803,7 +805,7 @@ impl Endpoint {
                 result: None,
                 result_tx: Some(result_tx),
                 completed: completed.clone(),
-                _registration: registration.clone(),
+                _registration: registered.clone(),
                 release,
                 failure: failure.clone(),
             }),
@@ -848,9 +850,10 @@ impl Endpoint {
         // allowing a foreign current-thread executor to deliver deferred wakes.
         // EVERY continuation owns a delivery receipt before predecessor
         // admission can pump a finalizer, including admitted work later dropped.
-        store.retain_delivery(registration.clone())?;
+        store.retain_delivery(registered)?;
+        let mut registration = Some(registration);
         if !admitted {
-            store.enroll_retirement_tail(registration)?;
+            store.enroll_owned_retirement_tail(registration.take().unwrap())?;
         }
         // NativeCleanupOwner commits this concrete custody before first polling.
         owner.retain(Box::pin(predecessor));
@@ -886,7 +889,10 @@ impl Endpoint {
         let queue_handoff = cancel.0.take().expect("one cancellation guard");
         let poll_owner = native_owner.clone();
         let observer = owner.subscribe();
+        let registration = Rc::new(RefCell::new(registration));
+        let running_registration = registration.clone();
         let run = Box::new(move || {
+            let registration = running_registration.borrow_mut().take();
             Box::pin(async move {
                 let result = std::future::poll_fn(move |cx| {
                     observer.with_context(cx, |cx| {
@@ -895,6 +901,9 @@ impl Endpoint {
                     })
                 })
                 .await;
+                if let Some(registration) = registration {
+                    registration.relinquish();
+                }
                 let error = match result {
                     Ok(Ok(status)) => exit_trap(status),
                     Ok(Err(error)) => RuntimeError::user(Box::new(error)),
@@ -906,7 +915,13 @@ impl Endpoint {
         Ok(LocalContinuation {
             store: store.clone(),
             run: Some(run),
-            cancel: Some(Box::new(move || queue_handoff.cancel())),
+            cancel: Some(Box::new(move || {
+                // Cancel ownership BEFORE handoff callbacks. The admitted=false
+                // transport has no guard and cannot cancel its live root tail.
+                let owned = registration.borrow_mut().take();
+                drop(owned);
+                queue_handoff.cancel();
+            })),
         })
     }
 }
