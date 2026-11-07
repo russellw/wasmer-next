@@ -2960,7 +2960,6 @@ impl std::future::Future for NativeStorePrelude {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<()> {
-        use std::future::Future;
         let this = self.get_mut();
         let actual = this.0.as_mut().unwrap();
         let failure = actual.failure.clone();
