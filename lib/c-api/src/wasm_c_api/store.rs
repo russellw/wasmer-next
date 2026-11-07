@@ -5011,6 +5011,318 @@ mod tests {
         common_collector_reentrant_tail_profile(true, false, false, false, true);
     }
 
+    #[cfg(feature = "wasi")]
+    #[test]
+    fn cancelled_common_collector_keeps_exact_unstamped_event_without_ordered_completion() {
+        use std::{
+            future::Future,
+            sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            },
+            task::{Context, Poll, Waker},
+        };
+        struct Payload(Arc<AtomicUsize>);
+        impl Drop for Payload {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        struct ReadyOnce(Arc<AtomicUsize>);
+        impl Future for ReadyOnce {
+            type Output = ();
+            fn poll(self: std::pin::Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+                assert_eq!(self.0.fetch_add(1, Ordering::SeqCst), 0);
+                Poll::Ready(())
+            }
+        }
+        let store = StoreRef::new(Store::default()).unwrap();
+        let owner = store.retirement_owner().unwrap();
+        let canonical = owner.driver.canonical_failure();
+        let weak_canonical = Rc::downgrade(&canonical);
+        let weak_driver = Rc::downgrade(&owner.driver);
+        owner.driver.ledger.clock.set(u64::MAX); // explicit primitive exhaustion injection
+        let drops = Arc::new(AtomicUsize::new(0));
+        let exact = Box::new(Payload(drops.clone()));
+        let address = (&*exact) as *const Payload;
+        owner
+            .owner
+            .try_retain(async move { std::panic::resume_unwind(exact) })
+            .unwrap_or_else(|_| panic!("original cleanup error refused"));
+        assert!(canonical.has_unstamped_event());
+        let polls = Arc::new(AtomicUsize::new(0));
+        let mut call = Box::pin(owner.driver.run_local(ReadyOnce(polls.clone())));
+        assert!(
+            call.as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        let identity = owner.driver.scopes.common_collector.borrow().clone();
+        assert!(identity.upgrade().is_some());
+        drop(call);
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+        assert!(identity.upgrade().is_none());
+        assert!(
+            owner
+                .driver
+                .scopes
+                .common_collector
+                .borrow()
+                .upgrade()
+                .is_none()
+        );
+        assert_eq!(owner.driver.ledger.service_claims.get(), 0);
+        assert!(canonical.has_unstamped_event() && canonical.take_event().is_none());
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            canonical
+                .0
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .payload
+                .downcast_ref::<Payload>()
+                .unwrap() as *const _,
+            address
+        );
+        assert!(!canonical.1.get());
+        // This injected exhaustion has NO normal ordered completion. Withdraw
+        // ONLY the test-owned injected value for fixture cleanup, without polling
+        // Ready or manufacturing an acknowledgement/ordinal/physical fence.
+        let event = canonical.0.borrow_mut().take().unwrap();
+        assert!(event.order.is_none());
+        drop(event);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        drop(owner);
+        drop(store);
+        assert!(weak_driver.upgrade().is_none());
+        drop(canonical);
+        assert!(weak_canonical.upgrade().is_none());
+    }
+
+    #[cfg(feature = "wasi")]
+    #[test]
+    fn post_driver_tail_cancel_owns_both_ordered_and_late_unstamped_payloads_until_terminal_drop() {
+        use std::{
+            future::Future,
+            sync::{
+                Arc,
+                atomic::{AtomicBool, AtomicUsize, Ordering},
+            },
+            task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
+        };
+        struct Payload(&'static str, Arc<AtomicUsize>);
+        impl Drop for Payload {
+            fn drop(&mut self) {
+                self.1.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        struct DropWork {
+            owner: wasmer_api::sys::NativeCleanupOwner,
+            gate: Rc<std::cell::Cell<bool>>,
+            completed: Rc<std::cell::Cell<bool>>,
+        }
+        impl Drop for DropWork {
+            fn drop(&mut self) {
+                let gate = self.gate.clone();
+                let completed = self.completed.clone();
+                self.owner
+                    .try_retain(std::future::poll_fn(move |_| {
+                        if gate.get() {
+                            completed.set(true);
+                            Poll::Ready(())
+                        } else {
+                            Poll::Pending
+                        }
+                    }))
+                    .unwrap_or_else(|_| panic!("actual LocalSet destructor job refused"));
+            }
+        }
+        struct Notify {
+            armed: AtomicBool,
+            payload: std::sync::Mutex<Option<RetirementPanic>>,
+        }
+        unsafe fn clone_notify(data: *const ()) -> RawWaker {
+            unsafe { Arc::increment_strong_count(data.cast::<Notify>()) };
+            RawWaker::new(data, &NOTIFY)
+        }
+        unsafe fn wake_notify(data: *const ()) {
+            unsafe {
+                drop_notify(data);
+            }
+        }
+        unsafe fn wake_notify_ref(_: *const ()) {}
+        unsafe fn drop_notify(data: *const ()) {
+            let notify = unsafe { Arc::from_raw(data.cast::<Notify>()) };
+            let exact = if notify.armed.load(Ordering::SeqCst) {
+                notify.payload.lock().unwrap().take()
+            } else {
+                None
+            };
+            if let Some(exact) = exact {
+                std::panic::resume_unwind(exact);
+            }
+        }
+        static NOTIFY: RawWakerVTable =
+            RawWakerVTable::new(clone_notify, wake_notify, wake_notify_ref, drop_notify);
+        let store = StoreRef::new(Store::default()).unwrap();
+        let owner = store.retirement_owner().unwrap();
+        let cleanup = owner.owner.clone();
+        let weak_driver = Rc::downgrade(&owner.driver);
+        let gate = Rc::new(std::cell::Cell::new(false));
+        let completed = Rc::new(std::cell::Cell::new(false));
+        let started = Rc::new(std::cell::Cell::new(false));
+        let work = DropWork {
+            owner: cleanup.clone(),
+            gate: gate.clone(),
+            completed: completed.clone(),
+        };
+        let start = started.clone();
+        store
+            .run_host(async move {
+                tokio::task::spawn_local(async move {
+                    let _work = work;
+                    start.set(true);
+                    std::future::pending::<()>().await;
+                });
+                tokio::task::yield_now().await;
+            })
+            .unwrap();
+        assert!(started.get());
+        let a_done = Rc::new(std::cell::Cell::new(false));
+        let b_done = Rc::new(std::cell::Cell::new(false));
+        let a_reg = store
+            .register_owned_retirement(a_done.clone(), RetirementFailure::default())
+            .unwrap();
+        let b_reg = store
+            .register_owned_retirement(b_done.clone(), RetirementFailure::default())
+            .unwrap();
+        let a_state = a_reg.state();
+        let b_state = b_reg.state();
+        store.retain_delivery(a_state.clone()).unwrap();
+        store.retain_delivery(b_state.clone()).unwrap();
+        a_state.disposition.set(DeliveryDisposition::LiveTail);
+        b_state.disposition.set(DeliveryDisposition::LiveTail);
+        let i_drops = Arc::new(AtomicUsize::new(0));
+        let n_drops = Arc::new(AtomicUsize::new(0));
+        let i = Box::new(Payload("owned I", i_drops.clone()));
+        let i_address = (&*i) as *const Payload;
+        let a = Rc::new(RefCell::new(Box::pin(NativeRetirementTail {
+            subscription: Some(owner.subscribe()),
+            _store: store.downgrade(),
+            base: Some(store.async_store().unwrap()),
+            owner: Some(owner.clone()),
+            cleanup: Some(cleanup.clone()),
+            release: Some(store.retirement_release(a_state.clone()).unwrap()),
+            state: a_state.clone(),
+            registration: Some(a_reg),
+            first: store.retirement_failure().unwrap(),
+            finalization_subscription: None,
+            finalization: store.finalization_handoff(&owner),
+            exit: None,
+        })));
+        let b = Rc::new(RefCell::new(Box::pin(NativeRetirementTail {
+            subscription: Some(owner.subscribe()),
+            _store: store.downgrade(),
+            base: Some(store.async_store().unwrap()),
+            owner: Some(owner.clone()),
+            cleanup: Some(cleanup.clone()),
+            release: Some(store.retirement_release(b_state.clone()).unwrap()),
+            state: b_state.clone(),
+            registration: Some(b_reg),
+            first: store.retirement_failure().unwrap(),
+            finalization_subscription: None,
+            finalization: store.finalization_handoff(&owner),
+            exit: None,
+        })));
+        let first_a = a.clone();
+        let first_b = b.clone();
+        let terminal_owner = cleanup.clone();
+        let b_failure = b_state.failure.clone();
+        cleanup.after_pump_existing(move || {
+            terminal_owner
+                .try_retain(async move {
+                    b_failure.attempt(|| std::panic::resume_unwind(i));
+                    a_done.set(true);
+                    b_done.set(true);
+                })
+                .unwrap_or_else(|_| panic!("actual tail terminal task refused"));
+            assert!(
+                first_a
+                    .borrow_mut()
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            assert!(
+                first_b
+                    .borrow_mut()
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+        });
+        assert!(a_state.physically_ready() && b_state.physically_ready());
+        let notify = Arc::new(Notify {
+            armed: AtomicBool::new(false),
+            payload: std::sync::Mutex::new(Some(Box::new(Payload("late N", n_drops.clone())))),
+        });
+        let wake = unsafe {
+            Waker::from_raw(RawWaker::new(Arc::into_raw(notify.clone()).cast(), &NOTIFY))
+        };
+        drop(owner);
+        drop(store);
+        assert!(
+            b.borrow_mut()
+                .as_mut()
+                .poll(&mut Context::from_waker(&wake))
+                .is_pending()
+        );
+        assert!(
+            weak_driver.upgrade().is_none(),
+            "actual Driver/LocalSet destruction precedes cancel"
+        );
+        assert!(!completed.get());
+        gate.set(true); // original A producer drives the SAME unfinished phase
+        assert!(
+            a.borrow_mut()
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_ready()
+        );
+        assert!(completed.get() && b_state.ledger.final_done.get());
+        assert_eq!(
+            b_state.ledger.service_claims.get(),
+            1,
+            "ONLY B retains its owned first ordering lease"
+        );
+        b_state.ledger.clock.set(u64::MAX);
+        notify.armed.store(true, Ordering::SeqCst);
+        let exact = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(b))).unwrap_err();
+        assert_eq!(
+            exact.downcast_ref::<Payload>().unwrap() as *const _,
+            i_address
+        );
+        assert_eq!(exact.downcast_ref::<Payload>().unwrap().0, "owned I");
+        assert_eq!(i_drops.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            n_drops.load(Ordering::SeqCst),
+            1,
+            "exact N safely disposed only after actual Done"
+        );
+        assert!(b_state.delivery_empty() && !b_state.delivery_ack.get());
+        assert!(
+            !b_state.receipt_queued.get(),
+            "no postseal receipt readmission"
+        );
+        assert_eq!(b_state.ledger.service_claims.get(), 0);
+        assert!(cleanup.is_idle() && cleanup.is_sealed());
+        drop(exact);
+        assert_eq!(i_drops.load(Ordering::SeqCst), 1);
+        drop(a);
+        drop(wake);
+    }
+
     #[test]
     fn final_store_retirement_waits_for_a_bare_stores_actual_unlock() {
         use std::{future::Future, task::Context};
