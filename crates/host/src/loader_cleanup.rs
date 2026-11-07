@@ -6,7 +6,10 @@ use std::{
     future::Future,
     pin::Pin,
     rc::Rc,
-    sync::{Arc, Mutex, MutexGuard, Weak},
+    sync::{
+        Arc, Mutex, MutexGuard, Weak,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     task::{Context, Poll, Waker},
 };
 
@@ -18,7 +21,14 @@ pub type LocalLoaderCleanupJob =
 /// Owner-local retirement custody. Implementations must commit custody before
 /// invoking callbacks and retain a continuation if notification unwinds.
 pub trait LocalCleanupSink {
+    /// Trusted internal transfer of the SAME counted/canonical obligation.
+    /// Fresh metadata-only work must use try_retain. This is a caller contract,
+    /// not an unforgeable capability or a Store seal check.
     fn retain(&self, future: LocalFuture<'static, ()>);
+    fn try_retain(&self, future: LocalFuture<'static, ()>) -> Result<(), LocalFuture<'static, ()>> {
+        self.retain(future);
+        Ok(())
+    }
     fn notify(&self);
 }
 
@@ -55,8 +65,32 @@ impl LocalCleanupRunner {
             }
             state.pending += 1;
         }
+        self.sink.try_retain(Box::pin(ScopedJob {
+            future: Some(ScopedJobFuture::Counted(future)),
+            completion: Some(Completion {
+                scope: self.scope.clone(),
+                local: Some(self.clone()),
+            }),
+            fallback: None,
+            panicked: false,
+        }))
+    }
+    /// Trusted internal transfer used by native Driver/attachment cancellation.
+    /// The caller already owns the actual Store/generation/receipt obligation;
+    /// fresh work must use retain. Err is ONLY the same raw input on scope close.
+    pub fn retain_existing(
+        &self,
+        future: LocalFuture<'static, ()>,
+    ) -> Result<(), LocalFuture<'static, ()>> {
+        {
+            let mut state = self.scope.state();
+            if state.closed {
+                return Err(future);
+            }
+            state.pending += 1;
+        }
         self.sink.retain(Box::pin(ScopedJob {
-            future: Some(future),
+            future: Some(ScopedJobFuture::Counted(future)),
             completion: Some(Completion {
                 scope: self.scope.clone(),
                 local: Some(self.clone()),
@@ -109,9 +143,172 @@ impl Job {
     }
 }
 
+/// Resource-local completion metadata; retains no loader, host or job.
+#[derive(Clone)]
+pub struct LoaderSettlement(Arc<LoaderSettlementState>);
+struct LoaderSettlementState {
+    base_closed: AtomicBool,
+    callbacks: AtomicUsize,
+    destroyed: AtomicBool,
+    waiters: Mutex<Vec<Weak<LoaderSettlementWaiter>>>,
+}
+struct LoaderSettlementWaiter {
+    waker: Mutex<Option<Arc<Waker>>>,
+}
+/// One independently cancellable wake registration. Distinct Store owners may
+/// observe the same loader without replacing each other's registrations.
+pub struct LoaderSettlementObserver {
+    state: Arc<LoaderSettlementState>,
+    waiter: Arc<LoaderSettlementWaiter>,
+}
+struct LoaderSettlementGuard(LoaderSettlement);
+struct LoaderCallbackSpan(LoaderSettlement);
+impl LoaderSettlement {
+    fn new() -> Self {
+        Self(Arc::new(LoaderSettlementState {
+            base_closed: AtomicBool::new(false),
+            callbacks: AtomicUsize::new(0),
+            destroyed: AtomicBool::new(false),
+            waiters: Mutex::default(),
+        }))
+    }
+    fn enter(&self) -> LoaderCallbackSpan {
+        self.0.callbacks.fetch_add(1, Ordering::AcqRel);
+        LoaderCallbackSpan(self.clone())
+    }
+    pub fn is_ready(&self) -> bool {
+        (self.0.destroyed.load(Ordering::Acquire) || self.0.base_closed.load(Ordering::Acquire))
+            && self.0.callbacks.load(Ordering::Acquire) == 0
+    }
+    pub fn observer(&self) -> LoaderSettlementObserver {
+        let waiter = Arc::new(LoaderSettlementWaiter {
+            waker: Mutex::default(),
+        });
+        self.0
+            .waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(Arc::downgrade(&waiter));
+        LoaderSettlementObserver {
+            state: self.0.clone(),
+            waiter,
+        }
+    }
+    fn notify(&self) {
+        let unwinding = std::thread::panicking();
+        let waiters = {
+            let mut registered = self
+                .0
+                .waiters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            registered.retain(|waiter| waiter.strong_count() != 0);
+            registered
+                .iter()
+                .filter_map(Weak::upgrade)
+                .collect::<Vec<_>>()
+        };
+        let mut first = None;
+        for waiter in waiters {
+            let waker = waiter
+                .waker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            let signal = waker.clone(); // Arc clone never invokes RawWaker code
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                callbacks(
+                    || {
+                        if let Some(waker) = signal {
+                            waker.wake_by_ref();
+                        }
+                    },
+                    || drop(waker),
+                );
+            }));
+            if let Err(panic) = result {
+                if first.is_none() {
+                    first = Some(panic);
+                } else {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(panic)));
+                }
+            }
+        }
+        if let Some(first) = first {
+            if unwinding {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(first)));
+            } else {
+                std::panic::resume_unwind(first);
+            }
+        }
+    }
+}
+impl LoaderSettlementObserver {
+    fn unregister(&self) {
+        self.state
+            .waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|waiter| !waiter.ptr_eq(&Arc::downgrade(&self.waiter)));
+        let previous = self
+            .waiter
+            .waker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        drop(previous);
+    }
+}
+impl Future for LoaderSettlementObserver {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let handle = LoaderSettlement(self.state.clone());
+        if handle.is_ready() {
+            self.unregister();
+            return Poll::Ready(());
+        }
+        let next = Arc::new(cx.waker().clone());
+        let previous = self
+            .waiter
+            .waker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace(next);
+        drop(previous);
+        if handle.is_ready() {
+            self.unregister();
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+}
+impl Drop for LoaderSettlementObserver {
+    fn drop(&mut self) {
+        self.unregister();
+    }
+}
+impl Drop for LoaderCallbackSpan {
+    fn drop(&mut self) {
+        if self.0.0.callbacks.fetch_sub(1, Ordering::AcqRel) == 1 && self.0.is_ready() {
+            self.0.notify();
+        }
+    }
+}
+impl Drop for LoaderSettlementGuard {
+    fn drop(&mut self) {
+        // LoaderCleanup::drop enters before field destruction; this LAST field
+        // publishes only after host/state/factory destructors returned or unwound.
+        self.0.0.destroyed.store(true, Ordering::Release);
+        self.0.0.callbacks.fetch_sub(1, Ordering::AcqRel);
+        self.0.notify();
+    }
+}
+
 pub struct LoaderCleanup {
     host: Arc<dyn Host>,
     state: Mutex<State>,
+    settlement: LoaderSettlementGuard, // LAST: actual resource destruction receipt
 }
 #[derive(Default)]
 struct State {
@@ -130,12 +327,19 @@ impl LoaderCleanup {
         Arc::new(Self {
             host,
             state: Mutex::default(),
+            settlement: LoaderSettlementGuard(LoaderSettlement::new()),
         })
     }
     fn state(&self) -> MutexGuard<'_, State> {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    pub fn settlement(&self) -> LoaderSettlement {
+        self.settlement.0.clone()
+    }
+    fn callback_span(&self) -> LoaderCallbackSpan {
+        self.settlement.0.enter()
     }
     pub fn is_open(&self) -> bool {
         !self.state().closed
@@ -156,6 +360,7 @@ impl LoaderCleanup {
         })
     }
     fn enqueue(&self, job: Job) -> Result<(), Job> {
+        let _span = self.callback_span();
         let mut state = self.state();
         if state.closed {
             return Err(job);
@@ -192,17 +397,26 @@ impl LoaderCleanup {
             })
     }
     fn retirement(&self, owner: &Arc<()>, job: Job) -> Result<(), Job> {
+        let _span = self.callback_span();
         let mut state = self.state();
         if state.closed {
             return Err(job);
         }
-        state
-            .retire
-            .retain(|retirement| retirement.owner.strong_count() != 0);
+        let retired = std::mem::take(&mut state.retire);
+        let mut expired = Vec::new();
+        for retirement in retired {
+            if retirement.owner.strong_count() != 0 {
+                state.retire.push(retirement);
+            } else {
+                expired.push(retirement);
+            }
+        }
         state.retire.push(Retirement {
             owner: Arc::downgrade(owner),
             job,
         });
+        drop(state);
+        drop(expired); // factory destructors may reenter; never hold state mutex
         Ok(())
     }
     /// Transfer on this runner's executor while its guest or another job owns custody.
@@ -232,7 +446,7 @@ impl LoaderCleanup {
         fallback: bool,
     ) {
         self.host.executor().spawn_local(Box::pin(ScopedJob {
-            future: Some(future),
+            future: Some(ScopedJobFuture::Counted(future)),
             completion: Some(Completion {
                 scope: self.clone(),
                 local: local.cloned(),
@@ -243,6 +457,7 @@ impl LoaderCleanup {
         }));
     }
     fn flush(self: &Arc<Self>, cx: &mut Context<'_>, local: Option<&LocalCleanupRunner>) {
+        let _span = self.callback_span();
         let next = cx.waker().clone();
         let old = self.state().waker.replace(next);
         drop(old);
@@ -258,7 +473,7 @@ impl LoaderCleanup {
             };
             let future = job.materialize(local);
             self.host.executor().spawn_local(Box::pin(ScopedJob {
-                future: Some(future),
+                future: Some(ScopedJobFuture::Counted(future)),
                 completion: Some(completion),
                 fallback: None,
                 panicked: false,
@@ -270,24 +485,40 @@ impl LoaderCleanup {
         cx: &mut Context<'_>,
         local: Option<&LocalCleanupRunner>,
     ) -> Poll<()> {
+        let _span = self.callback_span();
         loop {
             self.flush(cx, local);
-            let closed_waker = {
+            let retired = {
                 let mut state = self.state();
                 if state.pending != 0 {
                     return Poll::Pending;
                 }
-                let retire = std::mem::take(&mut state.retire);
-                for retirement in retire {
+                std::mem::take(&mut state.retire)
+            };
+            let mut expired = Vec::new();
+            {
+                let mut state = self.state();
+                for retirement in retired {
                     if retirement.owner.strong_count() != 0 {
                         state.pending += 1;
                         state.jobs.push_back(retirement.job);
+                    } else {
+                        expired.push(retirement);
                     }
                 }
-                if state.pending != 0 {
+            }
+            drop(expired);
+            let closed_waker = {
+                let mut state = self.state();
+                if state.pending != 0 || !state.jobs.is_empty() || !state.retire.is_empty() {
                     continue;
                 }
                 state.closed = true;
+                self.settlement
+                    .0
+                    .0
+                    .base_closed
+                    .store(true, Ordering::Release);
                 state.waker.take()
             };
             drop(closed_waker);
@@ -306,6 +537,13 @@ impl LoaderCleanup {
         keepalive: impl std::any::Any,
     ) -> impl Future<Output = R> + 'a {
         Runner::new(self.clone(), None, guest, Some(Box::new(keepalive)))
+    }
+}
+
+impl Drop for LoaderCleanup {
+    fn drop(&mut self) {
+        // Keep an already-closed scope unready through actual field destruction.
+        self.settlement.0.0.callbacks.fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -332,6 +570,7 @@ struct Completion {
 }
 impl Drop for Completion {
     fn drop(&mut self) {
+        let _span = self.scope.callback_span();
         let waker = {
             let mut state = self.scope.state();
             state.pending -= 1;
@@ -354,8 +593,21 @@ impl Drop for Completion {
 
 /// This wrapper transfers the same future and completion lease before either
 /// can drop. The sink-owned copy has no recursive executor fallback.
+enum ScopedJobFuture {
+    Counted(LocalFuture<'static, ()>),
+    CanonicalFinalDrain(FinalDrain),
+}
+impl Future for ScopedJobFuture {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        match self.get_mut() {
+            Self::Counted(future) => future.as_mut().poll(cx),
+            Self::CanonicalFinalDrain(future) => Pin::new(future).poll(cx),
+        }
+    }
+}
 struct ScopedJob {
-    future: Option<LocalFuture<'static, ()>>,
+    future: Option<ScopedJobFuture>,
     completion: Option<Completion>,
     fallback: Option<Rc<dyn LocalCleanupSink>>,
     panicked: bool,
@@ -365,12 +617,18 @@ impl Future for ScopedJob {
     type Output = ();
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let this = self.get_mut();
+        let _span = this
+            .completion
+            .as_ref()
+            .map(|completion| completion.scope.callback_span())
+            .or_else(|| match &this.future {
+                Some(ScopedJobFuture::CanonicalFinalDrain(future)) => {
+                    future.scope().map(|scope| scope.callback_span())
+                }
+                _ => None,
+            });
         let polled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            this.future
-                .as_mut()
-                .expect("live cleanup")
-                .as_mut()
-                .poll(cx)
+            Pin::new(this.future.as_mut().expect("live cleanup")).poll(cx)
         }));
         match polled {
             Ok(Poll::Pending) => return Poll::Pending,
@@ -388,9 +646,30 @@ impl Future for ScopedJob {
 }
 impl Drop for ScopedJob {
     fn drop(&mut self) {
+        let _span = self
+            .completion
+            .as_ref()
+            .map(|completion| completion.scope.callback_span())
+            .or_else(|| match &self.future {
+                Some(ScopedJobFuture::CanonicalFinalDrain(future)) => {
+                    future.scope().map(|scope| scope.callback_span())
+                }
+                _ => None,
+            });
+        if let Some(ScopedJobFuture::CanonicalFinalDrain(future)) = &mut self.future {
+            future.finish_closed();
+        }
         if !self.panicked
             && let Some(sink) = self.fallback.take()
-            && self.future.is_some()
+            && self.future.as_ref().is_some_and(|future| {
+                !matches!(
+                    future,
+                    ScopedJobFuture::CanonicalFinalDrain(FinalDrain {
+                        completed: true,
+                        ..
+                    })
+                )
+            })
         {
             let future = Box::pin(Self {
                 future: self.future.take(),
@@ -405,7 +684,11 @@ impl Drop for ScopedJob {
         // guards commit replacement state while the original lease is still held.
         let future = self.future.take();
         let completion = self.completion.take();
-        callbacks(|| drop(future), || drop(completion));
+        let fallback = self.fallback.take();
+        callbacks(
+            || callbacks(|| drop(future), || drop(completion)),
+            || drop(fallback),
+        );
     }
 }
 
@@ -419,8 +702,24 @@ impl Future for Drain {
         self.scope.poll_drain(cx, self.local.as_ref())
     }
 }
+enum FinalDrainObserver {
+    Canonical(Drain),
+    // Existing manual panic-observer control; production never erases a Drain.
+    #[cfg(test)]
+    Opaque(LocalFuture<'static, ()>),
+}
+impl Future for FinalDrainObserver {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        match self.get_mut() {
+            Self::Canonical(drain) => Pin::new(drain).poll(cx),
+            #[cfg(test)]
+            Self::Opaque(future) => future.as_mut().poll(cx),
+        }
+    }
+}
 struct FinalDrain {
-    drain: Option<LocalFuture<'static, ()>>,
+    drain: Option<FinalDrainObserver>,
     keepalive: Option<Box<dyn std::any::Any>>,
     local: Option<LocalCleanupRunner>,
     completed: bool,
@@ -429,25 +728,67 @@ impl Future for FinalDrain {
     type Output = ();
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let this = self.get_mut();
-        if this
-            .drain
-            .as_mut()
-            .expect("live final drain")
-            .as_mut()
+        let _span = this.scope().map(|scope| scope.callback_span());
+        if Pin::new(this.drain.as_mut().expect("live final drain"))
             .poll(cx)
             .is_pending()
         {
             return Poll::Pending;
         }
         this.completed = true;
-        drop(this.drain.take());
-        drop(this.keepalive.take());
+        let drain = this.drain.take();
+        let keepalive = this.keepalive.take();
+        callbacks(|| drop(drain), || drop(keepalive));
         Poll::Ready(())
+    }
+}
+impl FinalDrain {
+    fn scope(&self) -> Option<&Arc<LoaderCleanup>> {
+        match self.drain.as_ref()? {
+            FinalDrainObserver::Canonical(drain) => Some(&drain.scope),
+            #[cfg(test)]
+            FinalDrainObserver::Opaque(_) => self.local.as_ref().map(|local| &local.scope),
+        }
+    }
+    /// Only a concrete Drain may use this shortcut, never an opaque async frame.
+    fn finish_closed(&mut self) -> bool {
+        if self.completed {
+            return true;
+        }
+        let Some(FinalDrainObserver::Canonical(drain)) = self.drain.as_ref() else {
+            return false;
+        };
+        let scope = drain.scope.clone();
+        let _span = scope.callback_span();
+        let waker = {
+            let mut state = scope.state();
+            if state.pending != 0 || !state.jobs.is_empty() || !state.retire.is_empty() {
+                return false;
+            }
+            state.closed = true;
+            scope
+                .settlement
+                .0
+                .0
+                .base_closed
+                .store(true, Ordering::Release);
+            state.waker.take()
+        };
+        // Commit and take SAME fields before ANY fallible callback/drop.
+        self.completed = true;
+        let drain = self.drain.take();
+        let keepalive = self.keepalive.take();
+        callbacks(
+            || drop(waker),
+            || callbacks(|| drop(drain), || drop(keepalive)),
+        );
+        true
     }
 }
 impl Drop for FinalDrain {
     fn drop(&mut self) {
-        if self.completed {
+        let _span = self.scope().map(|scope| scope.callback_span());
+        if self.finish_closed() {
             return;
         }
         if let Some(local) = self.local.take() {
@@ -457,9 +798,17 @@ impl Drop for FinalDrain {
                 local: Some(local.clone()),
                 completed: false,
             });
+            self.completed = true; // replacement owns every unfinished field
             // This same obligation is uncounted: it observes the counted jobs.
             // A failed poll transfers its actual drain/lease without the executor.
             callbacks(|| {}, || local.sink.retain(future));
+        } else {
+            // Unbound/shared cancellation retains its old disposal behavior,
+            // but actual fields must finish inside the callback span as well.
+            self.completed = true;
+            let drain = self.drain.take();
+            let keepalive = self.keepalive.take();
+            callbacks(|| drop(drain), || drop(keepalive));
         }
     }
 }
@@ -468,7 +817,7 @@ struct Runner<'a, R> {
     local: Option<LocalCleanupRunner>,
     guest: Option<LocalFuture<'a, R>>,
     output: Option<R>,
-    drain: Option<LocalFuture<'static, ()>>,
+    drain: Option<Drain>,
     keepalive: Option<Box<dyn std::any::Any>>,
     done: bool,
 }
@@ -495,6 +844,7 @@ impl<R> Future for Runner<'_, R> {
     type Output = R;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<R> {
         let this = self.get_mut();
+        let _span = this.scope.callback_span();
         this.scope.flush(cx, this.local.as_ref());
         if let Some(guest) = &mut this.guest {
             match guest.as_mut().poll(cx) {
@@ -502,12 +852,12 @@ impl<R> Future for Runner<'_, R> {
                 Poll::Ready(output) => this.output = Some(output),
             }
             drop(this.guest.take());
-            this.drain = Some(Box::pin(Drain {
+            this.drain = Some(Drain {
                 scope: this.scope.clone(),
                 local: this.local.clone(),
-            }));
+            });
         }
-        if this.drain.as_mut().unwrap().as_mut().poll(cx).is_pending() {
+        if Pin::new(this.drain.as_mut().unwrap()).poll(cx).is_pending() {
             return Poll::Pending;
         }
         this.drain = None;
@@ -519,6 +869,7 @@ impl<R> Future for Runner<'_, R> {
 }
 impl<R> Drop for Runner<'_, R> {
     fn drop(&mut self) {
+        let _span = self.scope.callback_span();
         if self.done {
             return;
         }
@@ -539,55 +890,36 @@ impl<R> Drop for Runner<'_, R> {
 struct DrainCustody {
     scope: Arc<LoaderCleanup>,
     local: Option<LocalCleanupRunner>,
-    drain: Option<LocalFuture<'static, ()>>,
+    drain: Option<Drain>,
     keepalive: Option<Box<dyn std::any::Any>>,
 }
 impl Drop for DrainCustody {
     fn drop(&mut self) {
-        // Establish the exact final-drain and lease guard before a Waker or
-        // executor callback can unwind through any of the old owner's fields.
+        let _span = self.scope.callback_span();
         let mut future = FinalDrain {
-            drain: Some(self.drain.take().unwrap_or_else(|| {
-                Box::pin(Drain {
+            drain: Some(FinalDrainObserver::Canonical(
+                self.drain.take().unwrap_or_else(|| Drain {
                     scope: self.scope.clone(),
                     local: self.local.clone(),
-                })
-            })),
+                }),
+            )),
             keepalive: self.keepalive.take(),
             local: self.local.clone(),
             completed: false,
         };
-        let (closed, waker) = {
-            let mut state = self.scope.state();
-            if state.pending == 0 && state.retire.is_empty() {
-                state.closed = true;
-                (true, state.waker.take())
-            } else {
-                (false, None)
-            }
-        };
-        callbacks(
-            || drop(waker),
-            || {
-                if closed {
-                    future.completed = true;
-                    callbacks(
-                        || drop(future.drain.take()),
-                        || drop(future.keepalive.take()),
-                    );
-                } else if let Some(local) = &self.local {
-                    // The final drain is not counted among the jobs it observes.
-                    self.scope.host.executor().spawn_local(Box::pin(ScopedJob {
-                        future: Some(Box::pin(future)),
-                        completion: None,
-                        fallback: Some(local.sink.clone()),
-                        panicked: false,
-                    }));
-                } else {
-                    self.scope.host.executor().spawn_local(Box::pin(future));
-                }
-            },
-        );
+        if future.finish_closed() {
+            return;
+        }
+        if let Some(local) = &self.local {
+            self.scope.host.executor().spawn_local(Box::pin(ScopedJob {
+                future: Some(ScopedJobFuture::CanonicalFinalDrain(future)),
+                completion: None,
+                fallback: Some(local.sink.clone()),
+                panicked: false,
+            }));
+        } else {
+            self.scope.host.executor().spawn_local(Box::pin(future));
+        }
     }
 }
 
@@ -1190,7 +1522,7 @@ mod local_custody_tests {
             drops: drops.clone(),
         });
         let mut final_drain = Box::pin(FinalDrain {
-            drain: Some(drain),
+            drain: Some(FinalDrainObserver::Opaque(drain)),
             keepalive: Some(Box::new(Lease(lease_drops.clone()))),
             local: Some(local),
             completed: false,
@@ -1498,6 +1830,302 @@ mod local_custody_tests {
             assert_eq!(lease_drops.get(), 1);
             assert!(!scope.is_open());
             assert!(sink.futures.borrow().is_empty());
+        }
+    }
+    struct SettlementWake(AtomicUsize);
+    impl std::task::Wake for SettlementWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    fn poll_host_jobs() {
+        let jobs = JOBS.with(|jobs| std::mem::take(&mut *jobs.borrow_mut()));
+        for mut job in jobs {
+            assert!(
+                job.as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_ready()
+            );
+        }
+    }
+
+    #[test]
+    fn settlement_new_sink_refusal_returns_same_once_counted_wrapper() {
+        struct Reject {
+            notifications: Cell<usize>,
+        }
+        impl LocalCleanupSink for Reject {
+            fn retain(&self, _: LocalFuture<'static, ()>) {
+                panic!("fresh work used trusted transfer");
+            }
+            fn try_retain(
+                &self,
+                exact: LocalFuture<'static, ()>,
+            ) -> Result<(), LocalFuture<'static, ()>> {
+                Err(exact)
+            }
+            fn notify(&self) {
+                self.notifications.set(self.notifications.get() + 1);
+            }
+        }
+        let scope = LoaderCleanup::new(Arc::new(QueueHost(AtomicBool::new(false))));
+        let sink = Rc::new(Reject {
+            notifications: Cell::new(0),
+        });
+        let local = LocalCleanupRunner::new(scope.clone(), sink.clone());
+        let (future, _, dropped) = probe();
+        let mut refused = local.retain(Box::pin(future)).unwrap_err();
+        assert_eq!(scope.state().pending, 1);
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        assert_eq!(sink.notifications.get(), 0);
+        assert!(
+            refused
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        drop(refused);
+        assert_eq!(scope.state().pending, 0);
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        assert_eq!(sink.notifications.get(), 1);
+        assert!(scope.is_open(), "Completion must not close the scope");
+        drop(local.run(std::future::pending::<()>()));
+        let raw: LocalFuture<'static, ()> = Box::pin(async {});
+        let address = (&*raw) as *const dyn Future<Output = ()>;
+        let raw = local.retain(raw).unwrap_err();
+        assert!(std::ptr::eq(
+            address,
+            (&*raw) as *const dyn Future<Output = ()>
+        ));
+        assert_eq!(scope.state().pending, 0);
+    }
+
+    #[test]
+    fn settlement_existing_transfer_scope_closed_refusal_stays_raw() {
+        let scope = LoaderCleanup::new(Arc::new(QueueHost(AtomicBool::new(false))));
+        let sink = Rc::new(Sink::default());
+        let local = LocalCleanupRunner::new(scope.clone(), sink.clone());
+        drop(local.run(std::future::pending::<()>()));
+        let raw: LocalFuture<'static, ()> = Box::pin(async {});
+        let address = (&*raw) as *const dyn Future<Output = ()>;
+        let raw = local.retain_existing(raw).unwrap_err();
+        assert!(std::ptr::eq(
+            address,
+            (&*raw) as *const dyn Future<Output = ()>
+        ));
+        assert_eq!(scope.state().pending, 0);
+        assert!(sink.futures.borrow().is_empty());
+        assert!(JOBS.with(|jobs| jobs.borrow().is_empty()));
+    }
+
+    #[test]
+    fn settlement_covers_unmaterialized_factories_and_requires_actual_closer() {
+        let scope = LoaderCleanup::new(Arc::new(QueueHost(AtomicBool::new(false))));
+        let local = LocalCleanupRunner::new(scope.clone(), Rc::new(Sink::default()));
+        let settlement = scope.settlement();
+        let called = Arc::new(AtomicUsize::new(0));
+        let owner = Arc::new(());
+        let submit = called.clone();
+        assert!(
+            local
+                .submit(Box::new(move |_| {
+                    submit.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(async {})
+                }))
+                .is_ok()
+        );
+        let retire = called.clone();
+        assert!(
+            local
+                .on_retire(
+                    &owner,
+                    Box::new(move |_| {
+                        retire.fetch_add(1, Ordering::SeqCst);
+                        Box::pin(async {})
+                    })
+                )
+                .is_ok()
+        );
+        assert_eq!(called.load(Ordering::SeqCst), 0);
+        assert!(!settlement.is_ready());
+        let mut runner = Box::pin(local.run(async {}));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(runner.as_mut().poll(&mut cx).is_pending());
+        poll_host_jobs();
+        assert!(scope.is_open());
+        assert!(
+            !settlement.is_ready(),
+            "job completion alone is not a closer"
+        );
+        assert!(runner.as_mut().poll(&mut cx).is_pending());
+        poll_host_jobs();
+        assert!(runner.as_mut().poll(&mut cx).is_ready());
+        assert_eq!(called.load(Ordering::SeqCst), 2);
+        assert!(settlement.is_ready());
+    }
+
+    #[test]
+    fn settlement_observers_cancel_independently_on_shared_scope() {
+        let scope = LoaderCleanup::new(Arc::new(QueueHost(AtomicBool::new(false))));
+        let settlement = scope.settlement();
+        let mut first = settlement.observer();
+        let mut second = settlement.observer();
+        let mut canceled = settlement.observer();
+        let first_wake = Arc::new(SettlementWake(AtomicUsize::new(0)));
+        let second_wake = Arc::new(SettlementWake(AtomicUsize::new(0)));
+        let canceled_wake = Arc::new(SettlementWake(AtomicUsize::new(0)));
+        for (observer, wake) in [
+            (&mut first, &first_wake),
+            (&mut second, &second_wake),
+            (&mut canceled, &canceled_wake),
+        ] {
+            assert!(
+                Pin::new(observer)
+                    .poll(&mut Context::from_waker(&Waker::from(wake.clone())))
+                    .is_pending()
+            );
+        }
+        drop(canceled);
+        assert!(
+            !settlement.is_ready(),
+            "helper/empty open scope is not a closer"
+        );
+        drop(scope.run(std::future::pending::<()>())); // actual never-polled Runner closer
+        assert!(settlement.is_ready());
+        assert_eq!(first_wake.0.load(Ordering::SeqCst), 1);
+        assert_eq!(second_wake.0.load(Ordering::SeqCst), 1);
+        assert_eq!(canceled_wake.0.load(Ordering::SeqCst), 0);
+        assert!(
+            Pin::new(&mut first)
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_ready()
+        );
+        assert!(
+            Pin::new(&mut second)
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_ready()
+        );
+    }
+
+    #[test]
+    fn settlement_canonical_closed_drop_covers_exact_keepalive_and_unwind() {
+        struct Lease {
+            settlement: LoaderSettlement,
+            dropped: Arc<AtomicUsize>,
+            panic: bool,
+        }
+        impl Drop for Lease {
+            fn drop(&mut self) {
+                assert!(
+                    !self.settlement.is_ready(),
+                    "keepalive callback is still running"
+                );
+                self.dropped.fetch_add(1, Ordering::SeqCst);
+                if self.panic {
+                    panic!("exact canonical keepalive");
+                }
+            }
+        }
+        for panic in [false, true] {
+            let scope = LoaderCleanup::new(Arc::new(QueueHost(AtomicBool::new(false))));
+            let sink = Rc::new(Sink::default());
+            let local = LocalCleanupRunner::new(scope.clone(), sink.clone());
+            let settlement = scope.settlement();
+            drop(scope.run(std::future::pending::<()>()));
+            let dropped = Arc::new(AtomicUsize::new(0));
+            let final_drain = FinalDrain {
+                drain: Some(FinalDrainObserver::Canonical(Drain {
+                    scope: scope.clone(),
+                    local: Some(local.clone()),
+                })),
+                keepalive: Some(Box::new(Lease {
+                    settlement: settlement.clone(),
+                    dropped: dropped.clone(),
+                    panic,
+                })),
+                local: Some(local),
+                completed: false,
+            };
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(final_drain)));
+            if panic {
+                assert_eq!(
+                    result.unwrap_err().downcast_ref::<&str>(),
+                    Some(&"exact canonical keepalive")
+                );
+            } else {
+                assert!(result.is_ok());
+            }
+            assert_eq!(dropped.load(Ordering::SeqCst), 1);
+            assert!(settlement.is_ready());
+            assert!(sink.futures.borrow().is_empty());
+            assert!(JOBS.with(|jobs| jobs.borrow().is_empty()));
+        }
+    }
+
+    #[test]
+    fn settlement_actual_scope_destruction_finishes_after_factory_return_or_unwind() {
+        struct FactoryResource {
+            scope: Weak<LoaderCleanup>,
+            settlement: LoaderSettlement,
+            dropped: Arc<AtomicUsize>,
+            panic: bool,
+        }
+        impl Drop for FactoryResource {
+            fn drop(&mut self) {
+                assert!(self.scope.upgrade().is_none());
+                assert!(!self.settlement.is_ready());
+                self.dropped.fetch_add(1, Ordering::SeqCst);
+                if self.panic {
+                    panic!("original factory destructor");
+                }
+            }
+        }
+        for panic in [false, true] {
+            let scope = LoaderCleanup::new(Arc::new(QueueHost(AtomicBool::new(false))));
+            let settlement = scope.settlement();
+            let dropped = Arc::new(AtomicUsize::new(0));
+            let resource = FactoryResource {
+                scope: Arc::downgrade(&scope),
+                settlement: settlement.clone(),
+                dropped: dropped.clone(),
+                panic,
+            };
+            assert!(
+                scope
+                    .submit(Box::new(move || {
+                        drop(resource);
+                        Box::pin(async {})
+                    }))
+                    .is_ok()
+            );
+            let mut observer = settlement.observer();
+            let notified = Arc::new(SettlementWake(AtomicUsize::new(0)));
+            assert!(
+                Pin::new(&mut observer)
+                    .poll(&mut Context::from_waker(&Waker::from(notified.clone())))
+                    .is_pending()
+            );
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(scope)));
+            if panic {
+                assert_eq!(
+                    result.unwrap_err().downcast_ref::<&str>(),
+                    Some(&"original factory destructor")
+                );
+            } else {
+                assert!(result.is_ok());
+            }
+            assert_eq!(dropped.load(Ordering::SeqCst), 1);
+            assert!(settlement.is_ready());
+            assert_eq!(notified.0.load(Ordering::SeqCst), 1);
+            assert!(
+                Pin::new(&mut observer)
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_ready()
+            );
         }
     }
 }

@@ -7,7 +7,8 @@
 
 mod loader_cleanup;
 pub use loader_cleanup::{
-    LoaderCleanup, LoaderCleanupJob, LocalCleanupRunner, LocalCleanupSink, LocalLoaderCleanupJob,
+    LoaderCleanup, LoaderCleanupJob, LoaderSettlement, LoaderSettlementObserver,
+    LocalCleanupRunner, LocalCleanupSink, LocalLoaderCleanupJob,
 };
 
 #[cfg(all(feature = "terminal", unix))]
