@@ -295,14 +295,14 @@ impl Child {
                 let mut regs = get_regs(pid)?;
                 let mut args = args;
                 if regs.orig_rax == libc::SYS_fork as u64 {
-                    // TODO(native): run fork children as supervisor children so the tracer can reap them
-                    // after WLK's virtual wait4 consumes the corresponding process status.
+                    // TODO(native): replace this host-parent workaround while preserving reaping;
+                    // CLONE_PARENT currently lets the supervisor reap WLK's virtual children.
                     regs.orig_rax = libc::SYS_clone as u64;
                     args = [(libc::SIGCHLD | libc::CLONE_PARENT) as u64, 0, 0, 0, 0, 0];
                 } else if regs.orig_rax == libc::SYS_clone as u64
                     && args[0] & libc::CLONE_VM as u64 == 0
                 {
-                    // TODO(native): preserve guest parentage in WLK while making the tracer the host parent.
+                    // Process clones use the same reaping workaround; WLK keeps guest parentage.
                     args[0] |= libc::CLONE_PARENT as u64;
                 }
                 [
@@ -339,7 +339,8 @@ impl Child {
         path: &CStr,
         replacement_argv: Option<&[CString]>,
     ) -> io::Result<()> {
-        // TODO(native): monitor exec failure after WLK image commit and terminate the stale native image.
+        // WLK has committed the image; runtime.rs monitors this handoff and terminates the
+        // native task if host exec fails rather than resuming code from the previous image.
         let mut regs = get_regs(pid)?;
         let (mut argv, envp) = if regs.orig_rax == libc::SYS_execveat as u64 {
             (regs.rdx, regs.r10)
