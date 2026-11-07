@@ -19,7 +19,8 @@ use bytes::Bytes;
 use wasixv2_abi::{Errno, OpenFlags};
 use wasixv2_vfs::{
     Attr, Clock, Cred, Ctx, DirEntry, DirSink, File as VfsFile, FileType as Kind,
-    FsResult as VfsResult, LookupFlags, OpenHow, RenameMode, TimeSet, Timestamp, Vfs,
+    FsResult as VfsResult, LookupFlags, OpenHow, PathError, PathResult, RenameMode, TimeSet,
+    Timestamp, Vfs,
 };
 use wasixv2_vfs_mem::{Limits, MemFs};
 
@@ -72,6 +73,12 @@ fn complete<T>(future: impl Future<Output = VfsResult<T>>) -> FsResult<T> {
             }
         }
     }
+}
+
+fn complete_path<T>(future: impl Future<Output = PathResult<T>>) -> FsResult<T> {
+    // This closed provider exposes errno-based filesystem errors, not guest
+    // namespace verdicts. Use the VFS's deliberate projection at this boundary.
+    complete(async { future.await.map_err(PathError::errno) })
 }
 
 #[cfg(test)]
@@ -161,17 +168,18 @@ impl MemoryStorage {
                     &absolute(path),
                     LookupFlags::follow(),
                 )
-                .await?;
+                .await
+                .map_err(PathError::errno)?;
             self.vfs.stat(&path).await.map(metadata)
         })
     }
     fn mkdir_all(&self, path: &RelativePath) -> FsResult<()> {
         let root = self.vfs.root();
-        complete(self.vfs.mkdir_all(&self.context(&root), &absolute(path)))
+        complete_path(self.vfs.mkdir_all(&self.context(&root), &absolute(path)))
     }
     fn mkdir(&self, path: &RelativePath) -> FsResult<()> {
         let root = self.vfs.root();
-        complete(
+        complete_path(
             self.vfs
                 .mkdir(&self.context(&root), &root, &absolute(path), 0o755),
         )
@@ -203,7 +211,7 @@ impl MemoryStorage {
             flags |= OpenFlags::O_APPEND;
         }
         let root = self.vfs.root();
-        let file = complete(self.vfs.open(
+        let file = complete_path(self.vfs.open(
             &self.context(&root),
             &root,
             &absolute(path),
@@ -247,7 +255,8 @@ impl MemoryStorage {
                         lookup: LookupFlags::follow(),
                     },
                 )
-                .await?;
+                .await
+                .map_err(PathError::errno)?;
             let mut names = Names(Vec::new());
             file.readdir(0, &mut names).await?;
             let mut entries = Vec::with_capacity(names.0.len());
@@ -255,7 +264,8 @@ impl MemoryStorage {
                 let entry = self
                     .vfs
                     .lookup(&cx, &file.path, &name, LookupFlags::follow())
-                    .await?;
+                    .await
+                    .map_err(PathError::errno)?;
                 entries.push((name, metadata(self.vfs.stat(&entry).await?)));
             }
             Ok(entries)
@@ -280,7 +290,8 @@ impl MemoryStorage {
             let path = self
                 .vfs
                 .lookup(&self.context(&root), &root, name, LookupFlags::follow())
-                .await?;
+                .await
+                .map_err(PathError::errno)?;
             Ok(self.vfs.stat(&path).await?.file_type == Kind::Directory)
         })?;
         if directory {
@@ -294,14 +305,14 @@ impl MemoryStorage {
                     self.remove_entry(&path, true)?;
                 }
             }
-            complete(self.vfs.rmdir(&self.context(&root), &root, name))
+            complete_path(self.vfs.rmdir(&self.context(&root), &root, name))
         } else {
-            complete(self.vfs.unlink(&self.context(&root), &root, name))
+            complete_path(self.vfs.unlink(&self.context(&root), &root, name))
         }
     }
     fn rename(&self, from: &RelativePath, to: &RelativePath) -> FsResult<()> {
         let root = self.vfs.root();
-        complete(self.vfs.rename(
+        complete_path(self.vfs.rename(
             &self.context(&root),
             &root,
             &absolute(from),
@@ -332,7 +343,8 @@ impl MemoryStorage {
                         LookupFlags::nofollow()
                     },
                 )
-                .await?;
+                .await
+                .map_err(PathError::errno)?;
             self.vfs
                 .utimes(&cx, &path, atime.map(time), mtime.map(time))
                 .await
@@ -583,7 +595,7 @@ mod tests {
     }
     fn directory_file(storage: &MemoryStorage, path: &str) -> VfsFile {
         let root = storage.vfs.root();
-        complete(storage.vfs.open(
+        complete_path(storage.vfs.open(
             &storage.context(&root),
             &root,
             path.as_bytes(),
