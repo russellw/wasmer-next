@@ -14,7 +14,7 @@ jobs:
   candidate:
     name: Exact V8 13.6.233.17 private x64 candidate
     runs-on: macos-15-intel
-    timeout-minutes: 180
+    timeout-minutes: 240
     env:
       PYTHONDONTWRITEBYTECODE: "1"
       NAPI_PRODUCER_REPOSITORY_PRIVATE: ${{ toJSON(github.event.repository.private) }}
@@ -592,9 +592,9 @@ jobs:
               signal.signal(signal.SIGINT, requested)
               started = time.monotonic()
               recovery_only = recovery_failure is not None
-              work_deadline = started + 145 * 60
-              stage_deadline = started + 152 * 60
-              hard_deadline = started + (120 if recovery_only else 160 * 60)
+              work_deadline = started + 205 * 60
+              stage_deadline = started + 212 * 60
+              hard_deadline = started + (120 if recovery_only else 220 * 60)
               rows = []
               previous = EVIDENCE / 'phase-receipts.json'
               if recovery_only and previous.is_file():
@@ -715,7 +715,7 @@ jobs:
                       environment = json.loads((TASK / 'environment.json').read_text())
                       os.environ.update(environment)
                       phase('source', 8 * GIB, 45 * 60)
-                      phase('build', 4 * GIB, 130 * 60)
+                      phase('build', 4 * GIB, 190 * 60)
                       phase('stage', 800 * 1024**2, 5 * 60)
               except BaseException as error:
                   failure = repr(error)
@@ -838,10 +838,10 @@ jobs:
           PY
       - name: Produce the pinned candidate under continuous phase guards
         shell: bash
-        timeout-minutes: 165
+        timeout-minutes: 225
         run: |
           set -euo pipefail
-          # Driver work <=145min; staging/termination/evidence <=160min.
+          # Driver work <=205min; staging/termination/evidence <=220min.
           # Job slack remains for always-run group cleanup and artifact uploads.
           python3 "$NAPI_X64_TASK/driver.py"
       - name: Finish owned process-group cleanup and retain failure evidence
