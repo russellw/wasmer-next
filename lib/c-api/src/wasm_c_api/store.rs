@@ -30,6 +30,8 @@ struct ManagedStore {
     driver: RefCell<Option<Rc<Driver>>>,
     ledger: Rc<RetirementLedger>,
     scopes: Rc<DriverScopes>,
+    cleanup_failure: RetirementFailure,
+    failures_receiver: wasmer_api::sys::NativeCleanupFailures,
     seal: Option<wasmer_api::sys::NativeCleanupSeal>,
     finalization: RefCell<Weak<NativeStoreFinalizationHandoff>>,
     #[cfg(feature = "wasi")]
@@ -135,7 +137,7 @@ impl Drop for DriverUse {
         attempt_retirement(&mut first, || drop(self.exit.take()));
         if let Some(first) = first {
             if unwinding {
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(first)));
+                discard_retirement_panic(first);
             } else {
                 std::panic::resume_unwind(first);
             }
@@ -270,7 +272,7 @@ impl Drop for DriverSubscription {
         }
         if let Some(panic) = panic {
             if unwinding {
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(panic)));
+                discard_retirement_panic(panic);
             } else {
                 std::panic::resume_unwind(panic);
             }
@@ -495,7 +497,11 @@ impl RetirementFailure {
         }) {
             // This record follows an already-owned first event in the SAME
             // carrier. Preserve that earlier event; secondary Drop is guarded.
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(secondary)));
+            if let Err(panic) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(secondary)))
+            {
+                discard_retirement_panic(panic);
+            }
         }
     }
     fn accept_event(&self, event: RetirementEvent) -> Result<(), RetirementEvent> {
@@ -525,7 +531,11 @@ impl RetirementFailure {
         *self.0.borrow_mut() = Some(first);
         // Payload destruction can reenter. Publish the actual earlier value
         // before disposing a secondary, and hold no carrier/binding borrow.
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(secondary)));
+        if let Err(panic) =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(secondary)))
+        {
+            discard_retirement_panic(panic);
+        }
         Ok(())
     }
     fn has_unstamped_event(&self) -> bool {
@@ -535,10 +545,15 @@ impl RetirementFailure {
             .is_some_and(|event| event.order.is_none())
     }
     pub(crate) fn attempt<R>(&self, action: impl FnOnce() -> R) -> Option<R> {
+        let unwinding = std::thread::panicking();
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(action)) {
             Ok(value) => Some(value),
             Err(panic) => {
-                self.record(panic);
+                if unwinding {
+                    discard_retirement_panic(panic);
+                } else {
+                    self.record(panic);
+                }
                 None
             }
         }
@@ -581,6 +596,7 @@ struct RetirementLedger {
     enrolled: RefCell<Vec<Weak<NativeRetirementState>>>,
     clock: RetirementClock,
     final_done: std::cell::Cell<bool>,
+    finalization_started: std::cell::Cell<bool>,
 }
 #[cfg(feature = "sys")]
 impl RetirementLedger {
@@ -589,6 +605,7 @@ impl RetirementLedger {
             enrolled: RefCell::default(),
             clock: Rc::default(),
             final_done: std::cell::Cell::new(false),
+            finalization_started: std::cell::Cell::new(false),
         })
     }
     fn snapshot(&self) -> Vec<Rc<NativeRetirementState>> {
@@ -1185,6 +1202,56 @@ impl CallOwner {
     }
 }
 
+#[cfg(feature = "sys")]
+fn store_cleanup_failures(
+    failure: &RetirementFailure,
+    ledger: &Rc<RetirementLedger>,
+    scopes: &Rc<DriverScopes>,
+) -> wasmer_api::sys::NativeCleanupFailures {
+    use wasmer_api::sys::NativeCleanupFailureDisposition as Disposition;
+    let record = failure.clone();
+    let claim = failure.clone();
+    let claim_ledger = ledger.clone();
+    let claim_scopes = scopes.clone();
+    let terminal = failure.clone();
+    let terminal_ledger = ledger.clone();
+    wasmer_api::sys::NativeCleanupFailures::new(
+        move |exact| record.record(exact),
+        move |owner| {
+            if claim.is_empty() {
+                return Disposition::Empty;
+            }
+            let ready = if claim_ledger.finalization_started.get() {
+                claim_ledger.final_done.get()
+            } else {
+                owner.is_some_and(|owner| owner.is_quiescent())
+                    && claim_scopes.entered.get() == 0
+                    && claim_scopes.users.get() == 0
+                    && claim_ledger.resources_ready()
+            };
+            if !ready || claim.has_unstamped_event() {
+                return Disposition::Deferred;
+            }
+            match claim.take() {
+                Some(exact) => Disposition::Deliver(exact),
+                None => Disposition::Empty,
+            }
+        },
+        move || {
+            if terminal.is_empty() {
+                return None;
+            }
+            // Before Done the actual ManagedStore/unfinished phase owns another
+            // strong receiver. Constructor rollback is empty before publication.
+            assert!(
+                terminal_ledger.final_done.get(),
+                "unfinished Store lost its actual failure custodian"
+            );
+            terminal.take_terminal_payload()
+        },
+    )
+}
+
 impl StoreRef {
     #[allow(unused_mut)] // Only the native backend binds a generation before conversion.
     fn new(mut store: Store) -> Result<Self, RuntimeError> {
@@ -1193,7 +1260,12 @@ impl StoreRef {
         if store.engine().is_sys() {
             let ledger = RetirementLedger::new();
             let scopes = Rc::new(DriverScopes::default());
-            let owner = wasmer_api::sys::NativeCleanupOwner::new_store_bound();
+            let cleanup_failure = RetirementFailure::default();
+            cleanup_failure.bind_clock(&ledger.clock)?;
+            let failures_receiver = store_cleanup_failures(&cleanup_failure, &ledger, &scopes);
+            let owner = wasmer_api::sys::NativeCleanupOwner::new_store_bound_with_failures(
+                &failures_receiver,
+            );
             let seal = owner.take_store_seal()?;
             let generation = wasmer_api::sys::NativeInvocationScope::bind_with_cleanup(
                 &mut store,
@@ -1214,6 +1286,8 @@ impl StoreRef {
                         driver: RefCell::new(None),
                         ledger,
                         scopes,
+                        cleanup_failure,
+                        failures_receiver,
                         seal: Some(seal),
                         finalization: RefCell::default(),
                         #[cfg(feature = "wasi")]
@@ -1742,13 +1816,11 @@ impl StoreRef {
             unreachable!()
         };
         let handoff = native.finalization.borrow().upgrade().unwrap_or_else(|| {
-            let failure = RetirementFailure::default();
-            failure
-                .bind_clock(&native.ledger.clock)
-                .expect("new cleanup carrier");
+            let failure = native.cleanup_failure.clone();
             Rc::new(NativeStoreFinalizationHandoff {
                 pending: RefCell::default(),
                 failure,
+                _failures_receiver: native.failures_receiver.clone(),
                 wake: owner.driver.wake.clone(),
                 ledger: native.ledger.clone(),
                 polling: std::cell::Cell::new(false),
@@ -2043,12 +2115,22 @@ impl Driver {
 pub(crate) type RetirementPanic = Box<dyn std::any::Any + Send>;
 
 #[cfg(feature = "sys")]
+fn discard_retirement_panic(mut panic: RetirementPanic) {
+    loop {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(panic))) {
+            Ok(()) => return,
+            Err(next) => panic = next,
+        }
+    }
+}
+
+#[cfg(feature = "sys")]
 fn remember_retirement_panic(first: &mut Option<RetirementPanic>, panic: RetirementPanic) {
     if first.is_none() {
         *first = Some(panic);
     } else {
         // A later user panic payload may itself panic on destruction.
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(panic)));
+        discard_retirement_panic(panic);
     }
 }
 
@@ -2081,6 +2163,7 @@ async fn catch_retirement_future<F: std::future::Future>(
 struct NativeStoreFinalizationHandoff {
     pending: RefCell<Option<NativeStoreFinalization>>,
     failure: RetirementFailure,
+    _failures_receiver: wasmer_api::sys::NativeCleanupFailures,
     wake: std::sync::Arc<DriverWake>, // SAME original final-caller notification metadata
     ledger: Rc<RetirementLedger>,
     #[cfg(feature = "wasi")]
@@ -2157,14 +2240,9 @@ impl Drop for NativeStoreFinalizationHandoff {
                     .unwrap()
                     .defer(Box::new(move || Some(first)));
             }
-        } else {
-            // A never-published handoff has admitted no cleanup error. Its
-            // preterminal observer errors belong to each invocation's state.
-            assert!(
-                self.failure.is_empty(),
-                "unpublished finalizer owns a cleanup event"
-            );
         }
+        // A live Store/unfinished phase retains the SAME canonical carrier and
+        // receiver even when this particular handoff never published a phase.
     }
 }
 #[cfg(feature = "sys")]
@@ -2200,6 +2278,7 @@ struct NativeStoreFinalization {
     seal: wasmer_api::sys::NativeCleanupSeal,
     owner: wasmer_api::sys::NativeCleanupOwner,
     failure: RetirementFailure,
+    _failures_receiver: wasmer_api::sys::NativeCleanupFailures,
     poisoned: bool,
 }
 #[cfg(feature = "sys")]
@@ -2278,6 +2357,7 @@ impl NativeStoreFinalization {
         seal: wasmer_api::sys::NativeCleanupSeal,
         owner: wasmer_api::sys::NativeCleanupOwner,
         failure: RetirementFailure,
+        failures_receiver: wasmer_api::sys::NativeCleanupFailures,
     ) -> Self {
         let runtime = driver.as_ref().map(|driver| driver.runtime.clone());
         let destruction = generation.store_destruction();
@@ -2317,6 +2397,7 @@ impl NativeStoreFinalization {
             seal,
             owner,
             failure,
+            _failures_receiver: failures_receiver,
             poisoned: false,
         }
     }
@@ -2415,6 +2496,9 @@ impl NativeStoreFinalization {
                     self.failure.attempt(|| drop(self.store.take()));
                 }
                 StoreFinalizationPhase::StoreDestruction => {
+                    if self.runtime.is_none() && !self.destruction.notifications_complete() {
+                        return Poll::Pending;
+                    }
                     let _exit = self.owner.enter_exit_boundary();
                     let _runtime = self.runtime.as_ref().map(|runtime| runtime.enter());
                     let poll = self.destruction_observer.as_mut().unwrap();
@@ -2481,7 +2565,13 @@ impl NativeStoreFinalization {
             }
         }
     }
-    fn finish_blocking(mut self) -> Option<RetirementPanic> {
+    fn finish_blocking(self) -> Option<RetirementPanic> {
+        self.finish_at_boundary(false)
+    }
+    fn finish_no_driver(self) -> Option<RetirementPanic> {
+        self.finish_at_boundary(true)
+    }
+    fn finish_at_boundary(mut self, park_external: bool) -> Option<RetirementPanic> {
         use std::{
             sync::{Arc, Condvar, Mutex},
             task::{Context, Wake, Waker},
@@ -2514,6 +2604,42 @@ impl NativeStoreFinalization {
                 None => continue,
                 Some(std::task::Poll::Pending) => (),
             }
+            if park_external && matches!(self.phase, StoreFinalizationPhase::StoreDestruction) {
+                assert!(
+                    self.store.is_none()
+                        && self.driver.is_none()
+                        && self.runtime.is_none()
+                        && self.quiescence.is_none()
+                );
+                self.failure
+                    .attempt(|| drop(self.destruction_observer.take()));
+                let receipt = self.destruction.clone();
+                let owner = self.owner.clone();
+                let resume = move |notification_first| {
+                    let exit = owner.enter_exit_boundary(); // BEFORE moving/polling phase
+                    let mut actual = self;
+                    assert!(
+                        actual.destruction.is_complete()
+                            && actual.destruction.notifications_complete()
+                    );
+                    actual.phase = StoreFinalizationPhase::StoreDrain;
+                    if let Some(first) = notification_first {
+                        actual.failure.record(first);
+                    }
+                    exit.defer(Box::new(move || actual.finish_blocking()));
+                    None
+                };
+                if let Err(resume) = receipt.try_defer_cleanup(resume) {
+                    // Callback-free registration may find the actual guard has
+                    // already returned; exact uncalled closure stays owned here.
+                    assert!(
+                        receipt.notifications_complete(),
+                        "one actual noDriver continuation"
+                    );
+                    return resume(None);
+                }
+                return None; // SAME unfinished phase is actually guard-owned
+            }
             let mut ready = signal.0.lock().unwrap_or_else(|e| e.into_inner());
             while !*ready {
                 ready = signal.1.wait(ready).unwrap_or_else(|e| e.into_inner());
@@ -2522,23 +2648,62 @@ impl NativeStoreFinalization {
     }
 }
 #[cfg(feature = "sys")]
+struct NativeStorePrelude(Option<NativeStoreFinalization>);
+#[cfg(feature = "sys")]
+impl std::future::Future for NativeStorePrelude {
+    type Output = ();
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        use std::future::Future;
+        let this = self.get_mut();
+        let actual = this.0.as_mut().unwrap();
+        let failure = actual.failure.clone();
+        let polled = failure.attempt(|| actual.quiescence.as_mut().unwrap().as_mut().poll(cx));
+        let store = match polled {
+            Some(std::task::Poll::Ready(store)) => store,
+            Some(std::task::Poll::Pending) => return std::task::Poll::Pending,
+            None => {
+                failure.attempt(|| cx.waker().wake_by_ref());
+                return std::task::Poll::Pending;
+            }
+        };
+        actual.store = store;
+        actual.phase = StoreFinalizationPhase::Drain;
+        failure.attempt(|| drop(actual.quiescence.take()));
+        let actual = this.0.take().unwrap();
+        let owner = actual.owner.clone();
+        owner.clone().after_pump_existing(move || {
+            let exit = owner.enter_exit_boundary();
+            exit.defer(Box::new(move || actual.finish_no_driver()));
+        });
+        std::task::Poll::Ready(())
+    }
+}
+#[cfg(feature = "sys")]
+impl Drop for NativeStorePrelude {
+    fn drop(&mut self) {
+        if let Some(actual) = self.0.take() {
+            // A callback panic/cancellation never implicitly drops unfinished
+            // physical custody. Existing notify's outer boundary owns it.
+            let exit = actual.owner.enter_exit_boundary();
+            exit.defer(Box::new(move || actual.finish_no_driver()));
+        }
+    }
+}
+
+#[cfg(feature = "sys")]
 impl Drop for ManagedStore {
     fn drop(&mut self) {
         let Some(generation) = self.generation.take() else {
             return;
         };
+        self.ledger.finalization_started.set(true); // BEFORE any callback/publication
         let exit = self.owner.enter_exit_boundary();
         let handoff = self.finalization.get_mut().upgrade();
-        let failure = handoff
-            .as_ref()
-            .map(|handoff| handoff.failure.clone())
-            .unwrap_or_else(|| {
-                let failure = RetirementFailure::default();
-                failure
-                    .bind_clock(&self.ledger.clock)
-                    .expect("new finalizer carrier");
-                failure
-            });
+        let failure = self.cleanup_failure.clone();
+        let no_driver = self.driver.get_mut().is_none();
         let actual = NativeStoreFinalization::new(
             generation,
             self.store.take(),
@@ -2548,8 +2713,15 @@ impl Drop for ManagedStore {
             self.seal.take().unwrap(),
             self.owner.clone(),
             failure,
+            self.failures_receiver.clone(),
         );
-        if let Some(handoff) = handoff {
+        if no_driver {
+            // Preserve original queued generation/write-unlock producer. Only
+            // this noDriver prelude queues phase custody, never a Driver owner.
+            assert!(self.ledger.snapshot().is_empty());
+            self.owner
+                .transfer_existing(NativeStorePrelude(Some(actual)));
+        } else if let Some(handoff) = handoff {
             assert!(!handoff.complete.get());
             assert!(handoff.pending.borrow().is_none());
             *handoff.pending.borrow_mut() = Some(actual);
@@ -3151,6 +3323,390 @@ mod tests {
             .forward_handoff(&RuntimeError::new("ordinary guest trap"), None)
             .unwrap();
         assert!(native.endpoints.borrow().is_empty());
+    }
+
+    #[cfg(feature = "wasi")]
+    struct ParkedBareStore {
+        owner: wasmer_api::sys::NativeCleanupOwner,
+        failure: RetirementFailure,
+        ledger: Rc<RetirementLedger>,
+        backing: Option<wasmer_api::StoreAsync>,
+    }
+
+    #[cfg(feature = "wasi")]
+    fn parked_bare_store(first: Option<RetirementPanic>) -> ParkedBareStore {
+        let store = StoreRef::new(Store::default()).unwrap();
+        let backing = store.async_store().unwrap();
+        let weak = store.downgrade();
+        let StoreMode::Native(native) = &store.inner.mode else {
+            unreachable!()
+        };
+        assert!(native.driver.borrow().is_none());
+        let owner = native.owner.clone();
+        let failure = native.cleanup_failure.clone();
+        let ledger = native.ledger.clone();
+        let exit = owner.enter_exit_boundary();
+        if let Some(first) = first {
+            owner
+                .try_retain(async move { std::panic::resume_unwind(first) })
+                .unwrap_or_else(|_| panic!("prelude error job refused"));
+        }
+        drop(store);
+        drop(exit); // same phase runs outside real prelude/pump/context guards
+        assert!(weak.upgrade().is_none());
+        assert!(
+            owner.is_idle(),
+            "external backing must not keep the owner pump busy"
+        );
+        assert!(ledger.finalization_started.get());
+        assert!(
+            !ledger.final_done.get(),
+            "last external backing has not actually dropped"
+        );
+        ParkedBareStore {
+            owner,
+            failure,
+            ledger,
+            backing: Some(backing),
+        }
+    }
+
+    #[cfg(feature = "wasi")]
+    fn no_driver_same_pump_error_order(first_i: bool, field_drop: bool) {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct Payload(&'static str, Arc<AtomicUsize>);
+        impl Drop for Payload {
+            fn drop(&mut self) {
+                self.1.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        struct TaskFields {
+            owner: wasmer_api::sys::NativeCleanupOwner,
+            ledger: Rc<RetirementLedger>,
+            dropped: Rc<std::cell::Cell<bool>>,
+            admitted_done: Rc<std::cell::Cell<bool>>,
+        }
+        impl Drop for TaskFields {
+            fn drop(&mut self) {
+                assert!(
+                    !self.owner.is_idle(),
+                    "actual task field Drop still owns running guard"
+                );
+                assert!(
+                    !self.ledger.final_done.get(),
+                    "phase must wait for actual task fields"
+                );
+                self.dropped.set(true);
+                let ledger = self.ledger.clone();
+                let done = self.admitted_done.clone();
+                self.owner
+                    .try_retain(async move {
+                        assert!(
+                            !ledger.final_done.get(),
+                            "admitted finite work precedes phase completion"
+                        );
+                        done.set(true);
+                    })
+                    .unwrap_or_else(|_| panic!("actual task destructor work refused before seal"));
+            }
+        }
+        struct TaskTwo {
+            error: Option<RetirementPanic>,
+            direct: bool,
+            external: Option<wasmer_api::StoreAsync>, // actual field Drop fallback
+            fields: TaskFields, // LAST: actual external destructor already returned
+        }
+        impl std::future::Future for TaskTwo {
+            type Output = ();
+            fn poll(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<()> {
+                let this = self.get_mut();
+                if let Some(error) = this.error.take() {
+                    std::panic::resume_unwind(error);
+                }
+                if this.direct {
+                    drop(this.external.take());
+                    assert!(
+                        !this.fields.ledger.final_done.get(),
+                        "guard F must not self-join running task"
+                    );
+                }
+                std::task::Poll::Ready(())
+            }
+        }
+        let i_drops = Arc::new(AtomicUsize::new(0));
+        let q_drops = Arc::new(AtomicUsize::new(0));
+        let i = Box::new(Payload("I", i_drops.clone()));
+        let q = Box::new(Payload("Q", q_drops.clone()));
+        let expected_address = if first_i {
+            (&*i) as *const Payload
+        } else {
+            (&*q) as *const Payload
+        };
+        let mut later_i: Option<RetirementPanic> = Some(i);
+        let mut parked = parked_bare_store(if first_i { later_i.take() } else { None });
+        let weak_ledger = Rc::downgrade(&parked.ledger);
+        let weak_carrier = Rc::downgrade(&parked.failure.0);
+        let dropped = Rc::new(std::cell::Cell::new(false));
+        let admitted_done = Rc::new(std::cell::Cell::new(false));
+        let task2 = TaskTwo {
+            error: later_i,
+            direct: !field_drop,
+            external: parked.backing.take(),
+            fields: TaskFields {
+                owner: parked.owner.clone(),
+                ledger: parked.ledger.clone(),
+                dropped: dropped.clone(),
+                admitted_done: admitted_done.clone(),
+            },
+        };
+        let schedule = parked.owner.clone();
+        let exact = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            parked
+                .owner
+                .try_retain(async move {
+                    schedule
+                        .try_retain(async move { std::panic::resume_unwind(q) })
+                        .unwrap_or_else(|_| panic!("same-pump task1 refused"));
+                    schedule
+                        .try_retain(task2)
+                        .unwrap_or_else(|_| panic!("same-pump task2 refused"));
+                })
+                .unwrap_or_else(|_| panic!("original owner task refused"));
+        }))
+        .expect_err("actual completed phase must deliver its first cleanup value");
+        let payload = exact.downcast_ref::<Payload>().unwrap();
+        assert_eq!(payload as *const _, expected_address);
+        assert_eq!(payload.0, if first_i { "I" } else { "Q" });
+        assert!(dropped.get() && admitted_done.get());
+        assert!(parked.owner.is_idle() && parked.ledger.final_done.get());
+        assert!(parked.failure.is_empty());
+        assert_eq!(i_drops.load(Ordering::SeqCst), usize::from(!first_i));
+        assert_eq!(q_drops.load(Ordering::SeqCst), usize::from(first_i));
+        drop(exact);
+        assert_eq!(i_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(q_drops.load(Ordering::SeqCst), 1);
+        drop(parked);
+        assert!(
+            weak_ledger.upgrade().is_none(),
+            "no owner/guard/receiver metadata cycle"
+        );
+        assert!(weak_carrier.upgrade().is_none());
+    }
+
+    #[cfg(feature = "wasi")]
+    #[test]
+    fn no_driver_last_backing_inside_owner_task_preserves_earlier_phase_error() {
+        no_driver_same_pump_error_order(true, false);
+    }
+
+    #[cfg(feature = "wasi")]
+    #[test]
+    fn no_driver_last_backing_in_task_field_drop_preserves_earlier_phase_error() {
+        no_driver_same_pump_error_order(true, true);
+    }
+
+    #[cfg(feature = "wasi")]
+    #[test]
+    fn no_driver_same_pump_raw_error_precedes_later_phase_error_and_last_backing_drop() {
+        no_driver_same_pump_error_order(false, true);
+    }
+
+    #[cfg(feature = "wasi")]
+    #[test]
+    fn no_driver_external_backing_returns_before_drop_and_preserves_active_rust_primary() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct Secondary(Arc<AtomicUsize>);
+        impl Drop for Secondary {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut parked = parked_bare_store(Some(Box::new(Secondary(drops.clone()))));
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        let external = parked.backing.take().unwrap();
+        let primary = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _actual_last_backing = external;
+            std::panic::panic_any("original active Rust primary");
+        }))
+        .unwrap_err();
+        assert_eq!(
+            primary.downcast_ref::<&str>(),
+            Some(&"original active Rust primary")
+        );
+        assert!(parked.ledger.final_done.get() && parked.owner.is_idle());
+        assert!(parked.failure.is_empty());
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "wasi")]
+    #[test]
+    fn actual_retained_future_drop_preserves_g_before_receipt_release_wake_n() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct WakeN(AtomicUsize);
+        impl std::task::Wake for WakeN {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                std::panic::panic_any("secondary release wake N");
+            }
+        }
+        struct DropG;
+        impl std::future::Future for DropG {
+            type Output = ();
+            fn poll(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<()> {
+                std::task::Poll::Ready(())
+            }
+        }
+        impl Drop for DropG {
+            fn drop(&mut self) {
+                std::panic::panic_any("actual future Drop G");
+            }
+        }
+        let store = StoreRef::new(Store::default()).unwrap();
+        let receipt = store.retirement_owner().unwrap();
+        let handoff = store.finalization_handoff(&receipt);
+        let failure = handoff.failure.clone();
+        let cleanup = receipt.owner.clone();
+        drop(store);
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(handoff.poll(&mut cx).is_pending());
+        assert!(
+            handoff.blocked.get(),
+            "real phase is waiting for actual Driver receipt"
+        );
+        let wake = Arc::new(WakeN(AtomicUsize::new(0)));
+        let waker = std::task::Waker::from(wake.clone());
+        let subscription = receipt.subscribe();
+        subscription.with_context(&mut std::task::Context::from_waker(&waker), |_| ());
+        receipt.retain_receipt(Box::pin(DropG));
+        assert_eq!(wake.0.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            failure.inspect_message().as_deref(),
+            Some("actual future Drop G")
+        );
+        assert_eq!(
+            failure.0.borrow().as_ref().unwrap().order,
+            Some(1),
+            "N must not stamp before outer G catch"
+        );
+        drop(subscription);
+        let exact =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handoff.poll(&mut cx)))
+                .unwrap_err();
+        assert_eq!(exact.downcast_ref::<&str>(), Some(&"actual future Drop G"));
+        assert!(handoff.complete.get() && cleanup.is_idle());
+    }
+
+    #[cfg(feature = "wasi")]
+    fn last_no_driver_receiver_exhaustion(active_primary: bool) {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct Payload(Arc<AtomicUsize>);
+        impl Drop for Payload {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let mut parked = parked_bare_store(None);
+        let children = Rc::new(RefCell::new(None));
+        let child_out = children.clone();
+        let owner = parked.owner.clone();
+        let ledger = parked.ledger.clone();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let payload = Box::new(Payload(drops.clone()));
+        let address = (&*payload) as *const Payload;
+        let exit = parked.owner.enter_exit_boundary();
+        drop(parked.backing.take()); // exact phase becomes FIRST deferred action
+        exit.defer(Box::new(move || {
+            assert!(
+                ledger.final_done.get(),
+                "late action follows actual phase completion"
+            );
+            *child_out.borrow_mut() = Some(owner.enter_exit_boundary());
+            ledger.clock.set(u64::MAX);
+            std::panic::resume_unwind(payload)
+        }));
+        drop(exit); // actual child pins the root/receiver with unstamped Q
+        assert!(parked.ledger.final_done.get());
+        assert!(parked.failure.has_unstamped_event());
+        assert!(parked.failure.take_event().is_none());
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        let child = children.borrow_mut().take().unwrap();
+        let exact = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if active_primary {
+                let _last_actual_child = child;
+                std::panic::panic_any("active primary across LAST receiver");
+            } else {
+                drop(child);
+            }
+        }))
+        .expect_err("LAST receiver is an explicit terminal Rust boundary");
+        if active_primary {
+            assert_eq!(
+                exact.downcast_ref::<&str>(),
+                Some(&"active primary across LAST receiver")
+            );
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+        } else {
+            assert_eq!(
+                exact.downcast_ref::<Payload>().unwrap() as *const _,
+                address
+            );
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+        }
+        assert!(parked.failure.is_empty());
+        assert!(
+            !parked.failure.1.get(),
+            "terminal transport is no ordered acknowledgement"
+        );
+        drop(exact);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "wasi")]
+    #[test]
+    fn last_no_driver_lexical_receiver_delivers_late_unstamped_payload() {
+        last_no_driver_receiver_exhaustion(false);
+    }
+
+    #[cfg(feature = "wasi")]
+    #[test]
+    fn last_no_driver_lexical_receiver_preserves_active_rust_primary() {
+        last_no_driver_receiver_exhaustion(true);
+    }
+
+    #[test]
+    fn store_constructor_rollback_keeps_unpublished_failure_receiver_empty() {
+        let mut store = Store::default();
+        let original = wasmer_api::sys::NativeInvocationScope::bind(&mut store).unwrap();
+        let destruction = original.store_destruction();
+        assert!(StoreRef::new(store).is_err());
+        assert!(
+            destruction.is_complete(),
+            "failed constructor releases its actual backing"
+        );
+        assert!(destruction.notifications_complete());
+        drop(original);
     }
 
     #[test]
