@@ -304,6 +304,9 @@ enum TerminalPhase {
     Terminal,
 }
 #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+type UnenteredFailure = Box<dyn FnOnce() -> Option<(Arc<process::Handoff>, i32)> + Send>;
+
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
 struct TerminalState {
     task: TaskId,
     entry: Option<process::ExecImage>,
@@ -314,7 +317,7 @@ struct TerminalState {
     phase_waiter: Option<Waker>,
     completion_waiters: std::collections::BTreeMap<usize, Waker>,
     next_waiter: usize,
-    unentered_failure: Option<Box<dyn FnOnce() -> Option<(Arc<process::Handoff>, i32)> + Send>>,
+    unentered_failure: Option<UnenteredFailure>,
 }
 #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
 impl PreinstalledTerminalCustody {
@@ -440,10 +443,7 @@ impl PreinstalledTerminalCustody {
         drop(fallback);
         entry
     }
-    fn set_unentered_failure(
-        &self,
-        fallback: Box<dyn FnOnce() -> Option<(Arc<process::Handoff>, i32)> + Send>,
-    ) {
+    fn set_unentered_failure(&self, fallback: UnenteredFailure) {
         let old = self
             .0
             .lock()
@@ -621,6 +621,7 @@ fn panic_error(panic: Box<dyn std::any::Any + Send>) -> ExecError {
 }
 
 #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+#[allow(clippy::too_many_arguments)]
 async fn committed_worker<S>(
     profile: Result<Option<thread::OwningThread>, ExecError>,
     engine: Engine,
@@ -719,6 +720,7 @@ where
 }
 
 #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+#[allow(clippy::too_many_arguments)]
 fn start_entry<S>(
     engine: Engine,
     syscalls: Arc<S>,
