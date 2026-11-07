@@ -225,7 +225,7 @@ pub(crate) struct Image<S> {
 impl<S> Image<S> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        store: &Store,
+        engine: Engine,
         module: &Module,
         memory: SharedMemory,
         (low_guard, read_only, base): (u32, Arc<ReadOnly>, Option<Arc<Base>>),
@@ -238,7 +238,7 @@ impl<S> Image<S> {
         handoff: Arc<process::Handoff>,
     ) -> Arc<Self> {
         Arc::new(Self {
-            engine: store.engine().clone(),
+            engine,
             module: module.clone(),
             memory,
             low_guard,
@@ -722,7 +722,7 @@ mod tests {
             .as_shared(ready.store.as_ref().unwrap())
             .unwrap();
         let image = Image::new(
-            ready.store.as_ref().unwrap(),
+            ready.store.as_ref().unwrap().engine().clone(),
             &module,
             shared,
             (0, Arc::default(), None),
@@ -800,7 +800,7 @@ mod tests {
             reserved: Vec::new(),
         };
         let image = Image::new(
-            &store,
+            store.engine().clone(),
             &module,
             memory.as_shared(&store).unwrap(),
             (0, Arc::default(), None),
@@ -851,7 +851,7 @@ mod admission_tests {
         let memory =
             wasmer::Memory::new(&mut store, wasmer::MemoryType::new(1, Some(2), true)).unwrap();
         let image = Image::new(
-            &store,
+            store.engine().clone(),
             &module,
             memory.as_shared(&store).unwrap(),
             (0, Arc::default(), None),

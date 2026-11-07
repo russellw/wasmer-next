@@ -1,0 +1,225 @@
+//! External ownership of a process whose instances are supplied by an embedder.
+
+use std::sync::Arc;
+
+use wasixv2_exec::Abis;
+use wasixv2_host::Host;
+use wasixv2_syscalls::TaskId;
+
+use crate::{Machine, MachineSyscalls, OwnedRunning, ProcessConfig, RunError};
+
+pub use wasixv2_kernel::{BootstrappedProcess, DirectoryBootstrap, NamespaceBootstrap};
+
+/// One process started through the Machine's ordinary configuration path.
+///
+/// This owner contains no Store or instance. The embedder retains and settles its
+/// guest invocations before closing it; closing retires only this process. Other
+/// processes and their Machine remain usable.
+pub struct EmbeddingProcess {
+    machine: Arc<Machine>,
+    task: TaskId,
+    registration: Option<OwnedRunning>,
+    #[cfg(feature = "wasix1")]
+    wasix1: Option<wasixv2_wasix1::HostProcessState>,
+}
+
+impl Machine {
+    /// Starts a process without selecting or running an instance or entry point.
+    /// Drive this future on the executor configured for this Machine.
+    pub async fn start_embedding(
+        self: &Arc<Self>,
+        config: ProcessConfig,
+    ) -> Result<EmbeddingProcess, RunError> {
+        self.check_thread_profile()?;
+        let (task, registration) = self.start(config).await?;
+        Ok(EmbeddingProcess::new(
+            self.clone(),
+            task,
+            registration.into_owned(self.clone()),
+        ))
+    }
+
+    /// Starts a process in an explicitly granted filesystem namespace. Descriptor
+    /// identity comes from the kernel's completed bootstrap; no path is reopened.
+    pub async fn start_embedding_with_namespace(
+        self: &Arc<Self>,
+        config: ProcessConfig,
+        namespace: NamespaceBootstrap,
+    ) -> Result<(EmbeddingProcess, BootstrappedProcess), RunError> {
+        self.check_thread_profile()?;
+        let (task, registration, bootstrap) = self
+            .start_with(config, |config| async move {
+                self.syscalls
+                    .inner
+                    .spawn_with_namespace(config, namespace)
+                    .await
+                    .map(|bootstrap| (bootstrap.task, bootstrap))
+            })
+            .await?;
+        Ok((
+            EmbeddingProcess::new(self.clone(), task, registration.into_owned(self.clone())),
+            bootstrap,
+        ))
+    }
+}
+
+impl EmbeddingProcess {
+    fn new(machine: Arc<Machine>, task: TaskId, registration: OwnedRunning) -> Self {
+        #[cfg(feature = "wasix1")]
+        let wasix1 = Some(machine.wasix1.abi.host_process(task));
+        Self {
+            machine,
+            task,
+            registration: Some(registration),
+            #[cfg(feature = "wasix1")]
+            wasix1,
+        }
+    }
+
+    pub fn task(&self) -> TaskId {
+        self.task
+    }
+
+    pub fn syscalls(&self) -> Arc<MachineSyscalls> {
+        self.machine.syscalls.clone()
+    }
+
+    /// The Machine's guest-task executor and clocks, including a configured
+    /// executor override rather than its underlying host executor.
+    pub fn host(&self) -> Arc<dyn Host> {
+        self.machine.task_host.clone()
+    }
+
+    pub fn abis(&self) -> Arc<Abis<MachineSyscalls>> {
+        self.machine.abis.clone()
+    }
+
+    /// The process state of the exact Wasix1 ABI registered in this Machine.
+    /// Returns None after this process owner has been closed.
+    #[cfg(feature = "wasix1")]
+    pub fn wasix1(&self) -> Option<&wasixv2_wasix1::HostProcessState> {
+        self.wasix1.as_ref()
+    }
+
+    /// The exact Wasix1 factory already registered in this Machine. Host-selected
+    /// modules need not have ABI imports, so import-based selection is insufficient.
+    #[cfg(feature = "wasix1")]
+    pub fn wasix1_abi(&self) -> Option<Arc<wasixv2_wasix1::Wasix1>> {
+        self.wasix1
+            .as_ref()
+            .map(|_| self.machine.wasix1.abi.clone())
+    }
+
+    /// Disarms registration after an external executor has settled terminal cleanup.
+    /// This does not fault or release the task again. The executor must settle all
+    /// guest invocations and own the task's release before calling this method.
+    pub fn released(&mut self) {
+        if let Some(registration) = self.registration.take() {
+            registration.released();
+        }
+        #[cfg(feature = "wasix1")]
+        drop(self.wasix1.take());
+    }
+
+    /// Retires this process once. Settle its guest invocations before calling.
+    pub fn close(&mut self) {
+        drop(self.registration.take());
+        #[cfg(feature = "wasix1")]
+        drop(self.wasix1.take());
+    }
+}
+
+impl Drop for EmbeddingProcess {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+#[cfg(all(test, feature = "tokio"))]
+mod tests {
+    use super::*;
+    use crate::Stdio;
+    use wasixv2_abi::{Errno, Signal};
+
+    fn config() -> ProcessConfig {
+        ProcessConfig {
+            args: vec!["embedded".into()],
+            env: vec![],
+            stdio: Stdio::inherit(),
+        }
+    }
+
+    #[tokio::test]
+    async fn closing_one_embedding_process_keeps_its_sibling_live() {
+        let machine = Arc::new(Machine::new());
+        let mut first = machine.start_embedding(config()).await.unwrap();
+        let second = machine.start_embedding(config()).await.unwrap();
+        let first_task = first.task();
+        let second_task = second.task();
+        assert_ne!(first_task, second_task);
+        assert!(Arc::ptr_eq(&first.syscalls(), &second.syscalls()));
+        assert!(Arc::ptr_eq(&first.abis(), &machine.abis));
+        assert!(Arc::ptr_eq(&first.host(), &machine.task_host));
+
+        first.close();
+        first.close();
+        assert_eq!(
+            machine.syscalls.inner.kill(first_task, Signal::SIGCONT),
+            Err(Errno::ESRCH)
+        );
+        assert_eq!(
+            machine.syscalls.inner.kill(second_task, Signal::SIGCONT),
+            Ok(())
+        );
+        assert_eq!(*machine.running.lock().unwrap(), vec![second_task]);
+        #[cfg(feature = "wasix1")]
+        assert!(first.wasix1().is_none());
+
+        drop(second);
+        assert_eq!(
+            machine.syscalls.inner.kill(second_task, Signal::SIGCONT),
+            Err(Errno::ESRCH)
+        );
+        assert!(machine.running.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn released_embedding_registration_leaves_external_task_and_sibling_untouched() {
+        let machine = Arc::new(Machine::new());
+        let mut external = machine.start_embedding(config()).await.unwrap();
+        let sibling = machine.start_embedding(config()).await.unwrap();
+        let task = external.task();
+        let sibling_task = sibling.task();
+
+        // No guest has entered. Keep the executor-owned kernel task observable
+        // until its final cleanup to prove disarming performs no termination.
+        external.released();
+        external.released();
+        #[cfg(feature = "wasix1")]
+        assert!(external.wasix1().is_none());
+        drop(external);
+        assert_eq!(machine.syscalls.inner.kill(task, Signal::SIGCONT), Ok(()));
+        assert_eq!(
+            machine.syscalls.inner.kill(sibling_task, Signal::SIGCONT),
+            Ok(())
+        );
+        assert_eq!(*machine.running.lock().unwrap(), vec![sibling_task]);
+
+        // The external executor, rather than the retired registration, releases it.
+        crate::abandon(&machine.syscalls.inner, task);
+        drop(sibling);
+        assert!(machine.running.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_embedding_setup_releases_its_process_registration() {
+        let mut machine = Machine::new();
+        machine.set_working_dir("/missing");
+        let machine = Arc::new(machine);
+        assert!(matches!(
+            machine.start_embedding(config()).await,
+            Err(RunError::WorkingDir(_))
+        ));
+        assert!(machine.running.lock().unwrap().is_empty());
+    }
+}

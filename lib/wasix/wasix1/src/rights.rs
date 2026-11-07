@@ -9,12 +9,19 @@ use crate::{
 use wasixv2_abi::Fd;
 use wasixv2_syscalls::{Control, DescriptorAttachment, DescriptorUpdate, SysErr, Syscalls};
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct Record {
     pub(crate) base: Rights,
     pub(crate) inheriting: Rights,
     pub(crate) preopen: bool,
     pub(crate) socket: bool,
+    pub(crate) legacy: Option<std::sync::Arc<LegacyObject>>,
+    pub(crate) cloexec: bool,
+}
+
+pub(crate) struct LegacyObject {
+    pub(crate) name: std::sync::Arc<[u8]>,
+    pub(crate) stdio: bool,
 }
 
 impl Record {
@@ -24,6 +31,8 @@ impl Record {
             inheriting,
             preopen: false,
             socket: false,
+            legacy: None,
+            cloexec: false,
         }
     }
 
@@ -44,7 +53,7 @@ pub(crate) async fn record<S: Syscalls + Control + 'static>(
     match &entry.attachment {
         Some(attachment) => attachment
             .downcast_ref::<Record>()
-            .copied()
+            .cloned()
             .ok_or_else(|| Errno::NOTSUP.into()),
         None => {
             let stat = crate::calls::fs::infer_fdstat(frame, fd).await?;
@@ -111,16 +120,40 @@ pub(crate) async fn reduce<S: Syscalls + Control + 'static>(
 pub(crate) async fn duplicate<S: Syscalls + Control + 'static>(
     frame: &Frame<'_, S>,
     fd: Fd,
+    cloexec: bool,
 ) -> V1Result<()> {
     let old = record(frame, fd).await?;
     frame.install_descriptors(vec![
         Record {
-            preopen: false,
+            preopen: old.preopen && old.legacy.is_some(),
+            cloexec,
             ..old
         }
         .attachment(),
     ])?;
     Ok(())
+}
+
+pub(crate) async fn set_legacy_cloexec<S: Syscalls + Control + 'static>(
+    frame: &Frame<'_, S>,
+    fd: Fd,
+    cloexec: bool,
+) -> V1Result<()> {
+    let set = frame.bind_descriptors(&[fd])?;
+    let old = record(frame, fd).await?;
+    if !old.base.contains(Rights::FD_FDSTAT_SET_FLAGS) {
+        return shim::fail(Errno::ACCES);
+    }
+    let new = Record { cloexec, ..old };
+    match frame
+        .syscalls
+        .replace_descriptor_attachment(frame.task, &set, fd, new.attachment())
+        .map_err(SysErr::from)?
+    {
+        DescriptorUpdate::Replaced => return Ok(()),
+        DescriptorUpdate::Conflict => return Err(wasixv2_abi::Errno::EAGAIN.into()),
+        DescriptorUpdate::Stale => return shim::fail(Errno::BADF),
+    }
 }
 
 pub(crate) fn socket() -> Record {

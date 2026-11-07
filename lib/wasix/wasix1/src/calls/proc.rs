@@ -189,6 +189,29 @@ fn check_env(env: Vec<Vec<u8>>) -> V1Result<Vec<Vec<u8>>> {
 
 // ---- exec ----
 
+/// `_prepare_wasi` updated the first matching inherited key in place and appended
+/// new keys; successive supplied duplicates update that same slot. Keep byte values.
+fn merge_exec_environment(inherited: Vec<Vec<u8>>, supplied: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    // Legacy _prepare_wasi normalizes every inherited entry even for Some(empty).
+    let mut inherited: Vec<_> = inherited
+        .into_iter()
+        .map(|entry| String::from_utf8_lossy(&entry).into_owned().into_bytes())
+        .collect();
+    fn key(entry: &[u8]) -> Option<&[u8]> {
+        entry
+            .iter()
+            .position(|&byte| byte == b'=')
+            .map(|end| &entry[..end])
+    }
+    for entry in supplied {
+        match inherited.iter_mut().find(|old| key(old) == key(entry)) {
+            Some(old) => *old = entry.clone(),
+            None => inherited.push(entry.clone()),
+        }
+    }
+    inherited
+}
+
 /// A program to run: what `proc_exec*` and `proc_spawn*` decode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Command {
@@ -294,9 +317,10 @@ async fn exec<S: Syscalls + Control + 'static>(
     frame: &Frame<'_, S>,
     command: &Command,
 ) -> V1Result<()> {
+    let inherited = frame.startup().await?.env.clone();
     let env = match &command.env {
-        Some(env) => env.clone(),
-        None => frame.startup().await?.env.clone(),
+        Some(env) => merge_exec_environment(inherited, env),
+        None => inherited,
     };
     fn slices(strings: &[Vec<u8>]) -> Vec<&[u8]> {
         strings.iter().map(Vec::as_slice).collect()
@@ -578,12 +602,35 @@ fn start_vfork_child<S: Syscalls + Control + 'static>(
     frame: &Frame<'_, S>,
     parent: &Parent,
     resume: Option<wasixv2_exec::asyncify::StackId>,
-) -> (TaskId, i32) {
+) -> crate::errno::V1Result<(TaskId, i32)> {
     let child = frame.task;
     let state = Arc::new(parent.state.fork());
-    frame.instance().procs().replace(child, state.clone());
-    frame.instance().add_vfork(child, Vfork { state, resume });
-    (child, frame.syscalls.pid_in(parent.task, child))
+    let lease = match frame.instance().procs().fork_child(child, state.clone()) {
+        Ok(lease) => Some(lease),
+        Err(_) => {
+            // The kernel child already exists. Keep its vfork restoration record
+            // and terminate it rather than expose a child without owned compat state.
+            frame.instance().add_vfork(
+                child,
+                Vfork {
+                    state,
+                    resume,
+                    lease: None,
+                },
+            );
+            frame.syscalls.fault(child, wasixv2_abi::Signal::SIGKILL.0);
+            return shim::fail(Errno::BUSY);
+        }
+    };
+    frame.instance().add_vfork(
+        child,
+        Vfork {
+            state,
+            resume,
+            lease,
+        },
+    );
+    Ok((child, frame.syscalls.pid_in(parent.task, child)))
 }
 
 /// `proc_fork_env(pid_out)`: vfork without moving control flow (see the module docs). Returns
@@ -600,7 +647,7 @@ pub(crate) async fn proc_fork_env<S: Syscalls + Control + 'static>(
         Err(errno) => return Ok(errno),
     };
     shim::errno(&env, async |frame| {
-        let (_, pid) = start_vfork_child(frame, &parent, None);
+        let (_, pid) = start_vfork_child(frame, &parent, None)?;
         frame.write(pid_out as u32, &pid).await
     })
     .await
@@ -653,7 +700,7 @@ pub(crate) async fn proc_fork<S: Syscalls + Control + 'static>(
                 Err(errno) => return Ok(errno),
             };
             return shim::errno(&env, async |frame| {
-                start_vfork_child(frame, &parent, Some(point));
+                start_vfork_child(frame, &parent, Some(point))?;
                 frame.write(pid_out, &0u32).await
             })
             .await;
@@ -889,7 +936,7 @@ async fn spawn<S: Syscalls + Control + 'static>(
         env,
         async |frame| {
             if child.is_none() {
-                child = Some(start_vfork_child(frame, &parent, None));
+                child = Some(start_vfork_child(frame, &parent, None)?);
             }
             spawn_child(frame, &request).await
         },
@@ -1336,6 +1383,48 @@ pub(crate) async fn proc_parent<S: Syscalls + Control + 'static>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn exec_environment_merges_in_order_and_normalizes_only_inherited_entries() {
+        let inherited = vec![
+            b"OLD=parent".to_vec(),
+            b"DUP=first".to_vec(),
+            b"DUP=second".to_vec(),
+            b"RAW=\xff".to_vec(),
+        ];
+        let supplied = super::check_env(vec![
+            b"NEW=yes".to_vec(),
+            b"DUP=update".to_vec(),
+            b"NEW=last=equals".to_vec(),
+            b"EMPTY=".to_vec(),
+        ])
+        .unwrap();
+        assert_eq!(
+            super::merge_exec_environment(inherited.clone(), &supplied),
+            vec![
+                b"OLD=parent".to_vec(),
+                b"DUP=update".to_vec(),
+                b"DUP=second".to_vec(),
+                b"RAW=\xef\xbf\xbd".to_vec(),
+                b"NEW=last=equals".to_vec(),
+                b"EMPTY=".to_vec(),
+            ]
+        );
+        let mut normalized = inherited.clone();
+        normalized[3] = b"RAW=\xef\xbf\xbd".to_vec();
+        assert_eq!(
+            super::merge_exec_environment(inherited.clone(), &[]),
+            normalized
+        );
+        assert_eq!(
+            inherited[3], b"RAW=\xff",
+            "startup bytes stay raw until explicit exec normalization"
+        );
+        assert!(matches!(
+            super::check_env(vec![b"BARE".to_vec()]),
+            Err(crate::errno::Error::V1(crate::abi::Errno::INVAL))
+        ));
+    }
+
     use super::*;
 
     fn strings(items: &[&str]) -> Vec<Vec<u8>> {

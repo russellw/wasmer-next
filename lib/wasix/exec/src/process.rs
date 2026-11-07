@@ -26,7 +26,36 @@ use crate::{Ended, ExecEnv, ExecError, abi::Abis, asyncify};
 /// Raised from an import to unwind the old image after `execve`, carrying the new one.
 #[derive(Debug, thiserror::Error)]
 #[error("execve replaced the image")]
-pub(crate) struct ExecNew(pub(crate) Image);
+pub(crate) struct ExecNew(pub(crate) Arc<Handoff>);
+
+/// The new image and lifetime-only registration moved out of its predecessor.
+pub(crate) struct ExecImage {
+    image: Image,
+    lease: Option<Box<dyn crate::ExecProcessLease>>,
+}
+impl ExecImage {
+    pub(crate) fn new(image: Image, lease: Option<Box<dyn crate::ExecProcessLease>>) -> Self {
+        Self { image, lease }
+    }
+}
+impl From<Image> for ExecImage {
+    fn from(image: Image) -> Self {
+        Self::new(image, None)
+    }
+}
+impl std::ops::Deref for ExecImage {
+    type Target = Image;
+    fn deref(&self) -> &Self::Target {
+        &self.image
+    }
+}
+impl std::fmt::Debug for ExecImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExecImage")
+            .field("image", &self.image)
+            .finish_non_exhaustive()
+    }
+}
 
 /// Raised from an import to end an instance whose vfork child is done after the task the
 /// instance's run belongs to went on in another instance ([`Resume::Gone`]).
@@ -34,7 +63,7 @@ pub(crate) struct ExecNew(pub(crate) Image);
 /// [`Resume::Gone`]: wasixv2_syscalls::Resume::Gone
 #[derive(Debug, thiserror::Error)]
 #[error("the vfork parent's image went on in another instance")]
-pub(crate) struct Detached;
+pub(crate) struct Detached(pub(crate) Arc<Handoff>);
 
 /// Where the run that takes over a process leaves its result for the run it took over from,
 /// shared by the instances of one process image: the process instance and its threads'. Only
@@ -49,9 +78,183 @@ struct HandoffState {
     taken: bool,
     waker: Option<Waker>,
     cancellation: Option<crate::cancellation::WeakCancellation>,
+    process: Option<(TaskId, Option<Box<dyn crate::ExecProcessLease>>)>,
+    process_moved: bool,
+    pending: Option<PendingOutcome>,
+    committed: bool,
+    claimed: bool,
+    retired: bool,
+    #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+    takeover: Option<crate::cancellation::WeakCancellation>,
+    #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+    takeover_requested: bool,
+}
+
+pub(crate) enum PendingOutcome {
+    Exec { task: TaskId, image: ExecImage },
+    Detached,
+}
+
+impl std::fmt::Debug for Handoff {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Handoff").finish_non_exhaustive()
+    }
 }
 
 impl Handoff {
+    #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+    pub(crate) fn install_takeover(
+        &self,
+        cancellation: &crate::cancellation::Cancellation,
+    ) -> bool {
+        let requested = {
+            let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            if state.takeover.is_some() {
+                return false;
+            }
+            state.takeover = Some(cancellation.downgrade());
+            state.takeover_requested
+        };
+        if requested {
+            cancellation.request_process();
+        }
+        true
+    }
+    #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+    pub(crate) fn cancel_takeover(&self) {
+        let successor = {
+            let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            state.takeover_requested = true;
+            state.takeover.clone()
+        };
+        if let Some(successor) = successor.and_then(|successor| successor.upgrade()) {
+            successor.request_process();
+        }
+    }
+
+    pub(crate) fn publish(&self, outcome: PendingOutcome) -> Result<(), RuntimeError> {
+        let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.committed || state.retired {
+            drop(state);
+            drop(outcome);
+            return Err(RuntimeError::new(
+                "image handoff is already committed or retired",
+            ));
+        }
+        state.pending = Some(outcome);
+        state.committed = true;
+        Ok(())
+    }
+
+    pub(crate) fn is_committed(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .committed
+    }
+
+    pub(crate) fn is_pending(&self) -> bool {
+        let state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        state.committed && !state.claimed && !state.retired
+    }
+
+    pub(crate) fn claim(&self) -> Result<PendingOutcome, RuntimeError> {
+        let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.claimed || state.retired {
+            return Err(RuntimeError::new(
+                "image handoff was already claimed or retired",
+            ));
+        }
+        let outcome = state
+            .pending
+            .take()
+            .ok_or_else(|| RuntimeError::new("no committed image handoff"))?;
+        state.claimed = true;
+        Ok(outcome)
+    }
+
+    #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+    pub(crate) fn retire_pending(&self) -> Option<PendingOutcome> {
+        let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        state.retired = true;
+        state.pending.take()
+    }
+
+    pub(crate) fn retain_process<S: 'static>(
+        &self,
+        task: TaskId,
+        abi: &dyn crate::AbiInstance<S>,
+    ) -> Result<(), RuntimeError> {
+        {
+            let state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            if state.process_moved {
+                return Err(RuntimeError::new(
+                    "process execution custody was transferred",
+                ));
+            }
+            if let Some((owner, _)) = &state.process {
+                return if *owner == task {
+                    Ok(())
+                } else {
+                    Err(RuntimeError::new(
+                        "process execution custody belongs to another leader",
+                    ))
+                };
+            }
+        }
+        // The ABI can lock its registry or destroy rejected custody. Never call it
+        // while holding the handoff's state lock.
+        let lease = abi.retain_exec_process(task)?;
+        let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.process_moved || state.process.is_some() {
+            drop(state);
+            drop(lease);
+            return Err(RuntimeError::new(
+                "process execution custody was already installed",
+            ));
+        }
+        state.process = Some((task, lease));
+        Ok(())
+    }
+
+    fn owns_process(&self, task: TaskId) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .process
+            .as_ref()
+            .is_some_and(|(owner, _)| *owner == task)
+    }
+
+    fn take_process(
+        &self,
+        task: TaskId,
+    ) -> Result<Option<Box<dyn crate::ExecProcessLease>>, RuntimeError> {
+        let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.process_moved
+            || !state
+                .process
+                .as_ref()
+                .is_some_and(|(owner, _)| *owner == task)
+        {
+            return Err(RuntimeError::new(
+                "exact process execution custody is missing",
+            ));
+        }
+        let (_, lease) = state.process.take().expect("checked process");
+        state.process_moved = true;
+        Ok(lease)
+    }
+
+    pub(crate) fn retire_process(&self) {
+        let process = {
+            let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            state.process_moved = true;
+            state.process.take()
+        };
+        drop(process);
+    }
+
     /// Cancellation authority follows only this exact image; result delivery is unchanged.
     pub(crate) fn bind_cancellation(
         self: &Arc<Self>,
@@ -89,7 +292,7 @@ impl Handoff {
     }
 
     /// The run that took over ended with `result`; only the first result counts.
-    fn complete(&self, result: Result<i32, ExecError>) {
+    pub(crate) fn complete(&self, result: Result<i32, ExecError>) {
         let waker = {
             let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
             if state.taken || state.result.is_some() {
@@ -146,14 +349,27 @@ impl Drop for Takeover {
 /// vfork child; the type-erased part of the execution layer that the return-to-guest path can
 /// reach.
 pub(crate) trait Spawn: Send + Sync {
-    fn spawn(&self, task: TaskId, image: Image);
-    fn spawn_owned(&self, _: TaskId, _: Image, _: crate::spawn_custody::Publication) {
+    #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+    fn start_committed(
+        &self,
+        terminal: crate::PreinstalledTerminalCustody,
+        predecessor: std::pin::Pin<Box<dyn Future<Output = ()> + Send>>,
+        completion: Arc<Handoff>,
+    ) -> Result<crate::OwnedEntryWaiter, ExecError>;
+    #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+    fn retire_committed(
+        &self,
+        terminal: crate::PreinstalledTerminalCustody,
+        completion: Arc<Handoff>,
+    ) -> wasixv2_host::LocalFuture<'static, ()>;
+    fn spawn(&self, task: TaskId, image: ExecImage);
+    fn spawn_owned(&self, _: TaskId, _: ExecImage, _: crate::spawn_custody::Publication) {
         panic!("this spawner does not accept host-only child custody")
     }
     fn fork(&self, task: TaskId, image: asyncify::ForkImage);
     /// Starts `image` as `task`, whose run goes on there, and reports how it ends to
     /// `handoff`.
-    fn take_over(&self, task: TaskId, image: Image, handoff: Arc<Handoff>);
+    fn take_over(&self, task: TaskId, image: ExecImage, handoff: Arc<Handoff>);
 }
 
 pub(crate) struct Spawner<S> {
@@ -185,13 +401,51 @@ impl<S> Spawn for Spawner<S>
 where
     S: Syscalls + Control + Send + Sync + 'static,
 {
-    fn spawn(&self, task: TaskId, image: Image) {
+    #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+    fn start_committed(
+        &self,
+        terminal: crate::PreinstalledTerminalCustody,
+        predecessor: std::pin::Pin<Box<dyn Future<Output = ()> + Send>>,
+        completion: Arc<Handoff>,
+    ) -> Result<crate::OwnedEntryWaiter, ExecError> {
+        crate::cancellation::start_committed_entry(
+            self.engine.clone(),
+            self.syscalls.clone(),
+            self.host.clone(),
+            self.abis.clone(),
+            predecessor,
+            terminal,
+            completion,
+        )
+    }
+
+    #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+    fn retire_committed(
+        &self,
+        terminal: crate::PreinstalledTerminalCustody,
+        completion: Arc<Handoff>,
+    ) -> wasixv2_host::LocalFuture<'static, ()> {
+        let syscalls = self.syscalls.clone();
+        Box::pin(async move {
+            // The caller has already fenced every predecessor and drained its loader.
+            terminal.retirement_ready().await;
+            if let Some(entry) = terminal.claim_fallback() {
+                fault(&*syscalls, terminal.task(), Signal::SIGSEGV.0);
+                finish_task(&*syscalls, terminal.task()).await;
+                drop(entry);
+                completion.complete(Err(ExecError::Dropped));
+                terminal.mark_finished();
+            }
+        })
+    }
+
+    fn spawn(&self, task: TaskId, image: ExecImage) {
         self.spawn_image_owned(task, image, None);
     }
     fn spawn_owned(
         &self,
         task: TaskId,
-        image: Image,
+        image: ExecImage,
         publication: crate::spawn_custody::Publication,
     ) {
         self.spawn_image_owned(task, image, Some(publication));
@@ -216,7 +470,7 @@ where
         });
     }
 
-    fn take_over(&self, task: TaskId, image: Image, handoff: Arc<Handoff>) {
+    fn take_over(&self, task: TaskId, image: ExecImage, handoff: Arc<Handoff>) {
         let transfer = handoff
             .cancellation()
             .map(|authority| authority.transfer(task));
@@ -225,21 +479,34 @@ where
             handoff.complete(Err(ExecError::Dropped));
             return;
         }
-        let (engine, syscalls, host, abis) = (
+        #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+        crate::cancellation::start_takeover(
             self.engine.clone(),
+            image,
             self.syscalls.clone(),
+            task,
             self.host.clone(),
             self.abis.clone(),
+            handoff.clone(),
         );
-        let done = handoff.clone();
-        let started = self.start(task, move |cleanup| {
-            let takeover = Takeover(done);
-            let run = run_new_image(engine, image, syscalls, task, host, abis, cleanup);
-            async move { takeover.report(run.await) }
-        });
-        // The process died of SIGSEGV, as one whose image cannot start does.
-        if let Err(status) = started {
-            handoff.complete(Ok(status));
+        #[cfg(not(all(feature = "sys", not(target_arch = "wasm32"))))]
+        {
+            let (engine, syscalls, host, abis) = (
+                self.engine.clone(),
+                self.syscalls.clone(),
+                self.host.clone(),
+                self.abis.clone(),
+            );
+            let done = handoff.clone();
+            let started = self.start(task, move |cleanup| {
+                let takeover = Takeover(done);
+                let run = run_new_image(engine, image, syscalls, task, host, abis, cleanup);
+                async move { takeover.report(run.await) }
+            });
+            // The process died of SIGSEGV, as one whose image cannot start does.
+            if let Err(status) = started {
+                handoff.complete(Ok(status));
+            }
         }
         if let Some(crate::cancellation::Transfer::Reserved(transfer)) = transfer {
             // Successful spawn owns release. Failed spawn already faulted and
@@ -263,7 +530,7 @@ where
     fn spawn_image_owned(
         &self,
         task: TaskId,
-        image: Image,
+        image: ExecImage,
         publication: Option<crate::spawn_custody::Publication>,
     ) {
         let (engine, syscalls, host, abis) = (
@@ -575,6 +842,18 @@ where
     finish(engine, first, syscalls, task, host, abis, cleanup).await
 }
 
+/// A default/noop ABI preserves its predecessor's compat custody. A successor
+/// that supplies ownership has already installed its new token before entry.
+fn keep_process_lease(
+    current: &mut Option<Box<dyn crate::ExecProcessLease>>,
+    successor: Option<Box<dyn crate::ExecProcessLease>>,
+) {
+    if let Some(successor) = successor {
+        let previous = current.replace(successor);
+        drop(previous);
+    }
+}
+
 /// Follows `task`'s process from the end of its first image's run through the images its
 /// `execve` calls load, until it exits; releases the task then. An image that cannot start kills
 /// the process with SIGSEGV.
@@ -598,8 +877,9 @@ where
             return Err(err);
         }
     };
+    let mut process_lease = None;
     let status = loop {
-        let image = match ended {
+        let mut image = match ended {
             // The task runs on in the instance that took over, which releases it.
             Ended::Detached(handoff) => return handoff.wait().await,
             Ended::Exited(status) => break status,
@@ -619,6 +899,7 @@ where
             },
             Ended::Exec(image) => image,
         };
+        keep_process_lease(&mut process_lease, image.lease.take());
         // `de_thread`: the old image is gone from every thread before the new one starts.
         let Some(waited) =
             crate::cancellation::execution(cleanup.cancellation(), syscalls.exec_wait(task)).await
@@ -691,9 +972,9 @@ pub(crate) async fn finish_task<S: Control>(syscalls: &S, task: TaskId) {
 }
 
 /// The image of a vfork child's `execve`.
-async fn run_new_image<S>(
+pub(crate) async fn run_new_image<S>(
     engine: Engine,
-    image: Image,
+    mut image: ExecImage,
     syscalls: Arc<S>,
     task: TaskId,
     host: Arc<dyn Host>,
@@ -703,6 +984,7 @@ async fn run_new_image<S>(
 where
     S: Syscalls + Control + Send + Sync + 'static,
 {
+    let _process = image.lease.take();
     // `de_thread`: the old image is gone from every thread before the new one starts.
     if let Err(status) = syscalls.exec_wait(task).await {
         syscalls.group_wait(task).await;
@@ -794,10 +1076,63 @@ pub(crate) async fn switch<S: Control + 'static>(
 }
 
 /// Starts the image `task` loaded with `execve` while it was a vfork child.
-pub(crate) async fn spawn_image<S: 'static>(
+pub(crate) fn pending_marker(error: &RuntimeError) -> Option<&Arc<Handoff>> {
+    error
+        .downcast_ref::<ExecNew>()
+        .map(|marker| &marker.0)
+        .or_else(|| error.downcast_ref::<Detached>().map(|marker| &marker.0))
+}
+
+pub(crate) async fn commit_exec<S: 'static>(
     env: &AsyncFunctionEnvMut<ExecEnv<S>>,
     task: TaskId,
     image: Image,
+) -> RuntimeError {
+    let image = match exec_image(env, task, image).await {
+        Ok(image) => image,
+        Err(error) => return error,
+    };
+    let handoff = env.read().await.data().proc.handoff.clone();
+    if let Err(error) = handoff.publish(PendingOutcome::Exec { task, image }) {
+        return error;
+    }
+    RuntimeError::host_abort(Box::new(ExecNew(handoff)))
+}
+
+pub(crate) async fn commit_detached<S: 'static>(
+    env: &AsyncFunctionEnvMut<ExecEnv<S>>,
+) -> RuntimeError {
+    let handoff = env.read().await.data().proc.handoff.clone();
+    if let Err(error) = handoff.publish(PendingOutcome::Detached) {
+        return error;
+    }
+    RuntimeError::host_abort(Box::new(Detached(handoff)))
+}
+
+pub(crate) async fn exec_image<S: 'static>(
+    env: &AsyncFunctionEnvMut<ExecEnv<S>>,
+    process: TaskId,
+    image: Image,
+) -> Result<ExecImage, RuntimeError> {
+    let (handoff, abi) = {
+        let guard = env.read().await;
+        (guard.data().proc.handoff.clone(), guard.data().abi.clone())
+    };
+    let lease = if handoff.owns_process(process) {
+        handoff.take_process(process)?
+    } else {
+        // A shared-instance vfork child already owns this lease in its ABI record.
+        abi.ok_or_else(|| RuntimeError::new("exec before ABI binding"))?
+            .retain_exec_process(process)?
+    };
+    Ok(ExecImage::new(image, lease))
+}
+
+/// Starts the image of a vfork child, with custody taken before its record is removed.
+pub(crate) async fn spawn_image<S: 'static>(
+    env: &AsyncFunctionEnvMut<ExecEnv<S>>,
+    task: TaskId,
+    image: ExecImage,
     publication: Option<crate::spawn_custody::Publication>,
 ) {
     let spawner = env.read().await.data().proc.spawner.clone();
@@ -807,13 +1142,11 @@ pub(crate) async fn spawn_image<S: 'static>(
     }
 }
 
-/// Starts `image`, which an `execve` of the task the instance behind `env` runs as gave the
-/// leader `task` while the leader waited for its vfork child, as `task` on an instance of its
-/// own. The run of the leader's old image goes on there.
+/// Starts a leader's replacement without looking up a registration its old image retired.
 pub(crate) async fn take_over<S: 'static>(
     env: &AsyncFunctionEnvMut<ExecEnv<S>>,
     task: TaskId,
-    image: Image,
+    image: ExecImage,
 ) {
     let (spawner, handoff) = {
         let env = env.read().await;
@@ -871,6 +1204,80 @@ pub(crate) async fn vfork_return<S: 'static>(
 
 #[cfg(test)]
 pub(super) mod tests {
+    #[test]
+    fn cloned_runtime_markers_cannot_claim_or_restart_an_owned_image_twice() {
+        let handoff = Arc::new(Handoff::default());
+        handoff
+            .publish(PendingOutcome::Exec {
+                task: TaskId(71),
+                image: Image::copied(vec![1, 2, 3]).into(),
+            })
+            .unwrap();
+        let error = RuntimeError::host_abort(Box::new(ExecNew(handoff.clone())));
+        let cloned = error.clone();
+        let first = pending_marker(&cloned).unwrap();
+        assert!(Arc::ptr_eq(first, &handoff));
+        let PendingOutcome::Exec { task, image } = first.claim().unwrap() else {
+            panic!("exec payload");
+        };
+        assert_eq!(task, TaskId(71));
+        assert!(!handoff.is_pending());
+        assert!(pending_marker(&error).unwrap().claim().is_err());
+        drop(image);
+        assert!(
+            handoff.claim().is_err(),
+            "dropping payload never rearms the marker"
+        );
+    }
+
+    #[test]
+    fn repeated_exec_retires_predecessor_leases_and_keeps_noop_abi_custody_bounded() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Counted {
+            live: Arc<AtomicUsize>,
+            retired: Arc<AtomicUsize>,
+        }
+        impl crate::ExecProcessLease for Counted {}
+        impl Drop for Counted {
+            fn drop(&mut self) {
+                self.live.fetch_sub(1, Ordering::SeqCst);
+                self.retired.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let live = Arc::new(AtomicUsize::new(0));
+        let retired = Arc::new(AtomicUsize::new(0));
+        let mut custody = None;
+        super::keep_process_lease(&mut custody, None);
+        for image in 0..1000 {
+            live.fetch_add(1, Ordering::SeqCst);
+            super::keep_process_lease(
+                &mut custody,
+                Some(Box::new(Counted {
+                    live: live.clone(),
+                    retired: retired.clone(),
+                })),
+            );
+            assert_eq!(
+                live.load(Ordering::SeqCst),
+                1,
+                "one predecessor after image {image}"
+            );
+            assert_eq!(retired.load(Ordering::SeqCst), image);
+            for _ in 0..3 {
+                super::keep_process_lease(&mut custody, None);
+            }
+            assert_eq!(
+                live.load(Ordering::SeqCst),
+                1,
+                "noop successors retain custody"
+            );
+            assert_eq!(retired.load(Ordering::SeqCst), image);
+        }
+        drop(custody);
+        assert_eq!(live.load(Ordering::SeqCst), 0);
+        assert_eq!(retired.load(Ordering::SeqCst), 1000);
+    }
+
     use std::{
         collections::{HashMap, VecDeque},
         ops::Range,
@@ -1334,7 +1741,7 @@ pub(super) mod tests {
             abis,
         );
         let handoff = Arc::new(Handoff::default());
-        spawner.take_over(PARENT, Image::copied(Vec::new()), handoff.clone());
+        spawner.take_over(PARENT, Image::copied(Vec::new()).into(), handoff.clone());
         let status = futures::executor::block_on(handoff.wait());
         assert_eq!(status.ok(), Some(128 + Signal::SIGSEGV.0));
         assert_eq!(*control.released.lock().unwrap(), [PARENT]);

@@ -448,6 +448,9 @@ fn subprocess(name: &str) -> bool {
 }
 
 fn dropped_waiter(image: bool, retain_frame: bool) {
+    dropped_waiter_mode(image, retain_frame, false)
+}
+fn dropped_waiter_mode(image: bool, retain_frame: bool, detached: bool) {
     let (events, observed) = mpsc::channel();
     let (frame_tx, frame_rx) = async_mpsc::unbounded();
     let (cleanup_tx, cleanup_rx) = oneshot::channel();
@@ -486,26 +489,35 @@ fn dropped_waiter(image: bool, retain_frame: bool) {
     )
     .unwrap();
     let module = Module::new(&engine, &wasm).unwrap();
-    let mut caller: std::pin::Pin<Box<dyn Future<Output = Result<i32, ExecError>> + '_>> = if image
-    {
-        Box::pin(crate::run_exec(
-            engine,
-            Image::copied(wasm),
-            syscalls,
-            TaskId(1),
-            host,
-            Arc::new(abis),
-        ))
-    } else {
-        Box::pin(crate::run_on_owning_thread(
-            engine,
-            &module,
-            syscalls,
-            TaskId(1),
-            host,
-            Arc::new(abis),
-        ))
-    };
+    let detached_handoff = Arc::new(process::Handoff::default());
+    let mut caller: std::pin::Pin<Box<dyn Future<Output = Result<i32, ExecError>> + '_>> =
+        if detached {
+            process::spawner(engine, syscalls, host, Arc::new(abis)).take_over(
+                TaskId(1),
+                Image::copied(wasm).into(),
+                detached_handoff.clone(),
+            );
+            let handoff = detached_handoff.clone();
+            Box::pin(async move { handoff.wait().await })
+        } else if image {
+            Box::pin(crate::run_exec(
+                engine,
+                Image::copied(wasm),
+                syscalls,
+                TaskId(1),
+                host,
+                Arc::new(abis),
+            ))
+        } else {
+            Box::pin(crate::run_on_owning_thread(
+                engine,
+                &module,
+                syscalls,
+                TaskId(1),
+                host,
+                Arc::new(abis),
+            ))
+        };
     assert!(
         caller
             .as_mut()
@@ -528,6 +540,10 @@ fn dropped_waiter(image: bool, retain_frame: bool) {
     // This is the sole cancellation trigger. The custom control never wakes its
     // pending lease and kernel fault/release cannot make that future complete.
     drop(caller);
+    if detached {
+        detached_handoff.cancel_takeover();
+    }
+    let mut completion = detached.then(|| Box::pin(detached_handoff.wait()));
     if retain_frame {
         frame_tx
             .unbounded_send(FrameCommand::ObserveCancellation)
@@ -540,6 +556,15 @@ fn dropped_waiter(image: bool, retain_frame: bool) {
         frame_tx.unbounded_send(FrameCommand::Release).unwrap();
     }
     until("cleanup-start");
+    if let Some(completion) = &mut completion {
+        assert!(
+            completion
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending(),
+            "detached completion precedes neither native nor loader retirement"
+        );
+    }
     let scope = proof
         .scope
         .lock()
@@ -555,6 +580,15 @@ fn dropped_waiter(image: bool, retain_frame: bool) {
     );
     cleanup_tx.send(()).unwrap();
     until("tail-start");
+    if let Some(completion) = &mut completion {
+        assert!(
+            completion
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending(),
+            "the successor's actual final loader generation still owns completion"
+        );
+    }
     assert!(scope.is_open());
     assert!(
         observed.try_recv().is_err(),
@@ -562,7 +596,14 @@ fn dropped_waiter(image: bool, retain_frame: bool) {
     );
     tail_tx.send(()).unwrap();
     until("worker-done");
-    drop(until);
+    if let Some(completion) = &mut completion {
+        assert!(matches!(
+            completion
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Err(ExecError::Dropped))
+        ));
+    }
     assert!(!scope.is_open());
     let owner = events[0].1;
     assert_ne!(owner, std::thread::current().id());
@@ -721,7 +762,7 @@ impl InstantiationHook<PendingControl> for LifecycleHook {
                     async move {
                         // The real thread instance inherited the original image's
                         // Handoff, despite having its own worker/Store/cleanup scope.
-                        process::take_over(&env, TaskId(1), Image::copied(image)).await;
+                        process::take_over(&env, TaskId(1), Image::copied(image).into()).await;
                         proof.event("transferred");
                         Err::<(), RuntimeError>(RuntimeError::user(Box::new(crate::Exited(0))))
                     }
@@ -1056,7 +1097,7 @@ fn published_child_takeover_survives_dropping_its_old_worker() {
         );
         spawner.spawn_owned(
             TaskId(1),
-            Image::copied(shared_module(true)),
+            Image::copied(shared_module(true)).into(),
             crate::spawn_custody::Publication::test_child(TaskId(1)),
         );
         let mut events = Vec::new();
@@ -1153,7 +1194,7 @@ fn published_child_cancellation_drives_its_group_wait_before_release() {
     );
     spawner.spawn_owned(
         TaskId(1),
-        Image::copied(shared_module(false)),
+        Image::copied(shared_module(false)).into(),
         crate::spawn_custody::Publication::test_child(TaskId(1)),
     );
     let mut events = Vec::new();
@@ -1249,5 +1290,389 @@ fn cancellation_waits_for_an_actual_live_sibling_before_releasing_the_leader() {
     assert!(at("group-retired") < at("release"));
     for phase in ["fault", "release", "sibling-release"] {
         assert_eq!(events.iter().filter(|event| event.0 == phase).count(), 1);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CommittedStarter {
+    Normal,
+    Reject,
+    Panic,
+    Discard,
+    Busy,
+}
+struct CommittedHost {
+    proof: Arc<Proof>,
+    mode: CommittedStarter,
+}
+impl Host for CommittedHost {
+    fn realtime(&self) -> Duration {
+        Duration::ZERO
+    }
+    fn monotonic(&self) -> Duration {
+        Duration::ZERO
+    }
+    fn sleep(&self, _: Duration) -> LocalFuture<'_, ()> {
+        Box::pin(async {})
+    }
+    fn random(&self, _: &mut [u8]) {}
+    fn executor(&self) -> &dyn Executor {
+        self
+    }
+    fn report(&self, _: &str) {}
+}
+impl Executor for CommittedHost {
+    fn spawn_local(&self, future: LocalFuture<'static, ()>) {
+        ProofHost(self.proof.clone()).spawn_local(future);
+    }
+    fn spawn_blocking(&self, work: Box<dyn FnOnce() + Send>) -> LocalFuture<'static, ()> {
+        Box::pin(async move { work() })
+    }
+    fn spawn_thread(&self, start: ThreadStart) -> std::io::Result<()> {
+        match self.mode {
+            CommittedStarter::Busy => {
+                ProofHost(self.proof.clone()).spawn_thread(Box::new(move || {
+                    let busy = thread::OwningThread::acquire().unwrap();
+                    let run = start();
+                    Box::pin(async move {
+                        run.await;
+                        drop(busy);
+                    })
+                }))
+            }
+            CommittedStarter::Normal => ProofHost(self.proof.clone()).spawn_thread(start),
+            CommittedStarter::Reject => Err(std::io::ErrorKind::Unsupported.into()),
+            CommittedStarter::Panic => panic!("committed starter panic sentinel"),
+            CommittedStarter::Discard => {
+                drop(start);
+                Ok(())
+            }
+        }
+    }
+}
+
+#[test]
+fn committed_cancellation_and_starter_failures_retain_predecessor_and_exact_terminal_custody() {
+    if !subprocess(
+        "cancellation::tests::committed_cancellation_and_starter_failures_retain_predecessor_and_exact_terminal_custody",
+    ) {
+        return;
+    }
+    struct Lease(Arc<std::sync::atomic::AtomicUsize>);
+    impl crate::ExecProcessLease for Lease {}
+    impl Drop for Lease {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for mode in [
+        CommittedStarter::Normal,
+        CommittedStarter::Reject,
+        CommittedStarter::Panic,
+        CommittedStarter::Discard,
+        CommittedStarter::Busy,
+    ] {
+        let (proof, observed) = lifecycle_proof(false);
+        let host = Arc::new(CommittedHost {
+            proof: proof.clone(),
+            mode,
+        });
+        let control = Arc::new(PendingControl(proof.clone()));
+        let engine = Store::default().engine().clone();
+        let retired = Arc::new(AtomicUsize::new(0));
+        let image = process::ExecImage::new(
+            Image::copied(vec![]),
+            Some(Box::new(Lease(retired.clone()))),
+        );
+        let terminal = PreinstalledTerminalCustody::new(TaskId(1), image);
+        let completion = Arc::new(process::Handoff::default());
+        let mut abis = Abis::wasixv2();
+        abis.push_instantiation_hook(Arc::new(LifecycleHook {
+            proof: proof.clone(),
+            image: vec![],
+        }));
+        let abis = Arc::new(abis);
+        let (barrier_tx, barrier_rx) = oneshot::channel::<()>();
+        let starter = start_committed_entry(
+            engine.clone(),
+            control.clone(),
+            host.clone(),
+            abis.clone(),
+            Box::pin(async move {
+                let _ = barrier_rx.await;
+            }),
+            terminal.clone(),
+            completion.clone(),
+        );
+        // Drop even an entirely unpolled waiter. Cancellation must not drop the
+        // predecessor receiver or the only replacement image/lease.
+        drop(starter);
+        assert_eq!(retired.load(Ordering::SeqCst), 0);
+        let mut events = Vec::new();
+        if matches!(mode, CommittedStarter::Normal | CommittedStarter::Busy) {
+            until(&observed, &mut events, "worker-start");
+        }
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event.0, "fault" | "release"))
+        );
+        assert!(
+            observed.try_recv().is_err(),
+            "no terminal action before predecessor settlement"
+        );
+        let _ = barrier_tx.send(());
+        let spawner = process::spawner(engine, control, host, abis);
+        // This is the preinstalled old-thread owner, entered only once its real
+        // predecessor keepalive has released the barrier above.
+        futures::executor::block_on(spawner.retire_committed(terminal, completion));
+        if matches!(mode, CommittedStarter::Normal | CommittedStarter::Busy) {
+            until(&observed, &mut events, "worker-done");
+        } else {
+            while let Ok(event) = observed.try_recv() {
+                events.push(event);
+            }
+        }
+        assert_eq!(events.iter().filter(|event| event.0 == "fault").count(), 1);
+        assert_eq!(
+            events.iter().filter(|event| event.0 == "release").count(),
+            1
+        );
+        assert_eq!(retired.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[test]
+fn detached_pending_successor_cancellation_waits_for_physical_and_loader_cleanup() {
+    if subprocess(
+        "cancellation::tests::detached_pending_successor_cancellation_waits_for_physical_and_loader_cleanup",
+    ) {
+        dropped_waiter_mode(true, true, true);
+    }
+}
+
+#[test]
+fn takeover_cancellation_latches_before_install_and_before_transfer_without_rebinding_predecessor()
+{
+    for before_transfer in [false, true] {
+        let handoff = Arc::new(process::Handoff::default());
+        let original = Cancellation::new(TaskId(1));
+        handoff.bind_cancellation(Some(&original));
+        let successor = Cancellation::new(TaskId(1));
+        if before_transfer {
+            original.request_process();
+            let Transfer::Reserved(transfer) = original.transfer(TaskId(1)) else {
+                panic!("original owner");
+            };
+            assert!(handoff.install_takeover(&successor));
+            transfer.relinquish();
+        } else {
+            handoff.cancel_takeover();
+            assert!(handoff.install_takeover(&successor));
+        }
+        assert!(successor.0.lock().unwrap().requested);
+        original.0.lock().unwrap().image = None;
+        handoff.bind_cancellation(Some(&original));
+        assert!(
+            original
+                .0
+                .lock()
+                .unwrap()
+                .image
+                .as_ref()
+                .is_some_and(|image| Arc::ptr_eq(image, &handoff)),
+            "takeover installation preserves exact predecessor binding"
+        );
+        let unrelated = Cancellation::new(TaskId(1));
+        assert!(
+            !handoff.install_takeover(&unrelated),
+            "never replace existing successor authority"
+        );
+        assert!(!unrelated.0.lock().unwrap().requested);
+    }
+    // Old image waiter cancellation deliberately leaves an accepted successor alone.
+    let handoff = Arc::new(process::Handoff::default());
+    let original = Cancellation::new(TaskId(1));
+    handoff.bind_cancellation(Some(&original));
+    let successor = Cancellation::new(TaskId(1));
+    assert!(handoff.install_takeover(&successor));
+    let Transfer::Reserved(transfer) = original.transfer(TaskId(1)) else {
+        panic!("original owner");
+    };
+    transfer.relinquish();
+    original.request();
+    assert!(
+        !successor.0.lock().unwrap().requested,
+        "an old image waiter is not process cancellation authority"
+    );
+}
+
+#[test]
+fn detached_factory_failures_publish_only_after_single_release_and_lease_retirement() {
+    struct ControlProbe {
+        inner: PendingControl,
+        handoff: std::sync::Weak<process::Handoff>,
+        released: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl LoaderControl for ControlProbe {
+        fn loader_reserve_host<'a>(
+            &'a self,
+            caller: &'a Caller<'_>,
+            bytes: u32,
+            alignment: u32,
+        ) -> LocalFuture<'a, SysResult<Box<dyn HostMemoryLease>>> {
+            self.inner.loader_reserve_host(caller, bytes, alignment)
+        }
+    }
+    impl Syscalls for ControlProbe {
+        fn exit_group<'a>(
+            &'a self,
+            caller: &'a Caller<'_>,
+            status: i32,
+        ) -> MaybeFuture<'a, SysResult<()>> {
+            self.inner.exit_group(caller, status)
+        }
+        fn exit<'a>(
+            &'a self,
+            caller: &'a Caller<'_>,
+            status: i32,
+        ) -> MaybeFuture<'a, SysResult<()>> {
+            self.inner.exit(caller, status)
+        }
+    }
+    impl CpuTime for ControlProbe {}
+    impl PidView for ControlProbe {
+        fn tgid(&self, task: TaskId) -> TaskId {
+            self.inner.tgid(task)
+        }
+    }
+    impl ExitMm for ControlProbe {
+        fn exit_mm<'a>(&'a self, caller: &'a Caller<'a>) -> LocalFuture<'a, ()> {
+            self.inner.exit_mm(caller)
+        }
+    }
+    impl GroupStop for ControlProbe {
+        fn stop_wait(&self, task: TaskId) -> LocalFuture<'_, ()> {
+            self.inner.stop_wait(task)
+        }
+    }
+    impl VforkWait for ControlProbe {
+        fn vfork_wait(&self, task: TaskId) -> LocalFuture<'_, ()> {
+            self.inner.vfork_wait(task)
+        }
+    }
+    impl AtomicWait for ControlProbe {
+        fn atomic_wait<'a>(
+            &'a self,
+            caller: &'a Caller<'a>,
+            addr: u32,
+            expected: AtomicWord,
+            timeout: Option<Duration>,
+        ) -> LocalFuture<'a, SysResult<i32>> {
+            self.inner.atomic_wait(caller, addr, expected, timeout)
+        }
+        fn atomic_notify(&self, task: TaskId, addr: u32, count: u32) -> u32 {
+            self.inner.atomic_notify(task, addr, count)
+        }
+    }
+    impl SharedMappings for ControlProbe {
+        fn shared_mappings(&self, task: TaskId) -> Vec<SharedMapping> {
+            self.inner.shared_mappings(task)
+        }
+        fn wipe_on_fork(&self, task: TaskId) -> Vec<Range<u64>> {
+            self.inner.wipe_on_fork(task)
+        }
+    }
+    impl Control for ControlProbe {
+        fn take_pending(&self, task: TaskId) -> Option<GuestAction> {
+            self.inner.take_pending(task)
+        }
+        fn take_image(&self, task: TaskId) -> Option<Image> {
+            self.inner.take_image(task)
+        }
+        fn group_wait(&self, task: TaskId) -> LocalFuture<'_, ()> {
+            self.inner.group_wait(task)
+        }
+        fn fault(&self, task: TaskId, signal: i32) -> bool {
+            let handoff = self.handoff.upgrade().unwrap();
+            assert!(
+                Box::pin(handoff.wait())
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            self.inner.fault(task, signal)
+        }
+        fn release(&self, task: TaskId) {
+            let handoff = self.handoff.upgrade().unwrap();
+            assert!(
+                Box::pin(handoff.wait())
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending(),
+                "no completion before actual release"
+            );
+            assert!(
+                !self
+                    .released
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+            );
+            self.inner.release(task);
+        }
+    }
+    struct Lease {
+        released: Arc<std::sync::atomic::AtomicBool>,
+        dropped: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl crate::ExecProcessLease for Lease {}
+    impl Drop for Lease {
+        fn drop(&mut self) {
+            assert!(self.released.load(std::sync::atomic::Ordering::SeqCst));
+            self.dropped
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    for mode in [
+        CommittedStarter::Reject,
+        CommittedStarter::Panic,
+        CommittedStarter::Discard,
+    ] {
+        let (proof, observed) = lifecycle_proof(false);
+        let handoff = Arc::new(process::Handoff::default());
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let control = Arc::new(ControlProbe {
+            inner: PendingControl(proof.clone()),
+            handoff: Arc::downgrade(&handoff),
+            released: released.clone(),
+        });
+        let host = Arc::new(CommittedHost { proof, mode });
+        process::spawner(
+            Store::default().engine().clone(),
+            control,
+            host,
+            Arc::new(Abis::wasixv2()),
+        )
+        .take_over(
+            TaskId(1),
+            process::ExecImage::new(
+                Image::copied(vec![]),
+                Some(Box::new(Lease {
+                    released,
+                    dropped: dropped.clone(),
+                })),
+            ),
+            handoff.clone(),
+        );
+        assert!(
+            Box::pin(handoff.wait())
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_ready()
+        );
+        assert_eq!(dropped.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let events: Vec<_> = observed.try_iter().map(|event| event.0).collect();
+        assert_eq!(events, ["fault", "release"]);
     }
 }

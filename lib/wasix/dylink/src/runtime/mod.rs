@@ -1679,6 +1679,13 @@ async fn retire_local(
     .await;
 }
 impl<S: Syscalls + Control + Send + Sync + 'static> AbiInstance<S> for StoreImage<S> {
+    fn retain_exec_process(
+        &self,
+        process: TaskId,
+    ) -> Result<Option<Box<dyn wasixv2_exec::ExecProcessLease>>> {
+        self.inner.retain_exec_process(process)
+    }
+
     fn function_table(&self) -> Option<&Table> {
         self.inner.function_table()
     }

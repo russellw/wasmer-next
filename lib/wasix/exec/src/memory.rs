@@ -1083,7 +1083,157 @@ pub(crate) struct ForeignMemory {
     page_access: Option<Arc<PageAccess>>,
 }
 
+/// One mm attachment whose concrete remote backing follows explicit SHARED
+/// host selections. The mm owns this capability; host handles keep only Weak.
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+pub(crate) struct ForeignSelection(std::sync::Mutex<Arc<ForeignMemory>>);
+
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+impl ForeignSelection {
+    pub(crate) fn new(first: Arc<ForeignMemory>) -> Self {
+        Self(std::sync::Mutex::new(first))
+    }
+    pub(crate) fn snapshot(&self) -> Arc<ForeignMemory> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+    pub(crate) fn publish(&self, next: Arc<ForeignMemory>) -> Arc<ForeignMemory> {
+        std::mem::replace(
+            &mut *self.0.lock().unwrap_or_else(PoisonError::into_inner),
+            next,
+        )
+    }
+}
+
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+impl UserMemory for ForeignSelection {
+    fn foreign_snapshot(&self) -> Option<Arc<dyn UserMemory + Send + Sync>> {
+        Some(self.snapshot())
+    }
+    #[cfg(unix)]
+    unsafe fn pin_private_host_range(
+        &self,
+        addr: u32,
+        len: u64,
+    ) -> Result<Box<dyn wasixv2_syscalls::HostMemoryPin>, Errno> {
+        // SAFETY: preserve the caller's exact owned-private-range obligation.
+        unsafe { self.snapshot().pin_private_host_range(addr, len) }
+    }
+    fn read<'a>(&'a self, addr: u32, buf: &'a mut [u8]) -> LocalFuture<'a, Result<(), Fault>> {
+        let memory = self.snapshot();
+        Box::pin(async move { memory.read(addr, buf).await })
+    }
+    fn write<'a>(&'a self, addr: u32, data: &'a [u8]) -> LocalFuture<'a, Result<(), Fault>> {
+        let memory = self.snapshot();
+        Box::pin(async move { memory.write(addr, data).await })
+    }
+    fn force_read<'a>(
+        &'a self,
+        addr: u32,
+        buf: &'a mut [u8],
+    ) -> LocalFuture<'a, Result<(), Fault>> {
+        let memory = self.snapshot();
+        Box::pin(async move { memory.force_read(addr, buf).await })
+    }
+    fn force_write<'a>(&'a self, addr: u32, data: &'a [u8]) -> LocalFuture<'a, Result<(), Fault>> {
+        let memory = self.snapshot();
+        Box::pin(async move { memory.force_write(addr, data).await })
+    }
+    fn size(&self) -> LocalFuture<'_, u64> {
+        let memory = self.snapshot();
+        Box::pin(async move { memory.size().await })
+    }
+    fn grow(&self, pages: u32) -> LocalFuture<'_, Option<u64>> {
+        let memory = self.snapshot();
+        Box::pin(async move { memory.grow(pages).await })
+    }
+    fn layout(&self) -> LocalFuture<'_, Option<wasixv2_syscalls::MemoryLayout>> {
+        let memory = self.snapshot();
+        Box::pin(async move { memory.layout().await })
+    }
+    fn can_duplicate(&self) -> LocalFuture<'_, bool> {
+        let memory = self.snapshot();
+        Box::pin(async move { memory.can_duplicate().await })
+    }
+    fn stack_pointer(&self) -> LocalFuture<'_, u32> {
+        let memory = self.snapshot();
+        Box::pin(async move { memory.stack_pointer().await })
+    }
+    fn main_stack(&self) -> LocalFuture<'_, Range<u32>> {
+        let memory = self.snapshot();
+        Box::pin(async move { memory.main_stack().await })
+    }
+    fn low_guard(&self) -> LocalFuture<'_, u32> {
+        let memory = self.snapshot();
+        Box::pin(async move { memory.low_guard().await })
+    }
+    fn map_shared<'a>(
+        &'a self,
+        addr: u32,
+        len: u64,
+        pages: &'a dyn wasixv2_pages::SharedPages,
+        offset: u64,
+        writable: bool,
+    ) -> LocalFuture<'a, Result<(), wasixv2_syscalls::Errno>> {
+        let memory = self.snapshot();
+        Box::pin(async move { memory.map_shared(addr, len, pages, offset, writable).await })
+    }
+    fn unmap_shared(
+        &self,
+        addr: u32,
+        len: u64,
+    ) -> LocalFuture<'_, Result<(), wasixv2_syscalls::Errno>> {
+        let memory = self.snapshot();
+        Box::pin(async move { memory.unmap_shared(addr, len).await })
+    }
+    fn zero_pages(&self, addr: u32, len: u64) -> LocalFuture<'_, Result<(), Fault>> {
+        let memory = self.snapshot();
+        Box::pin(async move { memory.zero_pages(addr, len).await })
+    }
+    fn compare_exchange_u32(
+        &self,
+        addr: u32,
+        expected: u32,
+        new: u32,
+    ) -> LocalFuture<'_, Result<u32, Fault>> {
+        let memory = self.snapshot();
+        Box::pin(async move { memory.compare_exchange_u32(addr, expected, new).await })
+    }
+}
+
 impl ForeignMemory {
+    /// Capture the same checked native/shared backing for runners and externally
+    /// owned host images. This never creates shared memory from private memory.
+    pub(crate) fn capture(
+        memory: &Memory,
+        store: &impl AsStoreRef,
+        shared: Option<wasmer::SharedMemory>,
+        low_guard: u32,
+        read_only: Arc<ReadOnly>,
+        page_access: Option<Arc<PageAccess>>,
+        base: Option<Arc<Base>>,
+    ) -> Option<Self> {
+        #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+        let backing = memory
+            .host_memory_access(store)
+            .ok()
+            .map(ForeignBacking::Access)
+            .or_else(|| shared.map(ForeignBacking::Shared))?;
+        #[cfg(not(all(feature = "sys", not(target_arch = "wasm32"))))]
+        let backing = {
+            let _ = (memory, store);
+            shared?
+        };
+        let foreign = Self::new(backing, low_guard, read_only, page_access);
+        #[cfg(all(target_os = "linux", feature = "sys"))]
+        let foreign = foreign.with_base(base);
+        #[cfg(not(all(target_os = "linux", feature = "sys")))]
+        let _ = base;
+        Some(foreign)
+    }
+
     pub(crate) fn new(
         memory: impl Into<ForeignBacking>,
         low_guard: u32,
@@ -2163,5 +2313,151 @@ mod tests {
             memory.grow(&mut store, 1).unwrap();
             assert_eq!(block_on(foreign.read(end, &mut buf)), Ok(()));
         }
+    }
+
+    #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+    #[test]
+    fn foreign_selection_captures_the_old_concrete_future_before_publication() {
+        use futures::executor::block_on;
+        let mut store = wasmer::Store::default();
+        let a = Memory::new(&mut store, wasmer::MemoryType::new(1, Some(3), true)).unwrap();
+        let b = Memory::new(&mut store, wasmer::MemoryType::new(2, Some(3), true)).unwrap();
+        a.view(&store).write(0x2000, b"A").unwrap();
+        b.view(&store).write(0x2000, b"B").unwrap();
+        assert!(a.as_shared(&store).is_some() && b.as_shared(&store).is_some());
+        let foreign = |memory: &Memory| {
+            Arc::new(
+                ForeignMemory::capture(
+                    memory,
+                    &store,
+                    memory.as_shared(&store),
+                    0x1000,
+                    Arc::default(),
+                    None,
+                    None,
+                )
+                .unwrap(),
+            )
+        };
+        let first = foreign(&a);
+        let weak = Arc::downgrade(&first);
+        let selector = ForeignSelection::new(first);
+        let mut byte = [0];
+        // Capture occurs when the future is constructed, not after its first poll.
+        let read = selector.read(0x2000, &mut byte);
+        drop(selector.publish(foreign(&b)));
+        assert!(weak.upgrade().is_some());
+        block_on(read).unwrap();
+        assert_eq!(&byte, b"A");
+        assert!(
+            weak.upgrade().is_none(),
+            "completed old operation retains no wrapper history"
+        );
+        let snapshot = selector.foreign_snapshot().unwrap();
+        assert!(
+            snapshot.foreign_snapshot().is_none(),
+            "issued snapshots are concrete/defaultNone"
+        );
+        block_on(snapshot.read(0x2000, &mut byte)).unwrap();
+        assert_eq!(&byte, b"B");
+        assert_eq!(block_on(selector.size()), 2 * 65536);
+        drop(store);
+        block_on(snapshot.read(0x2000, &mut byte)).unwrap();
+        assert_eq!(
+            &byte, b"B",
+            "the snapshot owns backing, never a Store borrow"
+        );
+    }
+
+    #[cfg(all(unix, feature = "sys"))]
+    #[test]
+    fn foreign_selection_preserves_force_atomic_pin_and_independent_owner_custody() {
+        use futures::executor::block_on;
+        use std::sync::{
+            Mutex, Weak,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct Owner {
+            selector: Arc<Mutex<Weak<ForeignSelection>>>,
+            drops: Arc<AtomicUsize>,
+        }
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                let selector = { self.selector.lock().unwrap().upgrade() };
+                if let Some(selector) = selector {
+                    assert!(
+                        selector.0.try_lock().is_ok(),
+                        "opaque owner Drop occurs outside selector metadata"
+                    );
+                }
+                self.drops.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let mut store = wasmer::Store::default();
+        let a = Memory::new(&mut store, wasmer::MemoryType::new(2, Some(4), true)).unwrap();
+        let b = Memory::new(&mut store, wasmer::MemoryType::new(2, Some(4), true)).unwrap();
+        assert!(a.as_shared(&store).is_some() && b.as_shared(&store).is_some());
+        let mut access = a.host_memory_access(&store).unwrap();
+        let metadata = Arc::new(Mutex::new(Weak::new()));
+        let drops = Arc::new(AtomicUsize::new(0));
+        assert!(
+            access
+                .retain_owner(Arc::new(Owner {
+                    selector: metadata.clone(),
+                    drops: drops.clone()
+                }))
+                .is_ok()
+        );
+        let read_only = Arc::<ReadOnly>::default();
+        read_only.ranges_mut().push(0x3000..0x3001);
+        let selector = Arc::new(ForeignSelection::new(Arc::new(ForeignMemory::new(
+            ForeignBacking::Access(access),
+            0x1000,
+            read_only,
+            None,
+        ))));
+        *metadata.lock().unwrap() = Arc::downgrade(&selector);
+        let mut byte = [0];
+        assert_eq!(block_on(selector.low_guard()), 0x1000);
+        assert!(block_on(selector.read(0, &mut byte)).is_err());
+        block_on(selector.force_read(0, &mut byte)).unwrap();
+        assert!(block_on(selector.force_write(0x3000, b"x")).is_err());
+        a.view(&store).write(0x2000, &7u32.to_le_bytes()).unwrap();
+        assert_eq!(block_on(selector.compare_exchange_u32(0x2000, 7, 9)), Ok(7));
+        let snapshot = selector.foreign_snapshot().unwrap();
+        assert!(snapshot.foreign_snapshot().is_none());
+        // SAFETY: this isolated test exclusively owns this fresh entire page;
+        // no guest/mapping/other lease can overlap it.
+        let pin = unsafe { selector.pin_private_host_range(65536, 65536) }.unwrap();
+        assert!(
+            block_on(selector.zero_pages(65536, 65536)).is_err(),
+            "wrapper must preserve physical pin exclusion"
+        );
+        unsafe {
+            pin.as_ptr().write(93);
+        }
+        let next = ForeignMemory::capture(
+            &b,
+            &store,
+            b.as_shared(&store),
+            0x1000,
+            Arc::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        drop(selector.publish(Arc::new(next)));
+        drop(snapshot);
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            0,
+            "the actual independent pin still owns the opaque receipt"
+        );
+        drop(store);
+        assert_eq!(unsafe { pin.as_ptr().read() }, 93);
+        drop(pin);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        drop(selector);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 }

@@ -891,13 +891,35 @@ mod tests {
     struct NoSpawn;
 
     impl crate::process::Spawn for NoSpawn {
-        fn spawn(&self, _: TaskId, _: crate::Image) {
+        #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+        fn start_committed(
+            &self,
+            _: crate::PreinstalledTerminalCustody,
+            _: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+            _: Arc<crate::process::Handoff>,
+        ) -> Result<crate::OwnedEntryWaiter, crate::ExecError> {
+            unreachable!("the test starts no image")
+        }
+        #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+        fn retire_committed(
+            &self,
+            _: crate::PreinstalledTerminalCustody,
+            _: Arc<crate::process::Handoff>,
+        ) -> wasixv2_host::LocalFuture<'static, ()> {
+            unreachable!("the test retires no image")
+        }
+        fn spawn(&self, _: TaskId, _: crate::process::ExecImage) {
             unreachable!("the test spawns nothing")
         }
         fn fork(&self, _: TaskId, _: ForkImage) {
             unreachable!("the test forks nothing")
         }
-        fn take_over(&self, _: TaskId, _: crate::Image, _: Arc<crate::process::Handoff>) {
+        fn take_over(
+            &self,
+            _: TaskId,
+            _: crate::process::ExecImage,
+            _: Arc<crate::process::Handoff>,
+        ) {
             unreachable!("the test starts no image")
         }
     }

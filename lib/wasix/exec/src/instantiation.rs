@@ -1365,9 +1365,14 @@ mod tests {
                 RetainedPhase::StartOutcome,
             ));
             let error = if exec {
-                RuntimeError::user(Box::new(crate::process::ExecNew(
-                    wasixv2_syscalls::Image::copied(vec![17, 23]),
-                )))
+                let handoff = Arc::new(crate::process::Handoff::default());
+                handoff
+                    .publish(crate::process::PendingOutcome::Exec {
+                        task: TaskId(1),
+                        image: wasixv2_syscalls::Image::copied(vec![17, 23]).into(),
+                    })
+                    .unwrap();
+                RuntimeError::host_abort(Box::new(crate::process::ExecNew(handoff)))
             } else {
                 RuntimeError::user(Box::new(crate::Exited(37)))
             };

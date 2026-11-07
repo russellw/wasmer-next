@@ -24,11 +24,13 @@ struct State {
     released: bool,
 }
 
+type SpawnCleanup = Box<dyn FnOnce(State, Option<wasixv2_host::LocalFuture<'static, ()>>)>;
+
 /// Import-local custody for a spawn that never resumes a guest child activation.
 /// Construct before clone and pass to every completion until exec or failed-child reap.
 pub struct HostSpawn {
     state: Arc<Mutex<State>>,
-    cleanup: Option<Box<dyn FnOnce(State, Option<wasixv2_host::LocalFuture<'static, ()>>)>>,
+    cleanup: Option<SpawnCleanup>,
     exit_memory: Box<dyn Fn(TaskId) -> wasixv2_host::LocalFuture<'static, ()>>,
     pending_memory: RefCell<Option<wasixv2_host::LocalFuture<'static, ()>>>,
 }
@@ -294,7 +296,14 @@ async fn retire<S: Syscalls + Control + 'static>(
                     let image = syscalls
                         .take_image(task)
                         .unwrap_or_else(|| wasixv2_syscalls::Image::copied(Vec::new()));
-                    process::take_over(env, task, image).await;
+                    match process::exec_image(env, task, image).await {
+                        Ok(image) => process::take_over(env, task, image).await,
+                        Err(error) => {
+                            // A missing/already-transferred exact lease grants no
+                            // new terminal authority to this abandoned host call.
+                            tracing::warn!(?task, %error, "cannot transfer abandoned spawn image custody");
+                        }
+                    }
                     if let Some(parent) = &mut state.returning {
                         parent.resumes = Resume::Gone;
                     }
@@ -306,35 +315,35 @@ async fn retire<S: Syscalls + Control + 'static>(
         // vfork state. exit_mm above ran first on the exact retained old memory.
         syscalls.abort_thread(child);
     }
-    if !state.published && state.released {
-        if let Some(parent) = state.returning {
-            let memory = GuestMemory::new(env);
-            loop {
-                let result = syscalls
-                    .waitid(
-                        &Caller::new(state.parent, &memory),
-                        wasixv2_abi::Idtype::P_PID,
-                        parent.pid,
-                        wasixv2_abi::SiginfoPtr::NULL,
-                        wasixv2_abi::WaitOptions::WEXITED,
-                        wasixv2_abi::RusagePtr::NULL,
-                    )
-                    .await;
-                match result {
-                    Err(
-                        wasixv2_syscalls::SysErr::Restart
-                        | wasixv2_syscalls::SysErr::RestartNoIntr
-                        | wasixv2_syscalls::SysErr::RestartNoHand
-                        | wasixv2_syscalls::SysErr::RestartBlock,
-                    ) => continue,
-                    Ok(_)
-                    | Err(wasixv2_syscalls::SysErr::Errno(wasixv2_syscalls::Errno::ECHILD)) => {
-                        break;
-                    }
-                    Err(error) => {
-                        tracing::error!(?error, child = child.0, "cannot reap abandoned spawn");
-                        break;
-                    }
+    if !state.published
+        && state.released
+        && let Some(parent) = state.returning
+    {
+        let memory = GuestMemory::new(env);
+        loop {
+            let result = syscalls
+                .waitid(
+                    &Caller::new(state.parent, &memory),
+                    wasixv2_abi::Idtype::P_PID,
+                    parent.pid,
+                    wasixv2_abi::SiginfoPtr::NULL,
+                    wasixv2_abi::WaitOptions::WEXITED,
+                    wasixv2_abi::RusagePtr::NULL,
+                )
+                .await;
+            match result {
+                Err(
+                    wasixv2_syscalls::SysErr::Restart
+                    | wasixv2_syscalls::SysErr::RestartNoIntr
+                    | wasixv2_syscalls::SysErr::RestartNoHand
+                    | wasixv2_syscalls::SysErr::RestartBlock,
+                ) => continue,
+                Ok(_) | Err(wasixv2_syscalls::SysErr::Errno(wasixv2_syscalls::Errno::ECHILD)) => {
+                    break;
+                }
+                Err(error) => {
+                    tracing::error!(?error, child = child.0, "cannot reap abandoned spawn");
+                    break;
                 }
             }
         }
@@ -391,13 +400,28 @@ mod tests {
 
     struct NoSpawn;
     impl process::Spawn for NoSpawn {
-        fn spawn(&self, _: TaskId, _: Image) {
+        fn start_committed(
+            &self,
+            _: crate::PreinstalledTerminalCustody,
+            _: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+            _: Arc<process::Handoff>,
+        ) -> Result<crate::OwnedEntryWaiter, crate::ExecError> {
+            unreachable!()
+        }
+        fn retire_committed(
+            &self,
+            _: crate::PreinstalledTerminalCustody,
+            _: Arc<process::Handoff>,
+        ) -> LocalFuture<'static, ()> {
+            unreachable!()
+        }
+        fn spawn(&self, _: TaskId, _: process::ExecImage) {
             unreachable!()
         }
         fn fork(&self, _: TaskId, _: crate::asyncify::ForkImage) {
             unreachable!()
         }
-        fn take_over(&self, _: TaskId, _: Image, _: Arc<process::Handoff>) {
+        fn take_over(&self, _: TaskId, _: process::ExecImage, _: Arc<process::Handoff>) {
             unreachable!()
         }
     }
@@ -597,7 +621,7 @@ mod tests {
                 custody.switched(PARENT, CHILD);
                 let publication = custody.publication(CHILD).unwrap();
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    spawner.spawn_owned(CHILD, Image::copied(Vec::new()), publication);
+                    spawner.spawn_owned(CHILD, Image::copied(Vec::new()).into(), publication);
                 }));
                 assert_eq!(result.is_err(), matches!(host.mode, FactoryMode::Panic));
                 drop(custody);

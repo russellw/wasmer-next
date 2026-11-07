@@ -117,6 +117,145 @@ const PREVIEW1: &str = "wasi_snapshot_preview1";
 const RW: &str = "(i64.const 0x1fffffff)";
 
 #[test]
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+fn host_preopen_rights_reach_guest_fdstat_in_order_even_with_closed_stdio() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use wasixv2_abi::Fd;
+    use wasixv2_exec::{Abis, HostEnvironment, local_cleanup_runner};
+    use wasixv2_kernel::{Dispatch, HostClock, Kernel, SyscallEntry};
+    use wasixv2_syscalls::{
+        Caller, Layer, Layered, MaybeFuture, SysResult, Syscall, SyscallRet, Syscalls,
+    };
+    use wasixv2_wasix1::{PreopenRights, StartupInput, Wasix1, abi::fs::Rights, imports};
+    use wasmer::{AsStoreAsync, AsStoreMut, Instance, Module, Store, Value};
+
+    struct CloseStdio(AtomicBool);
+    impl Layer<Kernel> for CloseStdio {
+        fn call<'a>(
+            &'a self,
+            caller: &'a Caller<'_>,
+            call: Syscall,
+            next: &'a Kernel,
+        ) -> MaybeFuture<'a, SysResult<SyscallRet>> {
+            MaybeFuture::Future(Box::pin(async move {
+                if matches!(call, Syscall::Openat { .. }) && self.0.swap(false, Ordering::AcqRel) {
+                    let unbound = Caller::new(caller.task(), caller.memory());
+                    for fd in [0, 1, 2] {
+                        next.close(&unbound, Fd(fd)).await?;
+                    }
+                }
+                Dispatch.call(caller, call, next).await
+            }))
+        }
+    }
+    let rights = [
+        PreopenRights {
+            base: Rights::FD_READ.0,
+            inheriting: Rights::FD_WRITE.0,
+        },
+        PreopenRights {
+            base: Rights::PATH_OPEN.0,
+            inheriting: Rights::FD_FILESTAT_GET.0,
+        },
+    ];
+    let wasm = wat::parse_str(format!(
+        r#"(module
+      (import "wasi_snapshot_preview1" "fd_fdstat_get" (func $get (param i32 i32) (result i32)))
+      (memory (export "memory") 1)
+      (func (export "probe") (result i32)
+        (if (call $get (i32.const 3) (i32.const 0)) (then (return (i32.const 1))))
+        (if (call $get (i32.const 4) (i32.const 24)) (then (return (i32.const 2))))
+        (if (i64.ne (i64.load (i32.const 8)) (i64.const {})) (then (return (i32.const 3))))
+        (if (i64.ne (i64.load (i32.const 16)) (i64.const {})) (then (return (i32.const 4))))
+        (if (i64.ne (i64.load (i32.const 32)) (i64.const {})) (then (return (i32.const 5))))
+        (if (i64.ne (i64.load (i32.const 40)) (i64.const {})) (then (return (i32.const 6))))
+        i32.const 0))"#,
+        rights[0].base, rights[0].inheriting, rights[1].base, rights[1].inheriting,
+    ))
+    .unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, async {
+        for close_stdio in [false, true] {
+            let host: Arc<dyn wasixv2::Host> = Arc::new(wasixv2::TokioHost::default());
+            let root = Arc::new(wasixv2_vfs_mem::MemFs::new(
+                Arc::new(HostClock(host.clone())),
+                0o777,
+                1,
+                1,
+            ));
+            let wasi = Arc::new(Wasix1::new());
+            let mut abis = Abis::new();
+            abis.push(wasi.clone());
+            let abis = Arc::new(abis);
+            let kernel = Kernel::new(host.clone(), root).with_binfmt(abis.clone());
+            let task = kernel
+                .spawn(ProcessConfig {
+                    args: vec!["rights".into()],
+                    env: vec![],
+                    stdio: Stdio::from_fns(|_| {}, |_| {}),
+                })
+                .unwrap();
+            let process = wasi.host_process(task);
+            process
+                .set_startup_input_with_preopen_rights(
+                    StartupInput {
+                        preopens: vec![
+                            (b"/".to_vec(), b"first".to_vec()),
+                            (b"/".to_vec(), b"second".to_vec()),
+                        ],
+                        ..StartupInput::default()
+                    },
+                    rights.to_vec(),
+                )
+                .unwrap();
+            let syscalls = Arc::new(Layered::new(
+                SyscallEntry(CloseStdio(AtomicBool::new(close_stdio))),
+                kernel,
+            ));
+            let mut store = Store::default();
+            let owner = wasmer::sys::NativeCleanupOwner::new();
+            let mut generation =
+                wasmer::sys::NativeInvocationScope::bind_with_cleanup(&mut store, Some(owner))
+                    .unwrap();
+            let environment =
+                HostEnvironment::new(&mut store.as_store_mut(), syscalls, task, host, abis);
+            let imports = imports::namespace(
+                &mut store.as_store_mut(),
+                environment.environment(),
+                imports::Module::Preview1,
+            );
+            let module = Module::new(&store, &wasm).unwrap();
+            let instance = Instance::new(&mut store, &module, &imports).unwrap();
+            let binding = process.attach(&instance, &mut store.as_store_mut());
+            environment
+                .initialize(&mut store.as_store_mut(), &instance, binding)
+                .unwrap();
+            let probe = instance.exports.get_function("probe").unwrap().clone();
+            let asynchronous = store.into_async();
+            let cleanup =
+                local_cleanup_runner(&asynchronous, environment.loader_cleanup().clone()).unwrap();
+            let result = probe.call_async(&asynchronous, vec![]).await;
+            generation.close_and_wait().await.unwrap();
+            cleanup
+                .run(async {
+                    let mut guard = asynchronous.write_lock().await;
+                    environment.deactivate(&mut guard.as_store_mut());
+                })
+                .await;
+            assert_eq!(
+                result.unwrap().as_ref(),
+                &[Value::I32(0)],
+                "closed stdio: {close_stdio}"
+            );
+        }
+    });
+}
+
+#[test]
 fn descriptor_rights_reduce_independently_and_deny_path_effects_before_creation() {
     use wasixv2_wasix1::abi::fs::Rights;
     let read = (Rights::FD_READ | Rights::FD_FILESTAT_GET).0;
@@ -295,6 +434,141 @@ async fn descriptor_compat_read_uses_its_authorized_pipe_after_a_layer_reuses_th
             .await
             .unwrap(),
         0
+    );
+}
+
+/// The ABI authorizes a replaceable stdio target, then a suspended layer installs
+/// a named directory there. The kernel must reject the stale target under its install lock.
+#[tokio::test]
+async fn descriptor_renumber_does_not_overwrite_a_named_target_installed_while_pending() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use wasixv2_abi::{Errno, Fd, OpenFlags};
+    use wasixv2_kernel::{Dispatch, HostClock, Kernel, SyscallEntry};
+    use wasixv2_syscalls::{
+        Caller, Control, DescriptorUpdate, Layer, Layered, MaybeFuture, SysResult, Syscall,
+        SyscallRet, Syscalls,
+    };
+    struct PauseDup(Arc<AtomicBool>);
+    impl Layer<Kernel> for PauseDup {
+        fn call<'a>(
+            &'a self,
+            caller: &'a Caller<'_>,
+            call: Syscall,
+            next: &'a Kernel,
+        ) -> MaybeFuture<'a, SysResult<SyscallRet>> {
+            MaybeFuture::Future(Box::pin(async move {
+                if let Syscall::Dup3 {
+                    oldfd: Fd(1),
+                    newfd: Fd(20),
+                    ..
+                } = call
+                    && !self.0.swap(true, Ordering::AcqRel)
+                {
+                    let original = caller.descriptors().unwrap();
+                    assert!(original.get(Fd(20)).unwrap().present);
+                    let plan = caller.descriptor_installations().unwrap();
+                    assert!(plan.result(0).is_none());
+                    // This is after the ABI's target-kind check, before kernel dup3.
+                    tokio::task::yield_now().await;
+                    let directory = next.snapshot_descriptors(caller.task(), &[Fd(3)]).unwrap();
+                    let named = wasixv2_wasix1::PreopenRights::ALL
+                        .named_attachment(b"protected")
+                        .unwrap();
+                    assert_eq!(
+                        next.replace_descriptor_attachment(
+                            caller.task(),
+                            &directory,
+                            Fd(3),
+                            Some(named.clone()),
+                        ),
+                        Ok(DescriptorUpdate::Replaced)
+                    );
+                    let unbound = Caller::new(caller.task(), caller.memory());
+                    assert_eq!(
+                        next.dup3(&unbound, Fd(3), Fd(20), OpenFlags(0)).await,
+                        Ok(Fd(20))
+                    );
+                    let result = Dispatch.call(caller, call, next).await;
+                    assert!(matches!(
+                        result,
+                        Err(wasixv2_syscalls::SysErr::Errno(Errno::EAGAIN))
+                    ));
+                    assert!(
+                        plan.result(0).is_none(),
+                        "failed replacement must not publish outputs"
+                    );
+                    let current = next.snapshot_descriptors(caller.task(), &[Fd(20)]).unwrap();
+                    assert!(
+                        current
+                            .get(Fd(20))
+                            .unwrap()
+                            .attachment
+                            .as_ref()
+                            .unwrap()
+                            .ptr_eq(&named)
+                    );
+                    return result;
+                }
+                Dispatch.call(caller, call, next).await
+            }))
+        }
+    }
+    let host: Arc<dyn wasixv2::Host> = Arc::new(wasixv2::TokioHost::default());
+    let root = Arc::new(wasixv2_vfs_mem::MemFs::new(
+        Arc::new(HostClock(host.clone())),
+        0o777,
+        1,
+        1,
+    ));
+    let mut abis = wasixv2_exec::Abis::new();
+    abis.push(Arc::new(wasixv2_wasix1::Wasix1::new()));
+    let abis = Arc::new(abis);
+    let kernel = Kernel::new(host.clone(), root).with_binfmt(abis.clone());
+    let task = kernel
+        .spawn(ProcessConfig {
+            args: vec!["conditional-destination".into()],
+            env: vec![],
+            stdio: Stdio::from_fns(|_| {}, |_| {}),
+        })
+        .unwrap();
+    let interleaved = Arc::new(AtomicBool::new(false));
+    let syscalls = Arc::new(Layered::new(
+        SyscallEntry(PauseDup(interleaved.clone())),
+        kernel,
+    ));
+    let store = wasmer::Store::default();
+    let module = wasixv2_exec::load(store.engine(), &wat::parse_str(r#"(module
+      (import "wasix_32v1" "fd_renumber" (func $renumber (param i32 i32) (result i32)))
+      (import "wasix_32v1" "fd_prestat_get" (func $prestat (param i32 i32) (result i32)))
+      (import "wasix_32v1" "fd_prestat_dir_name" (func $name (param i32 i32 i32) (result i32)))
+      (import "wasix_32v1" "fd_fdstat_get" (func $stat (param i32 i32) (result i32)))
+      (import "wasix_32v1" "proc_exit2" (func $exit (param i32)))
+      (memory (export "memory") 1)
+      (func $check (param $step i32) (param $actual i32) (param $expected i32)
+        (if (i32.ne (local.get $actual) (local.get $expected)) (then (call $exit (local.get $step)))))
+      (func (export "_start")
+        (call $check (i32.const 1) (call $renumber (i32.const 0) (i32.const 20)) (i32.const 0))
+        (call $check (i32.const 2) (call $renumber (i32.const 1) (i32.const 20)) (i32.const 6))
+        (call $check (i32.const 3) (call $prestat (i32.const 20) (i32.const 0)) (i32.const 0))
+        (call $check (i32.const 4) (i32.load (i32.const 4)) (i32.const 9))
+        (call $check (i32.const 5) (call $name (i32.const 20) (i32.const 64) (i32.const 9)) (i32.const 0))
+        (call $check (i32.const 6) (i32.load (i32.const 64)) (i32.const 0x746f7270))
+        (call $check (i32.const 7) (i32.load (i32.const 68)) (i32.const 0x65746365))
+        (call $check (i32.const 8) (i32.load8_u (i32.const 72)) (i32.const 100))
+        (call $check (i32.const 9) (call $stat (i32.const 20) (i32.const 128)) (i32.const 0))
+        (call $check (i32.const 10) (i32.load8_u (i32.const 128)) (i32.const 3))
+        (call $check (i32.const 11) (call $renumber (i32.const 1) (i32.const 20)) (i32.const 58))
+        (call $check (i32.const 12) (call $renumber (i32.const -1) (i32.const 20)) (i32.const 8))
+        (call $exit (i32.const 0))))"#).unwrap()).unwrap();
+    assert_eq!(
+        wasixv2_exec::run_with_abis(store, &module, syscalls, task, host, abis)
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(
+        interleaved.load(Ordering::Acquire),
+        "the guarded kernel call must actually be reached"
     );
 }
 

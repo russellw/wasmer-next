@@ -55,18 +55,41 @@ fn repack(records: &[u8], out: &mut Vec<u8>, limit: usize) -> bool {
             d_namlen: name.len() as u32,
             d_type: dirent_type(record.d_type),
         };
-        let mut bytes = vec![0; Dirent::SIZE];
-        dirent.write_to(&mut bytes);
-        bytes.extend_from_slice(name);
-        let room = limit - out.len();
-        if bytes.len() >= room {
-            out.extend_from_slice(&bytes[..room]);
+        if append(dirent, name, out, limit) {
             return true;
         }
-        out.extend_from_slice(&bytes);
         rest = &rest[reclen..];
     }
     out.len() >= limit
+}
+
+fn append(dirent: Dirent, name: &[u8], out: &mut Vec<u8>, limit: usize) -> bool {
+    let mut bytes = vec![0; Dirent::SIZE];
+    dirent.write_to(&mut bytes);
+    bytes.extend_from_slice(name);
+    let room = limit - out.len();
+    out.extend_from_slice(&bytes[..bytes.len().min(room)]);
+    out.len() == limit
+}
+
+fn root_entries(entries: &[(Vec<u8>, u64)], cookie: u64, out: &mut Vec<u8>, limit: usize) {
+    let start = usize::try_from(cookie).unwrap_or(usize::MAX);
+    for (index, (name, ino)) in entries.iter().enumerate().skip(start) {
+        let name = [b"/".as_slice(), name].concat();
+        if append(
+            Dirent {
+                d_next: index as u64 + 1,
+                d_ino: *ino,
+                d_namlen: name.len() as u32,
+                d_type: Filetype::DIRECTORY,
+            },
+            &name,
+            out,
+            limit,
+        ) {
+            break;
+        }
+    }
 }
 
 pub(crate) async fn fd_readdir<S: Syscalls + Control + 'static>(
@@ -79,8 +102,25 @@ pub(crate) async fn fd_readdir<S: Syscalls + Control + 'static>(
 ) -> Result<i32, RuntimeError> {
     shim::errno(&env, async |frame| {
         crate::rights::require(frame, &[(wasixv2_abi::Fd(fd), Rights::FD_READDIR)]).await?;
-        let caller = frame.caller();
         let limit = buf_len as u32 as usize;
+        let startup = frame.startup().await?;
+        if let Some(root) = &startup.root {
+            let stat =
+                crate::calls::fs::fstat(frame, Fd(fd), wasixv2_abi::StatxMask::STATX_BASIC_STATS)
+                    .await?;
+            if root.root
+                == (crate::process::FileId {
+                    dev: (stat.stx_dev_major, stat.stx_dev_minor),
+                    ino: stat.stx_ino,
+                })
+            {
+                let mut out = Vec::with_capacity(limit.min(CHUNK as usize));
+                root_entries(&root.entries, cookie as u64, &mut out, limit);
+                frame.write_bytes(buf as u32, &out).await?;
+                return frame.write(used as u32, &(out.len() as u32)).await;
+            }
+        }
+        let caller = frame.caller();
         frame
             .syscalls
             .lseek(&caller, Fd(fd), cookie, SeekWhence::SEEK_SET)
@@ -109,6 +149,40 @@ pub(crate) async fn fd_readdir<S: Syscalls + Control + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn root_presentation_keeps_opaque_names_cookies_and_truncated_prefixes() {
+        let entries = vec![(b"same//path".to_vec(), 7), (b"same/path".to_vec(), 8)];
+        let mut full = Vec::new();
+        root_entries(&entries, 0, &mut full, 4096);
+        let first = Dirent::read_from(&full).unwrap();
+        assert_eq!(first.d_next, 1);
+        assert_eq!(first.d_ino, 7);
+        assert_eq!(first.d_type, Filetype::DIRECTORY);
+        assert_eq!(
+            &full[Dirent::SIZE..Dirent::SIZE + first.d_namlen as usize],
+            b"/same//path"
+        );
+        let next = Dirent::SIZE + first.d_namlen as usize;
+        let second = Dirent::read_from(&full[next..]).unwrap();
+        assert_eq!(second.d_next, 2);
+        assert_eq!(&full[next + Dirent::SIZE..], b"/same/path");
+        let mut resumed = Vec::new();
+        root_entries(&entries, 1, &mut resumed, 4096);
+        assert_eq!(resumed, full[next..]);
+        for limit in [0, 1, Dirent::SIZE - 1, next, next + 3] {
+            let mut prefix = Vec::new();
+            root_entries(&entries, 0, &mut prefix, limit);
+            assert_eq!(prefix, full[..limit]);
+        }
+        let mut empty = Vec::new();
+        root_entries(&[], 0, &mut empty, 4096);
+        root_entries(&entries, u64::MAX, &mut empty, 4096);
+        assert!(
+            empty.is_empty(),
+            "no implicit dot entries or cookie wraparound"
+        );
+    }
 
     /// One `linux_dirent64` record, padded to 8 bytes as the kernel does.
     fn record(ino: u64, off: i64, d_type: u8, name: &[u8]) -> Vec<u8> {

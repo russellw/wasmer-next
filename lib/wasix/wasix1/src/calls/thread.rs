@@ -36,6 +36,19 @@ async fn spawn<S: Syscalls + Control + 'static>(
     frame: &Frame<'_, S>,
     start_arg: u32,
 ) -> V1Result<i32> {
+    {
+        let guard = frame.env.read().await;
+        if !frame.instance().thread_entry_available(&guard) {
+            return Err(crate::abi::Errno::NOTCAPABLE.into());
+        }
+        if !guard
+            .data()
+            .memory()
+            .is_some_and(|memory| memory.ty(&guard).shared)
+        {
+            return Err(crate::abi::Errno::MEMVIOLATION.into());
+        }
+    }
     super::signal::end_spawn_hold(frame).await?;
     Ok(frame
         .syscalls

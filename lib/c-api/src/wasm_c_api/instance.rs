@@ -42,7 +42,6 @@ pub unsafe extern "C" fn wasm_instance_new(
     trap: Option<&mut *mut wasm_trap_t>,
 ) -> Option<Box<wasm_instance_t>> {
     let store = store?;
-    let mut store_mut = unsafe { store.inner.store_mut() };
     let module = module?;
     let imports = imports?;
 
@@ -56,7 +55,27 @@ pub unsafe extern "C" fn wasm_instance_new(
         .take(module_import_count)
         .collect::<Vec<Extern>>();
 
-    let instance = match Instance::new_by_index(&mut store_mut, wasm_module, &externs) {
+    #[cfg(all(feature = "wasi", feature = "sys"))]
+    if let Some(memory) = externs.iter().find_map(|value| match value {
+        Extern::Memory(memory) => Some(memory),
+        _ => None,
+    }) {
+        for import in imports
+            .as_slice()
+            .iter()
+            .take(module_import_count)
+            .flatten()
+        {
+            if let Some(origin) = &import.wasi_origin {
+                c_try!(
+                    store
+                        .inner
+                        .with_mut(|store| origin.prebind_memory(store, memory))
+                );
+            }
+        }
+    }
+    let instance = match c_try!(store.inner.instantiate(wasm_module, externs)) {
         Ok(instance) => instance,
 
         Err(InstantiationError::Link(link_error)) => {
