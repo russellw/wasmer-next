@@ -502,8 +502,8 @@ impl std::future::Future for NativeRetirementTail {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<()> {
         let this = self.get_mut();
-        if let Some(owner) = &this.owner {
-            if this
+        if let Some(owner) = &this.owner
+            && this
                 .state
                 .failure
                 .attempt(|| {
@@ -513,9 +513,8 @@ impl std::future::Future for NativeRetirementTail {
                         .with_context(cx, |cx| owner.driver.poll_retirement(cx));
                 })
                 .is_none()
-            {
-                this.state.failure.attempt(|| cx.waker().wake_by_ref());
-            }
+        {
+            this.state.failure.attempt(|| cx.waker().wake_by_ref());
         }
         if !this.state.terminal_done.get() {
             return std::task::Poll::Pending;

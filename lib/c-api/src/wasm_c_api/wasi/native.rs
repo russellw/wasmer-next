@@ -2617,7 +2617,6 @@ mod tests {
         wasi.close();
         drop(public);
         drop(results);
-        drop(function);
         drop(instance);
         drop(base);
     }
@@ -3082,7 +3081,6 @@ mod tests {
             );
             drop(results);
             drop(public);
-            drop(sibling);
             drop(imports);
             drop(instance);
             drop(module);
@@ -3093,7 +3091,6 @@ mod tests {
                 weak_target.upgrade().is_none(),
                 "no completion job retains C API StoreState"
             );
-            drop(function);
             drop(outer);
             drop(callback);
             drop(asynchronous);
