@@ -502,6 +502,299 @@ mod tests {
         );
     }
 
+    /// Public constructor/getter/initialize/copy/call with DIFFERENT real
+    /// allocations. The observation guest deliberately has NO memory: all its
+    /// imports use the environment's explicit current local selection, while
+    /// process_vm_* independently resolves that process's remote attachment.
+    #[test]
+    fn public_remote_memory_selection_uses_distinct_shared_backings_and_preserves_private_boundary()
+    {
+        use super::super::{
+            WasiBackend, wasi_config_new, wasi_env_delete, wasi_env_initialize_instance,
+            wasi_env_new, wasi_get_imports,
+        };
+        use crate::wasm_c_api::{
+            externals::{
+                wasm_extern_t, wasm_extern_vec_t, wasm_func_call, wasm_func_copy, wasm_func_t,
+                wasm_memory_copy, wasm_memory_data, wasm_memory_data_size, wasm_memory_t,
+            },
+            instance::{wasm_instance_new, wasm_instance_t},
+            module::{wasm_module_new, wasm_module_t},
+            store::wasm_store_t,
+            types::{wasm_byte_vec_t, wasm_valkind_enum},
+            value::{wasm_val_inner, wasm_val_t, wasm_val_vec_t},
+        };
+        use std::ffi::CString;
+        use wasixv2_exec::{Abi, Wasixv2};
+        fn module(store: &mut wasm_store_t, source: &str) -> Box<wasm_module_t> {
+            let bytes: wasm_byte_vec_t = wat::parse_str(source).unwrap().into();
+            unsafe { wasm_module_new(Some(store), Some(&bytes)) }.unwrap()
+        }
+        fn function(store: &wasm_store_t, instance: &wasm_instance_t, name: &str) -> wasm_func_t {
+            wasm_func_t {
+                extern_: wasm_extern_t::new(
+                    store.inner.clone(),
+                    instance
+                        .inner
+                        .exports
+                        .get_function(name)
+                        .unwrap()
+                        .clone()
+                        .into(),
+                ),
+            }
+        }
+        fn call(function: &mut wasm_func_t) -> i32 {
+            let args: wasm_val_vec_t = Vec::<wasm_val_t>::new().into();
+            let mut results: wasm_val_vec_t = vec![wasm_val_t {
+                kind: wasm_valkind_enum::WASM_I32 as u8,
+                of: wasm_val_inner { int32_t: -12345 },
+            }]
+            .into();
+            let trap = unsafe { wasm_func_call(Some(function), Some(&args), &mut results) };
+            assert!(
+                trap.is_none(),
+                "{:?}",
+                trap.as_ref().map(|trap| trap.inner.message())
+            );
+            assert_eq!(
+                results.as_slice()[0].kind,
+                wasm_valkind_enum::WASM_I32 as u8
+            );
+            unsafe { results.as_slice()[0].of.int32_t }
+        }
+        fn byte(pointer: *mut u8, address: usize) -> u8 {
+            // SAFETY: every offset is explicitly bounded by this fixture's
+            // public memory-data-size result; no guest runs concurrently.
+            unsafe { pointer.add(address).read() }
+        }
+        fn put(pointer: *mut u8, address: usize, bytes: &[u8]) {
+            // SAFETY: same checked stable allocation and exclusive host phase.
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), pointer.add(address), bytes.len());
+            }
+        }
+        fn iov(pointer: *mut u8, address: usize, base: u32) {
+            put(pointer, address, &base.to_le_bytes());
+            put(pointer, address + 4, &1u32.to_le_bytes());
+        }
+        let engine = wasm_engine_new();
+        let mut store = unsafe { wasm_store_new(Some(&engine)) }.unwrap();
+        let config =
+            unsafe { wasi_config_new(CString::new("remote-selection").unwrap().as_ptr()) }.unwrap();
+        let mut environment = unsafe { wasi_env_new(Some(&mut store), config) }.unwrap();
+        // Initial private P, different private Q, then real shared A and B.
+        let profiles = [(1, false), (2, false), (1, true), (2, true)];
+        let mut instances = Vec::new();
+        let mut memories = Vec::new();
+        let mut pointers = Vec::new();
+        for (index, (pages, shared)) in profiles.iter().copied().enumerate() {
+            let module = module(
+                &mut store,
+                &format!(
+                    r#"(module
+                (import "env" "memory" (memory {pages} 3 {}))
+                (import "wasix_32v1" "proc_id" (func (param i32) (result i32)))
+                (export "memory" (memory 0))
+                (func (export "identity") (result i32) i32.const {}))"#,
+                    if shared { "shared" } else { "" },
+                    17 + index
+                ),
+            );
+            let mut imports: wasm_extern_vec_t = Vec::<Option<Box<wasm_extern_t>>>::new().into();
+            assert!(unsafe {
+                wasi_get_imports(
+                    Some(&store),
+                    Some(&mut environment),
+                    Some(&module),
+                    &mut imports,
+                )
+            });
+            let mut memory = imports
+                .as_slice()
+                .iter()
+                .flatten()
+                .find_map(|value| wasm_memory_t::try_from(value))
+                .map(|value| unsafe { wasm_memory_copy(value) })
+                .unwrap();
+            store
+                .inner
+                .with_mut(|store| {
+                    assert_eq!(
+                        memory.extern_.memory().as_shared(store).is_some(),
+                        shared,
+                        "sharedness is real engine metadata"
+                    );
+                })
+                .unwrap();
+            let pointer = unsafe { wasm_memory_data(Some(&mut memory)) };
+            assert!(!pointer.is_null());
+            assert_eq!(
+                unsafe { wasm_memory_data_size(Some(&memory)) },
+                pages as usize * 65536
+            );
+            assert!(
+                !pointers.contains(&pointer),
+                "every profile owns a different allocation"
+            );
+            put(pointer, 0x400, &[31 + index as u8]);
+            if pages == 2 {
+                put(pointer, 65536 + 0x400, &[71 + index as u8]);
+            }
+            let mut trap = std::ptr::null_mut();
+            let instance = unsafe {
+                wasm_instance_new(
+                    Some(&mut store),
+                    Some(&module),
+                    Some(&imports),
+                    Some(&mut trap),
+                )
+            }
+            .unwrap();
+            assert!(trap.is_null());
+            pointers.push(pointer);
+            memories.push(memory);
+            instances.push(instance);
+        }
+        assert!(unsafe {
+            wasi_env_initialize_instance(&mut environment, &mut store, &mut instances[0])
+        });
+        let probe = module(
+            &mut store,
+            r#"(module
+            (import "wasixv2" "getpid" (func $pid (result i32)))
+            (import "wasixv2" "process_vm_readv" (func $read (param i32 i32 i32 i32 i32 i32) (result i32)))
+            (import "wasixv2" "process_vm_writev" (func $write (param i32 i32 i32 i32 i32 i32) (result i32)))
+            (func (export "pid") (result i32) call $pid)
+            (func (export "read") (result i32)
+                call $pid i32.const 256 i32.const 1 i32.const 264 i32.const 1 i32.const 0 call $read)
+            (func (export "write") (result i32)
+                call $pid i32.const 256 i32.const 1 i32.const 264 i32.const 1 i32.const 0 call $write))"#,
+        );
+        assert_eq!(probe.inner.imports().memories().count(), 0);
+        let reference = store.inner.clone();
+        // Test observation only: use the EXISTING core ABI over this EXACT
+        // environment. No public C import namespace, kernel process, or memory
+        // selection is added, and the probe is never initialized as a WASI image.
+        let probe_imports: wasm_extern_vec_t = store
+            .inner
+            .with_mut(|store| {
+                let native = match &environment.inner {
+                    WasiBackend::Native(native) => native,
+                    #[cfg(feature = "v8")]
+                    WasiBackend::Legacy(_) => panic!("this proof requires the native C API"),
+                };
+                let imports =
+                    Wasixv2.imports(store, native.environment().environment(), &probe.inner);
+                probe
+                    .inner
+                    .imports()
+                    .map(|import| {
+                        Some(Box::new(wasm_extern_t::new(
+                            reference.clone(),
+                            imports.get_export(import.module(), import.name()).unwrap(),
+                        )))
+                    })
+                    .collect::<Vec<_>>()
+                    .into()
+            })
+            .unwrap();
+        let mut trap = std::ptr::null_mut();
+        let observation = unsafe {
+            wasm_instance_new(
+                Some(&mut store),
+                Some(&probe),
+                Some(&probe_imports),
+                Some(&mut trap),
+            )
+        }
+        .unwrap();
+        assert!(trap.is_null());
+        let mut pid = wasm_func_copy(&function(&store, &observation, "pid"));
+        let mut read = wasm_func_copy(&function(&store, &observation, "read"));
+        let mut write = wasm_func_copy(&function(&store, &observation, "write"));
+        let mut old_a = wasm_func_copy(&function(&store, &instances[2], "identity"));
+        let process = call(&mut pid);
+        assert!(process > 0);
+        let store_id = store
+            .inner
+            .with_mut(|store| store.objects_mut().id())
+            .unwrap();
+        // (explicit LOCAL selection, expected REMOTE selection): private Q
+        // never registers; every real shared A/B/A selection does.
+        for (phase, (local, remote)) in [(0, 0), (1, 0), (2, 2), (3, 3), (2, 2), (1, 2), (3, 3)]
+            .into_iter()
+            .enumerate()
+        {
+            assert!(unsafe {
+                wasi_env_initialize_instance(&mut environment, &mut store, &mut instances[local])
+            });
+            assert_eq!(
+                call(&mut old_a),
+                19,
+                "an old function does not reselect memory by origin"
+            );
+            assert_eq!(call(&mut pid), process);
+            assert_eq!(
+                store
+                    .inner
+                    .with_mut(|store| store.objects_mut().id())
+                    .unwrap(),
+                store_id
+            );
+            for (index, &pointer) in pointers.iter().enumerate() {
+                put(pointer, 0x300, &[101 + index as u8]);
+                put(pointer, 0x401, &[111 + index as u8]);
+            }
+            let selected = pointers[local];
+            iov(selected, 0x100, 0x300);
+            iov(selected, 0x108, 0x400);
+            assert_eq!(call(&mut read), 1, "phase {phase}");
+            for (index, &pointer) in pointers.iter().enumerate() {
+                assert_eq!(
+                    byte(pointer, 0x300),
+                    if index == local {
+                        31 + remote as u8
+                    } else {
+                        101 + index as u8
+                    },
+                    "only selected local memory receives the remote byte; phase {phase}"
+                );
+            }
+            let written = 151 + phase as u8;
+            put(selected, 0x301, &[written]);
+            iov(selected, 0x100, 0x301);
+            iov(selected, 0x108, 0x401);
+            assert_eq!(call(&mut write), 1);
+            for (index, &pointer) in pointers.iter().enumerate() {
+                assert_eq!(
+                    byte(pointer, 0x401),
+                    if index == remote {
+                        written
+                    } else {
+                        111 + index as u8
+                    },
+                    "only the captured remote allocation is written; phase {phase}"
+                );
+            }
+            iov(selected, 0x100, 0x300);
+            iov(selected, 0x108, 65536 + 0x400);
+            let long = profiles[remote].0 == 2;
+            assert_eq!(
+                call(&mut read),
+                if long { 1 } else { -14 },
+                "remote bounds follow real selected backing, never another instance's size; phase {phase}"
+            );
+            if long {
+                assert_eq!(byte(selected, 0x300), 71 + remote as u8);
+            }
+        }
+        // Public retirement is unchanged; neither the memoryless observation
+        // instance nor copied function handles acquire a new process/MM.
+        wasi_env_delete(Some(environment));
+        drop(memories);
+    }
+
     #[test]
     fn foreign_instance_metadata_is_rejected_before_attachment_and_selection_survives() {
         let engine = wasm_engine_new();

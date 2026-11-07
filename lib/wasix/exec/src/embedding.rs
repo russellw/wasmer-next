@@ -15,6 +15,10 @@ pub struct HostEnvironment<S: 'static> {
     initialized: Arc<std::sync::atomic::AtomicBool>,
     cleanup: Arc<LoaderCleanup>,
     abis: Arc<Abis<S>>,
+    // None means never attempted. An expired Some must never retry attachment
+    // after rejection/mm exit or take authority from an unrelated first owner.
+    #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+    selection: Arc<std::sync::Mutex<Option<std::sync::Weak<memory::ForeignSelection>>>>,
 }
 
 impl<S: 'static> Clone for HostEnvironment<S> {
@@ -25,6 +29,8 @@ impl<S: 'static> Clone for HostEnvironment<S> {
             initialized: self.initialized.clone(),
             cleanup: self.cleanup.clone(),
             abis: self.abis.clone(),
+            #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+            selection: self.selection.clone(),
         }
     }
 }
@@ -53,6 +59,8 @@ impl<S: Syscalls + Control + Send + Sync + 'static> HostEnvironment<S> {
             initialized: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cleanup,
             abis,
+            #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+            selection: Arc::default(),
         }
     }
 
@@ -171,6 +179,8 @@ impl<S: Syscalls + Control + Send + Sync + 'static> HostEnvironment<S> {
         let stack_pointer = crate::stack_pointer(instance);
         let main_stack = memory::main_stack(instance, store);
         let shared = memory.as_shared(store);
+        #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+        let is_shared = shared.is_some();
         let (syscalls, task, host, handoff, low_guard, read_only, base, layout) = {
             let data = self.env.as_ref(store);
             (
@@ -208,11 +218,6 @@ impl<S: Syscalls + Control + Send + Sync + 'static> HostEnvironment<S> {
                 handoff,
             ) as Arc<dyn thread::Start>
         });
-        // Kernel first-attachment semantics remain unchanged; remote reselection
-        // requires the separately reviewed stable host-selection capability.
-        if let Some(foreign) = foreign {
-            syscalls.attach_memory(task, Arc::new(foreign));
-        }
         let old = {
             let data = self.env.as_mut(store);
             data.main_stack = main_stack;
@@ -225,9 +230,51 @@ impl<S: Syscalls + Control + Send + Sync + 'static> HostEnvironment<S> {
                 std::mem::replace(&mut data.asyncify, asyncify),
             )
         };
-        drop(old);
+        // All fallible staging is complete and the selected local tuple is
+        // installed before publishing remote visibility. No guest entry/await
+        // occurs between these commits, under the caller's exclusive Store.
+        #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+        let retired = foreign.and_then(|foreign| {
+            let attempt = {
+                self.selection
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone()
+            };
+            match attempt {
+                None => {
+                    let selector = Arc::new(memory::ForeignSelection::new(Arc::new(foreign)));
+                    let previous = self
+                        .selection
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .replace(Arc::downgrade(&selector));
+                    // Keep this strong candidate through the attachment call.
+                    // The kernel owns acceptance; rejection leaves only Weak.
+                    syscalls.attach_memory(task, selector.clone());
+                    drop(previous);
+                    drop(selector);
+                    None
+                }
+                Some(weak) => {
+                    let selector = weak.upgrade();
+                    drop(weak);
+                    match selector {
+                        Some(selector) if is_shared => Some(selector.publish(Arc::new(foreign))),
+                        _ => None, // Private selection/stale capability never republishes.
+                    }
+                }
+            }
+        });
+        #[cfg(not(all(feature = "sys", not(target_arch = "wasm32"))))]
+        if let Some(foreign) = foreign {
+            syscalls.attach_memory(task, Arc::new(foreign));
+        }
         self.initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        drop(old);
+        #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+        drop(retired);
         Ok(())
     }
 
@@ -460,5 +507,76 @@ impl HostCallHandoff {
             HostCallState::Retired,
         );
         drop(old);
+    }
+}
+
+#[cfg(all(test, feature = "sys", not(target_arch = "wasm32")))]
+mod selection_tests {
+    use super::*;
+    use crate::process::tests::{NoThreads, Recorder};
+
+    #[test]
+    fn rejected_host_selection_never_recreates_an_expired_attachment() {
+        let mut store = wasmer::Store::default();
+        let syscalls = Arc::new(Recorder::default());
+        // Recorder's default attach_memory rejects/drops every provider, just
+        // like an already-attached mm refusing an unrelated first provider.
+        let environment = HostEnvironment::new(
+            &mut store.as_store_mut(),
+            syscalls,
+            TaskId(2),
+            Arc::new(NoThreads),
+            Arc::new(Abis::wasixv2()),
+        );
+        let make = |store: &mut wasmer::Store, pages| {
+            let source = format!(
+                "(module (memory (export \"memory\") {pages} 3 shared) (func (export \"_start\")))"
+            );
+            let module = wasmer::Module::new(store, source.as_bytes()).unwrap();
+            Instance::new(store, &module, &wasmer::Imports::new()).unwrap()
+        };
+        let first = make(&mut store, 1);
+        let second = make(&mut store, 2);
+        let select = |environment: &HostEnvironment<Recorder>,
+                      store: &mut wasmer::Store,
+                      instance: &Instance| {
+            let binding = crate::Wasixv2
+                .bind(
+                    instance,
+                    &mut store.as_store_mut(),
+                    TaskId(2),
+                    crate::Role::Process,
+                )
+                .unwrap();
+            environment
+                .initialize(&mut store.as_store_mut(), instance, binding)
+                .unwrap();
+        };
+        select(&environment, &mut store, &first);
+        let original = environment.selection.lock().unwrap().clone().unwrap();
+        assert!(
+            original.upgrade().is_none(),
+            "rejection expires the only strong candidate"
+        );
+        let clone = environment.clone();
+        assert!(Arc::ptr_eq(&clone.selection, &environment.selection));
+        select(&clone, &mut store, &second);
+        let current = environment.selection.lock().unwrap().clone().unwrap();
+        assert!(
+            std::sync::Weak::ptr_eq(&original, &current),
+            "expired means attempted, never a fresh attachment"
+        );
+        assert!(current.upgrade().is_none());
+        assert_eq!(
+            environment.env.as_ref(&store).memory.as_ref().unwrap(),
+            second.exports.get_memory("memory").unwrap(),
+            "local selection still changes normally"
+        );
+        environment.deactivate(&mut store.as_store_mut());
+        let current = environment.selection.lock().unwrap().clone().unwrap();
+        assert!(
+            std::sync::Weak::ptr_eq(&original, &current),
+            "deactivation cannot reset attachment admission"
+        );
     }
 }
