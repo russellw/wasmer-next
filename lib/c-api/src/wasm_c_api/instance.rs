@@ -9,6 +9,10 @@ use wasmer_api::{Extern, Instance, InstantiationError};
 pub struct wasm_instance_t {
     pub(crate) store: StoreRef,
     pub(crate) inner: Instance,
+    // V8's real InstanceHandle destructor must run before this instance's
+    // already-owned Store lifetime ends. Native field Drop order is unchanged.
+    #[cfg(all(feature = "v8", feature = "wasi"))]
+    _v8_store: Option<StoreRef>,
 }
 
 /// Creates a new instance from a WebAssembly module and a
@@ -73,6 +77,18 @@ pub unsafe extern "C" fn wasm_instance_new(
                         .with_mut(|store| origin.prebind_memory(store, memory))
                 );
             }
+            #[cfg(feature = "v8")]
+            if let Some(origin) = import
+                .wasi_v8_origin
+                .as_ref()
+                .and_then(std::rc::Weak::upgrade)
+            {
+                c_try!(
+                    store
+                        .inner
+                        .with_mut(|store| origin.prebind_memory(store, memory))
+                );
+            }
         }
     }
     let instance = match c_try!(store.inner.instantiate(wasm_module, externs)) {
@@ -115,6 +131,8 @@ pub unsafe extern "C" fn wasm_instance_new(
     Some(Box::new(wasm_instance_t {
         store: store.inner.clone(),
         inner: instance,
+        #[cfg(all(feature = "v8", feature = "wasi"))]
+        _v8_store: store.inner.is_v8_managed().then(|| store.inner.clone()),
     }))
 }
 

@@ -33,12 +33,8 @@ wasmer-compiler-llvm = { version = "=7.5.0", path = "../compiler-llvm", optional
 wasmer-compiler-singlepass = { version = "=7.5.0", path = "../compiler-singlepass", optional = true }
 wasmer-middlewares = { version = "=7.5.0", path = "../middlewares", optional = true }
 wasmer-types = { version = "=7.5.0", path = "../types" }
-wasmer-wasix = { path = "../wasix-legacy", version = "=0.705.0", features = [
-  "host-fs",
-  "host-vnet",
-  "sys",
-], default-features = false, optional = true }
 wasixv2 = { path = "../wasix/api", default-features = false, features = ["tokio", "wasix1", "host-network"], optional = true }
+wasixv2-host = { workspace = true, optional = true }
 wasixv2-exec = { path = "../wasix/exec", default-features = false, optional = true }
 wasixv2-wasix1 = { path = "../wasix/wasix1", default-features = false, optional = true }
 anyhow.workspace = true
@@ -68,7 +64,7 @@ wat.workspace = true
 [features]
 default = ["wat", "sys-default", "cranelift", "compiler", "wasi", "middlewares"]
 wat = ["wasmer-api/wat", "wasmer-c-api-imports/wat"]
-wasi = ["sys", "wat", "dep:wasixv2", "dep:wasixv2-exec", "dep:wasixv2-wasix1"]
+wasi = ["sys", "wat", "dep:wasixv2", "dep:wasixv2-host", "dep:wasixv2-exec", "dep:wasixv2-wasix1"]
 middlewares = ["compiler", "wasmer-middlewares", "wasmer-api/wasmparser"]
 engine = ["compiler"]
 
@@ -119,9 +115,8 @@ compiler-headless = [
   "wasmer-compiler/compiler",
 ]
 
-# Enable the `v8` backend. Its WASI bridge still needs the legacy runtime
-# until the separately tracked V8 async migration is complete.
-v8 = ["wasmer-api/v8", "wasmer-c-api-imports/v8", "dep:wasmer-wasix"]
+# Enable the `v8` backend. WASI uses the canonical backend-neutral runtime.
+v8 = ["wasmer-api/v8", "wasmer-c-api-imports/v8"]
 
 # Enable the `sys` backend and use it as default. Notice that this does not
 # enable a default compiler, and users should therefore add one (or more) of

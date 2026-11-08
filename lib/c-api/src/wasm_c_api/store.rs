@@ -16,10 +16,42 @@ struct StoreState {
     mode: StoreMode,
 }
 
+#[cfg(all(feature = "v8", feature = "wasi"))]
+pub(super) mod v8;
+
 enum StoreMode {
-    Plain(RefCell<Store>),
+    Plain(PlainStore),
     #[cfg(feature = "sys")]
     Native(ManagedStore),
+}
+
+// Keep the existing outer mode matches (including frozen native controls).
+// Only the actual V8 path uses this owned backing; other plain Stores keep
+// their existing RefCell borrow behavior.
+enum PlainStore {
+    Borrowed(RefCell<Store>),
+    #[cfg(all(feature = "v8", feature = "wasi"))]
+    V8(v8::ManagedStore),
+}
+impl PlainStore {
+    fn new(store: Store) -> Self {
+        #[cfg(all(feature = "v8", feature = "wasi"))]
+        if store.engine().is_v8() {
+            return Self::V8(v8::ManagedStore::new(store));
+        }
+        Self::Borrowed(RefCell::new(store))
+    }
+    fn try_borrow_mut(&self) -> Result<std::cell::RefMut<'_, Store>, RuntimeError> {
+        match self {
+            Self::Borrowed(store) => store
+                .try_borrow_mut()
+                .map_err(|_| RuntimeError::new("Store is already borrowed")),
+            #[cfg(all(feature = "v8", feature = "wasi"))]
+            Self::V8(_) => Err(RuntimeError::new(
+                "V8 Store requires its actual owner guard",
+            )),
+        }
+    }
 }
 
 #[cfg(feature = "sys")]
@@ -306,6 +338,55 @@ impl std::task::Wake for DriverWake {
 }
 
 #[cfg(feature = "sys")]
+impl DriverWake {
+    fn with_real_context<R>(
+        &self,
+        token: u64,
+        fallback: &mut std::task::Context<'_>,
+        poll: impl FnOnce(&mut std::task::Context<'_>) -> R,
+    ) -> R {
+        let real = self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .subscribers
+            .get(&token)
+            .and_then(Clone::clone);
+        match real {
+            Some(real) => poll(&mut std::task::Context::from_waker(&real)),
+            // A directly nested internal poll may already carry our stable
+            // observer. It creates no new consumer or substitute caller.
+            None => poll(fallback),
+        }
+    }
+
+    fn with_context<R>(
+        self: &std::sync::Arc<Self>,
+        token: u64,
+        cx: &mut std::task::Context<'_>,
+        poll: impl FnOnce(&mut std::task::Context<'_>) -> R,
+    ) -> R {
+        let waker = std::task::Waker::from(self.clone());
+        // Nested polling can already carry this exact stable observer. It must
+        // never be stored as its own consumer (self-wake and an Arc cycle).
+        if !waker.will_wake(cx.waker()) {
+            let next = std::sync::Arc::new(cx.waker().clone());
+            let previous = {
+                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                let slot = state.subscribers.get_mut(&token).unwrap();
+                if slot.as_ref().is_some_and(|old| old.will_wake(&next)) {
+                    Some(next)
+                } else {
+                    slot.replace(next)
+                }
+            };
+            drop(previous);
+        }
+        poll(&mut std::task::Context::from_waker(&waker))
+    }
+}
+
+#[cfg(feature = "sys")]
 pub(crate) struct DriverSubscription {
     wake: std::sync::Arc<DriverWake>,
     owner: wasmer_api::sys::NativeCleanupOwner,
@@ -318,20 +399,7 @@ impl DriverSubscription {
         fallback: &mut std::task::Context<'_>,
         poll: impl FnOnce(&mut std::task::Context<'_>) -> R,
     ) -> R {
-        let real = self
-            .wake
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .subscribers
-            .get(&self.token)
-            .and_then(Clone::clone);
-        match real {
-            Some(real) => poll(&mut std::task::Context::from_waker(&real)),
-            // A directly nested internal poll may already carry our stable
-            // observer. It creates no new consumer or substitute caller.
-            None => poll(fallback),
-        }
+        self.wake.with_real_context(self.token, fallback, poll)
     }
 
     pub(crate) fn with_context<R>(
@@ -339,23 +407,7 @@ impl DriverSubscription {
         cx: &mut std::task::Context<'_>,
         poll: impl FnOnce(&mut std::task::Context<'_>) -> R,
     ) -> R {
-        let waker = std::task::Waker::from(self.wake.clone());
-        // Nested polling can already carry this exact stable observer. It must
-        // never be stored as its own consumer (self-wake and an Arc cycle).
-        if !waker.will_wake(cx.waker()) {
-            let next = std::sync::Arc::new(cx.waker().clone());
-            let previous = {
-                let mut state = self.wake.state.lock().unwrap_or_else(|e| e.into_inner());
-                let slot = state.subscribers.get_mut(&self.token).unwrap();
-                if slot.as_ref().is_some_and(|old| old.will_wake(&next)) {
-                    Some(next)
-                } else {
-                    slot.replace(next)
-                }
-            };
-            drop(previous);
-        }
-        poll(&mut std::task::Context::from_waker(&waker))
+        self.wake.with_context(self.token, cx, poll)
     }
 }
 #[cfg(feature = "sys")]
@@ -1830,7 +1882,7 @@ impl StoreRef {
         Ok(Self {
             inner: Rc::new(StoreState {
                 id,
-                mode: StoreMode::Plain(RefCell::new(store)),
+                mode: StoreMode::Plain(PlainStore::new(store)),
             }),
         })
     }
@@ -1840,6 +1892,10 @@ impl StoreRef {
         &self,
         f: impl FnOnce(&mut StoreMut<'_>) -> R,
     ) -> Result<R, RuntimeError> {
+        #[cfg(all(feature = "v8", feature = "wasi"))]
+        if let Some(v8) = self.v8_managed() {
+            return v8.with_mut(f);
+        }
         #[cfg(feature = "sys")]
         if let StoreMode::Native(native) = &self.inner.mode
             && !wasmer_api::sys::native_invocation_active()
@@ -1929,6 +1985,10 @@ impl StoreRef {
         args: Vec<Value>,
     ) -> Result<Box<[Value]>, RuntimeError> {
         let _keepalive = self.clone();
+        #[cfg(all(feature = "v8", feature = "wasi"))]
+        if let Some(v8) = self.v8_managed() {
+            return v8.call(function, args);
+        }
         #[cfg(feature = "sys")]
         if matches!(&self.inner.mode, StoreMode::Native(_))
             && tokio::runtime::Handle::try_current().is_ok()
@@ -2095,6 +2155,10 @@ impl StoreRef {
         externs: Vec<Extern>,
     ) -> Result<Result<Instance, InstantiationError>, RuntimeError> {
         let _keepalive = self.clone();
+        #[cfg(all(feature = "v8", feature = "wasi"))]
+        if let Some(v8) = self.v8_managed() {
+            return v8.instantiate(module, externs);
+        }
         if let Some(result) = Store::with_current(|current| {
             if current.objects_mut().id() == self.inner.id {
                 Ok(Instance::new_by_index(current, module, &externs))
@@ -2208,6 +2272,26 @@ impl StoreRef {
         value.ok_or_else(|| RuntimeError::new("native instantiation did not settle"))
     }
 
+    #[cfg(all(feature = "v8", feature = "wasi"))]
+    fn v8_managed(&self) -> Option<&v8::ManagedStore> {
+        match &self.inner.mode {
+            StoreMode::Plain(PlainStore::V8(store)) => Some(store),
+            _ => None,
+        }
+    }
+
+    #[cfg(all(feature = "v8", feature = "wasi"))]
+    pub(crate) fn is_v8_managed(&self) -> bool {
+        self.v8_managed().is_some()
+    }
+
+    #[cfg(all(feature = "v8", feature = "wasi"))]
+    pub(crate) fn v8_driver(&self) -> Result<Rc<v8::Driver>, RuntimeError> {
+        self.v8_managed()
+            .ok_or_else(|| RuntimeError::new("Store is not managed by V8"))?
+            .driver()
+    }
+
     #[cfg(feature = "wasi")]
     pub(crate) fn is_native(&self) -> bool {
         match &self.inner.mode {
@@ -2220,6 +2304,10 @@ impl StoreRef {
     #[cfg(all(feature = "sys", any(feature = "wasi", test)))]
     pub(crate) fn async_store(&self) -> Result<wasmer_api::StoreAsync, RuntimeError> {
         use wasmer_api::AsStoreAsync;
+        #[cfg(all(feature = "v8", feature = "wasi"))]
+        if let Some(v8) = self.v8_managed() {
+            return Ok(v8.asynchronous());
+        }
         match &self.inner.mode {
             StoreMode::Native(native) => Ok(native.store.as_ref().unwrap().store()),
             StoreMode::Plain(_) => Err(RuntimeError::new(
@@ -2233,6 +2321,10 @@ impl StoreRef {
         &self,
         future: impl std::future::Future<Output = R>,
     ) -> Result<R, RuntimeError> {
+        #[cfg(all(feature = "v8", feature = "wasi"))]
+        if let Some(v8) = self.v8_managed() {
+            return v8.driver()?.run(future);
+        }
         match &self.inner.mode {
             StoreMode::Native(native) => DriverUse::acquire(native)?.run(future),
             StoreMode::Plain(_) => Err(RuntimeError::new(
@@ -2510,16 +2602,21 @@ impl StoreRef {
 }
 
 #[cfg(feature = "sys")]
+fn new_owner_runtime() -> Result<tokio::runtime::Runtime, RuntimeError> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .map_err(|error| RuntimeError::new(error.to_string()))
+}
+
+#[cfg(feature = "sys")]
 impl ManagedStore {
     fn driver(&self) -> Result<Rc<Driver>, RuntimeError> {
         if let Some(driver) = self.driver.borrow().as_ref() {
             return Ok(driver.clone());
         }
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .map_err(|error| RuntimeError::new(error.to_string()))?;
+        let runtime = new_owner_runtime()?;
         let driver = Rc::new(Driver {
             runtime: std::sync::Arc::new(runtime),
             local: tokio::task::LocalSet::new(),

@@ -18,6 +18,8 @@ pub struct wasm_extern_t {
     pub(crate) store: StoreRef,
     #[cfg(all(feature = "wasi", feature = "sys"))]
     pub(crate) wasi_origin: Option<wasixv2_exec::HostEnvironment<wasixv2::MachineSyscalls>>,
+    #[cfg(all(feature = "wasi", feature = "v8"))]
+    pub(crate) wasi_v8_origin: Option<std::rc::Weak<super::wasi::v8::Endpoint>>,
 }
 
 impl wasm_extern_t {
@@ -27,6 +29,8 @@ impl wasm_extern_t {
             store,
             #[cfg(all(feature = "wasi", feature = "sys"))]
             wasi_origin: None,
+            #[cfg(all(feature = "wasi", feature = "v8"))]
+            wasi_v8_origin: None,
         }
     }
 
