@@ -6242,6 +6242,409 @@ mod tests {
         trace.record("all-no-tail-final-store-fences-completed");
     }
 
+    #[cfg(feature = "wasi")]
+    fn borrowed_capi_result(function: &mut wasm_func_t) -> (Option<Box<wasm_trap_t>>, i32) {
+        use crate::wasm_c_api::{types::wasm_valkind_enum, value::wasm_val_inner};
+        let args: wasm_val_vec_t = Vec::<wasm_val_t>::new().into();
+        let mut results: wasm_val_vec_t = vec![wasm_val_t {
+            kind: wasm_valkind_enum::WASM_I32 as u8,
+            of: wasm_val_inner { int32_t: -1973 },
+        }]
+        .into();
+        let trap = unsafe { wasm_func_call(Some(function), Some(&args), &mut results) };
+        (trap, unsafe { results.as_slice()[0].of.int32_t })
+    }
+    #[cfg(feature = "wasi")]
+    #[test]
+    fn borrowed_capi_ready_host_pending_exact_disposal_trap_and_store_reuse() {
+        use std::{
+            future::Future,
+            pin::Pin,
+            task::{Context, Poll},
+        };
+        struct PendingBody {
+            polls: Rc<std::cell::Cell<usize>>,
+            drops: Rc<std::cell::Cell<usize>>,
+        }
+        impl Future for PendingBody {
+            type Output = Result<Vec<Value>, RuntimeError>;
+            fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+                self.polls.set(self.polls.get() + 1);
+                Poll::Pending
+            }
+        }
+        impl Drop for PendingBody {
+            fn drop(&mut self) {
+                self.drops.set(self.drops.get() + 1);
+            }
+        }
+        let engine = crate::wasm_c_api::engine::wasm_engine_new();
+        let store = unsafe { wasm_store_new(Some(&engine)) }.unwrap();
+        let ready_count = Rc::new(std::cell::Cell::new(0));
+        let ready_observed = ready_count.clone();
+        let ready = store
+            .inner
+            .with_mut(|view| {
+                Function::new_async(
+                    view,
+                    wasmer_api::FunctionType::new([], [wasmer_api::Type::I32]),
+                    move |_| {
+                        let observed = ready_observed.clone();
+                        async move {
+                            assert!(!wasmer_api::sys::native_invocation_active());
+                            observed.set(observed.get() + 1);
+                            Ok(vec![Value::I32(59)])
+                        }
+                    },
+                )
+            })
+            .unwrap();
+        let polls = Rc::new(std::cell::Cell::new(0));
+        let drops = Rc::new(std::cell::Cell::new(0));
+        let p = polls.clone();
+        let d = drops.clone();
+        let pending = store
+            .inner
+            .with_mut(|view| {
+                Function::new_async(
+                    view,
+                    wasmer_api::FunctionType::new([], [wasmer_api::Type::I32]),
+                    move |_| PendingBody {
+                        polls: p.clone(),
+                        drops: d.clone(),
+                    },
+                )
+            })
+            .unwrap();
+        let trapped = store
+            .inner
+            .with_mut(|view| {
+                let module = Module::new(
+                    view,
+                    "(module (func (export \"fail\") (result i32) unreachable))",
+                )
+                .unwrap();
+                Instance::new(view, &module, &wasmer_api::imports! {})
+                    .unwrap()
+                    .exports
+                    .get_function("fail")
+                    .unwrap()
+                    .clone()
+            })
+            .unwrap();
+        let mut ready = wasm_func_t {
+            extern_: wasm_extern_t::new(store.inner.clone(), ready.into()),
+        };
+        let mut pending = wasm_func_t {
+            extern_: wasm_extern_t::new(store.inner.clone(), pending.into()),
+        };
+        let mut trapped = wasm_func_t {
+            extern_: wasm_extern_t::new(store.inner.clone(), trapped.into()),
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (error, value) = borrowed_capi_result(&mut ready);
+            assert!(error.is_none());
+            assert_eq!(value, 59);
+            let (error, value) = borrowed_capi_result(&mut pending);
+            assert_eq!(
+                error.unwrap().inner.to_trap(),
+                Some(wasmer_types::TrapCode::YieldOutsideAsyncContext)
+            );
+            assert_eq!(value, -1973, "controlled Pending must not write results");
+            assert_eq!((polls.get(), drops.get()), (1, 1));
+            let (error, value) = borrowed_capi_result(&mut trapped);
+            assert_eq!(
+                error.unwrap().inner.to_trap(),
+                Some(wasmer_types::TrapCode::UnreachableCodeReached)
+            );
+            assert_eq!(value, -1973);
+            let (error, value) = borrowed_capi_result(&mut ready);
+            assert!(error.is_none());
+            assert_eq!(value, 59);
+            assert_eq!(ready_count.get(), 2);
+            assert!(Store::with_current(|_| ()).is_none());
+            assert!(!wasmer_api::sys::native_invocation_active());
+            store.inner.with_mut(|_| ()).unwrap();
+        });
+    }
+
+    #[cfg(feature = "wasi")]
+    fn borrowed_capi_guest(
+        store: &mut wasm_store_t,
+        wat: &str,
+        imports: wasm_extern_vec_t,
+    ) -> wasm_func_t {
+        use crate::wasm_c_api::{module::wasm_module_new, types::wasm_byte_vec_t};
+        let bytes: wasm_byte_vec_t = wat::parse_str(wat).unwrap().into();
+        let module = unsafe { wasm_module_new(Some(store), Some(&bytes)) }.unwrap();
+        let instance =
+            unsafe { wasm_instance_new(Some(store), Some(&module), Some(&imports), None) }.unwrap();
+        wasm_func_t {
+            extern_: wasm_extern_t::new(
+                store.inner.clone(),
+                instance
+                    .inner
+                    .exports
+                    .get_function("run")
+                    .unwrap()
+                    .clone()
+                    .into(),
+            ),
+        }
+    }
+    #[cfg(feature = "wasi")]
+    #[test]
+    fn borrowed_capi_real_wasi_timer_yields_without_resuming_guest_and_reuses_store() {
+        use crate::wasm_c_api::{
+            module::wasm_module_new,
+            types::wasm_byte_vec_t,
+            wasi::{
+                wasi_config_new, wasi_env_delete, wasi_env_initialize_instance, wasi_env_new,
+                wasi_get_imports,
+            },
+        };
+        let engine = crate::wasm_c_api::engine::wasm_engine_new();
+        let mut store = unsafe { wasm_store_new(Some(&engine)) }.unwrap();
+        let config =
+            unsafe { wasi_config_new(std::ffi::CString::new("borrowed-timer").unwrap().as_ptr()) }
+                .unwrap();
+        let mut environment = unsafe { wasi_env_new(Some(&mut store), config) }.unwrap();
+        // Match the preview1 subscription layout exercised by the WASI poll
+        // siblings: CLOCK/MONOTONIC at 8/16, relative nanoseconds at 24.
+        let bytes: wasm_byte_vec_t = wat::parse_str(
+            r#"(module
+              (import "wasi_snapshot_preview1" "poll_oneoff"
+                (func $poll (param i32 i32 i32 i32) (result i32)))
+              (memory (export "memory") 1)
+              (func (export "run") (result i32)
+                (i32.store (i32.const 16) (i32.const 1))
+                (i64.store (i32.const 24) (i64.const 60000000000))
+                (drop (call $poll (i32.const 0) (i32.const 128)
+                  (i32.const 1) (i32.const 192)))
+                (i32.store (i32.const 256) (i32.const 1))
+                (i32.const 99))
+              (func (export "after") (result i32) (i32.load (i32.const 256)))
+              (func (export "reuse") (result i32) (i32.const 61)))"#,
+        )
+        .unwrap()
+        .into();
+        let module = unsafe { wasm_module_new(Some(&mut store), Some(&bytes)) }.unwrap();
+        let mut imports: wasm_extern_vec_t = Vec::<Option<Box<wasm_extern_t>>>::new().into();
+        assert!(unsafe {
+            wasi_get_imports(
+                Some(&store),
+                Some(&mut environment),
+                Some(&module),
+                &mut imports,
+            )
+        });
+        let mut instance =
+            unsafe { wasm_instance_new(Some(&mut store), Some(&module), Some(&imports), None) }
+                .unwrap();
+        assert!(unsafe {
+            wasi_env_initialize_instance(&mut environment, &mut store, &mut instance)
+        });
+        let exported = |name| wasm_func_t {
+            extern_: wasm_extern_t::new(
+                store.inner.clone(),
+                instance
+                    .inner
+                    .exports
+                    .get_function(name)
+                    .unwrap()
+                    .clone()
+                    .into(),
+            ),
+        };
+        let mut timer = exported("run");
+        let mut after = exported("after");
+        let mut reuse = exported("reuse");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            assert!(!wasmer_api::sys::native_invocation_active());
+            let (error, value) = borrowed_capi_result(&mut timer);
+            assert_eq!(
+                error.unwrap().inner.to_trap(),
+                Some(wasmer_types::TrapCode::YieldOutsideAsyncContext)
+            );
+            assert_eq!(value, -1973);
+            let (error, value) = borrowed_capi_result(&mut after);
+            assert!(error.is_none());
+            assert_eq!(
+                value, 0,
+                "suspended WASI import must not resume old guest frame"
+            );
+            let (error, value) = borrowed_capi_result(&mut reuse);
+            assert!(error.is_none());
+            assert_eq!(value, 61);
+            assert!(Store::with_current(|_| ()).is_none());
+            assert!(!wasmer_api::sys::native_invocation_active());
+            store.inner.with_mut(|_| ()).unwrap();
+        });
+        drop(timer);
+        drop(after);
+        drop(reuse);
+        drop(instance);
+        drop(imports);
+        drop(module);
+        wasi_env_delete(Some(environment));
+        drop(store);
+    }
+
+    #[cfg(feature = "wasi")]
+    fn borrowed_public_foreign_chain(trap: bool) {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        };
+        struct Other {
+            target: WeakStoreRef,
+            function: Function,
+            parent: wasmer_types::StoreId,
+            observations: Arc<AtomicBool>,
+            calls: Arc<AtomicUsize>,
+        }
+        unsafe extern "C" fn bridge(
+            data: *mut std::ffi::c_void,
+            args: &wasm_val_vec_t,
+            results: &mut wasm_val_vec_t,
+        ) -> Option<Box<wasm_trap_t>> {
+            let data = unsafe { &*data.cast::<Other>() };
+            let before = Store::with_current(|store| store.objects_mut().id()) == Some(data.parent);
+            let Some(target) = data.target.upgrade() else {
+                return Some(Box::new(
+                    RuntimeError::new("test foreign Store disappeared").into(),
+                ));
+            };
+            let mut function = wasm_func_t {
+                extern_: wasm_extern_t::new(target, data.function.clone().into()),
+            };
+            let result = unsafe { wasm_func_call(Some(&mut function), Some(args), results) };
+            let after = Store::with_current(|store| store.objects_mut().id()) == Some(data.parent);
+            data.observations.fetch_and(
+                before && after && !wasmer_api::sys::native_invocation_active(),
+                Ordering::SeqCst,
+            );
+            data.calls.fetch_add(1, Ordering::SeqCst);
+            result
+        }
+        unsafe extern "C" fn finalize(data: *mut std::ffi::c_void) {
+            drop(unsafe { Box::from_raw(data.cast::<Other>()) });
+        }
+        fn callback(
+            store: &mut wasm_store_t,
+            target: &wasm_store_t,
+            function: &wasm_func_t,
+            observations: &Arc<AtomicBool>,
+            calls: &Arc<AtomicUsize>,
+        ) -> Box<wasm_func_t> {
+            let data = Box::into_raw(Box::new(Other {
+                target: target.inner.downgrade(),
+                function: function.extern_.function(),
+                parent: store.inner.inner.id,
+                observations: observations.clone(),
+                calls: calls.clone(),
+            }));
+            let ty =
+                wasm_functype_t::new(wasmer_api::FunctionType::new([], [wasmer_api::Type::I32]));
+            unsafe {
+                wasm_func_new_with_env(
+                    Some(store),
+                    Some(&ty),
+                    Some(bridge),
+                    data.cast(),
+                    Some(finalize),
+                )
+            }
+            .unwrap()
+        }
+        let engine = crate::wasm_c_api::engine::wasm_engine_new();
+        let mut a = unsafe { wasm_store_new(Some(&engine)) }.unwrap();
+        let mut b = unsafe { wasm_store_new(Some(&engine)) }.unwrap();
+        let mut leaf = borrowed_capi_guest(
+            &mut a,
+            if trap {
+                "(module (func (export \"run\") (result i32) unreachable))"
+            } else {
+                "(module (func (export \"run\") (result i32) i32.const 37))"
+            },
+            Vec::<Option<Box<wasm_extern_t>>>::new().into(),
+        );
+        let observations = Arc::new(AtomicBool::new(true));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let b_bridge = callback(&mut b, &a, &leaf, &observations, &calls);
+        let b_guest = borrowed_capi_guest(
+            &mut b,
+            "(module (import \"test\" \"bridge\" (func $b (result i32))) (func (export \"run\") (result i32) call $b i32.const 5 i32.add))",
+            vec![Some(Box::new(b_bridge.extern_.clone()))].into(),
+        );
+        let a_bridge = callback(&mut a, &b, &b_guest, &observations, &calls);
+        let mut outer = borrowed_capi_guest(
+            &mut a,
+            "(module (import \"test\" \"bridge\" (func $b (result i32))) (func (export \"run\") (result i32) call $b i32.const 10 i32.add))",
+            vec![Some(Box::new(a_bridge.extern_.clone()))].into(),
+        );
+        let mut reuse = borrowed_capi_guest(
+            &mut a,
+            "(module (func (export \"run\") (result i32) i32.const 61))",
+            Vec::<Option<Box<wasm_extern_t>>>::new().into(),
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (error, value) = borrowed_capi_result(&mut outer);
+            if trap {
+                assert_eq!(
+                    error.unwrap().inner.to_trap(),
+                    Some(wasmer_types::TrapCode::UnreachableCodeReached)
+                );
+                assert_eq!(
+                    value, -1973,
+                    "no old outer guest code resumes after callee trap"
+                );
+            } else {
+                assert!(
+                    error.is_none(),
+                    "{:?}",
+                    error.map(|error| error.inner.message())
+                );
+                assert_eq!(value, 52);
+            }
+            assert!(observations.load(Ordering::SeqCst));
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            assert!(Store::with_current(|_| ()).is_none());
+            let (error, value) = borrowed_capi_result(&mut reuse);
+            assert!(error.is_none());
+            assert_eq!(value, 61);
+            a.inner.with_mut(|_| ()).unwrap();
+            b.inner.with_mut(|_| ()).unwrap();
+            assert!(!wasmer_api::sys::native_invocation_active());
+            // Leaf remains a real public handle after the outer chain too.
+            if !trap {
+                assert_eq!(borrowed_capi_result(&mut leaf).1, 37);
+            }
+        });
+    }
+    #[cfg(feature = "wasi")]
+    #[test]
+    fn borrowed_public_cross_store_a_b_a_returns_values_and_restores_parents() {
+        borrowed_public_foreign_chain(false);
+    }
+    #[cfg(feature = "wasi")]
+    #[test]
+    fn borrowed_public_cross_store_a_b_a_trap_unwinds_and_preserves_store_reuse() {
+        borrowed_public_foreign_chain(true);
+    }
+
     #[cfg(all(unix, feature = "wasi"))]
     #[test]
     fn pure_tokio_last_public_store_preserves_live_source_callback_and_wasi_cleanup() {
