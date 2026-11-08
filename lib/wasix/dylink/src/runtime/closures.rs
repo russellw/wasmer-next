@@ -644,13 +644,14 @@ impl<S: Syscalls + Control + Send + Sync + 'static> StoreImage<S> {
                     environment,
                 });
             }
-            let state = lock(&self.root.state);
-            let publication = Publication {
-                graph: Arc::new(graph),
-                references: state.references.clone(),
-                ctors: state.ctors.clone(),
+            let publication = {
+                let state = lock(&self.root.state);
+                Publication {
+                    graph: Arc::new(graph),
+                    references: state.references.clone(),
+                    ctors: state.ctors.clone(),
+                }
             };
-            drop(state);
             *lock(&work.publication) = Some(publication);
             for phase in [LoaderPhase::Prepare, LoaderPhase::Apply] {
                 coordinator
