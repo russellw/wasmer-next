@@ -406,3 +406,418 @@ mod tests {
         eprintln!("canonical-v8-public-env-import-start-args-env-write-pending-cleanup-complete");
     }
 }
+
+#[cfg(test)]
+mod reentry_tests {
+    use super::*;
+    use crate::wasm_c_api::{
+        engine::{
+            wasm_config_new, wasm_config_set_backend, wasm_engine_new_with_config, wasm_engine_t,
+            wasmer_backend_t,
+        },
+        externals::{
+            wasm_extern_as_func, wasm_extern_copy, wasm_extern_t, wasm_extern_vec_t,
+            wasm_func_as_extern, wasm_func_call, wasm_func_copy, wasm_func_new_with_env,
+            wasm_func_t,
+        },
+        instance::{wasm_instance_exports, wasm_instance_new},
+        module::{wasm_module_new, wasm_module_t},
+        store::{wasm_store_new, wasm_store_t},
+        trap::wasm_trap_t,
+        types::{wasm_byte_vec_t, wasm_functype_t, wasm_valkind_enum},
+        value::{wasm_val_inner, wasm_val_t, wasm_val_vec_t},
+        wasi::{
+            wasi_config_new, wasi_env_delete, wasi_env_initialize_instance, wasi_env_new,
+            wasi_get_imports,
+        },
+    };
+    use std::{
+        ffi::{CString, c_void},
+        sync::atomic::{AtomicI32, AtomicUsize, Ordering},
+    };
+
+    fn owned_child(name: &str, variable: &str) -> bool {
+        if std::env::var_os(variable).is_some() {
+            return true;
+        }
+        struct Owned(std::process::Child);
+        impl Drop for Owned {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = Owned(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture"])
+                .env(variable, "1")
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            match child.0.try_wait() {
+                Ok(Some(status)) => {
+                    assert!(status.success(), "V8 reentry child failed: {status}");
+                    return false;
+                }
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10))
+                }
+                status => panic!("V8 reentry did not finish: {status:?}"),
+            }
+        }
+    }
+    fn public_store() -> (Box<wasm_engine_t>, Box<wasm_store_t>) {
+        let mut config = wasm_config_new();
+        wasm_config_set_backend(&mut config, wasmer_backend_t::V8);
+        let engine = wasm_engine_new_with_config(Some(config)).unwrap();
+        let store = unsafe { wasm_store_new(Some(&engine)) }.unwrap();
+        (engine, store)
+    }
+    fn module(store: &mut wasm_store_t, source: &str) -> Box<wasm_module_t> {
+        let bytes: wasm_byte_vec_t = wat::parse_str(source).unwrap().into();
+        unsafe { wasm_module_new(Some(store), Some(&bytes)) }.unwrap()
+    }
+    fn result() -> wasm_val_vec_t {
+        vec![wasm_val_t {
+            kind: wasm_valkind_enum::WASM_I32 as _,
+            of: wasm_val_inner { int32_t: 0 },
+        }]
+        .into()
+    }
+    fn call(function: &mut wasm_func_t) -> i32 {
+        let args: wasm_val_vec_t = Vec::<wasm_val_t>::new().into();
+        let mut result = result();
+        let trap = unsafe { wasm_func_call(Some(function), Some(&args), &mut result) };
+        assert!(
+            trap.is_none(),
+            "public V8 call trapped: {:?}",
+            trap.map(|trap| trap.inner.to_string())
+        );
+        unsafe { result.as_slice()[0].of.int32_t }
+    }
+
+    struct Callback {
+        nested: *mut wasm_func_t,
+        survivor: *mut wasm_func_t,
+        calls: Arc<AtomicUsize>,
+        drops: Arc<AtomicUsize>,
+        final_value: Arc<AtomicI32>,
+        final_traps: Arc<std::sync::Mutex<Vec<Box<wasm_trap_t>>>>,
+    }
+    unsafe extern "C" fn nested_callback(
+        data: *mut c_void,
+        _: &wasm_val_vec_t,
+        output: &mut wasm_val_vec_t,
+    ) -> Option<Box<wasm_trap_t>> {
+        let data = unsafe { &*data.cast::<Callback>() };
+        data.calls.fetch_add(1, Ordering::SeqCst);
+        let args: wasm_val_vec_t = Vec::<wasm_val_t>::new().into();
+        let mut result = result();
+        if let Some(trap) =
+            unsafe { wasm_func_call(Some(&mut *data.nested), Some(&args), &mut result) }
+        {
+            return Some(trap);
+        }
+        let value = unsafe { result.as_slice()[0].of.int32_t };
+        let Some(slot) = output.as_uninit_slice().first_mut() else {
+            return Some(Box::new(wasm_trap_t {
+                inner: RuntimeError::new("missing C callback result slot"),
+            }));
+        };
+        slot.write(wasm_val_t {
+            kind: wasm_valkind_enum::WASM_I32 as _,
+            of: wasm_val_inner { int32_t: value + 1 },
+        });
+        None
+    }
+    unsafe extern "C" fn delete_callback(data: *mut c_void) {
+        let data = unsafe { Box::from_raw(data.cast::<Callback>()) };
+        let args: wasm_val_vec_t = Vec::<wasm_val_t>::new().into();
+        let mut result = result();
+        let trap = unsafe { wasm_func_call(Some(&mut *data.survivor), Some(&args), &mut result) };
+        if let Some(trap) = trap {
+            // Keep an actual error owned until Rust assertions outside C ABI.
+            data.final_traps
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(trap);
+        } else {
+            data.final_value
+                .store(unsafe { result.as_slice()[0].of.int32_t }, Ordering::SeqCst);
+        }
+        data.drops.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn public_c_callback_nested_wasi_timer_restores_ambient_runtime_and_drops_into_live_store() {
+        if !owned_child(
+            "wasm_c_api::wasi::v8::reentry_tests::public_c_callback_nested_wasi_timer_restores_ambient_runtime_and_drops_into_live_store",
+            "WASMER_CAPI_V8_NESTED_WASI_CHILD",
+        ) {
+            return;
+        }
+        let (live_engine, mut live_store) = public_store();
+        let live_module = module(
+            &mut live_store,
+            "(module (func (export \"run\") (result i32) i32.const 37))",
+        );
+        let empty: wasm_extern_vec_t = Vec::<Option<Box<wasm_extern_t>>>::new().into();
+        let live_instance = unsafe {
+            wasm_instance_new(
+                Some(&mut live_store),
+                Some(&live_module),
+                Some(&empty),
+                None,
+            )
+        }
+        .unwrap();
+        let mut live_exports: wasm_extern_vec_t = Vec::<Option<Box<wasm_extern_t>>>::new().into();
+        unsafe {
+            wasm_instance_exports(&live_instance, &mut live_exports);
+        }
+        let mut survivor =
+            wasm_func_copy(wasm_extern_as_func(live_exports.as_slice()[0].as_deref()).unwrap());
+
+        let (engine, mut store) = public_store();
+        let name = CString::new("nested-v8-wasi").unwrap();
+        let config = unsafe { wasi_config_new(name.as_ptr()) }.unwrap();
+        let mut env = unsafe { wasi_env_new(Some(&mut store), config) }.unwrap();
+        let timer_module = module(
+            &mut store,
+            r#"(module
+            (import "wasi_snapshot_preview1" "poll_oneoff" (func $poll (param i32 i32 i32 i32) (result i32)))
+            (memory (export "memory") 1)
+            (func (export "run") (result i32)
+                i32.const 0 i64.const 17 i64.store
+                i32.const 16 i32.const 1 i32.store
+                i32.const 24 i64.const 50000000 i64.store
+                i32.const 32 i64.const 1 i64.store
+                i32.const 0 i32.const 128 i32.const 1 i32.const 256 call $poll if unreachable end
+                i32.const 256 i32.load i32.const 1 i32.ne if unreachable end
+                i32.const 41))"#,
+        );
+        let mut imports: wasm_extern_vec_t = Vec::<Option<Box<wasm_extern_t>>>::new().into();
+        assert!(unsafe {
+            wasi_get_imports(
+                Some(&store),
+                Some(&mut env),
+                Some(&timer_module),
+                &mut imports,
+            )
+        });
+        let mut timer_instance = unsafe {
+            wasm_instance_new(Some(&mut store), Some(&timer_module), Some(&imports), None)
+        }
+        .unwrap();
+        assert!(unsafe { wasi_env_initialize_instance(&mut env, &mut store, &mut timer_instance) });
+        let mut timer_exports: wasm_extern_vec_t = Vec::<Option<Box<wasm_extern_t>>>::new().into();
+        unsafe {
+            wasm_instance_exports(&timer_instance, &mut timer_exports);
+        }
+        let mut timer =
+            wasm_func_copy(wasm_extern_as_func(timer_exports.as_slice()[1].as_deref()).unwrap());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let final_value = Arc::new(AtomicI32::new(0));
+        let final_traps = Arc::new(std::sync::Mutex::new(Vec::new()));
+        // Borrowed C handles stay actually owned outside the Store allocation;
+        // the userdata neither owns a StoreRef nor retains a Store cycle.
+        let userdata = Box::into_raw(Box::new(Callback {
+            nested: &mut *timer,
+            survivor: &mut *survivor,
+            calls: calls.clone(),
+            drops: drops.clone(),
+            final_value: final_value.clone(),
+            final_traps: final_traps.clone(),
+        }));
+        let signature =
+            wasm_functype_t::new(wasmer_api::FunctionType::new([], [wasmer_api::Type::I32]));
+        let callback = unsafe {
+            wasm_func_new_with_env(
+                Some(&mut store),
+                Some(&signature),
+                Some(nested_callback),
+                userdata.cast(),
+                Some(delete_callback),
+            )
+        }
+        .unwrap();
+        let nested_module = module(
+            &mut store,
+            r#"(module
+            (import "host" "nested" (func $nested (result i32)))
+            (func $boot call $nested drop) (start $boot)
+            (func (export "run") (result i32) call $nested))"#,
+        );
+        let callback_imports: wasm_extern_vec_t = vec![Some(unsafe {
+            wasm_extern_copy(wasm_func_as_extern(Some(&callback)).unwrap())
+        })]
+        .into();
+        let nested_instance = unsafe {
+            wasm_instance_new(
+                Some(&mut store),
+                Some(&nested_module),
+                Some(&callback_imports),
+                None,
+            )
+        }
+        .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "actual Wasm start must enter the C callback"
+        );
+        let mut nested_exports: wasm_extern_vec_t = Vec::<Option<Box<wasm_extern_t>>>::new().into();
+        unsafe {
+            wasm_instance_exports(&nested_instance, &mut nested_exports);
+        }
+        let mut run =
+            wasm_func_copy(wasm_extern_as_func(nested_exports.as_slice()[0].as_deref()).unwrap());
+        let driver = store.inner.v8_driver().unwrap();
+        let weak_store = store.inner.downgrade();
+        let weak_driver = Rc::downgrade(&driver);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let original = tokio::spawn(async {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                19
+            });
+            let before = driver.pending_imports();
+            assert_eq!(call(&mut run), 42);
+            assert!(
+                driver.pending_imports() > before,
+                "nested timer import must actually return Pending"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                tokio::runtime::Handle::current().runtime_flavor(),
+                tokio::runtime::RuntimeFlavor::CurrentThread
+            );
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+            drop(run);
+            drop(nested_exports);
+            drop(nested_instance);
+            drop(callback_imports);
+            drop(nested_module);
+            drop(callback);
+            drop(timer);
+            drop(timer_exports);
+            drop(timer_instance);
+            drop(imports);
+            drop(timer_module);
+            wasi_env_delete(Some(env));
+            drop(driver);
+            drop(store); // actual userdata Drop calls the still-live unrelated S
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            let traps = final_traps.lock().unwrap().drain(..).collect::<Vec<_>>();
+            assert!(
+                traps.is_empty(),
+                "live-Store finalizer reentry trapped: {:?}",
+                traps
+                    .into_iter()
+                    .map(|trap| trap.inner.to_string())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(final_value.load(Ordering::SeqCst), 37);
+            assert!(weak_store.upgrade().is_none());
+            assert!(weak_driver.upgrade().is_none());
+            assert_eq!(
+                tokio::runtime::Handle::current().runtime_flavor(),
+                tokio::runtime::RuntimeFlavor::CurrentThread
+            );
+            assert_eq!(original.await.unwrap(), 19);
+        });
+        assert_eq!(call(&mut survivor), 37);
+        drop(runtime);
+        drop(engine);
+        drop(survivor);
+        drop(live_exports);
+        drop(live_instance);
+        drop(live_module);
+        drop(empty);
+        drop(live_store);
+        drop(live_engine);
+    }
+
+    #[test]
+    fn public_v8_on_called_reborrows_the_checked_store_then_replays_without_a_guard() {
+        if !owned_child(
+            "wasm_c_api::wasi::v8::reentry_tests::public_v8_on_called_reborrows_the_checked_store_then_replays_without_a_guard",
+            "WASMER_CAPI_V8_ON_CALLED_CHILD",
+        ) {
+            return;
+        }
+        let (engine, mut store) = public_store();
+        let module = module(
+            &mut store,
+            r#"(module
+            (global $calls (mut i32) (i32.const 0))
+            (func (export "run") (result i32)
+                global.get $calls i32.const 1 i32.add global.set $calls global.get $calls))"#,
+        );
+        let imports: wasm_extern_vec_t = Vec::<Option<Box<wasm_extern_t>>>::new().into();
+        let instance =
+            unsafe { wasm_instance_new(Some(&mut store), Some(&module), Some(&imports), None) }
+                .unwrap();
+        let mut exports: wasm_extern_vec_t = Vec::<Option<Box<wasm_extern_t>>>::new().into();
+        unsafe {
+            wasm_instance_exports(&instance, &mut exports);
+        }
+        let mut run =
+            wasm_func_copy(wasm_extern_as_func(exports.as_slice()[0].as_deref()).unwrap());
+        let target = store
+            .inner
+            .with_mut(|store| Function::new_typed(store, || 73i32))
+            .unwrap();
+        let weak = store.inner.downgrade();
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let nested_result = Arc::new(AtomicI32::new(0));
+        let observed = callbacks.clone();
+        let nested_observed = nested_result.clone();
+        store
+            .inner
+            .with_mut(|store| {
+                store.on_called(move |mut current| {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    let nested: Result<Box<[wasmer_api::Value]>, RuntimeError> =
+                        current.parked(|| {
+                            weak.upgrade()
+                                .ok_or_else(|| RuntimeError::new("checked Store expired"))?
+                                .with_mut(|checked| target.call(checked, &[]))?
+                        });
+                    let nested = nested?;
+                    nested_observed.store(nested[0].i32().unwrap_or(-1), Ordering::SeqCst);
+                    current.on_called(move |_| {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        Ok(wasmer_types::OnCalledAction::Finish)
+                    });
+                    Ok(wasmer_types::OnCalledAction::InvokeAgain)
+                });
+            })
+            .unwrap();
+        assert_eq!(
+            call(&mut run),
+            2,
+            "same guest root must be invoked exactly twice"
+        );
+        assert_eq!(callbacks.load(Ordering::SeqCst), 2);
+        assert_eq!(nested_result.load(Ordering::SeqCst), 73);
+        assert_eq!(
+            call(&mut run),
+            3,
+            "one-shot callback and actual guard must be gone"
+        );
+        drop(run);
+        drop(exports);
+        drop(instance);
+        drop(module);
+        drop(imports);
+        drop(store);
+        drop(engine);
+    }
+}
