@@ -1644,6 +1644,16 @@ impl StoreRef {
             && tokio::runtime::Handle::try_current().is_ok()
             && !wasmer_api::sys::native_invocation_active()
         {
+            let StoreMode::Native(native) = &self.inner.mode else {
+                unreachable!()
+            };
+            let driver = DriverUse::acquire(native)?;
+            let _claim = ServiceClaimLease::new(native.ledger.clone());
+            let _entered = driver.entered();
+            let _runtime = driver.runtime.enter();
+            let _local = driver.local.enter();
+            // Supply the EXISTING host context for timer/loader first polls,
+            // without polling its LocalSet or adopting an async root/producer.
             let result = Store::with_current(|current| {
                 current.parked(|| self.with_mut(|store| function.call(store, &args)))
             })
