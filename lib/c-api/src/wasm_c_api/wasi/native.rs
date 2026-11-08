@@ -1162,7 +1162,7 @@ mod tests {
                 data.leaf.as_ref().unwrap().call(&mut actual)
             });
             let entered = saves.clone();
-            let save = Function::new_typed_with_env_async_captured(actual, wasi.environment().environment(), move |env| {
+            let save = Function::new_typed_with_env_async_captured(actual, wasi.environment().environment(), move |env: wasmer_api::AsyncFunctionEnvMut<wasixv2_exec::ExecEnv<MachineSyscalls>>| {
                 let entered = entered.clone();
                 async move {
                     assert!(env.native_local_owner().is_some(), "capture survives outside the coroutine");
@@ -1404,7 +1404,9 @@ mod tests {
                 let probe = Function::new_typed_with_env_async_captured(
                     actual,
                     wasi.environment().environment(),
-                    move |env| {
+                    move |env: wasmer_api::AsyncFunctionEnvMut<
+                        wasixv2_exec::ExecEnv<MachineSyscalls>,
+                    >| {
                         let dead = weak_dead.upgrade().unwrap();
                         async move {
                             if env.native_import_snapshot().is_none() {
