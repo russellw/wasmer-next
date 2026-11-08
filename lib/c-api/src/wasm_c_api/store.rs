@@ -6748,6 +6748,536 @@ mod tests {
     }
     #[cfg(feature = "wasi")]
     #[test]
+    fn initialized_start_escaped_helper_cancellation_preserves_first_panic_and_original_driver() {
+        use crate::wasm_c_api::{
+            module::wasm_module_new,
+            types::wasm_byte_vec_t,
+            wasi::{
+                wasi_config_new, wasi_env_delete, wasi_env_initialize_instance, wasi_env_new,
+                wasi_get_imports,
+            },
+        };
+        use std::{
+            cell::Cell,
+            future::Future,
+            pin::Pin,
+            sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            },
+            task::{Context, Poll, Waker},
+        };
+        use wasixv2_syscalls::UserMemory;
+        use wasmer_api::sys::{NativeAncestrySettlement, NativeFrameGuard, WeakNativeInvocation};
+        use wasmer_api::{AsStoreAsync, AsyncFunctionEnvMut, FunctionEnv, FunctionType, Type};
+        type Env = AsyncFunctionEnvMut<wasixv2_exec::ExecEnv<wasixv2::MachineSyscalls>>;
+        const TEST: &str = "wasm_c_api::store::tests::initialized_start_escaped_helper_cancellation_preserves_first_panic_and_original_driver";
+        const CHILD: &str = "WASMER_CAPI_ESCAPED_ENTRY_CHILD";
+        let directory = match std::env::var_os(CHILD) {
+            Some(path) => std::path::PathBuf::from(path),
+            None => {
+                struct Directory(std::path::PathBuf);
+                impl Drop for Directory {
+                    fn drop(&mut self) {
+                        let _ = std::fs::remove_dir_all(&self.0);
+                    }
+                }
+                struct OwnedChild(std::process::Child);
+                impl Drop for OwnedChild {
+                    fn drop(&mut self) {
+                        let _ = self.0.kill();
+                        let _ = self.0.wait();
+                    }
+                }
+                let directory = Directory(std::env::temp_dir().join(format!(
+                    "wasmer-entry-escaped-{}-{:?}",
+                    std::process::id(),
+                    std::thread::current().id()
+                )));
+                std::fs::create_dir(&directory.0).unwrap();
+                let mut child = OwnedChild(
+                    std::process::Command::new(std::env::current_exe().unwrap())
+                        .args(["--exact", TEST, "--nocapture"])
+                        .env(CHILD, &directory.0)
+                        .spawn()
+                        .unwrap(),
+                );
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+                loop {
+                    if let Some(status) = child.0.try_wait().unwrap() {
+                        assert!(status.success(), "escaped helper child failed: {status}");
+                        assert_eq!(
+                            std::fs::read_to_string(directory.0.join("complete")).unwrap(),
+                            "both-physical-profiles-completed"
+                        );
+                        return;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "escaped helper child did not finish"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        };
+        struct Primary(Arc<AtomicUsize>);
+        impl Drop for Primary {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        struct Secondary(Arc<AtomicUsize>);
+        impl Drop for Secondary {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        struct BodyDrop {
+            body: Arc<AtomicUsize>,
+            secondary: Option<Arc<AtomicUsize>>,
+        }
+        impl Drop for BodyDrop {
+            fn drop(&mut self) {
+                self.body.fetch_add(1, Ordering::SeqCst);
+                if let Some(secondary) = self.secondary.take() {
+                    std::panic::panic_any(Secondary(secondary));
+                }
+            }
+        }
+        struct VmDrop(Arc<AtomicUsize>);
+        impl Drop for VmDrop {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        struct Probe {
+            frame: RefCell<Option<NativeFrameGuard>>,
+            main: RefCell<Option<WeakNativeInvocation>>,
+            entry: RefCell<Weak<CallEntry>>,
+            settlement: RefCell<Option<NativeAncestrySettlement>>,
+            leaf: RefCell<Option<Function>>,
+            release_rx: RefCell<Option<tokio::sync::oneshot::Receiver<()>>>,
+            pending_rx: RefCell<Option<tokio::sync::oneshot::Receiver<()>>>,
+            pending_tx: RefCell<Option<tokio::sync::oneshot::Sender<()>>>,
+            complete_rx: RefCell<Option<tokio::sync::oneshot::Receiver<()>>>,
+            complete_tx: RefCell<Option<tokio::sync::oneshot::Sender<()>>>,
+            reuse: Cell<bool>,
+            task_admitted: Cell<bool>,
+            pinned: Cell<bool>,
+            sibling_pending: Cell<bool>,
+            released: Cell<bool>,
+            helper_factories: Cell<usize>,
+            primary_pointer: Cell<usize>,
+            primary_drops: Arc<AtomicUsize>,
+            secondary_drops: Arc<AtomicUsize>,
+            helper_drops: Arc<AtomicUsize>,
+            outer_drops: Arc<AtomicUsize>,
+            leaf_drops: Arc<AtomicUsize>,
+            outer_depth_one: Cell<usize>,
+            leaf_depth_two: Cell<usize>,
+        }
+        struct PendingHelper {
+            state: Weak<Probe>,
+            root: WeakNativeInvocation,
+            first: bool,
+            primary: Option<Box<Primary>>,
+            _drop: BodyDrop,
+        }
+        impl Future for PendingHelper {
+            type Output = Result<(), RuntimeError>;
+            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+                let this = self.get_mut();
+                if std::mem::take(&mut this.first) {
+                    assert!(WeakNativeInvocation::current().is_none());
+                    let state = this.state.upgrade().unwrap();
+                    // SAFETY: the ORIGINAL helper factory captured this exact
+                    // root, which has now yielded. This owner-thread external
+                    // frame has no independently parking descendants and its
+                    // SAME guard leaves only after its finite task's scopes.
+                    let frame = unsafe { this.root.enter_descendant_frame() }.unwrap();
+                    let previous = state.frame.borrow_mut().replace(frame);
+                    assert!(previous.is_none());
+                    state.pinned.set(true);
+                    cx.waker().wake_by_ref(); // one finite next poll, not a Pending loop
+                    return Poll::Pending;
+                }
+                std::panic::resume_unwind(this.primary.take().unwrap())
+            }
+        }
+        for secondary in [false, true] {
+            let engine = crate::wasm_c_api::engine::wasm_engine_new();
+            let mut target = unsafe { wasm_store_new(Some(&engine)) }.unwrap();
+            let config = unsafe {
+                wasi_config_new(std::ffi::CString::new("escaped-helper").unwrap().as_ptr())
+            }
+            .unwrap();
+            let mut wasi = unsafe { wasi_env_new(Some(&mut target), config) }.unwrap();
+            // Existing CAPI import metadata yields the exact attached environment;
+            // no target/name/origin inference or new test accessor is introduced.
+            let bytes: wasm_byte_vec_t = wat::parse_str(
+                r#"(module
+                (import "wasix_32v1" "sched_yield" (func (result i32)))
+                (memory (export "memory") 1))"#,
+            )
+            .unwrap()
+            .into();
+            let origin_module =
+                unsafe { wasm_module_new(Some(&mut target), Some(&bytes)) }.unwrap();
+            let mut origin_imports: wasm_extern_vec_t =
+                Vec::<Option<Box<wasm_extern_t>>>::new().into();
+            assert!(unsafe {
+                wasi_get_imports(
+                    Some(&target),
+                    Some(&mut wasi),
+                    Some(&origin_module),
+                    &mut origin_imports,
+                )
+            });
+            let environment = origin_imports.as_slice()[0]
+                .as_ref()
+                .unwrap()
+                .wasi_origin
+                .clone()
+                .unwrap();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let (pending_tx, pending_rx) = tokio::sync::oneshot::channel();
+            let (complete_tx, complete_rx) = tokio::sync::oneshot::channel();
+            let state = Rc::new(Probe {
+                frame: RefCell::default(),
+                main: RefCell::default(),
+                entry: RefCell::new(Weak::new()),
+                settlement: RefCell::default(),
+                leaf: RefCell::default(),
+                release_rx: RefCell::new(Some(release_rx)),
+                pending_rx: RefCell::new(Some(pending_rx)),
+                pending_tx: RefCell::new(Some(pending_tx)),
+                complete_rx: RefCell::new(Some(complete_rx)),
+                complete_tx: RefCell::new(Some(complete_tx)),
+                reuse: Cell::new(false),
+                task_admitted: Cell::new(false),
+                pinned: Cell::new(false),
+                sibling_pending: Cell::new(false),
+                released: Cell::new(false),
+                helper_factories: Cell::new(0),
+                primary_pointer: Cell::new(0),
+                primary_drops: Arc::default(),
+                secondary_drops: Arc::default(),
+                helper_drops: Arc::default(),
+                outer_drops: Arc::default(),
+                leaf_drops: Arc::default(),
+                outer_depth_one: Cell::new(0),
+                leaf_depth_two: Cell::new(0),
+            });
+            let weak = Rc::downgrade(&state);
+            let vm_drops = Arc::new(AtomicUsize::new(0));
+            let vm = target
+                .inner
+                .with_mut(|actual| FunctionEnv::new(actual, VmDrop(vm_drops.clone())))
+                .unwrap();
+            let (functions, sibling) = target
+                .inner
+                .with_mut(|actual| {
+                    let outer_weak = weak.clone();
+                    let outer = Function::new_typed_with_env_async_captured(
+                        actual,
+                        environment.environment(),
+                        move |env: Env| {
+                            let state = outer_weak.upgrade().unwrap();
+                            let previous = state
+                                .main
+                                .borrow_mut()
+                                .replace(WeakNativeInvocation::current().unwrap());
+                            drop(previous);
+                            async move {
+                                let _drop = BodyDrop {
+                                    body: state.outer_drops.clone(),
+                                    secondary: None,
+                                };
+                                if !wasixv2_exec::GuestMemory::new(&env).can_duplicate().await {
+                                    return Err(RuntimeError::new(
+                                        "entry did not reset to depth one",
+                                    ));
+                                }
+                                state.outer_depth_one.set(state.outer_depth_one.get() + 1);
+                                let leaf = state.leaf.borrow().as_ref().unwrap().clone();
+                                let result = wasixv2_exec::call_guest(&env, &leaf, &[]).await?;
+                                if result.as_ref() != [Value::I32(42)] {
+                                    return Err(RuntimeError::new("nested guest result changed"));
+                                }
+                                Ok::<(), RuntimeError>(())
+                            }
+                        },
+                        wasixv2_exec::asyncify::capture_host_entry::<wasixv2::MachineSyscalls>,
+                    );
+                    let leaf_weak = weak.clone();
+                    let save = Function::new_typed_with_env_async_captured(
+                        actual,
+                        environment.environment(),
+                        move |env: Env| {
+                            let state = leaf_weak.upgrade().unwrap();
+                            async move {
+                                let _drop = BodyDrop {
+                                    body: state.leaf_drops.clone(),
+                                    secondary: None,
+                                };
+                                if wasixv2_exec::GuestMemory::new(&env).can_duplicate().await {
+                                    return Err(RuntimeError::new(
+                                        "nested call failed to enter depth two",
+                                    ));
+                                }
+                                state.leaf_depth_two.set(state.leaf_depth_two.get() + 1);
+                                if !state.reuse.get() {
+                                    wasixv2_exec::asyncify::import::save(&env, 64).await?;
+                                }
+                                Ok::<(), RuntimeError>(())
+                            }
+                        },
+                        wasixv2_exec::asyncify::capture_host_entry::<wasixv2::MachineSyscalls>,
+                    );
+                    let helper_weak = weak.clone();
+                    let helper = Function::new_typed_with_env_async_captured(
+                        actual,
+                        environment.environment(),
+                        move |env: Env| -> Pin<Box<dyn Future<Output = Result<(), RuntimeError>>>> {
+                            let state = helper_weak.upgrade().unwrap();
+                            let root = WeakNativeInvocation::current().unwrap();
+                            assert!(
+                                !state.main.borrow().as_ref().unwrap().is_current(),
+                                "must observe the actual distinct helper root"
+                            );
+                            state.helper_factories.set(state.helper_factories.get() + 1);
+                            let owner = env
+                                .native_local_owner()
+                                .unwrap()
+                                .upgrade()
+                                .unwrap()
+                                .downcast::<CallOwner>()
+                                .ok()
+                                .unwrap();
+                            let entry = owner.entry.borrow().clone().unwrap();
+                            *state.entry.borrow_mut() = Rc::downgrade(&entry);
+                            drop(entry);
+                            drop(owner);
+                            *state.settlement.borrow_mut() =
+                                NativeAncestrySettlement::current(None);
+                            let release = state.release_rx.borrow_mut().take().unwrap();
+                            let pending = state.pending_rx.borrow_mut().take().unwrap();
+                            let complete = state.complete_tx.borrow_mut().take().unwrap();
+                            let task_weak = helper_weak.clone();
+                            // ADMIT inside this ACTUAL helper factory, before its
+                            // Pending/I. The SAME original LocalSet owns this finite task.
+                            let task = tokio::task::spawn_local(async move {
+                                release.await.unwrap();
+                                pending.await.unwrap(); // actual sibling Receiver::Pending
+                                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                                let state = task_weak.upgrade().unwrap();
+                                assert!(state.sibling_pending.get());
+                                let frame = state.frame.borrow_mut().take().unwrap();
+                                drop(state);
+                                drop(frame); // no cell/Store borrow; actual physical release
+                                task_weak.upgrade().unwrap().released.set(true);
+                                complete.send(()).unwrap(); // AFTER actual guard Drop returns
+                            });
+                            state.task_admitted.set(true);
+                            drop(task);
+                            let primary = Box::new(Primary(state.primary_drops.clone()));
+                            state
+                                .primary_pointer
+                                .set((&*primary as *const Primary) as usize);
+                            Box::pin(PendingHelper {
+                                state: helper_weak.clone(),
+                                root,
+                                first: true,
+                                primary: Some(primary),
+                                _drop: BodyDrop {
+                                    body: state.helper_drops.clone(),
+                                    secondary: secondary.then(|| state.secondary_drops.clone()),
+                                },
+                            })
+                        },
+                        wasixv2_exec::asyncify::capture_host_entry::<wasixv2::MachineSyscalls>,
+                    );
+                    let sibling_weak = weak.clone();
+                    let sibling = Function::new_async(
+                        actual,
+                        FunctionType::new([], [Type::I32]),
+                        move |_| {
+                            let state = sibling_weak.upgrade().unwrap();
+                            let mut receive = state.complete_rx.borrow_mut().take().unwrap();
+                            let mut pending = state.pending_tx.borrow_mut().take();
+                            async move {
+                                std::future::poll_fn(|cx| match Pin::new(&mut receive).poll(cx) {
+                                    Poll::Pending => {
+                                        state.sibling_pending.set(true);
+                                        if let Some(pending) = pending.take() {
+                                            pending.send(()).unwrap();
+                                        }
+                                        Poll::Pending
+                                    }
+                                    Poll::Ready(result) => {
+                                        result.unwrap();
+                                        Poll::Ready(())
+                                    }
+                                })
+                                .await;
+                                Ok::<_, RuntimeError>(vec![Value::I32(37)])
+                            }
+                        },
+                    );
+                    (vec![outer, save, helper], sibling)
+                })
+                .unwrap();
+            let bytes: wasm_byte_vec_t = wat::parse_str(
+                r#"(module
+                (import "test" "outer" (func $outer))
+                (import "test" "save" (func $save))
+                (import "test" "helper" (func $helper))
+                (memory (export "memory") 1)
+                (global (export "__stack_pointer") (mut i32) (i32.const 1024))
+                (func (export "asyncify_start_unwind") (param i32) call $helper)
+                (func (export "asyncify_stop_unwind"))
+                (func (export "asyncify_start_rewind") (param i32))
+                (func (export "asyncify_stop_rewind"))
+                (func (export "leaf") (result i32) call $save i32.const 42)
+                (func (export "_start") call $outer))"#,
+            )
+            .unwrap()
+            .into();
+            let module = unsafe { wasm_module_new(Some(&mut target), Some(&bytes)) }.unwrap();
+            let imports: wasm_extern_vec_t = functions
+                .into_iter()
+                .map(|function| {
+                    Some(Box::new(wasm_extern_t::new(
+                        target.inner.clone(),
+                        function.into(),
+                    )))
+                })
+                .collect::<Vec<_>>()
+                .into();
+            let mut instance = unsafe {
+                wasm_instance_new(Some(&mut target), Some(&module), Some(&imports), None)
+            }
+            .unwrap();
+            assert!(unsafe { wasi_env_initialize_instance(&mut wasi, &mut target, &mut instance) });
+            *state.leaf.borrow_mut() =
+                Some(instance.inner.exports.get_function("leaf").unwrap().clone());
+            let start = instance
+                .inner
+                .exports
+                .get_function("_start")
+                .unwrap()
+                .clone();
+            let weak_store = target.inner.downgrade();
+            let StoreMode::Native(native) = &target.inner.inner.mode else {
+                unreachable!()
+            };
+            let weak_driver = Rc::downgrade(native.driver.borrow().as_ref().unwrap());
+            // Rust facade boundary: deliberately NEVER unwind across extern C.
+            let first = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                target.inner.call(&start, vec![])
+            }))
+            .expect_err("actual helper second poll must transport I");
+            assert_eq!(
+                first
+                    .downcast_ref::<Primary>()
+                    .map(|value| value as *const Primary as usize),
+                Some(state.primary_pointer.get())
+            );
+            assert_eq!(state.primary_drops.load(Ordering::SeqCst), 0);
+            assert!(state.task_admitted.get() && state.pinned.get() && !state.released.get());
+            assert_eq!(state.helper_factories.get(), 1);
+            assert_eq!(state.helper_drops.load(Ordering::SeqCst), 1);
+            assert_eq!(state.outer_drops.load(Ordering::SeqCst), 1);
+            assert_eq!(state.leaf_drops.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                state.secondary_drops.load(Ordering::SeqCst),
+                usize::from(secondary)
+            );
+            let mut settlement = state.settlement.borrow_mut().take().unwrap();
+            assert!(
+                Pin::new(&mut settlement)
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            {
+                let entry = state
+                    .entry
+                    .borrow()
+                    .upgrade()
+                    .expect("same unfinished entry retained outside Driver/root");
+                assert!(!entry.done.get());
+            } // no temporary strong entry survives into the actual sibling drive
+            assert!(state.frame.borrow().is_some());
+            target.inner.with_mut(|_| ()).unwrap(); // access is NOT physical settlement
+            release_tx.send(()).unwrap();
+            assert_eq!(
+                target.inner.call(&sibling, vec![]).unwrap().as_ref(),
+                &[Value::I32(37)]
+            );
+            assert!(state.sibling_pending.get() && state.released.get());
+            assert!(state.frame.borrow().is_none());
+            assert!(
+                Pin::new(&mut settlement)
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_ready()
+            );
+            assert!(
+                state.entry.borrow().upgrade().is_none(),
+                "no retained cleanup/owner/Store cycle"
+            );
+            assert!(
+                Rc::ptr_eq(
+                    &weak_driver.upgrade().unwrap(),
+                    native.driver.borrow().as_ref().unwrap()
+                ),
+                "reuse the SAME original Driver"
+            );
+            state.reuse.set(true);
+            assert!(target.inner.call(&start, vec![]).unwrap().is_empty());
+            assert_eq!(state.outer_depth_one.get(), 2);
+            assert_eq!(state.leaf_depth_two.get(), 2);
+            assert_eq!(state.outer_drops.load(Ordering::SeqCst), 2);
+            assert_eq!(state.leaf_drops.load(Ordering::SeqCst), 2);
+            assert_eq!(state.helper_factories.get(), 1);
+            assert_eq!(
+                state.secondary_drops.load(Ordering::SeqCst),
+                usize::from(secondary)
+            );
+            drop(first);
+            assert_eq!(state.primary_drops.load(Ordering::SeqCst), 1);
+            drop(settlement);
+            let leaf = state.leaf.borrow_mut().take();
+            drop(leaf);
+            drop(start);
+            drop(sibling);
+            drop(instance);
+            drop(imports);
+            drop(module);
+            drop(origin_imports);
+            drop(origin_module);
+            drop(environment);
+            drop(vm);
+            wasi_env_delete(Some(wasi));
+            assert_eq!(
+                vm_drops.load(Ordering::SeqCst),
+                0,
+                "actual VM remains owned by the public Store"
+            );
+            drop(target);
+            assert!(weak_store.upgrade().is_none());
+            assert!(weak_driver.upgrade().is_none());
+            assert_eq!(vm_drops.load(Ordering::SeqCst), 1);
+            drop(state);
+        }
+        std::fs::write(
+            directory.join("complete"),
+            "both-physical-profiles-completed",
+        )
+        .unwrap();
+    }
+
+    #[cfg(feature = "wasi")]
+    #[test]
     fn borrowed_capi_real_wasi_timer_yields_without_resuming_guest_and_reuses_store() {
         use crate::wasm_c_api::{
             module::wasm_module_new,
