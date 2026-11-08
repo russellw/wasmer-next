@@ -150,9 +150,9 @@ pub(crate) async fn set_legacy_cloexec<S: Syscalls + Control + 'static>(
         .replace_descriptor_attachment(frame.task, &set, fd, new.attachment())
         .map_err(SysErr::from)?
     {
-        DescriptorUpdate::Replaced => return Ok(()),
-        DescriptorUpdate::Conflict => return Err(wasixv2_abi::Errno::EAGAIN.into()),
-        DescriptorUpdate::Stale => return shim::fail(Errno::BADF),
+        DescriptorUpdate::Replaced => Ok(()),
+        DescriptorUpdate::Conflict => Err(wasixv2_abi::Errno::EAGAIN.into()),
+        DescriptorUpdate::Stale => shim::fail(Errno::BADF),
     }
 }
 

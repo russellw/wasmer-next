@@ -319,7 +319,7 @@ impl Drop for HostOwner {
             let removed = {
                 let mut entries = procs.procs.lock().unwrap();
                 let remove = entries.get_mut(&self.task).is_some_and(|entry| {
-                    if entry.host_owner.as_ptr() != self as *const Self {
+                    if !std::ptr::eq(entry.host_owner.as_ptr(), self) {
                         return false;
                     }
                     entry.host_owner = Weak::new();
