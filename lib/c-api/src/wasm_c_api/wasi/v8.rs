@@ -192,8 +192,8 @@ mod tests {
             wasm_config_new, wasm_config_set_backend, wasm_engine_new_with_config, wasmer_backend_t,
         },
         externals::{
-            wasm_extern_as_func, wasm_extern_as_memory, wasm_extern_vec_t, wasm_func_call,
-            wasm_func_copy, wasm_memory_copy, wasm_memory_data,
+            wasm_extern_as_func, wasm_extern_as_memory, wasm_extern_t, wasm_extern_vec_t,
+            wasm_func_call, wasm_func_copy, wasm_memory_copy, wasm_memory_data,
         },
         instance::{wasm_instance_exports, wasm_instance_new},
         module::wasm_module_new,
@@ -304,7 +304,7 @@ mod tests {
                 i32.const 304 i32.const 4 i32.store
                 i32.const 41))"#).unwrap().into();
         let module = unsafe { wasm_module_new(Some(&mut store), Some(&guest)) }.unwrap();
-        let mut imports = wasm_extern_vec_t::default();
+        let mut imports: wasm_extern_vec_t = Vec::<Option<Box<wasm_extern_t>>>::new().into();
         assert!(unsafe {
             wasi_get_imports(Some(&store), Some(&mut env), Some(&module), &mut imports)
         });
@@ -319,7 +319,7 @@ mod tests {
         }
         .unwrap();
         assert!(trap.is_null(), "actual Wasm start imports must be accepted");
-        let mut exports = wasm_extern_vec_t::default();
+        let mut exports: wasm_extern_vec_t = Vec::<Option<Box<wasm_extern_t>>>::new().into();
         unsafe {
             wasm_instance_exports(&instance, &mut exports);
         }
@@ -338,7 +338,7 @@ mod tests {
         let driver = store.inner.v8_driver().unwrap();
         let before_pending = driver.pending_imports();
         let mut start = unsafe { wasi_get_start_function(&mut instance) }.unwrap();
-        let args = wasm_val_vec_t::default();
+        let args: wasm_val_vec_t = Vec::<wasm_val_t>::new().into();
         let mut results: wasm_val_vec_t = vec![wasm_val_t {
             kind: wasm_valkind_enum::WASM_I32 as _,
             of: wasm_val_inner { int32_t: 0 },

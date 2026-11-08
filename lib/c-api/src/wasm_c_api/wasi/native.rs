@@ -785,7 +785,7 @@ mod tests {
         {
             match &environment.inner {
                 super::super::WasiBackend::Native(native) => native,
-                super::super::WasiBackend::Legacy(_) => panic!("native backend required"),
+                super::super::WasiBackend::V8(_) => panic!("native backend required"),
             }
         }
     }
@@ -1870,7 +1870,7 @@ mod tests {
                                         .as_ref()
                                         .is_some_and(HostCallHandoff::is_detached),
                                     #[cfg(feature = "v8")]
-                                    WasiBackend::Legacy(_) => false,
+                                    WasiBackend::V8(_) => false,
                                 }
                             })
                         })

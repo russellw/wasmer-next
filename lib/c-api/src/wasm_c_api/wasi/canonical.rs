@@ -23,7 +23,7 @@ type CaptureState = (VecDeque<(Vec<u8>, usize)>, bool);
 
 #[derive(Default)]
 pub(super) struct Capture {
-    queue: Mutex<CaptureState>,
+    pub(super) queue: Mutex<CaptureState>,
     ready: Condvar,
 }
 struct Writer(Arc<Capture>);
