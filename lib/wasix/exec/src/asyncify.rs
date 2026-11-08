@@ -108,9 +108,16 @@ pub type HostEntryInvoke = fn(
     usize,
 ) -> HostEntryFuture;
 
+/// Pure local-owner/finite-row validation. It runs outside every Store borrow;
+/// the actual image/token is then rechecked atomically in that checked Store.
+#[doc(hidden)]
+pub type HostEntryAuthorize =
+    fn(Option<Weak<dyn Any>>, &HostEntryToken, usize) -> Result<(), RuntimeError>;
+
 #[derive(Clone)]
 pub(crate) struct EntryHook {
     invoke: HostEntryInvoke,
+    authorize: HostEntryAuthorize,
     token: HostEntryToken,
     row: usize,
 }
@@ -360,6 +367,14 @@ pub(crate) trait Access<S: 'static> {
         f: impl FnOnce(&mut ExecEnv<S>, &mut StoreMut<'_>, Option<EntryHook>) -> R,
     ) -> Result<R, RuntimeError> {
         let snapshot = self.entry_snapshot();
+        if let Some(snapshot) = snapshot.as_deref() {
+            let snapshot = snapshot
+                .downcast_ref::<EntrySnapshot<S>>()
+                .ok_or_else(|| RuntimeError::new("native import has an invalid entry snapshot"))?;
+            // Do not extract an asynchronous cap here: a Sync host environment
+            // must reject a missing/incorrect owner before any async conversion.
+            (snapshot.hook.authorize)(self.local_owner(), &snapshot.hook.token, snapshot.hook.row)?;
+        }
         self.with(|env, store| {
             let hook = match snapshot.as_deref() {
                 None => None,
@@ -588,7 +603,11 @@ impl<S: wasixv2_syscalls::Syscalls + wasixv2_syscalls::Control + Send + Sync + '
 
     /// All row custody is committed before its first depth/hook mutation. There
     /// are no guest callbacks between the row publication and those assignments.
-    pub async fn enter(&self, factory: HostEntryInvoke) -> Result<(), RuntimeError> {
+    pub async fn enter(
+        &self,
+        factory: HostEntryInvoke,
+        authorize: HostEntryAuthorize,
+    ) -> Result<(), RuntimeError> {
         let mut store = self.store.write_lock().await;
         for environment in &self.environments {
             let data = environment.environment().as_ref(&store);
@@ -623,6 +642,7 @@ impl<S: wasixv2_syscalls::Syscalls + wasixv2_syscalls::Control + Send + Sync + '
             let index = self.rows.borrow().len();
             let hook = EntryHook {
                 invoke: factory,
+                authorize,
                 token: self.token.clone(),
                 row: index,
             };
@@ -647,6 +667,17 @@ impl<S: wasixv2_syscalls::Syscalls + wasixv2_syscalls::Control + Send + Sync + '
             }
         }
         Ok(())
+    }
+
+    /// Pure finite-row identity, not Store access, liveness or admission authority.
+    pub fn contains(&self, token: &HostEntryToken, row: usize) -> bool {
+        !self.finished.get()
+            && self.token.same(token)
+            && self
+                .rows
+                .borrow()
+                .get(row)
+                .is_some_and(|row| row.snapshot.hook.token.same(token))
     }
 
     /// Checks the captured factory owner against this exact live image and row,
@@ -694,8 +725,9 @@ impl<S: wasixv2_syscalls::Syscalls + wasixv2_syscalls::Control + Send + Sync + '
         args: &[Value],
         owner: Weak<dyn Any>,
         factory: HostEntryInvoke,
+        authorize: HostEntryAuthorize,
     ) -> Result<Box<[Value]>, RuntimeError> {
-        self.enter(factory).await?;
+        self.enter(factory, authorize).await?;
         loop {
             let result = factory(
                 function.clone(),

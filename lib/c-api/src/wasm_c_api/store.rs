@@ -1517,6 +1517,34 @@ impl std::future::Future for ObservedEntryCall {
     }
 }
 
+#[cfg(all(feature = "sys", feature = "wasi"))]
+fn authorize_initialized_entry(
+    captured: Option<Weak<dyn std::any::Any>>,
+    token: &wasixv2_exec::asyncify::HostEntryToken,
+    row: usize,
+) -> Result<(), RuntimeError> {
+    let owner = captured
+        .and_then(|weak| weak.upgrade())
+        .and_then(|owner| owner.downcast::<CallOwner>().ok())
+        .ok_or_else(|| RuntimeError::new("initialized entry import has no live matching owner"))?;
+    let entry = owner
+        .entry
+        .borrow()
+        .clone()
+        .ok_or_else(|| RuntimeError::new("initialized entry owner has no active scope"))?;
+    // Both RefCell borrows end before either local Rc can run a destructor.
+    let active = !entry.done.get() && entry.scope.contains(token, row);
+    drop(entry);
+    drop(owner);
+    if active {
+        Ok(())
+    } else {
+        Err(RuntimeError::new(
+            "initialized entry import has no matching active scope",
+        ))
+    }
+}
+
 /// Plain fn pointer stored in the finite asyncify scope. It never captures a
 /// local owner in ExecEnv, and never falls back when that scope's owner is stale.
 #[cfg(all(feature = "sys", feature = "wasi"))]
@@ -2014,7 +2042,13 @@ impl StoreRef {
                 Box::pin(async move {
                     let result = entry
                         .scope
-                        .call(function, &args, weak_owner, invoke_initialized_entry)
+                        .call(
+                            function,
+                            &args,
+                            weak_owner,
+                            invoke_initialized_entry,
+                            authorize_initialized_entry,
+                        )
                         .await;
                     entry.finish().await;
                     result
