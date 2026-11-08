@@ -627,6 +627,103 @@ mod tests {
     )]
     #[cfg_attr(coverage_nightly, coverage(off))]
     #[test]
+    fn public_initialized_start_copying_fork_rewinds_reaps_and_preserves_private_memory() {
+        // The independently built B9 v1 fixture is selected explicitly so the
+        // SAME bytes can be linked against a retained old or current C library.
+        // No guest build, hidden task injection or runtime fallback occurs here.
+        (assert_c! {
+            #include "tests/wasmer.h"
+            #include <stdint.h>
+            #include <stdlib.h>
+
+            int main() {
+                const char* path = getenv("WASMER_COPYING_FORK_FIXTURE");
+                assert(path && "set the reviewed original asyncified fork fixture");
+                FILE* file = fopen(path, "rb");
+                assert(file);
+                assert(fseek(file, 0, SEEK_END) == 0);
+                long length = ftell(file);
+                assert(length > 0);
+                assert(fseek(file, 0, SEEK_SET) == 0);
+                wasm_byte_vec_t binary;
+                wasm_byte_vec_new_uninitialized(&binary, (size_t)length);
+                assert(fread(binary.data, 1, binary.size, file) == binary.size);
+                assert(fclose(file) == 0);
+
+                wasm_engine_t* engine = wasm_engine_new();
+                assert(engine);
+                wasm_store_t* store = wasm_store_new(engine);
+                assert(store);
+                wasm_module_t* module = wasm_module_new(store, &binary);
+                assert(module);
+                wasi_config_t* config = wasi_config_new("copying-fork-public-start");
+                assert(config);
+                wasi_env_t* env = wasi_env_new(store, config);
+                assert(env);
+                wasm_extern_vec_t imports = WASM_EMPTY_VEC;
+                assert(wasi_get_imports(store, env, module, &imports));
+                wasm_instance_t* instance = wasm_instance_new(store, module, &imports, NULL);
+                assert(instance);
+                assert(wasi_env_initialize_instance(env, store, instance));
+                wasm_func_t* start = wasi_get_start_function(instance);
+                assert(start);
+                wasm_extern_vec_t exports = WASM_EMPTY_VEC;
+                wasm_instance_exports(instance, &exports);
+                wasm_memory_t* memory = NULL;
+                for (size_t i = 0; i < exports.size; ++i) {
+                    if (wasm_extern_kind(exports.data[i]) == WASM_EXTERN_MEMORY) {
+                        assert(!memory && "fixture has one actual exported memory");
+                        memory = wasm_extern_as_memory(exports.data[i]);
+                    }
+                }
+                assert(memory && wasm_memory_data_size(memory) >= 276);
+                wasm_val_vec_t args = WASM_EMPTY_VEC;
+                wasm_val_t sentinel[1] = { WASM_I64_VAL(0x123456789) };
+                wasm_val_vec_t results = WASM_ARRAY_VEC(sentinel);
+                fprintf(stderr, "public-copying-fork-before-start\n");
+                wasm_trap_t* trap = wasm_func_call(start, &args, &results);
+                assert(trap && "_start must complete through actual proc_exit2");
+                assert(sentinel[0].kind == WASM_I64 && sentinel[0].of.i64 == 0x123456789);
+                wasm_message_t message;
+                wasm_trap_message(trap, &message);
+                const char expected[] = "WASI exited with code: ExitCode::0";
+                fprintf(stderr, "public-copying-fork-trap: %.*s\n", (int)message.size, message.data);
+                assert(message.size == sizeof(expected));
+                assert(memcmp(message.data, expected, sizeof(expected)) == 0);
+                const unsigned char* bytes = (const unsigned char*)wasm_memory_data(memory);
+                uint32_t pid = 0, private_value = 0;
+                memcpy(&pid, bytes + 100, sizeof(pid));
+                memcpy(&private_value, bytes + 200, sizeof(private_value));
+                assert(pid > 0 && "parent must receive the actual fork child pid");
+                assert(private_value == 7 && "child's copied memory write of9 must stay private");
+                // The original guest joins this exact pid and checks child's exit3
+                // before it can reach exit0; an unwind-only return cannot pass.
+                assert(bytes[274] == 3 && bytes[275] == 0);
+                fprintf(stderr, "public-copying-fork-parent-rewound-child-exit3-reaped-private7\n");
+                wasm_byte_vec_delete(&message);
+                wasm_trap_delete(trap);
+                wasm_func_delete(start);
+                wasm_extern_vec_delete(&exports);
+                wasm_instance_delete(instance);
+                wasm_extern_vec_delete(&imports);
+                wasi_env_delete(env);
+                wasm_module_delete(module);
+                wasm_byte_vec_delete(&binary);
+                wasm_store_delete(store);
+                wasm_engine_delete(engine);
+                fprintf(stderr, "public-copying-fork-all-public-handles-released\n");
+                return 0;
+            }
+        })
+        .success();
+    }
+
+    #[allow(
+        unexpected_cfgs,
+        reason = "tools like cargo-llvm-coverage pass --cfg coverage"
+    )]
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    #[test]
     fn test_wasi_get_wasi_version_snapshot0() {
         (assert_c! {
             #include "tests/wasmer.h"
