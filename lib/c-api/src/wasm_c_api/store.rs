@@ -5701,6 +5701,200 @@ mod tests {
         late_tail_original_caller_cancel_profile(true);
     }
 
+    #[cfg(feature = "wasi")]
+    fn late_tail_observer_failure_profile(clone_failure: bool) {
+        use std::{
+            future::Future,
+            sync::{
+                Arc, Mutex,
+                atomic::{AtomicBool, AtomicUsize, Ordering},
+            },
+            task::{RawWaker, RawWakerVTable, Waker},
+        };
+        struct Payload(Arc<AtomicUsize>);
+        impl Drop for Payload {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        struct Observer {
+            caller: Mutex<Option<Arc<Waker>>>,
+            payload: Mutex<Option<RetirementPanic>>,
+            armed: AtomicBool,
+            clone_failure: bool,
+            clones: AtomicUsize,
+            drops: AtomicUsize,
+            fired: AtomicBool,
+            retry_wakes: AtomicUsize,
+        }
+        unsafe fn clone_observer(data: *const ()) -> RawWaker {
+            let state = unsafe { &*data.cast::<Observer>() };
+            if state.clone_failure
+                && state.armed.load(Ordering::SeqCst)
+                && state.clones.fetch_add(1, Ordering::SeqCst) == 1
+            {
+                // First clone is core poll_tails' saved caller. SECOND is the
+                // actual late-tail DriverSubscription observer, before H.poll.
+                state.fired.store(true, Ordering::SeqCst);
+                let exact = state.payload.lock().unwrap().take().unwrap();
+                std::panic::resume_unwind(exact);
+            }
+            unsafe { Arc::increment_strong_count(data.cast::<Observer>()) };
+            RawWaker::new(data, &OBSERVER)
+        }
+        unsafe fn wake_observer(data: *const ()) {
+            let state = unsafe { Arc::from_raw(data.cast::<Observer>()) };
+            forward(&state);
+        }
+        unsafe fn wake_observer_ref(data: *const ()) {
+            forward(unsafe { &*data.cast::<Observer>() });
+        }
+        fn forward(state: &Observer) {
+            if state.fired.load(Ordering::SeqCst) {
+                state.retry_wakes.fetch_add(1, Ordering::SeqCst);
+            }
+            let wake = state.caller.lock().unwrap().as_ref().unwrap().clone();
+            wake.wake_by_ref();
+        }
+        unsafe fn drop_observer(data: *const ()) {
+            let state = unsafe { Arc::from_raw(data.cast::<Observer>()) };
+            if !state.clone_failure
+                && state.armed.load(Ordering::SeqCst)
+                && state.drops.fetch_add(1, Ordering::SeqCst) == 1
+            {
+                // First Drop is the core saved caller; SECOND is the actual
+                // subscription replacement, after the new observer is stored.
+                state.fired.store(true, Ordering::SeqCst);
+                let exact = state.payload.lock().unwrap().take().unwrap();
+                std::panic::resume_unwind(exact);
+            }
+        }
+        static OBSERVER: RawWakerVTable = RawWakerVTable::new(
+            clone_observer,
+            wake_observer,
+            wake_observer_ref,
+            drop_observer,
+        );
+        let payload_drops = Arc::new(AtomicUsize::new(0));
+        let exact = Box::new(Payload(payload_drops.clone()));
+        let address = (&*exact) as *const Payload;
+        let state = Arc::new(Observer {
+            caller: Mutex::new(None),
+            payload: Mutex::new(Some(exact)),
+            armed: AtomicBool::new(false),
+            clone_failure,
+            clones: AtomicUsize::new(0),
+            drops: AtomicUsize::new(0),
+            fired: AtomicBool::new(false),
+            retry_wakes: AtomicUsize::new(0),
+        });
+        let LateTailFixture {
+            target,
+            owner,
+            ledger,
+            weak,
+            driver,
+            local,
+            vm,
+        } = late_tail_fixture(None);
+        let target = Rc::new(RefCell::new(Some(target)));
+        let deleting = target.clone();
+        let arm = state.clone();
+        let mut source = Store::default();
+        let callback = Function::new_async(
+            &mut source,
+            wasmer_api::FunctionType::new([], []),
+            move |_| {
+                assert!(
+                    wasmer_api::sys::WeakNativeInvocation::current()
+                        .unwrap()
+                        .is_current()
+                );
+                unsafe { wasm_store_delete(deleting.borrow_mut().take()) };
+                if clone_failure {
+                    arm.armed.store(true, Ordering::SeqCst);
+                }
+                std::future::ready(Ok(Vec::new()))
+            },
+        );
+        let asynchronous = source.into_async();
+        let mut original = Box::pin(callback.call_async(&asynchronous, vec![]));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut first_poll = true;
+        let exact = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(std::future::poll_fn(|cx| {
+                let next = Arc::new(cx.waker().clone());
+                let old = state.caller.lock().unwrap().replace(next);
+                drop(old);
+                let custom = clone_failure || first_poll;
+                let result = if custom {
+                    let wake = unsafe {
+                        Waker::from_raw(RawWaker::new(
+                            Arc::into_raw(state.clone()).cast(),
+                            &OBSERVER,
+                        ))
+                    };
+                    let result = original
+                        .as_mut()
+                        .poll(&mut std::task::Context::from_waker(&wake));
+                    drop(wake); // BEFORE arming the later replacement-Drop probe
+                    result
+                } else {
+                    original.as_mut().poll(cx)
+                };
+                if first_poll {
+                    assert!(result.is_pending());
+                    if !clone_failure {
+                        state.armed.store(true, Ordering::SeqCst);
+                    }
+                    first_poll = false;
+                }
+                result
+            }))
+        }))
+        .unwrap_err();
+        assert!(
+            state.fired.load(Ordering::SeqCst),
+            "fault must reach actual late observer"
+        );
+        assert!(
+            state.retry_wakes.load(Ordering::SeqCst) > 0,
+            "original R receives a real retry wake"
+        );
+        assert_eq!(
+            exact.downcast_ref::<Payload>().unwrap() as *const _,
+            address
+        );
+        assert_eq!(payload_drops.load(Ordering::SeqCst), 0);
+        assert!(
+            target.borrow().is_none() && weak.upgrade().is_none() && driver.upgrade().is_none()
+        );
+        assert_eq!((local.get(), vm.get()), (1, 1));
+        assert!(ledger.final_done.get() && ledger.service_claims.get() == 0);
+        assert_eq!(
+            ledger.clock.get(),
+            1,
+            "observer error caught and stamped ONCE in canonical T carrier"
+        );
+        assert!(owner.is_idle() && owner.is_sealed());
+        drop(exact);
+        assert_eq!(payload_drops.load(Ordering::SeqCst), 1);
+        drop(original);
+    }
+    #[cfg(feature = "wasi")]
+    #[test]
+    fn late_finalization_observer_clone_failure_retries_original_caller_and_preserves_first() {
+        late_tail_observer_failure_profile(true);
+    }
+    #[cfg(feature = "wasi")]
+    #[test]
+    fn late_finalization_observer_replacement_drop_failure_retries_and_preserves_first() {
+        late_tail_observer_failure_profile(false);
+    }
+
     #[cfg(all(unix, feature = "wasi"))]
     #[test]
     fn active_foreign_caller_without_target_tail_drives_last_public_store_cleanup() {
