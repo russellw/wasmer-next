@@ -345,11 +345,23 @@ jobs:
           export CAPI_REAL_CC="$(xcrun --find clang)"
           printf 'CAPI_REAL_CC=%s\n' "$CAPI_REAL_CC" >> "$GITHUB_ENV"
           python3 - <<'PY'
-          import json, os, shutil, sys
+          import json, os, shutil, subprocess, sys
           from pathlib import Path
           sys.path.insert(0, os.environ["RUNNER_TEMP"])
           from capi_macho import audit
           evidence = Path(os.environ["CAPI_EVIDENCE"])
+          sdk = Path(subprocess.check_output(["xcrun", "--sdk", "macosx", "--show-sdk-path"], text=True).strip())
+          if not sdk.is_absolute():
+              raise SystemExit("selected macOS SDK path must be absolute")
+          sdk = sdk.resolve(strict=True)
+          stdlib = sdk / "usr/include/stdlib.h"
+          selected_clang = Path(subprocess.check_output(["xcrun", "--sdk", "macosx", "--find", "clang"], text=True).strip()).resolve(strict=True)
+          if not sdk.is_dir() or not stdlib.is_file() or selected_clang != Path(os.environ["CAPI_REAL_CC"]).resolve(strict=True):
+              raise SystemExit("selected macOS SDK/stdlib does not match the runtime Xcode compiler")
+          sdk_record = {"path": str(sdk), "version": subprocess.check_output(["xcrun", "--sdk", "macosx", "--show-sdk-version"], text=True).strip(),
+                        "selected_clang": str(selected_clang), "stdlib_header": str(stdlib)}
+          (evidence / "runtime-sdk.json").write_text(json.dumps(sdk_record, indent=2) + "\n")
+          print(json.dumps(sdk_record, indent=2))
           library = Path(os.environ["CARGO_TARGET_DIR"]) / "aarch64-apple-darwin/debug/libwasmer.dylib"
           binary = Path((evidence / "test-executable.txt").read_text().strip())
           records = [audit(library), audit(binary)]
@@ -431,6 +443,7 @@ jobs:
                   previous[sig] = signal.signal(sig, note_signal)
               environment = os.environ.copy()
               environment.update(flags)  # Cargo's EXACT recorded build-script env for direct execution.
+              environment["SDKROOT"] = json.loads((evidence / "runtime-sdk.json").read_text())["path"]
               with (evidence / "test-list.txt").open("xb") as listing:
                   if run_owned([str(binary), "--list"], listing, environment):
                       raise RuntimeError("CAPI test listing failed")
