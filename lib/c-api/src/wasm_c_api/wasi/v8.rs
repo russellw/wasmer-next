@@ -507,7 +507,7 @@ mod reentry_tests {
         calls: Arc<AtomicUsize>,
         drops: Arc<AtomicUsize>,
         final_value: Arc<AtomicI32>,
-        final_traps: Arc<std::sync::Mutex<Vec<Box<wasm_trap_t>>>>,
+        final_traps: Arc<std::sync::Mutex<Vec<wasm_trap_t>>>,
     }
     unsafe extern "C" fn nested_callback(
         data: *mut c_void,
@@ -545,7 +545,7 @@ mod reentry_tests {
             data.final_traps
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .push(trap);
+                .push(*trap);
         } else {
             data.final_value
                 .store(unsafe { result.as_slice()[0].of.int32_t }, Ordering::SeqCst);
