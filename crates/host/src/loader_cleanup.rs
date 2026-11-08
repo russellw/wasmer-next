@@ -39,10 +39,28 @@ pub trait LocalCleanupSink {
 pub struct LocalCleanupRunner {
     scope: Arc<LoaderCleanup>,
     sink: Rc<dyn LocalCleanupSink>,
+    owned_jobs: bool,
 }
 impl LocalCleanupRunner {
     pub fn new(scope: Arc<LoaderCleanup>, sink: Rc<dyn LocalCleanupSink>) -> Self {
-        Self { scope, sink }
+        Self {
+            scope,
+            sink,
+            owned_jobs: false,
+        }
+    }
+    /// Transfer this runner's accepted jobs to its local sink instead of the host.
+    ///
+    /// The owner must drive these jobs while `run` is pending and retain the
+    /// sink through runner and scope destruction. Custody must be committed
+    /// before notification. Other runners of the same shared scope do not
+    /// inherit this policy; keep and pass this capability to its factories.
+    pub fn new_owned(scope: Arc<LoaderCleanup>, sink: Rc<dyn LocalCleanupSink>) -> Self {
+        Self {
+            scope,
+            sink,
+            owned_jobs: true,
+        }
     }
     pub fn shared(&self) -> &Arc<LoaderCleanup> {
         &self.scope
@@ -438,6 +456,14 @@ impl LoaderCleanup {
     pub fn spawn(self: &Arc<Self>, future: LocalFuture<'static, ()>) {
         self.spawn_inner(future, None, false);
     }
+    fn dispatch(&self, future: LocalFuture<'static, ()>, local: Option<&LocalCleanupRunner>) {
+        if let Some(local) = local.filter(|local| local.owned_jobs) {
+            // SAME accepted future/lease; fresh admission uses try_retain.
+            local.sink.retain(future);
+        } else {
+            self.host.executor().spawn_local(future);
+        }
+    }
     fn spawn_inner(
         self: &Arc<Self>,
         future: LocalFuture<'static, ()>,
@@ -447,7 +473,7 @@ impl LoaderCleanup {
         let mut state = self.state();
         if state.closed {
             drop(state);
-            self.host.executor().spawn_local(future);
+            self.dispatch(future, local);
             return;
         }
         state.pending += 1;
@@ -460,16 +486,19 @@ impl LoaderCleanup {
         local: Option<&LocalCleanupRunner>,
         fallback: bool,
     ) {
-        self.host.executor().spawn_local(Box::pin(ScopedJob {
-            future: Some(ScopedJobFuture::Counted(future)),
-            completion: Some(Completion {
-                scope: self.clone(),
-                local: local.cloned(),
+        self.dispatch(
+            Box::pin(ScopedJob {
+                future: Some(ScopedJobFuture::Counted(future)),
+                completion: Some(Completion {
+                    scope: self.clone(),
+                    local: local.cloned(),
+                }),
+                fallback: fallback
+                    .then(|| local.expect("fallback requires local custody").sink.clone()),
+                panicked: false,
             }),
-            fallback: fallback
-                .then(|| local.expect("fallback requires local custody").sink.clone()),
-            panicked: false,
-        }));
+            local,
+        );
     }
     fn flush(self: &Arc<Self>, cx: &mut Context<'_>, local: Option<&LocalCleanupRunner>) {
         let _span = self.callback_span();
@@ -487,12 +516,15 @@ impl LoaderCleanup {
                 local: local.cloned(),
             };
             let future = job.materialize(local);
-            self.host.executor().spawn_local(Box::pin(ScopedJob {
-                future: Some(ScopedJobFuture::Counted(future)),
-                completion: Some(completion),
-                fallback: None,
-                panicked: false,
-            }));
+            self.dispatch(
+                Box::pin(ScopedJob {
+                    future: Some(ScopedJobFuture::Counted(future)),
+                    completion: Some(completion),
+                    fallback: None,
+                    panicked: false,
+                }),
+                local,
+            );
         }
     }
     fn poll_drain(
@@ -926,12 +958,15 @@ impl Drop for DrainCustody {
             return;
         }
         if let Some(local) = &self.local {
-            self.scope.host.executor().spawn_local(Box::pin(ScopedJob {
-                future: Some(ScopedJobFuture::CanonicalFinalDrain(future)),
-                completion: None,
-                fallback: Some(local.sink.clone()),
-                panicked: false,
-            }));
+            self.scope.dispatch(
+                Box::pin(ScopedJob {
+                    future: Some(ScopedJobFuture::CanonicalFinalDrain(future)),
+                    completion: None,
+                    fallback: Some(local.sink.clone()),
+                    panicked: false,
+                }),
+                Some(local),
+            );
         } else {
             self.scope.host.executor().spawn_local(Box::pin(future));
         }
@@ -2310,5 +2345,243 @@ mod local_custody_tests {
                 .is_ready()
         );
         assert!(settlement.is_ready());
+    }
+
+    #[derive(Default)]
+    struct OwnedSink {
+        futures: RefCell<VecDeque<LocalFuture<'static, ()>>>,
+        notifications: Cell<usize>,
+        notification_panic: RefCell<Option<Box<dyn std::any::Any + Send>>>,
+    }
+    impl LocalCleanupSink for OwnedSink {
+        fn retain(&self, future: LocalFuture<'static, ()>) {
+            self.futures.borrow_mut().push_back(future);
+            self.notify();
+        }
+        fn notify(&self) {
+            self.notifications.set(self.notifications.get() + 1);
+            let panic = self.notification_panic.borrow_mut().take();
+            if let Some(panic) = panic {
+                std::panic::resume_unwind(panic);
+            }
+        }
+    }
+    impl OwnedSink {
+        fn pop(&self) -> LocalFuture<'static, ()> {
+            self.futures.borrow_mut().pop_front().expect("owned job")
+        }
+        fn finish_one(&self) {
+            let mut future = self.pop();
+            assert!(
+                future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_ready()
+            );
+            drop(future);
+        }
+    }
+
+    #[test]
+    fn owned_runner_routes_same_factory_jobs_and_preserves_default_host_route() {
+        assert!(JOBS.with(|jobs| jobs.borrow().is_empty()));
+        let scope = LoaderCleanup::new(Arc::new(QueueHost(AtomicBool::new(false))));
+        let sink = Rc::new(OwnedSink::default());
+        let local = LocalCleanupRunner::new_owned(scope.clone(), sink.clone());
+        let completed = Arc::new(AtomicUsize::new(0));
+        let shared_completed = completed.clone();
+        scope
+            .submit(Box::new(move || {
+                Box::pin(async move {
+                    shared_completed.fetch_add(1, Ordering::SeqCst);
+                })
+            }))
+            .unwrap_or_else(|_| panic!("shared factory refused"));
+        let local_completed = completed.clone();
+        local
+            .submit(Box::new(move |runner| {
+                let runner = runner.expect("same owned runner supplied");
+                assert!(runner.owned_jobs);
+                Box::pin(async move {
+                    local_completed.fetch_add(1, Ordering::SeqCst);
+                    drop(runner);
+                })
+            }))
+            .unwrap_or_else(|_| panic!("local factory refused"));
+        let owner = Arc::new(());
+        let retired_completed = completed.clone();
+        local
+            .on_retire(
+                &owner,
+                Box::new(move |runner| {
+                    assert!(runner.unwrap().owned_jobs);
+                    Box::pin(async move {
+                        retired_completed.fetch_add(1, Ordering::SeqCst);
+                    })
+                }),
+            )
+            .unwrap_or_else(|_| panic!("retirement factory refused"));
+        let mut runner = Box::pin(local.run(async {}));
+        assert!(
+            runner
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        assert_eq!(scope.state().pending, 2);
+        assert_eq!(sink.futures.borrow().len(), 2);
+        assert!(JOBS.with(|jobs| jobs.borrow().is_empty()));
+        sink.finish_one();
+        sink.finish_one();
+        assert_eq!(scope.state().pending, 0);
+        assert!(
+            runner
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        assert_eq!(scope.state().pending, 1);
+        sink.finish_one();
+        assert!(
+            runner
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_ready()
+        );
+        assert_eq!(completed.load(Ordering::SeqCst), 3);
+        assert_eq!(scope.state().pending, 0);
+        assert!(!scope.is_open());
+        drop(runner);
+        let ordinary = LoaderCleanup::new(Arc::new(QueueHost(AtomicBool::new(false))));
+        let default = LocalCleanupRunner::new(ordinary.clone(), sink.clone());
+        default.spawn(Box::pin(async {}));
+        assert_eq!(ordinary.state().pending, 1);
+        assert!(sink.futures.borrow().is_empty());
+        assert_eq!(JOBS.with(|jobs| jobs.borrow().len()), 1);
+        poll_host_jobs();
+        assert_eq!(ordinary.state().pending, 0);
+        drop(default.run(std::future::pending::<()>()));
+    }
+
+    #[test]
+    fn owned_runner_cancellation_transfers_canonical_uncounted_drain_and_closed_raw_future() {
+        struct Lease(Rc<Cell<usize>>);
+        impl Drop for Lease {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+        let scope = LoaderCleanup::new(Arc::new(QueueHost(AtomicBool::new(false))));
+        let sink = Rc::new(OwnedSink::default());
+        let local = LocalCleanupRunner::new_owned(scope.clone(), sink.clone());
+        let (future, ready, dropped) = probe();
+        local.spawn(Box::pin(future));
+        let leases = Rc::new(Cell::new(0));
+        let mut runner =
+            Box::pin(local.run_with_keepalive(std::future::pending::<()>(), Lease(leases.clone())));
+        assert!(
+            runner
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        drop(runner);
+        assert_eq!(
+            scope.state().pending,
+            1,
+            "canonical drain must not count itself"
+        );
+        assert_eq!(sink.futures.borrow().len(), 2);
+        assert_eq!(leases.get(), 0);
+        assert!(JOBS.with(|jobs| jobs.borrow().is_empty()));
+        ready.store(true, Ordering::SeqCst);
+        sink.finish_one();
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        assert_eq!(scope.state().pending, 0);
+        sink.finish_one();
+        assert_eq!(leases.get(), 1);
+        assert!(!scope.is_open());
+        let (future, ready, dropped) = probe();
+        local.spawn(Box::pin(future));
+        assert_eq!(
+            scope.state().pending,
+            0,
+            "closed raw transfer has no invented Completion"
+        );
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        ready.store(true, Ordering::SeqCst);
+        sink.finish_one();
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        assert!(JOBS.with(|jobs| jobs.borrow().is_empty()));
+    }
+
+    #[test]
+    fn owned_runner_notification_panic_keeps_accepted_job_and_poll_panic_value() {
+        let scope = LoaderCleanup::new(Arc::new(QueueHost(AtomicBool::new(false))));
+        let first = Box::new(31u64);
+        let first_address = (&*first) as *const u64;
+        let sink = Rc::new(OwnedSink {
+            notification_panic: RefCell::new(Some(first)),
+            ..OwnedSink::default()
+        });
+        let local = LocalCleanupRunner::new_owned(scope.clone(), sink.clone());
+        let (future, ready, dropped) = probe();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            local.spawn(Box::pin(future))
+        }))
+        .unwrap_err();
+        assert!(std::ptr::eq(
+            panic.downcast_ref::<u64>().unwrap(),
+            first_address
+        ));
+        assert_eq!(scope.state().pending, 1);
+        assert_eq!(sink.futures.borrow().len(), 1);
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        ready.store(true, Ordering::SeqCst);
+        sink.finish_one();
+        assert_eq!(scope.state().pending, 0);
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+
+        struct Fails {
+            panic: Option<Box<dyn std::any::Any + Send>>,
+            dropped: Arc<AtomicUsize>,
+        }
+        impl Future for Fails {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+                std::panic::resume_unwind(self.get_mut().panic.take().unwrap())
+            }
+        }
+        impl Drop for Fails {
+            fn drop(&mut self) {
+                self.dropped.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let first = Box::new(47u64);
+        let first_address = (&*first) as *const u64;
+        let dropped = Arc::new(AtomicUsize::new(0));
+        local.spawn(Box::pin(Fails {
+            panic: Some(first),
+            dropped: dropped.clone(),
+        }));
+        let mut job = sink.pop();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            job.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+        }))
+        .unwrap_err();
+        assert!(std::ptr::eq(
+            panic.downcast_ref::<u64>().unwrap(),
+            first_address
+        ));
+        assert_eq!(
+            scope.state().pending,
+            1,
+            "poll panic did not fabricate completion"
+        );
+        drop(job);
+        assert_eq!(scope.state().pending, 0);
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        assert!(JOBS.with(|jobs| jobs.borrow().is_empty()));
+        drop(local.run(std::future::pending::<()>()));
     }
 }
