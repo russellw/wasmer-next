@@ -5727,6 +5727,17 @@ mod tests {
             fired: AtomicBool,
             retry_wakes: AtomicUsize,
         }
+        // Distinct identity forces actual subscriber replacement, while its
+        // ordinary Drop cannot trigger the original observer's one-shot fault.
+        struct RetryObserver(Arc<Observer>);
+        impl std::task::Wake for RetryObserver {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                forward(&self.0);
+            }
+        }
         unsafe fn clone_observer(data: *const ()) -> RawWaker {
             let state = unsafe { &*data.cast::<Observer>() };
             if state.clone_failure
@@ -5823,6 +5834,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
+        let retry = Waker::from(Arc::new(RetryObserver(state.clone())));
         let mut first_poll = true;
         let exact = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             runtime.block_on(std::future::poll_fn(|cx| {
@@ -5843,7 +5855,9 @@ mod tests {
                     drop(wake); // BEFORE arming the later replacement-Drop probe
                     result
                 } else {
-                    original.as_mut().poll(cx)
+                    original
+                        .as_mut()
+                        .poll(&mut std::task::Context::from_waker(&retry))
                 };
                 if first_poll {
                     assert!(result.is_pending());
