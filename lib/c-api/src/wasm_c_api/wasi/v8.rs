@@ -818,7 +818,7 @@ mod reentry_tests {
         );
         assert_eq!(args.data, original_arguments);
         assert_eq!(args.size, 1);
-        assert_eq!(args.as_slice()[0].kind, wasm_valkind_enum::WASM_I32 as _);
+        assert_eq!(args.as_slice()[0].kind, wasm_valkind_enum::WASM_I32 as u8);
         assert_eq!(unsafe { args.as_slice()[0].of.int32_t }, 29);
         assert_eq!(callbacks.load(Ordering::SeqCst), 2);
         assert_eq!(nested_result.load(Ordering::SeqCst), 73);
@@ -829,7 +829,7 @@ mod reentry_tests {
         );
         assert_eq!(args.data, original_arguments);
         assert_eq!(args.size, 1);
-        assert_eq!(args.as_slice()[0].kind, wasm_valkind_enum::WASM_I32 as _);
+        assert_eq!(args.as_slice()[0].kind, wasm_valkind_enum::WASM_I32 as u8);
         assert_eq!(unsafe { args.as_slice()[0].of.int32_t }, 29);
         drop(args);
         drop(run);
