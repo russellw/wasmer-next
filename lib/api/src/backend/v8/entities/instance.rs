@@ -3,10 +3,16 @@ use std::sync::Arc;
 
 use crate::{
     AsStoreMut, AsStoreRef, Exports, Extern, Imports, InstantiationError, Module,
-    backend::v8::bindings::*, v8::error::Trap, vm::VMExtern,
+    backend::v8::bindings::*,
+    v8::error::{TrapCallScope, TrapMode},
+    vm::VMExtern,
 };
 
 use super::check_isolate;
+use crate::backend::v8::{
+    origin::{Handle, Origin},
+    references::{Exports as OwnedExports, OwnedValue},
+};
 
 #[derive(PartialEq, Eq)]
 pub(crate) struct InstanceHandle(pub(crate) *mut wasm_instance_t);
@@ -20,30 +26,23 @@ impl InstanceHandle {
         store: *mut wasm_store_t,
         module: *mut wasm_shared_module_t,
         mut externs: Vec<VMExtern>,
+        traps: &TrapCallScope,
     ) -> Result<Self, InstantiationError> {
         let mut trap: *mut wasm_trap_t = std::ptr::null_mut() as _;
 
-        let externs: Vec<_> = externs.into_iter().map(|v| v.unwrap_v_8()).collect();
-
-        let instance = unsafe {
-            let mut imports = unsafe {
-                let mut vec = Default::default();
-                wasm_extern_vec_new(&mut vec, externs.len(), externs.as_ptr());
-                vec
-            };
-
-            std::mem::forget(externs);
-
-            wasm_instance_new(
-                store,
-                wasm_module_obtain(store, module),
-                &mut imports,
-                &mut trap,
-            )
+        let mut externs: Vec<_> = externs.into_iter().map(|v| v.unwrap_v_8().raw()).collect();
+        // instance_new borrows this vector and its already-rooted handles.
+        // Do not manufacture an owning C vector from borrowed wrappers.
+        let imports = wasm_extern_vec_t {
+            size: externs.len(),
+            data: externs.as_mut_ptr(),
         };
+        let obtained = unsafe { wasm_module_obtain(store, module) };
+        let _module = OwnedValue::reference(unsafe { wasm_module_as_ref(obtained) }, false);
+        let instance = unsafe { wasm_instance_new(store, obtained, &imports, &mut trap) };
 
         if instance.is_null() {
-            let trap = Trap::from(trap);
+            let trap = traps.decode_owned(trap);
             return Err(InstantiationError::Start(trap.into()));
         }
 
@@ -58,23 +57,29 @@ impl InstanceHandle {
             vec
         };
 
-        let wasm_exports: &[*mut wasm_extern_t] = if exports.size == 0 {
-            &[]
-        } else {
-            unsafe { std::slice::from_raw_parts(exports.data, exports.size) }
-        };
+        let mut exports = OwnedExports(exports);
 
         let exports_ty = module.exports().collect::<Vec<_>>();
         exports_ty
             .iter()
-            .zip(wasm_exports.iter())
-            .map(|(export_type, wasm_export)| {
+            .take(exports.0.size)
+            .enumerate()
+            .map(|(index, export_type)| {
                 let name = export_type.name();
                 let mut store = store.as_store_mut();
                 let _extern_type = export_type.ty();
                 // Annotation is here to prevent spurious IDE warnings.
 
-                let extern_ = Extern::from_vm_extern(&mut store, VMExtern::V8(*wasm_export));
+                let origin = Origin::of(&store).expect("actual V8 instance Store");
+                let retained = store
+                    .inner
+                    .store
+                    .as_v8()
+                    .reference_roots
+                    .adopt(exports.take(index));
+                let raw = unsafe { wasm_ref_as_extern(retained) };
+                let extern_ =
+                    Extern::from_vm_extern(&mut store, VMExtern::V8(Handle::new(raw, origin)));
                 (name.to_string(), extern_)
             })
             .collect::<Exports>()
@@ -116,24 +121,46 @@ impl Instance {
         externs: &[Extern],
     ) -> Result<(Self, Exports), InstantiationError> {
         check_isolate(store);
-        let store_ref = store.as_store_ref();
+        if externs.iter().any(|value| {
+            // Sys handles may share a numeric StoreId; that is not V8 origin.
+            let is_v8 = match value {
+                Extern::Function(value) => matches!(&value.0, crate::BackendFunction::V8(_)),
+                Extern::Memory(value) => matches!(&value.0, crate::BackendMemory::V8(_)),
+                Extern::Table(value) => matches!(&value.0, crate::BackendTable::V8(_)),
+                Extern::Global(value) => matches!(&value.0, crate::BackendGlobal::V8(_)),
+                Extern::Tag(value) => matches!(&value.0, crate::BackendTag::V8(_)),
+            };
+            !is_v8 || !value.is_from_store(store)
+        }) {
+            return Err(InstantiationError::DifferentStores);
+        }
         let externs: Vec<VMExtern> = externs
             .iter()
             .map(|extern_| extern_.to_vm_extern())
             .collect::<Vec<_>>();
-        let instance = InstanceHandle::new(
-            store_ref.inner.store.as_v8().inner,
-            module.as_v8().handle.v8_shared_module_handle,
-            externs,
-        )?;
-        let exports = instance.get_exports(store, module);
+        let traps = TrapCallScope::enter(store, TrapMode::BorrowedSync, None)
+            .map_err(InstantiationError::Start)?;
+        let outcome = traps.catch(|| {
+            let instance = InstanceHandle::new(
+                store.as_store_ref().inner.store.as_v8().inner,
+                module.as_v8().handle.v8_shared_module_handle,
+                externs,
+                &traps,
+            )?;
+            let exports = instance.get_exports(store, module);
 
-        Ok((
-            Self {
-                handle: Arc::new(instance),
-            },
-            exports,
-        ))
+            Ok((
+                Self {
+                    handle: Arc::new(instance),
+                },
+                exports,
+            ))
+        });
+        traps.finish_outcome(outcome.unwrap_or_else(|| {
+            Err(InstantiationError::Start(crate::RuntimeError::new(
+                "V8 instance start panicked",
+            )))
+        }))
     }
 }
 

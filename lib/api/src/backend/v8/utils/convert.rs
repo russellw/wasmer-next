@@ -1,3 +1,4 @@
+use crate::backend::v8::origin::Handle;
 use wasmer_types::{ExternType, FunctionType, Mutability, Type};
 
 /// Utilities to convert between `v8` and `wasmer` values
@@ -10,86 +11,212 @@ use crate::{
 };
 
 pub trait IntoCApiValue {
-    /// Consume [`self`] to produce a [`wasm_val_t`].
-    fn into_cv(self) -> wasm_val_t;
+    /// Borrow a value only after validating the canonical declared type.
+    fn into_cv(self, expected: Type) -> Result<wasm_val_t, crate::RuntimeError>;
 }
 
 impl IntoCApiValue for Value {
-    fn into_cv(self) -> wasm_val_t {
-        match self {
-            Self::I32(val) => wasm_val_t {
-                kind: bindings::wasm_valkind_enum_WASM_I32 as _,
-                of: wasm_val_t__bindgen_ty_1 { i32_: val },
-            },
-            Self::I64(val) => wasm_val_t {
-                kind: bindings::wasm_valkind_enum_WASM_I64 as _,
-                of: wasm_val_t__bindgen_ty_1 { i64_: val },
-            },
-            Self::F32(val) => wasm_val_t {
-                kind: bindings::wasm_valkind_enum_WASM_F32 as _,
-                of: wasm_val_t__bindgen_ty_1 { f32_: val },
-            },
-            Self::F64(val) => wasm_val_t {
-                kind: bindings::wasm_valkind_enum_WASM_F64 as _,
-                of: wasm_val_t__bindgen_ty_1 { f64_: val },
-            },
-            Self::FuncRef(Some(val)) => wasm_val_t {
-                kind: bindings::wasm_valkind_enum_WASM_FUNCREF as _,
+    fn into_cv(self, expected: Type) -> Result<wasm_val_t, crate::RuntimeError> {
+        // Null carries no callable/object identity. Preserve the C API's
+        // generic null-table initializer while stamping its declared family.
+        if matches!(&self, Value::FuncRef(None) | Value::ExternRef(None))
+            && matches!(expected, Type::FuncRef | Type::ExternRef)
+        {
+            return Ok(wasm_val_t {
+                kind: if expected == Type::FuncRef {
+                    bindings::wasm_valkind_enum_WASM_FUNCREF
+                } else {
+                    bindings::wasm_valkind_enum_WASM_EXTERNREF
+                } as _,
                 of: wasm_val_t__bindgen_ty_1 {
-                    ref_: unsafe { wasm_func_as_ref(val.as_v8().handle) },
+                    ref_: std::ptr::null_mut(),
                 },
+            });
+        }
+        if self.ty() != expected {
+            return Err(crate::RuntimeError::new(
+                "V8 value does not match its declared type",
+            ));
+        }
+        Ok(match self {
+            Self::I32(value) => wasm_val_t {
+                kind: bindings::wasm_valkind_enum_WASM_I32 as _,
+                of: wasm_val_t__bindgen_ty_1 { i32_: value },
             },
+            Self::I64(value) => wasm_val_t {
+                kind: bindings::wasm_valkind_enum_WASM_I64 as _,
+                of: wasm_val_t__bindgen_ty_1 { i64_: value },
+            },
+            Self::F32(value) => wasm_val_t {
+                kind: bindings::wasm_valkind_enum_WASM_F32 as _,
+                of: wasm_val_t__bindgen_ty_1 { f32_: value },
+            },
+            Self::F64(value) => wasm_val_t {
+                kind: bindings::wasm_valkind_enum_WASM_F64 as _,
+                of: wasm_val_t__bindgen_ty_1 { f64_: value },
+            },
+            Self::FuncRef(Some(value)) => {
+                let BackendFunction::V8(function) = value.0 else {
+                    return Err(crate::RuntimeError::new(
+                        "V8 function reference has a foreign backend",
+                    ));
+                };
+                function.handle.origin.check_alive()?;
+                wasm_val_t {
+                    kind: bindings::wasm_valkind_enum_WASM_FUNCREF as _,
+                    of: wasm_val_t__bindgen_ty_1 {
+                        ref_: unsafe { wasm_func_as_ref(function.handle.raw()) },
+                    },
+                }
+            }
             Self::FuncRef(None) => wasm_val_t {
                 kind: bindings::wasm_valkind_enum_WASM_FUNCREF as _,
                 of: wasm_val_t__bindgen_ty_1 {
-                    ref_: unsafe { wasm_func_as_ref(std::ptr::null_mut()) },
+                    ref_: std::ptr::null_mut(),
                 },
             },
-            Self::ExternRef(_) => panic!(
-                "Creating host values from guest ExternRefs is not currently supported in V8."
-            ),
-            Self::ExceptionRef(_) => {
-                panic!(
-                    "Creating host values from guest ExceptionRefs is not currently supported in V8."
-                )
-            }
-            Self::V128(val) => wasm_val_t {
+            Self::ExternRef(None) => wasm_val_t {
+                kind: bindings::wasm_valkind_enum_WASM_EXTERNREF as _,
+                of: wasm_val_t__bindgen_ty_1 {
+                    ref_: std::ptr::null_mut(),
+                },
+            },
+            Self::V128(value) => wasm_val_t {
                 kind: bindings::wasm_valkind_enum_WASM_V128 as _,
                 of: wasm_val_t__bindgen_ty_1 {
                     v128: wasm_v128_t {
-                        bytes: val.to_le_bytes(),
+                        bytes: value.to_le_bytes(),
                     },
                 },
             },
-        }
+            Self::ExternRef(Some(_)) | Self::ExceptionRef(_) => {
+                return Err(crate::RuntimeError::new(
+                    "V8 value reference type is not supported",
+                ));
+            }
+        })
     }
 }
 
+pub(crate) fn validate_values(
+    values: &[Value],
+    expected: &[Type],
+) -> Result<(), crate::RuntimeError> {
+    if values.len() != expected.len() {
+        return Err(crate::RuntimeError::new(
+            "V8 value count does not match its signature",
+        ));
+    }
+    for (value, expected) in values.iter().zip(expected) {
+        if value.ty() != *expected {
+            return Err(crate::RuntimeError::new(
+                "V8 value does not match its declared type",
+            ));
+        }
+        if matches!(value, Value::ExternRef(Some(_)) | Value::ExceptionRef(_)) {
+            return Err(crate::RuntimeError::new(
+                "V8 value reference type is not supported",
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_raw_values(
+    values: &[wasm_val_t],
+    expected: &[Type],
+) -> Result<(), crate::RuntimeError> {
+    if values.len() != expected.len() {
+        return Err(crate::RuntimeError::new(
+            "V8 value count does not match its signature",
+        ));
+    }
+    for (value, expected) in values.iter().zip(expected) {
+        validate_raw_value(value, *expected)?;
+    }
+    Ok(())
+}
+
+fn validate_raw_value(value: &wasm_val_t, expected: Type) -> Result<(), crate::RuntimeError> {
+    let kind = value.kind as u32;
+    let valid = match expected {
+        Type::FuncRef | Type::ExternRef => matches!(
+            kind,
+            bindings::wasm_valkind_enum_WASM_FUNCREF | bindings::wasm_valkind_enum_WASM_EXTERNREF
+        ),
+        Type::I32 => kind == bindings::wasm_valkind_enum_WASM_I32,
+        Type::I64 => kind == bindings::wasm_valkind_enum_WASM_I64,
+        Type::F32 => kind == bindings::wasm_valkind_enum_WASM_F32,
+        Type::F64 => kind == bindings::wasm_valkind_enum_WASM_F64,
+        Type::V128 => kind == bindings::wasm_valkind_enum_WASM_V128,
+        _ => false,
+    };
+    if !valid {
+        return Err(crate::RuntimeError::new(
+            "V8 value does not match its declared type",
+        ));
+    }
+    if expected == Type::ExternRef && !unsafe { value.of.ref_ }.is_null() {
+        return Err(crate::RuntimeError::new(
+            "V8 nonnull externref is not supported",
+        ));
+    }
+    Ok(())
+}
+
 pub trait IntoWasmerValue {
-    /// Consume [`self`] to produce a [`Value`].
-    fn into_wv(self) -> Value;
+    /// The pinned C++ Val(own<Ref>) uses EXTERNREF for both reference families.
+    /// Only the already-validated signature supplies the actual Wasm type.
+    fn into_wv(
+        self,
+        expected: Type,
+        store: &impl crate::AsStoreRef,
+    ) -> Result<Value, crate::RuntimeError>;
 }
 
 impl IntoWasmerValue for wasm_val_t {
-    fn into_wv(self) -> Value {
-        match self.kind as _ {
-            bindings::wasm_valkind_enum_WASM_I32 => Value::I32(unsafe { self.of.i32_ }),
-            bindings::wasm_valkind_enum_WASM_I64 => Value::I64(unsafe { self.of.i64_ }),
-            bindings::wasm_valkind_enum_WASM_F32 => Value::F32(unsafe { self.of.f32_ }),
-            bindings::wasm_valkind_enum_WASM_F64 => Value::F64(unsafe { self.of.f64_ }),
-            bindings::wasm_valkind_enum_WASM_V128 => {
-                Value::V128(u128::from_le_bytes(unsafe { self.of.v128.bytes }))
-            }
-            bindings::wasm_valkind_enum_WASM_FUNCREF => Value::FuncRef(Some(Function(
-                BackendFunction::V8(crate::backend::v8::function::Function {
-                    handle: unsafe { self.of.ref_ as _ },
-                }),
-            ))),
-            bindings::wasm_valkind_enum_WASM_EXTERNREF => {
-                panic!("ExternRefs are not currently supported through wasm_c_api")
-            }
-            _ => unreachable!("v8 kind {} has no matching wasmer type", self.kind),
+    fn into_wv(
+        self,
+        expected: Type,
+        store: &impl crate::AsStoreRef,
+    ) -> Result<Value, crate::RuntimeError> {
+        validate_raw_value(&self, expected)?;
+        let view = store.as_store_ref();
+        if !view.inner.store.is_v8() {
+            return Err(crate::RuntimeError::new(
+                "V8 value requires its actual V8 Store",
+            ));
         }
+        let backend = view.inner.store.as_v8();
+        let origin = backend.origin.capture();
+        origin.check_alive()?;
+        if matches!(expected, Type::FuncRef | Type::ExternRef) {
+            let raw = unsafe { self.of.ref_ };
+            return match expected {
+                Type::FuncRef if raw.is_null() => Ok(Value::FuncRef(None)),
+                Type::FuncRef => {
+                    // The checked producer's declared FuncRef type, not the
+                    // generic C++ Val tag, certifies this callable reference.
+                    let retained = backend.reference_roots.copy(raw, true);
+                    let function = unsafe { wasm_ref_as_func(retained) };
+                    Ok(Value::FuncRef(Some(Function(BackendFunction::V8(
+                        function::Function {
+                            handle: Handle::new(function, origin),
+                        },
+                    )))))
+                }
+                Type::ExternRef => Ok(Value::ExternRef(None)),
+                _ => unreachable!(),
+            };
+        }
+        Ok(match expected {
+            Type::I32 => Value::I32(unsafe { self.of.i32_ }),
+            Type::I64 => Value::I64(unsafe { self.of.i64_ }),
+            Type::F32 => Value::F32(unsafe { self.of.f32_ }),
+            Type::F64 => Value::F64(unsafe { self.of.f64_ }),
+            Type::V128 => Value::V128(u128::from_le_bytes(unsafe { self.of.v128.bytes })),
+            _ => unreachable!(),
+        })
     }
 }
 

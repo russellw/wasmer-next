@@ -10,11 +10,20 @@
 
 use std::iter::FromIterator;
 
+#[cfg(feature = "experimental-async")]
+use crate::{AsStoreAsync, StoreAsync};
 use crate::{
     AsStoreMut, FromToNativeWasmType, NativeWasmType, NativeWasmTypeInto, RuntimeError,
     TypedFunction, Value, WasmTypeList,
-    backend::v8::{bindings::*, error::Trap, function::Function, utils::convert::*},
+    backend::v8::{
+        bindings::*,
+        error::{TrapCallScope, TrapMode},
+        function::Function,
+        utils::convert::*,
+    },
 };
+#[cfg(feature = "experimental-async")]
+use std::future::Future;
 use wasmer_types::RawValue;
 
 macro_rules! impl_native_traits {
@@ -25,11 +34,45 @@ macro_rules! impl_native_traits {
              $( $x: FromToNativeWasmType, )*
              Rets: WasmTypeList,
          {
-             /// Call the typed func and return results.
+             #[cfg(feature = "experimental-async")]
+            pub(crate) fn call_async_v8(
+                function: crate::Function, store: StoreAsync, arguments: ( $( $x, )* )
+            ) -> impl Future<Output = Result<Rets, RuntimeError>> + 'static
+            where $( $x: FromToNativeWasmType + 'static, )*
+            {
+                async move {
+                    let ( $( $x, )* ) = arguments;
+                    let mut write = crate::StoreAsyncWriteLock::try_acquire(&store)
+                        .ok_or_else(|| RuntimeError::new("V8 typed call Store is busy"))?;
+                    if !function.is_from_store(&write) {
+                        return Err(RuntimeError::new("V8 typed function belongs to another Store"));
+                    }
+                    let signature = function.ty(&write);
+                    let raw = [ $( $x.to_native().into_raw(&mut write) ),* ];
+                    let values = raw.iter().zip(signature.params()).map(|(raw, ty)| {
+                        unsafe { Value::from_raw(&mut write, *ty, *raw) }
+                    }).collect();
+                    drop(write);
+                    let values = function.call_async(&store, values).await?;
+                    let mut write = crate::StoreAsyncWriteLock::try_acquire(&store)
+                        .ok_or_else(|| RuntimeError::new("V8 typed call Store is busy"))?;
+                    let mut raw = Rets::empty_array();
+                    for (slot, value) in raw.as_mut().iter_mut().zip(values.iter()) {
+                        *slot = value.as_raw(&mut write);
+                    }
+                    Ok(unsafe { Rets::from_array(&mut write, raw) })
+                }
+            }
+
+            /// Call the typed func and return results.
             #[allow(clippy::too_many_arguments)]
             pub fn call_v8(&self, mut store: &mut impl AsStoreMut, $( $x: $x, )* ) -> Result<Rets, RuntimeError> where
             $( $x: FromToNativeWasmType, )*
             {
+
+                 if !self.func.is_from_store(store) {
+                     return Err(RuntimeError::new("V8 typed function belongs to another Store"));
+                 }
 
                  // // let store_ptr = Value::I64(store.as_store_mut().as_raw() as _).as_jsvalue(store);
                  #[allow(unused_unsafe)]
@@ -37,33 +80,38 @@ macro_rules! impl_native_traits {
                      vec![ $( {
                          let raw = $x.to_native().into_raw(store);
                          let value = Value::from_raw(&mut store, <$x::Native as NativeWasmType>::WASM_TYPE, raw);
-                         value.into_cv()
+                         value
                      } ),* ]
                  };
 
-                 let mut results = {
-                    unsafe {
-                        let mut ret = std::mem::zeroed();
-                        wasm_val_vec_new_uninitialized(&mut ret, Rets::wasm_types().len());
-                        ret
-                    }
-                };
+                 let traps = TrapCallScope::enter(store, TrapMode::BorrowedSync, None)?;
+                 let mut decoded = None;
+                 let outcome = traps.catch(|| {
+                 let mut results = crate::backend::v8::references::Values::empty(Rets::wasm_types().len());
 
 
-                 let func = unsafe { wasm_extern_as_func(self.func.to_vm_extern().unwrap_v_8()) };
+                 let func = unsafe { wasm_extern_as_func(self.func.to_vm_extern().unwrap_v_8().raw()) };
 
-                let mut params = unsafe {std::mem::zeroed()};
-                unsafe {wasm_val_vec_new(&mut params, params_list.len(), params_list.as_ptr())};
 
                  let mut trap;
 
                  loop {
-                    trap = unsafe { wasm_func_call(func, &params, &mut results) };
+                    results.clear();
+                    let arguments = crate::backend::v8::references::Values::from_values(&params_list, &[ $( <$x::Native as NativeWasmType>::WASM_TYPE, )* ])?;
+                    let raw_results = &mut results.0;
+                    let raw_arguments = arguments.into_call_arguments();
+                    trap = unsafe { wasm_func_call(func, &raw_arguments, raw_results) };
 
+                    decoded = if trap.is_null() { None } else { Some(traps.decode_owned(trap)) };
+                    if traps.has_panic() { return Err(RuntimeError::new("V8 typed call panicked")); }
                     let store_mut = store.as_store_mut();
                     if let Some(callback) = store_mut.inner.on_called.take() {
                         match callback(store_mut) {
-                            Ok(wasmer_types::OnCalledAction::InvokeAgain) => { continue; }
+                            Ok(wasmer_types::OnCalledAction::InvokeAgain) => {
+                                traps.dispose(|| drop(decoded.take()));
+                                if traps.has_panic() { return Err(RuntimeError::new("V8 typed replay panicked")); }
+                                continue;
+                            }
                             Ok(wasmer_types::OnCalledAction::Finish) => { break; }
                             Ok(wasmer_types::OnCalledAction::Trap(trap)) => { return Err(RuntimeError::user(trap)) },
                             Err(trap) => { return Err(RuntimeError::user(trap)) },
@@ -74,13 +122,9 @@ macro_rules! impl_native_traits {
 
 
 
-                 if !trap.is_null() {
-                     unsafe {
-                        let trap: Trap = trap.into();
-                        return Err(RuntimeError::from(trap));
-                     }
-                }
+                 if let Some(trap) = decoded.take() { return Err(RuntimeError::from(trap)); }
 
+                crate::backend::v8::utils::convert::validate_raw_values(results.as_slice(), &Rets::wasm_types())?;
                 unsafe {
                     let mut rets_list_array = Rets::empty_array();
                     let mut_rets = rets_list_array.as_mut() as *mut [RawValue] as *mut RawValue;
@@ -88,14 +132,14 @@ macro_rules! impl_native_traits {
                     match Rets::size() {
                         0 => {},
                         1 => {
-                            let val = (*results.data.wrapping_add(0)).clone();
-                            let val = val.into_wv();
+                            let val = (*results.0.data.wrapping_add(0)).clone();
+                            let val = val.into_wv(Rets::wasm_types()[0], store)?;
                             *mut_rets = val.as_raw(&mut store);
                         }
                         _n => {
                             for (i, ret_type) in Rets::wasm_types().iter().enumerate() {
-                                    let val = (*results.data.wrapping_add(i)).clone();
-                                    let val = val.into_wv();
+                                    let val = (*results.0.data.wrapping_add(i)).clone();
+                                    let val = val.into_wv(*ret_type, store)?;
                                     let slot = mut_rets.add(i);
                                     *slot = val.as_raw(&mut store);
                             }
@@ -104,6 +148,9 @@ macro_rules! impl_native_traits {
 
                     Ok(unsafe { Rets::from_array(store, rets_list_array) })
                 }
+                 });
+                 traps.dispose(|| drop(decoded.take()));
+                 traps.finish_outcome(outcome.unwrap_or_else(|| Err(RuntimeError::new("V8 typed call panicked"))))
             }
 
             #[doc(hidden)]

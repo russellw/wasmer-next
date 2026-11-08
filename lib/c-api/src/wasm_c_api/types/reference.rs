@@ -67,6 +67,19 @@ impl wasm_ref_t {
     /// Box a reference value. Returns `None` (i.e. the null `wasm_ref_t*`) for
     /// null references and non-reference values.
     pub(crate) fn new(store: StoreRef, inner: Value) -> Option<Box<wasm_ref_t>> {
+        if matches!(&inner, Value::ExternRef(Some(_)) | Value::FuncRef(Some(_))) {
+            match store.with_mut(|store| inner.is_from_store(store)) {
+                Ok(true) => {}
+                Ok(false) => {
+                    crate::error::update_last_error("reference belongs to another Store");
+                    return None;
+                }
+                Err(error) => {
+                    crate::error::update_last_error(error);
+                    return None;
+                }
+            }
+        }
         match &inner {
             Value::ExternRef(Some(_)) | Value::FuncRef(Some(_)) => Some(Box::new(wasm_ref_t {
                 inner,

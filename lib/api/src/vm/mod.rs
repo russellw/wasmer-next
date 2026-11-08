@@ -40,3 +40,36 @@ define_vm_like!(Table, Debug);
 define_vm_like!(ExceptionRef);
 define_vm_like!(ExternRef);
 define_vm_like!(FuncRef);
+
+#[cfg(feature = "v8")]
+impl VMExtern {
+    /// Imports a raw wee8 extern into the named actual Store.
+    ///
+    /// # Safety
+    /// `raw` must be a nonnull, live wee8 wasm_extern_t created in this exact
+    /// Store on its original thread, with its wee8 reference retained for the
+    /// Store's lifetime. A foreign, expired or arbitrary address is not valid.
+    /// This constructor cannot discover ownership by querying the raw pointer.
+    #[doc(hidden)]
+    pub unsafe fn from_raw_v8_unchecked(
+        store: &impl crate::AsStoreRef,
+        raw: *mut std::ffi::c_void,
+    ) -> Result<Self, crate::RuntimeError> {
+        let origin = crate::backend::v8::origin::Origin::of(store)?;
+        if raw.is_null() {
+            return Err(crate::RuntimeError::new("null V8 extern"));
+        }
+        let view = store.as_store_ref();
+        let reference = unsafe { crate::backend::v8::bindings::wasm_extern_as_ref(raw.cast()) };
+        let retained = view
+            .inner
+            .store
+            .as_v8()
+            .reference_roots
+            .copy(reference, false);
+        let raw = unsafe { crate::backend::v8::bindings::wasm_ref_as_extern(retained) };
+        Ok(Self::V8(crate::backend::v8::origin::Handle::new(
+            raw, origin,
+        )))
+    }
+}

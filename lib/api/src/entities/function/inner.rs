@@ -227,7 +227,9 @@ impl BackendFunction {
                 crate::backend::sys::entities::function::Function::new_async(store, ty, func),
             ),
             #[cfg(feature = "v8")]
-            crate::BackendStore::V8(_) => unsupported_async_backend("v8"),
+            crate::BackendStore::V8(_) => Self::V8(
+                crate::backend::v8::function::Function::new_async(store, ty, func),
+            ),
             #[cfg(feature = "js")]
             crate::BackendStore::Js(_) => Self::Js(
                 crate::backend::js::entities::function::Function::new_async(store, ty, func),
@@ -264,7 +266,9 @@ impl BackendFunction {
                 ),
             ),
             #[cfg(feature = "v8")]
-            crate::BackendStore::V8(_) => unsupported_async_backend("v8"),
+            crate::BackendStore::V8(_) => Self::V8(
+                crate::backend::v8::function::Function::new_with_env_async(store, env, ty, func),
+            ),
             #[cfg(feature = "js")]
             crate::BackendStore::Js(_) => Self::Js(
                 crate::backend::js::entities::function::Function::new_with_env_async(
@@ -292,7 +296,9 @@ impl BackendFunction {
                 crate::backend::sys::entities::function::Function::new_typed_async(store, func),
             ),
             #[cfg(feature = "v8")]
-            crate::BackendStore::V8(_) => unsupported_async_backend("v8"),
+            crate::BackendStore::V8(_) => Self::V8(
+                crate::backend::v8::function::Function::new_typed_async(store, func),
+            ),
             #[cfg(feature = "js")]
             crate::BackendStore::Js(_) => Self::Js(
                 crate::backend::js::entities::function::Function::new_typed_async(store, func),
@@ -321,7 +327,9 @@ impl BackendFunction {
                 ),
             ),
             #[cfg(feature = "v8")]
-            crate::BackendStore::V8(_) => unsupported_async_backend("v8"),
+            crate::BackendStore::V8(_) => Self::V8(
+                crate::backend::v8::function::Function::new_typed_with_env_async(store, env, func),
+            ),
             #[cfg(feature = "js")]
             crate::BackendStore::Js(_) => Self::Js(
                 crate::backend::js::entities::function::Function::new_typed_with_env_async(
@@ -349,7 +357,7 @@ impl BackendFunction {
                 crate::backend::sys::entities::function::Function::new_typed_with_env_async_captured(store, env, func, Some(capture)),
             ),
             #[cfg(feature = "v8")]
-            crate::BackendStore::V8(_) => unsupported_async_backend("v8"),
+            crate::BackendStore::V8(_) => Self::V8(crate::backend::v8::function::Function::new_typed_with_env_async_captured(store, env, func, Some(capture))),
             #[cfg(feature = "js")]
             crate::BackendStore::Js(_) => {
                 let _ = capture;
@@ -493,7 +501,7 @@ impl BackendFunction {
             #[cfg(feature = "sys")]
             Self::Sys(f) => f.call_async(store, params),
             #[cfg(feature = "v8")]
-            Self::V8(_) => unsupported_async_future(),
+            Self::V8(function) => function.call_async(store, params),
             #[cfg(feature = "js")]
             Self::Js(f) => f.call_async(store, params),
         }
@@ -677,9 +685,16 @@ impl BackendFunction {
     /// Checks whether this `Function` can be used with the given store.
     #[inline]
     pub fn is_from_store(&self, store: &impl AsStoreRef) -> bool {
-        match_rt!(on self => f {
-            f.is_from_store(store)
-        })
+        let view = store.as_store_ref();
+        match (self, &view.inner.store) {
+            #[cfg(feature = "sys")]
+            (Self::Sys(function), crate::BackendStore::Sys(_)) => function.is_from_store(&view),
+            #[cfg(feature = "v8")]
+            (Self::V8(function), crate::BackendStore::V8(_)) => function.is_from_store(&view),
+            #[cfg(feature = "js")]
+            (Self::Js(function), crate::BackendStore::Js(_)) => function.is_from_store(&view),
+            _ => false,
+        }
     }
 
     #[inline]
@@ -688,13 +703,6 @@ impl BackendFunction {
             f.to_vm_extern()
         })
     }
-}
-
-#[cold]
-fn unsupported_async_backend(backend: &str) -> ! {
-    panic!(
-        "async host functions are only supported with the `sys` backend (attempted on {backend})"
-    )
 }
 
 #[allow(clippy::type_complexity)]
