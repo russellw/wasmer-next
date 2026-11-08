@@ -1140,7 +1140,9 @@ mod tests {
         }
         let calls = Arc::new(AtomicUsize::new(0));
         let saves = Arc::new(AtomicUsize::new(0));
-        let store = StoreRef::new(wasmer_api::Store::default()).unwrap();
+        let engine = wasm_engine_new();
+        let public_store = unsafe { wasm_store_new(Some(&engine)) }.unwrap();
+        let store = public_store.inner.clone();
         let wasi = NativeWasi::new(
             &store,
             vec!["borrowed-helper".into()],
@@ -1211,6 +1213,7 @@ mod tests {
         drop(instance);
         drop(wasi);
         drop(store);
+        drop(public_store);
     }
 
     fn canonical_entry_child(test: &str) -> bool {
@@ -1300,7 +1303,9 @@ mod tests {
                 .unwrap()
         }
         for same_instance in [true, false] {
-            let store = StoreRef::new(wasmer_api::Store::default()).unwrap();
+            let engine = wasm_engine_new();
+            let public_store = unsafe { wasm_store_new(Some(&engine)) }.unwrap();
+            let store = public_store.inner.clone();
             // B registers first: neither first-candidate selection nor the
             // initial root's row number identifies the actual imports' owner.
             let b =
@@ -1372,6 +1377,7 @@ mod tests {
             drop(a);
             drop(b);
             drop(store);
+            drop(public_store);
         }
     }
 
@@ -1383,7 +1389,9 @@ mod tests {
             return;
         }
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let store = StoreRef::new(wasmer_api::Store::default()).unwrap();
+        let engine = wasm_engine_new();
+        let public_store = unsafe { wasm_store_new(Some(&engine)) }.unwrap();
+        let store = public_store.inner.clone();
         let wasi =
             NativeWasi::new(&store, vec!["owner".into()], vec![], vec![], false, false).unwrap();
         let probe_slot = Rc::new(RefCell::new(None::<Function>));
@@ -1506,6 +1514,7 @@ mod tests {
         drop(instance);
         drop(wasi);
         drop(store);
+        drop(public_store);
     }
 
     #[test]
