@@ -6769,7 +6769,7 @@ mod tests {
         };
         use wasixv2_syscalls::UserMemory;
         use wasmer_api::sys::{NativeAncestrySettlement, NativeFrameGuard, WeakNativeInvocation};
-        use wasmer_api::{AsStoreAsync, AsyncFunctionEnvMut, FunctionEnv, FunctionType, Type};
+        use wasmer_api::{AsyncFunctionEnvMut, FunctionEnv, FunctionType, Type};
         type Env = AsyncFunctionEnvMut<wasixv2_exec::ExecEnv<wasixv2::MachineSyscalls>>;
         const TEST: &str = "wasm_c_api::store::tests::initialized_start_escaped_helper_cancellation_preserves_first_panic_and_original_driver";
         const CHILD: &str = "WASMER_CAPI_ESCAPED_ENTRY_CHILD";

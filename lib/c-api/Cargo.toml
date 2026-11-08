@@ -58,6 +58,7 @@ tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
 
 [dev-dependencies]
+wasixv2-syscalls.workspace = true
 wasixv2-vfs.workspace = true
 field-offset.workspace = true
 inline-c.workspace = true
