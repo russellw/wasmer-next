@@ -5909,6 +5909,10 @@ mod tests {
         late_tail_observer_failure_profile(false);
     }
 
+    #[allow(
+        clippy::drop_non_drop,
+        reason = "Preserve the frozen a708 public oracle body and its explicit caller handle lifetime boundary"
+    )]
     #[cfg(all(unix, feature = "wasi"))]
     #[test]
     fn active_foreign_caller_without_target_tail_drives_last_public_store_cleanup() {
