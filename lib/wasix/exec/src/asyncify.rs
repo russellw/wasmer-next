@@ -32,7 +32,15 @@
 //!   same object there. Ranges `MADV_WIPEONFORK` marked are not copied either: they read zero
 //!   in the child.
 
-use std::{any::Any, collections::HashMap, future::Future, ops::Range, sync::Arc};
+use std::{
+    any::Any,
+    collections::HashMap,
+    future::Future,
+    ops::Range,
+    pin::Pin,
+    rc::{Rc, Weak},
+    sync::Arc,
+};
 
 use wasixv2_syscalls::{SharedMapping, TaskId};
 use wasmer::{
@@ -72,6 +80,54 @@ pub(crate) fn instrumented(module: &Module) -> bool {
     ]
     .into_iter()
     .all(has)
+}
+
+/// A finite external entry's identity. This carries no Store or root authority.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct HostEntryToken(Arc<()>);
+
+impl HostEntryToken {
+    pub fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+#[doc(hidden)]
+pub type HostEntryFuture = Pin<Box<dyn Future<Output = Result<Box<[Value]>, RuntimeError>>>>;
+
+/// The embedder's local factory. Only the function pointer and Send identity live
+/// in ExecEnv; captured local owner metadata stays in AsyncFunctionEnvMut.
+#[doc(hidden)]
+pub type HostEntryInvoke = fn(
+    Function,
+    StoreAsync,
+    Vec<Value>,
+    Option<Weak<dyn Any>>,
+    HostEntryToken,
+    usize,
+) -> HostEntryFuture;
+
+#[derive(Clone)]
+pub(crate) struct EntryHook {
+    invoke: HostEntryInvoke,
+    token: HostEntryToken,
+    row: usize,
+}
+
+struct EntrySnapshot<S: 'static> {
+    hook: EntryHook,
+    binding: std::sync::Weak<dyn crate::AbiInstance<S>>,
+}
+
+/// Trusted pure import-factory metadata capture. The exact ABI resource remains
+/// strongly owned only by the external finite entry row.
+#[doc(hidden)]
+pub fn capture_host_entry<S: 'static>(env: &ExecEnv<S>) -> Option<Arc<dyn Any + Send + Sync>> {
+    Some(Arc::new(EntrySnapshot::<S> {
+        hook: env.asyncify.as_ref()?.entry_hook.clone()?,
+        binding: Arc::downgrade(env.abi.as_ref()?),
+    }))
 }
 
 /// What an unwind is for, as the import that started it asked.
@@ -193,6 +249,11 @@ pub(crate) struct Asyncify {
     /// Saved stacks by generation; see [`Saved::dead_after`] for when they go.
     saved: HashMap<u64, Arc<Saved>>,
     generation: u64,
+    entry_hook: Option<EntryHook>,
+    start_unwind_function: Function,
+    stop_unwind_function: Function,
+    start_rewind_function: Function,
+    stop_rewind_function: Function,
 }
 
 impl Asyncify {
@@ -257,6 +318,11 @@ impl Asyncify {
             resume: None,
             saved: HashMap::new(),
             generation: 0,
+            entry_hook: None,
+            start_unwind_function: exports.get_function(START_UNWIND)?.clone(),
+            stop_unwind_function: exports.get_function(STOP_UNWIND)?.clone(),
+            start_rewind_function: exports.get_function(START_REWIND)?.clone(),
+            stop_rewind_function: exports.get_function(STOP_REWIND)?.clone(),
         }))
     }
 
@@ -280,6 +346,42 @@ impl Asyncify {
 /// How the execution layer reaches an instance: from outside any guest call (its function
 /// environment and store), or from an import (its async environment).
 pub(crate) trait Access<S: 'static> {
+    fn local_owner(&self) -> Option<Weak<dyn Any>> {
+        None
+    }
+    fn entry_snapshot(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+        None
+    }
+
+    /// Validate the ORIGINAL factory snapshot inside this actual existing Store
+    /// borrow, before the callback can mutate a replacement image's state.
+    async fn with_entry<R>(
+        &self,
+        f: impl FnOnce(&mut ExecEnv<S>, &mut StoreMut<'_>, Option<EntryHook>) -> R,
+    ) -> Result<R, RuntimeError> {
+        let snapshot = self.entry_snapshot();
+        self.with(|env, store| {
+            let hook = match snapshot.as_deref() {
+                None => None,
+                Some(snapshot) => {
+                    let snapshot =
+                        snapshot.downcast_ref::<EntrySnapshot<S>>().ok_or_else(|| {
+                            RuntimeError::new("native import has an invalid entry snapshot")
+                        })?;
+                    if !env.abi.as_ref().is_some_and(|binding| {
+                        std::sync::Weak::ptr_eq(&snapshot.binding, &Arc::downgrade(binding))
+                    }) {
+                        return Err(RuntimeError::new(
+                            "native import belongs to a replaced entry binding",
+                        ));
+                    }
+                    Some(snapshot.hook.clone())
+                }
+            };
+            Ok(f(env, store, hook))
+        })
+        .await
+    }
     fn store(&self) -> StoreAsync;
     fn with<R>(
         &self,
@@ -307,6 +409,12 @@ impl<S: Send + Sync + 'static> Access<S> for Outside<'_, S> {
 }
 
 impl<S: 'static> Access<S> for AsyncFunctionEnvMut<ExecEnv<S>> {
+    fn entry_snapshot(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+        self.native_import_snapshot()
+    }
+    fn local_owner(&self) -> Option<Weak<dyn Any>> {
+        self.native_local_owner()
+    }
     fn store(&self) -> StoreAsync {
         self.as_store_async().store()
     }
@@ -318,11 +426,377 @@ impl<S: 'static> Access<S> for AsyncFunctionEnvMut<ExecEnv<S>> {
     }
 }
 
+async fn invoke<S: 'static>(
+    cx: &impl Access<S>,
+    function: &Function,
+    args: Vec<Value>,
+    hook: Option<EntryHook>,
+) -> Result<Box<[Value]>, RuntimeError> {
+    if let Some(hook) = hook {
+        (hook.invoke)(
+            function.clone(),
+            cx.store(),
+            args,
+            cx.local_owner(),
+            hook.token,
+            hook.row,
+        )
+        .await
+    } else {
+        function.call_async(&cx.store(), args).await
+    }
+}
+
+async fn control0<S: 'static>(
+    cx: &impl Access<S>,
+    typed: TypedFunction<(), ()>,
+    function: Function,
+    hook: Option<EntryHook>,
+) -> Result<(), RuntimeError> {
+    if let Some(hook) = hook {
+        (hook.invoke)(
+            function,
+            cx.store(),
+            vec![],
+            cx.local_owner(),
+            hook.token,
+            hook.row,
+        )
+        .await?;
+        Ok(())
+    } else {
+        typed.call_async(&cx.store()).await
+    }
+}
+
+async fn control1<S: 'static>(
+    cx: &impl Access<S>,
+    typed: TypedFunction<i32, ()>,
+    function: Function,
+    arg: i32,
+    hook: Option<EntryHook>,
+) -> Result<(), RuntimeError> {
+    if let Some(hook) = hook {
+        (hook.invoke)(
+            function,
+            cx.store(),
+            vec![Value::I32(arg)],
+            cx.local_owner(),
+            hook.token,
+            hook.row,
+        )
+        .await?;
+        Ok(())
+    } else {
+        typed.call_async(&cx.store(), arg).await
+    }
+}
+
+/// Finite bookkeeping for explicitly initialized external entry points. The
+/// caller installs this value in its outer cancellation custody before enter.
+#[doc(hidden)]
+pub struct HostEntryCleanup<S: 'static> {
+    environments: Vec<crate::HostEnvironment<S>>,
+    store: StoreAsync,
+    token: HostEntryToken,
+    rows: std::cell::RefCell<Vec<Rc<EntryRow<S>>>>,
+    finished: std::cell::Cell<bool>,
+}
+
+struct EntryRow<S: 'static> {
+    environment: FunctionEnv<ExecEnv<S>>,
+    binding: Arc<dyn crate::AbiInstance<S>>,
+    context: std::sync::Weak<crate::contexts::Shared>,
+    baseline: u32,
+    level: Option<u32>,
+    previous: Option<EntryHook>,
+    snapshot: Arc<EntrySnapshot<S>>,
+}
+
+struct EntryAccess<'a, S: 'static> {
+    outside: Outside<'a, S>,
+    owner: Weak<dyn Any>,
+    snapshot: Arc<EntrySnapshot<S>>,
+}
+
+impl<S: Send + Sync + 'static> Access<S> for EntryAccess<'_, S> {
+    fn entry_snapshot(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+        Some(self.snapshot.clone())
+    }
+    fn local_owner(&self) -> Option<Weak<dyn Any>> {
+        Some(self.owner.clone())
+    }
+    fn store(&self) -> StoreAsync {
+        self.outside.store()
+    }
+    async fn with<R>(&self, f: impl FnOnce(&mut ExecEnv<S>, &mut StoreMut<'_>) -> R) -> R {
+        self.outside.with(f).await
+    }
+}
+
+impl<S: wasixv2_syscalls::Syscalls + wasixv2_syscalls::Control + Send + Sync + 'static>
+    HostEntryCleanup<S>
+{
+    pub fn new(environments: Vec<crate::HostEnvironment<S>>, store: StoreAsync) -> Self {
+        Self {
+            environments,
+            store,
+            token: HostEntryToken(Arc::new(())),
+            rows: Default::default(),
+            finished: Default::default(),
+        }
+    }
+
+    pub fn token(&self) -> HostEntryToken {
+        self.token.clone()
+    }
+
+    /// All row custody is committed before its first depth/hook mutation. There
+    /// are no guest callbacks between the row publication and those assignments.
+    pub async fn enter(&self, factory: HostEntryInvoke) -> Result<(), RuntimeError> {
+        let mut store = self.store.write_lock().await;
+        for environment in &self.environments {
+            let data = environment.environment().as_ref(&store);
+            let binding = data
+                .abi
+                .clone()
+                .ok_or_else(|| RuntimeError::new("initialized entry lost its ABI binding"))?;
+            if data.contexts.upgrade().is_some() || data.layout.is_some() {
+                return Err(RuntimeError::new(
+                    "external initialized entry requires its original main context",
+                ));
+            }
+            let baseline = data.asyncify.as_ref().map_or(0, |a| a.depth);
+            let level = data
+                .asyncify
+                .as_ref()
+                .map(|_| {
+                    baseline
+                        .checked_add(1)
+                        .ok_or_else(|| RuntimeError::new("asyncify entry depth exhausted"))
+                })
+                .transpose()?;
+            if data
+                .asyncify
+                .as_ref()
+                .is_some_and(|a| a.entry_hook.is_some())
+            {
+                return Err(RuntimeError::new(
+                    "initialized entry already has an active owner",
+                ));
+            }
+            let index = self.rows.borrow().len();
+            let hook = EntryHook {
+                invoke: factory,
+                token: self.token.clone(),
+                row: index,
+            };
+            let snapshot = Arc::new(EntrySnapshot {
+                hook: hook.clone(),
+                binding: Arc::downgrade(&binding),
+            });
+            let row = EntryRow {
+                environment: environment.environment().clone(),
+                binding,
+                context: data.contexts.clone(),
+                baseline,
+                level,
+                previous: data.asyncify.as_ref().and_then(|a| a.entry_hook.clone()),
+                snapshot,
+            };
+            self.rows.borrow_mut().push(Rc::new(row));
+            let data = environment.environment().as_mut(&mut store);
+            if let Some(a) = &mut data.asyncify {
+                a.depth = level.expect("instrumented row has a level");
+                a.entry_hook = Some(hook);
+            }
+        }
+        Ok(())
+    }
+
+    /// Checks the captured factory owner against this exact live image and row,
+    /// before an embedder is allowed to construct a helper root.
+    pub async fn accepts(&self, token: &HostEntryToken, row: usize, actual: &StoreAsync) -> bool {
+        #[cfg(feature = "sys")]
+        let same_backing = self.store.same_native_backing(actual);
+        #[cfg(not(feature = "sys"))]
+        let same_backing = false;
+        if !same_backing || self.finished.get() || !self.token.same(token) {
+            return false;
+        }
+        let selected = self.rows.borrow().get(row).map(|row| {
+            (
+                row.environment.clone(),
+                row.binding.clone(),
+                row.context.clone(),
+                row.level,
+            )
+        });
+        let Some((environment, binding, context, level)) = selected else {
+            return false;
+        };
+        // Preserve the exact supplied borrowed capability. The base lock may
+        // still belong to its parked parent until this helper returns.
+        let store = actual.write_lock().await;
+        let data = environment.as_ref(&store);
+        data.abi
+            .as_ref()
+            .is_some_and(|actual| Arc::ptr_eq(actual, &binding))
+            && data.contexts.ptr_eq(&context)
+            && match (&data.asyncify, level) {
+                (Some(a), Some(_)) => a
+                    .entry_hook
+                    .as_ref()
+                    .is_some_and(|hook| hook.row == row && hook.token.same(token)),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+
+    pub async fn call(
+        &self,
+        function: &Function,
+        args: &[Value],
+        owner: Weak<dyn Any>,
+        factory: HostEntryInvoke,
+    ) -> Result<Box<[Value]>, RuntimeError> {
+        self.enter(factory).await?;
+        loop {
+            let result = factory(
+                function.clone(),
+                self.store.store(),
+                args.to_vec(),
+                Some(owner.clone()),
+                self.token.clone(),
+                0,
+            )
+            .await;
+            let mut requester = None;
+            // Inspect every row before touching shared asyncify exports. Only the
+            // real requesting environment may settle the single guest call.
+            let rows = self
+                .rows
+                .borrow()
+                .iter()
+                .map(|row| (row.environment.clone(), row.level, row.snapshot.clone()))
+                .collect::<Vec<_>>();
+            for (environment, level, snapshot) in rows {
+                let Some(level) = level else {
+                    continue;
+                };
+                let cx = EntryAccess {
+                    outside: Outside {
+                        env: &environment,
+                        store: &self.store,
+                    },
+                    owner: owner.clone(),
+                    snapshot: snapshot.clone(),
+                };
+                let requested = cx
+                    .with_entry(|env, _, _| {
+                        env.asyncify.as_ref().is_some_and(|a| {
+                            if result.is_ok() {
+                                a.unwinding.is_some()
+                            } else {
+                                result
+                                    .as_ref()
+                                    .err()
+                                    .and_then(|err| err.downcast_ref::<Restore>())
+                                    .is_some_and(|restore| {
+                                        restore.saved.id.level == level
+                                            && a.saved
+                                                .get(&restore.saved.id.generation)
+                                                .is_some_and(|saved| {
+                                                    Arc::ptr_eq(saved, &restore.saved)
+                                                })
+                                    })
+                            }
+                        })
+                    })
+                    .await?;
+                if requested {
+                    if requester.is_some() {
+                        return Err(RuntimeError::new(
+                            "multiple initialized environments requested the same unwind",
+                        ));
+                    }
+                    requester = Some((environment, level, snapshot));
+                }
+            }
+            let Some((environment, level, snapshot)) = requester else {
+                return result;
+            };
+            let cx = EntryAccess {
+                outside: Outside {
+                    env: &environment,
+                    store: &self.store,
+                },
+                owner: owner.clone(),
+                snapshot,
+            };
+            match settle(&cx, level, Some("_start"), args, result).await? {
+                None => continue,
+                Some(values) => return Ok(values),
+            }
+        }
+    }
+
+    /// Called only after ALL actual owned guest/helper futures have dropped and
+    /// their physical/write-epoch observers settled. Replaced ABI states are not
+    /// reset. The finite hook and all abandoned nested levels belong to this token.
+    pub async fn finish(&self) {
+        if self.finished.get() {
+            return;
+        }
+        let rows = self.rows.borrow().clone();
+        if rows.is_empty() {
+            self.finished.set(true);
+            return;
+        }
+        let mut retired = Vec::new();
+        {
+            let mut store = self.store.write_lock().await;
+            for row in &rows {
+                let data = row.environment.as_mut(&mut store);
+                let same_image = data
+                    .abi
+                    .as_ref()
+                    .is_some_and(|actual| Arc::ptr_eq(actual, &row.binding))
+                    && data.contexts.ptr_eq(&row.context);
+                if same_image
+                    && let Some(a) = &mut data.asyncify
+                    && a.entry_hook
+                        .as_ref()
+                        .is_some_and(|hook| hook.token.same(&self.token))
+                {
+                    a.depth = row.baseline;
+                    a.entry_hook = row.previous.clone();
+                    let unwinding = a.unwinding.take();
+                    let resume = a.resume.take();
+                    let saved = std::mem::take(&mut a.saved);
+                    let (keep, removed): (HashMap<_, _>, HashMap<_, _>) = saved
+                        .into_iter()
+                        .partition(|(_, saved)| saved.id.level <= row.baseline);
+                    a.saved = keep;
+                    retired.push((unwinding, resume, removed));
+                }
+            }
+            // Every hook/reset commit precedes unlock or resource callbacks.
+            // The local metadata snapshot still owns each removed row.
+            self.rows.borrow_mut().clear();
+        }
+        drop(retired);
+        drop(rows);
+        self.finished.set(true);
+    }
+}
+
 /// Whether an import running now could have the whole stack unwound: the instance is
 /// instrumented and the import runs in the outermost level.
 pub(crate) async fn whole_stack<S: 'static>(cx: &impl Access<S>) -> bool {
-    cx.with(|env, _| env.asyncify.as_ref().is_some_and(|a| a.depth == 1))
+    cx.with_entry(|env, _, _| env.asyncify.as_ref().is_some_and(|a| a.depth == 1))
         .await
+        .unwrap_or(false)
 }
 
 /// Calls `function` as one level of guest calls on the instance behind `cx` and carries out
@@ -335,8 +809,8 @@ pub(crate) async fn call<S: 'static>(
     function: &Function,
     args: &[Value],
 ) -> Result<Box<[Value]>, RuntimeError> {
-    let (level, owner) = cx
-        .with(|env, _| {
+    let (level, owner, hook) = cx
+        .with_entry(|env, _, hook| {
             let owner = env
                 .contexts
                 .upgrade()
@@ -346,14 +820,14 @@ pub(crate) async fn call<S: 'static>(
                 a.depth += 1;
                 a.depth
             });
-            (level, owner)
+            (level, owner, hook)
         })
-        .await;
+        .await?;
     let Some(level) = level else {
-        return function.call_async(&cx.store(), args.to_vec()).await;
+        return invoke(cx, function, args.to_vec(), hook).await;
     };
     let result = loop {
-        let result = function.call_async(&cx.store(), args.to_vec()).await;
+        let result = invoke(cx, function, args.to_vec(), hook.clone()).await;
         let _pending = crate::contexts::PendingError::new(owner.clone(), result.as_ref().err());
         match settle(cx, level, entry, args, result).await {
             Ok(None) => continue,
@@ -362,7 +836,7 @@ pub(crate) async fn call<S: 'static>(
         }
     };
     let _pending = crate::contexts::PendingError::new(owner, result.as_ref().err());
-    cx.with(|env, _| {
+    cx.with_entry(|env, _, _| {
         let a = env.asyncify.as_mut().expect("entered above");
         a.depth -= 1;
         if result.is_err() {
@@ -375,7 +849,7 @@ pub(crate) async fn call<S: 'static>(
         // Stacks saved in this level cannot be restored once it returned.
         a.saved.retain(|_, saved| saved.id.level < level);
     })
-    .await;
+    .await?;
     result
 }
 
@@ -404,19 +878,30 @@ async fn settle<S: 'static>(
         }
     };
     let Some((request, functions)) = cx
-        .with(|env, _| {
+        .with_entry(|env, _, hook| {
             let a = env.asyncify.as_mut()?;
             Some((
                 a.unwinding.take()?,
-                (a.stop_unwind.clone(), a.start_rewind.clone()),
+                (
+                    (
+                        a.stop_unwind.clone(),
+                        a.stop_unwind_function.clone(),
+                        hook.clone(),
+                    ),
+                    (
+                        a.start_rewind.clone(),
+                        a.start_rewind_function.clone(),
+                        hook.clone(),
+                    ),
+                ),
             ))
         })
-        .await
+        .await?
     else {
         return Ok(Some(values));
     };
     let (stop_unwind, start_rewind) = functions;
-    stop_unwind.call_async(&cx.store()).await?;
+    control0(cx, stop_unwind.0, stop_unwind.1, stop_unwind.2).await?;
     let resume = match request {
         Request::Save { slot } => Resume::Saved(save(cx, level, slot).await?),
         Request::Fork {
@@ -429,7 +914,7 @@ async fn settle<S: 'static>(
                 RuntimeError::new("fork from a guest call that is not the entry point")
             })?;
             let image = snapshot(cx, entry, args, tag.clone(), shared, &wiped).await?;
-            let spawner = cx.with(|env, _| env.proc.spawner.clone()).await;
+            let spawner = cx.with_entry(|env, _, _| env.proc.spawner.clone()).await?;
             spawner.fork(child, image);
             Resume::Forked {
                 child: Some(child),
@@ -438,13 +923,20 @@ async fn settle<S: 'static>(
         }
     };
     let buffer = cx
-        .with(|env, _| {
+        .with_entry(|env, _, _| {
             let a = env.asyncify.as_mut().expect("unwound above");
             a.resume = Some(resume);
             a.buffer.expect("an unwind has a buffer")
         })
-        .await;
-    start_rewind.call_async(&cx.store(), buffer as i32).await?;
+        .await?;
+    control1(
+        cx,
+        start_rewind.0,
+        start_rewind.1,
+        buffer as i32,
+        start_rewind.2,
+    )
+    .await?;
     Ok(None)
 }
 
@@ -455,7 +947,7 @@ async fn save<S: 'static>(
     level: u32,
     slot: u32,
 ) -> Result<StackId, RuntimeError> {
-    cx.with(|env, store| {
+    cx.with_entry(|env, store, _| {
         let memory = env.memory.clone().expect("an instance has memory");
         let a = env.asyncify.as_mut().expect("unwound above");
         let buffer = a.buffer.expect("an unwind has a buffer");
@@ -487,7 +979,7 @@ async fn save<S: 'static>(
         );
         Ok(id)
     })
-    .await
+    .await?
 }
 
 /// Puts `saved` back into the unwind buffer and starts rewinding it; the import that saved it
@@ -498,7 +990,7 @@ async fn rewind_saved<S: 'static>(
     val: i32,
 ) -> Result<(), RuntimeError> {
     let (start_rewind, buffer) = cx
-        .with(|env, store| {
+        .with_entry(|env, store, hook| {
             let memory = env.memory.clone().expect("an instance has memory");
             let (low_guard, read_only) = (env.low_guard, env.read_only.clone());
             let a = env.asyncify.as_mut().expect("saved stacks are asyncify's");
@@ -515,10 +1007,24 @@ async fn rewind_saved<S: 'static>(
             write(buffer + HEADER, &saved.data)?;
             a.stack_pointer.set(store, saved.stack_pointer.clone())?;
             a.resume = Some(Resume::Restored(val));
-            Ok::<_, RuntimeError>((a.start_rewind.clone(), buffer))
+            Ok::<_, RuntimeError>((
+                (
+                    a.start_rewind.clone(),
+                    a.start_rewind_function.clone(),
+                    hook.clone(),
+                ),
+                buffer,
+            ))
         })
-        .await?;
-    start_rewind.call_async(&cx.store(), buffer as i32).await
+        .await??;
+    control1(
+        cx,
+        start_rewind.0,
+        start_rewind.1,
+        buffer as i32,
+        start_rewind.2,
+    )
+    .await
 }
 
 /// Starts unwinding the calling level's stack for `request`. The import returns afterwards
@@ -529,17 +1035,28 @@ pub(crate) async fn unwind<S: 'static>(
 ) -> Result<(), RuntimeError> {
     let buffer = buffer(cx).await?;
     let start_unwind = cx
-        .with(|env, store| {
+        .with_entry(|env, store, hook| {
             let mut header = [0u8; HEADER as usize];
             header[..4].copy_from_slice(&(buffer + HEADER).to_le_bytes());
             header[4..].copy_from_slice(&(buffer + BUFFER_SIZE).to_le_bytes());
             env.write_memory(&*store, buffer, &header).map_err(fault)?;
             let a = env.asyncify.as_mut().ok_or_else(not_instrumented)?;
             a.unwinding = Some(request);
-            Ok::<_, RuntimeError>(a.start_unwind.clone())
+            Ok::<_, RuntimeError>((
+                a.start_unwind.clone(),
+                a.start_unwind_function.clone(),
+                hook.clone(),
+            ))
         })
-        .await?;
-    start_unwind.call_async(&cx.store(), buffer as i32).await
+        .await??;
+    control1(
+        cx,
+        start_unwind.0,
+        start_unwind.1,
+        buffer as i32,
+        start_unwind.2,
+    )
+    .await
 }
 
 /// A thread's unwind buffer uses the existing kernel allocator before guest entry. Unlike
@@ -549,11 +1066,11 @@ where
     S: wasixv2_syscalls::Syscalls + wasixv2_syscalls::Control + Send + Sync + 'static,
 {
     let request = cx
-        .with(|env, _| {
+        .with_entry(|env, _, _| {
             (env.layout.is_some() && env.asyncify.as_ref().is_some_and(|a| a.buffer.is_none()))
                 .then(|| (env.syscalls.clone(), env.task))
         })
-        .await;
+        .await?;
     if let Some((syscalls, task)) = request {
         use wasixv2_abi::{Fd, MapFlags, ProtFlags};
         let memory = crate::memory::OutsideMemory { cx };
@@ -570,13 +1087,13 @@ where
             )
             .await
             .map_err(|err| RuntimeError::new(format!("no memory for unwinding: {err:?}")))?;
-        cx.with(|env, _| {
+        cx.with_entry(|env, _, _| {
             env.asyncify
                 .as_mut()
                 .expect("checked above")
                 .reserve_buffer(addr)
         })
-        .await;
+        .await?;
     }
     Ok(())
 }
@@ -584,7 +1101,7 @@ where
 /// Back the reserved unwind buffer on first use. Unknown layouts retain lazy growth at the
 /// end of memory; known layouts never grow beyond their reservation.
 async fn buffer<S: 'static>(cx: &impl Access<S>) -> Result<u32, RuntimeError> {
-    cx.with(|env, store| {
+    cx.with_entry(|env, store, _| {
         let memory = env.memory.clone().expect("an instance has memory");
         let a = env.asyncify.as_mut().ok_or_else(not_instrumented)?;
         if let Some(buffer) = a.buffer {
@@ -605,7 +1122,7 @@ async fn buffer<S: 'static>(cx: &impl Access<S>) -> Result<u32, RuntimeError> {
         a.buffer = Some(buffer);
         Ok(buffer)
     })
-    .await
+    .await?
 }
 
 /// The [`Resume`] of the import the guest is rewinding into, which ends the rewind; `None` when
@@ -614,15 +1131,22 @@ pub(crate) async fn resumed<S: 'static>(
     cx: &impl Access<S>,
 ) -> Result<Option<Resume>, RuntimeError> {
     let resumed = cx
-        .with(|env, _| {
+        .with_entry(|env, _, hook| {
             let a = env.asyncify.as_mut()?;
-            Some((a.resume.take()?, a.stop_rewind.clone()))
+            Some((
+                a.resume.take()?,
+                (
+                    a.stop_rewind.clone(),
+                    a.stop_rewind_function.clone(),
+                    hook.clone(),
+                ),
+            ))
         })
-        .await;
+        .await?;
     let Some((resume, stop_rewind)) = resumed else {
         return Ok(None);
     };
-    stop_rewind.call_async(&cx.store()).await?;
+    control0(cx, stop_rewind.0, stop_rewind.1, stop_rewind.2).await?;
     Ok(Some(resume))
 }
 
@@ -635,12 +1159,16 @@ pub(crate) async fn restore<S: 'static>(
     val: i32,
 ) -> RuntimeError {
     let saved = cx
-        .with(|env, _| {
+        .with_entry(|env, _, _| {
             let a = env.asyncify.as_ref()?;
             let saved = a.saved.get(&id.generation)?;
             (saved.id == id && id.level <= a.depth).then(|| saved.clone())
         })
         .await;
+    let saved = match saved {
+        Ok(saved) => saved,
+        Err(error) => return error,
+    };
     match saved {
         Some(saved) => RuntimeError::user(Box::new(Restore { saved, val })),
         None => RuntimeError::new("restoring a stack that was not saved, or whose call returned"),
@@ -692,7 +1220,7 @@ async fn snapshot<S: 'static>(
     shared: Vec<SharedMapping>,
     wiped: &[Range<u64>],
 ) -> Result<ForkImage, RuntimeError> {
-    cx.with(|env, store| {
+    cx.with_entry(|env, store, _| {
         let module = env
             .proc
             .module
@@ -737,7 +1265,7 @@ async fn snapshot<S: 'static>(
             },
         })
     })
-    .await
+    .await?
 }
 
 /// Starts rewinding a fork child's stack; the child then calls its entry point through
@@ -747,10 +1275,25 @@ pub(crate) async fn start_rewind<S: 'static>(
     buffer: u32,
 ) -> Result<(), RuntimeError> {
     let start_rewind = cx
-        .with(|env, _| env.asyncify.as_ref().map(|a| a.start_rewind.clone()))
-        .await
+        .with_entry(|env, _, hook| {
+            env.asyncify.as_ref().map(|a| {
+                (
+                    a.start_rewind.clone(),
+                    a.start_rewind_function.clone(),
+                    hook.clone(),
+                )
+            })
+        })
+        .await?
         .ok_or_else(not_instrumented)?;
-    start_rewind.call_async(&cx.store(), buffer as i32).await
+    control1(
+        cx,
+        start_rewind.0,
+        start_rewind.1,
+        buffer as i32,
+        start_rewind.2,
+    )
+    .await
 }
 
 fn fault(_: wasixv2_syscalls::Fault) -> RuntimeError {
@@ -787,7 +1330,9 @@ pub mod import {
 
     /// Whether the instance is instrumented with asyncify.
     pub async fn instrumented<S: 'static>(env: &AsyncFunctionEnvMut<ExecEnv<S>>) -> bool {
-        env.read().await.data().asyncify.is_some()
+        super::Access::with_entry(env, |data, _, _| data.asyncify.is_some())
+            .await
+            .unwrap_or(false)
     }
 
     /// The outcome of the import the guest is rewinding into, which ends the rewind; `None`

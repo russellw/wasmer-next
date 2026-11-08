@@ -26,7 +26,9 @@ use wasixv2_wasix1::{
     PreopenRights, StartupDescriptors, StartupInput,
     imports::{self, Module as Namespace},
 };
-use wasmer_api::{AsStoreAsync, AsStoreMut, Imports, Instance, Module, RuntimeError, StoreMut};
+use wasmer_api::{
+    AsStoreAsync, AsStoreMut, Function, Imports, Instance, Module, RuntimeError, StoreMut,
+};
 
 type CaptureState = (VecDeque<(Vec<u8>, usize)>, bool);
 
@@ -91,6 +93,7 @@ struct Endpoint {
     retired: Cell<bool>,
     committed: Cell<bool>,
     handoff: RefCell<Option<HostCallHandoff>>,
+    selected_start: RefCell<Option<Function>>,
 }
 
 impl NativeWasi {
@@ -235,6 +238,7 @@ impl NativeWasi {
                 retired: Cell::new(false),
                 committed: Cell::new(false),
                 handoff: RefCell::new(None),
+                selected_start: RefCell::new(None),
             }),
             stdout,
             stderr,
@@ -323,9 +327,12 @@ impl NativeWasi {
             )
         };
         let binding = wasi.attach(instance, store);
+        let selected = instance.exports.get_function("_start").ok().cloned();
         self.endpoint
             .env
             .initialize_with_thread_abi(store, instance, binding, image_abi)?;
+        let previous = self.endpoint.selected_start.replace(selected);
+        drop(previous);
         Ok(())
     }
 
@@ -927,6 +934,25 @@ impl Endpoint {
     }
 }
 impl ContinuationEndpoint for Endpoint {
+    fn initialized_start(
+        &self,
+        store: &mut StoreMut<'_>,
+        actual: &Function,
+    ) -> Option<HostEnvironment<MachineSyscalls>> {
+        if self.retired.get()
+            || self.committed.get()
+            || !self.env.is_initialized()
+            || store.objects_mut().id() != self.env.store_id()
+        {
+            return None;
+        }
+        let selected = self.selected_start.borrow();
+        selected
+            .as_ref()
+            .filter(|selected| *selected == actual)
+            .map(|_| self.env.clone())
+    }
+
     fn matches(&self, store: &mut StoreMut<'_>, error: &RuntimeError) -> bool {
         self.env.call_handoff(store, error).is_some()
     }
@@ -1069,6 +1095,122 @@ mod tests {
         )
         .unwrap();
         assert_eq!(get_wasi_version(&memory_only), None);
+    }
+
+    #[test]
+    fn initialized_start_observed_helpers_return_through_actual_borrowed_parent() {
+        const TEST: &str = "wasm_c_api::wasi::native::tests::initialized_start_observed_helpers_return_through_actual_borrowed_parent";
+        const CHILD: &str = "WASMER_CAPI_INITIALIZED_BORROWED_HELPER_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            struct OwnedChild(std::process::Child);
+            impl Drop for OwnedChild {
+                fn drop(&mut self) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+            let mut child = OwnedChild(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", TEST, "--nocapture"])
+                    .env(CHILD, "1")
+                    .spawn()
+                    .unwrap(),
+            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    assert!(
+                        status.success(),
+                        "borrowed canonical helper child failed: {status}"
+                    );
+                    return;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "borrowed canonical helper did not return"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wasmer_api::{FunctionEnv, FunctionEnvMut, TypedFunction};
+        struct Bridge {
+            leaf: Option<TypedFunction<(), ()>>,
+            calls: Arc<AtomicUsize>,
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let saves = Arc::new(AtomicUsize::new(0));
+        let store = StoreRef::new(wasmer_api::Store::default()).unwrap();
+        let wasi = NativeWasi::new(
+            &store,
+            vec!["borrowed-helper".into()],
+            vec![],
+            vec![],
+            false,
+            false,
+        )
+        .unwrap();
+        let instance = store.with_mut(|actual| {
+            let bridge = FunctionEnv::new(actual, Bridge { leaf: None, calls: calls.clone() });
+            let borrowed = Function::new_typed_with_env(actual, &bridge, |mut env: FunctionEnvMut<Bridge>| {
+                let (data, mut actual) = env.data_and_store_mut();
+                data.calls.fetch_add(1, Ordering::SeqCst);
+                // This synchronous child keeps the REAL base Store guard parked.
+                // Its async import receives an actual derived Store loan.
+                data.leaf.as_ref().unwrap().call(&mut actual)
+            });
+            let entered = saves.clone();
+            let save = Function::new_typed_with_env_async_captured(actual, wasi.environment().environment(), move |env| {
+                let entered = entered.clone();
+                async move {
+                    assert!(env.native_local_owner().is_some(), "capture survives outside the coroutine");
+                    entered.fetch_add(1, Ordering::SeqCst);
+                    if wasixv2_exec::asyncify::import::resumed(&env).await?.is_none() {
+                        wasixv2_exec::asyncify::import::save(&env, 64).await?;
+                    }
+                    Ok::<(), RuntimeError>(())
+                }
+            }, wasixv2_exec::asyncify::capture_host_entry::<MachineSyscalls>);
+            // Like Exec's TRAP_WHILE_UNWINDING sibling, this spells the asyncify
+            // control exports explicitly. The unchanged public binaryen fixture
+            // independently proves real copying-fork instrumentation.
+            let module = Module::new(actual, r#"(module
+                (import "test" "borrowed" (func $borrowed))
+                (import "test" "save" (func $save))
+                (memory (export "memory") 1)
+                (global (export "__stack_pointer") (mut i32) (i32.const 1024))
+                (global $controls (export "controls") (mut i32) (i32.const 0))
+                (func $control (global.set $controls (i32.add (global.get $controls) (i32.const 1))))
+                (func (export "asyncify_start_unwind") (param i32) call $control)
+                (func (export "asyncify_stop_unwind") call $control)
+                (func (export "asyncify_start_rewind") (param i32) call $control)
+                (func (export "asyncify_stop_rewind") call $control)
+                (func (export "leaf") call $save)
+                (func (export "_start") call $borrowed))"#).unwrap();
+            let instance = Instance::new(actual, &module, &wasmer_api::imports! {
+                "test" => { "borrowed" => borrowed, "save" => save }
+            }).unwrap();
+            bridge.as_mut(actual).leaf = Some(instance.exports.get_typed_function(actual, "leaf").unwrap());
+            wasi.initialize(actual, &instance).unwrap();
+            instance
+        }).unwrap();
+        let start = instance.exports.get_function("_start").unwrap().clone();
+        assert!(store.call(&start, vec![]).unwrap().is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(saves.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            store
+                .with_mut(|actual| instance.exports.get_global("controls").unwrap().get(actual))
+                .unwrap(),
+            wasmer_api::Value::I32(4)
+        );
+        // Reuse also proves the entry reset did not strand its hook/parent loan.
+        assert!(store.call(&start, vec![]).unwrap().is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        drop(start);
+        drop(instance);
+        drop(wasi);
+        drop(store);
     }
 
     #[test]

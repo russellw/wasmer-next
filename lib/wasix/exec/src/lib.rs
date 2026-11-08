@@ -329,6 +329,12 @@ pub async fn call_guest<S: 'static>(
 #[error("thread group exited with status {0}")]
 struct Exited(i32);
 
+/// Typed exit classification for explicitly selected external initialized entries.
+#[doc(hidden)]
+pub fn thread_exit_status(error: &RuntimeError) -> Option<i32> {
+    error.downcast_ref::<Exited>().map(|exit| exit.0)
+}
+
 /// Compiles `wasm` for [`run`], with the preemption points that let a busy guest notice signals
 /// and the exit of its thread group, and atomic waits that a signal interrupts. A module they
 /// cannot be added to is compiled as it is, with a warning; [`is_preemptible`] tells.

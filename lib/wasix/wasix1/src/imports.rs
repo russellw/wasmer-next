@@ -392,7 +392,12 @@ where
     use calls::*;
     macro_rules! f {
         ($f:path) => {
-            Function::new_typed_with_env_async(store, env, $f)
+            Function::new_typed_with_env_async_captured(
+                store,
+                env,
+                $f,
+                wasixv2_exec::asyncify::capture_host_entry::<S>,
+            )
         };
     }
     Some(match name {

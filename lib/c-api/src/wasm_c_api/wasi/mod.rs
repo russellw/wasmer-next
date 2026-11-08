@@ -64,7 +64,7 @@ pub(super) enum ConfigurationError {
 struct Exit(u16);
 
 #[cfg(feature = "sys")]
-fn exit_trap(status: i32) -> wasmer_api::RuntimeError {
+pub(crate) fn exit_trap(status: i32) -> wasmer_api::RuntimeError {
     wasmer_api::RuntimeError::user(Box::new(Exit((status % 256) as u16)))
 }
 

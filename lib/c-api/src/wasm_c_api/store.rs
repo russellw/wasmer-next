@@ -415,6 +415,13 @@ pub(crate) fn completed_handoff(error: RuntimeError) -> RuntimeError {
 
 #[cfg(all(feature = "sys", feature = "wasi"))]
 pub(crate) trait ContinuationEndpoint {
+    fn initialized_start(
+        &self,
+        _store: &mut StoreMut<'_>,
+        _actual: &Function,
+    ) -> Option<wasixv2_exec::HostEnvironment<wasixv2::MachineSyscalls>> {
+        None
+    }
     fn matches(&self, store: &mut StoreMut<'_>, error: &RuntimeError) -> bool;
     fn prepare(
         self: Rc<Self>,
@@ -1389,7 +1396,254 @@ impl Drop for NativeRetirementTail {
 struct CallOwner {
     driver: Rc<Driver>,
     #[cfg(feature = "wasi")]
+    entry: RefCell<Option<Rc<CallEntry>>>,
+    #[cfg(feature = "wasi")]
     pending: RefCell<std::collections::VecDeque<LocalContinuation>>,
+}
+
+#[cfg(all(feature = "sys", feature = "wasi"))]
+struct CallEntry {
+    scope: wasixv2_exec::asyncify::HostEntryCleanup<wasixv2::MachineSyscalls>,
+    cleanup: wasmer_api::sys::NativeCleanupOwner,
+    failure: Rc<RetirementFailure>,
+    observers: RefCell<Vec<Rc<CallEntryObserver>>>,
+    done: std::cell::Cell<bool>,
+}
+
+#[cfg(all(feature = "sys", feature = "wasi"))]
+struct CallEntryObserver {
+    observer: RefCell<Option<wasmer_api::sys::NativeAncestrySettlement>>,
+    done: std::cell::Cell<bool>,
+}
+
+#[cfg(all(feature = "sys", feature = "wasi"))]
+impl CallEntryObserver {
+    fn poll(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        use std::future::Future;
+        if self.done.get() {
+            return std::task::Poll::Ready(());
+        }
+        // RawWaker callbacks run outside this metadata borrow.
+        let Some(mut observer) = self.observer.borrow_mut().take() else {
+            return std::task::Poll::Pending;
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            std::pin::Pin::new(&mut observer).poll(cx)
+        }));
+        let result = match result {
+            Ok(result) => result,
+            Err(exact) => {
+                // Keep the SAME physical certificate on notification panic.
+                *self.observer.borrow_mut() = Some(observer);
+                std::panic::resume_unwind(exact);
+            }
+        };
+        if result.is_ready() {
+            self.done.set(true);
+            drop(observer);
+        } else {
+            *self.observer.borrow_mut() = Some(observer);
+        }
+        result
+    }
+}
+
+#[cfg(all(feature = "sys", feature = "wasi"))]
+impl CallEntry {
+    fn observe_ready(&self, cx: &mut std::task::Context<'_>) {
+        let observers = self.observers.borrow().clone();
+        for observer in observers {
+            if observer.poll(cx).is_ready() {
+                self.observers
+                    .borrow_mut()
+                    .retain(|old| !Rc::ptr_eq(old, &observer));
+            }
+            drop(observer);
+        }
+    }
+
+    async fn finish(&self) {
+        loop {
+            let observers = self.observers.borrow().clone();
+            if observers.is_empty() {
+                break;
+            }
+            for observer in observers {
+                std::future::poll_fn(|cx| observer.poll(cx)).await;
+                self.observers
+                    .borrow_mut()
+                    .retain(|old| !Rc::ptr_eq(old, &observer));
+                drop(observer);
+            }
+        }
+        self.scope.finish().await;
+        self.done.set(true);
+    }
+}
+
+#[cfg(all(feature = "sys", feature = "wasi"))]
+struct ObservedEntryCall {
+    // The actual future is destroyed before any observer can certify it.
+    future: Option<wasixv2_exec::asyncify::HostEntryFuture>,
+    result: Option<Result<Box<[Value]>, RuntimeError>>,
+    entry: Rc<CallEntry>,
+}
+
+#[cfg(all(feature = "sys", feature = "wasi"))]
+impl std::future::Future for ObservedEntryCall {
+    type Output = Result<Box<[Value]>, RuntimeError>;
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = self.get_mut();
+        this.entry.observe_ready(cx);
+        if let Some(future) = &mut this.future {
+            match future.as_mut().poll(cx) {
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+                std::task::Poll::Ready(result) => this.result = Some(result),
+            }
+            drop(this.future.take());
+        }
+        // A borrowed helper can require its parent's next base unlock epoch.
+        // Return the engine outcome to that parent; only final entry reset may
+        // await ALL certificates outside the actual guest/helper frames.
+        this.entry.observe_ready(cx);
+        std::task::Poll::Ready(this.result.take().expect("one actual guest result"))
+    }
+}
+
+/// Plain fn pointer stored in the finite asyncify scope. It never captures a
+/// local owner in ExecEnv, and never falls back when that scope's owner is stale.
+#[cfg(all(feature = "sys", feature = "wasi"))]
+fn invoke_initialized_entry(
+    function: Function,
+    store: wasmer_api::StoreAsync,
+    args: Vec<Value>,
+    captured: Option<Weak<dyn std::any::Any>>,
+    token: wasixv2_exec::asyncify::HostEntryToken,
+    row: usize,
+) -> wasixv2_exec::asyncify::HostEntryFuture {
+    Box::pin(async move {
+        let weak = captured
+            .ok_or_else(|| RuntimeError::new("initialized entry import has no captured owner"))?;
+        let owner = weak
+            .upgrade()
+            .and_then(|owner| owner.downcast::<CallOwner>().ok())
+            .ok_or_else(|| RuntimeError::new("initialized entry import owner is no longer live"))?;
+        let entry = owner
+            .entry
+            .borrow()
+            .clone()
+            .ok_or_else(|| RuntimeError::new("initialized entry owner has no active scope"))?;
+        // Retain no strong CallOwner across the actual guest poll.
+        drop(owner);
+        if !entry.scope.accepts(&token, row, &store).await {
+            return Err(RuntimeError::new(
+                "initialized entry import belongs to a replaced scope or ABI",
+            ));
+        }
+        let (future, observer) = wasmer_api::sys::call_async_with_local_owner_observed(
+            &function,
+            &store,
+            args,
+            weak,
+            Some(&entry.cleanup),
+        )?;
+        let observer = Rc::new(CallEntryObserver {
+            observer: RefCell::new(Some(observer)),
+            done: Default::default(),
+        });
+        // Commit cancellation custody BEFORE the first poll of this exact future.
+        entry.observers.borrow_mut().push(observer.clone());
+        ObservedEntryCall {
+            future: Some(future),
+            result: None,
+            entry,
+        }
+        .await
+    })
+}
+
+#[cfg(all(feature = "sys", feature = "wasi"))]
+struct CallEntryRetirement {
+    entry: Option<Rc<CallEntry>>,
+    running: Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>>,
+}
+
+#[cfg(all(feature = "sys", feature = "wasi"))]
+impl std::future::Future for CallEntryRetirement {
+    type Output = ();
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        let this = self.get_mut();
+        if this.running.is_none() {
+            let entry = this
+                .entry
+                .as_ref()
+                .expect("unfinished entry custody")
+                .clone();
+            this.running = Some(Box::pin(async move {
+                entry.finish().await;
+            }));
+        }
+        if this
+            .running
+            .as_mut()
+            .unwrap()
+            .as_mut()
+            .poll(cx)
+            .is_pending()
+        {
+            return std::task::Poll::Pending;
+        }
+        drop(this.running.take());
+        drop(this.entry.take()); // actual base capability released before Ready
+        std::task::Poll::Ready(())
+    }
+}
+
+#[cfg(all(feature = "sys", feature = "wasi"))]
+impl Drop for CallEntryRetirement {
+    fn drop(&mut self) {
+        let Some(entry) = self.entry.take() else {
+            return;
+        };
+        let failure = entry.failure.clone();
+        failure.attempt(|| drop(self.running.take()));
+        if !entry.done.get() {
+            let cleanup = entry.cleanup.clone();
+            failure.attempt(|| {
+                cleanup.transfer_existing(Self {
+                    entry: Some(entry),
+                    running: None,
+                })
+            });
+        }
+    }
+}
+
+#[cfg(feature = "sys")]
+impl Drop for CallOwner {
+    fn drop(&mut self) {
+        #[cfg(feature = "wasi")]
+        if let Some(entry) = self.entry.get_mut().take() {
+            if !entry.done.get() {
+                let cleanup = entry.cleanup.clone();
+                // Same already-entered generation/physical receipt obligation.
+                // No StoreRef, Driver or CallOwner is captured by this queue job.
+                let failure = entry.failure.clone();
+                failure.attempt(|| {
+                    cleanup.transfer_existing(CallEntryRetirement {
+                        entry: Some(entry),
+                        running: None,
+                    })
+                });
+            }
+        }
+    }
 }
 
 #[cfg(feature = "sys")]
@@ -1709,16 +1963,64 @@ impl StoreRef {
         let owner = Rc::new(CallOwner {
             driver: driver.clone(),
             #[cfg(feature = "wasi")]
+            entry: RefCell::default(),
+            #[cfg(feature = "wasi")]
             pending: RefCell::default(),
         });
         let erased: Rc<dyn std::any::Any> = owner.clone();
         let store = native.store.as_ref().unwrap();
-        let call = wasmer_api::sys::call_async_with_local_owner(
-            function,
-            store,
-            args,
-            Rc::downgrade(&erased),
-        );
+        #[cfg(feature = "wasi")]
+        let entry = {
+            let weak = native.endpoints.borrow().clone();
+            let endpoints = weak
+                .into_iter()
+                .filter_map(|endpoint| endpoint.upgrade())
+                .collect::<Vec<_>>();
+            let environments = self.with_mut(|store| {
+                endpoints
+                    .iter()
+                    .filter_map(|endpoint| endpoint.initialized_start(store, function))
+                    .collect::<Vec<_>>()
+            })?;
+            if environments.is_empty() {
+                None
+            } else {
+                let entry = Rc::new(CallEntry {
+                    scope: wasixv2_exec::asyncify::HostEntryCleanup::new(
+                        environments,
+                        wasmer_api::AsStoreAsync::store(store),
+                    ),
+                    cleanup: native.owner.clone(),
+                    failure: driver.canonical_failure(),
+                    observers: RefCell::default(),
+                    done: Default::default(),
+                });
+                // Outer owner exists before any depth mutation or guest factory.
+                *owner.entry.borrow_mut() = Some(entry.clone());
+                Some(entry)
+            }
+        };
+        let weak_owner = Rc::downgrade(&erased);
+        let call: std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Box<[Value]>, RuntimeError>> + '_>,
+        > = {
+            #[cfg(feature = "wasi")]
+            if let Some(entry) = &entry {
+                let entry = entry.clone();
+                Box::pin(async move {
+                    let result = entry
+                        .scope
+                        .call(function, &args, weak_owner, invoke_initialized_entry)
+                        .await;
+                    entry.finish().await;
+                    result
+                })
+            } else {
+                wasmer_api::sys::call_async_with_local_owner(function, store, args, weak_owner)
+            }
+            #[cfg(not(feature = "wasi"))]
+            wasmer_api::sys::call_async_with_local_owner(function, store, args, weak_owner)
+        };
         driver.run(async {
             use wasmer_api::AsStoreAsync;
             let result = call.await;
@@ -1728,6 +2030,16 @@ impl StoreRef {
             if let Err(error) = &result {
                 self.forward_handoff(error, Some(&owner))?;
             }
+            #[cfg(feature = "wasi")]
+            let result = if entry.is_some() {
+                result.map_err(|error| {
+                    wasixv2_exec::thread_exit_status(&error)
+                        .map(super::wasi::exit_trap)
+                        .unwrap_or(error)
+                })
+            } else {
+                result
+            };
             match owner.drain().await {
                 Some(error) => Err(error),
                 None => result,
