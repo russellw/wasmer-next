@@ -1393,6 +1393,10 @@ impl Drop for NativeRetirementTail {
 }
 
 #[cfg(feature = "sys")]
+type NativeCallFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Box<[Value]>, RuntimeError>> + 'a>>;
+
+#[cfg(feature = "sys")]
 struct CallOwner {
     driver: Rc<Driver>,
     #[cfg(feature = "wasi")]
@@ -1661,19 +1665,19 @@ impl Drop for CallEntryRetirement {
 impl Drop for CallOwner {
     fn drop(&mut self) {
         #[cfg(feature = "wasi")]
-        if let Some(entry) = self.entry.get_mut().take() {
-            if !entry.done.get() {
-                let cleanup = entry.cleanup.clone();
-                // Same already-entered generation/physical receipt obligation.
-                // No StoreRef, Driver or CallOwner is captured by this queue job.
-                let failure = entry.failure.clone();
-                failure.attempt(|| {
-                    cleanup.transfer_existing(CallEntryRetirement {
-                        entry: Some(entry),
-                        running: None,
-                    })
-                });
-            }
+        if let Some(entry) = self.entry.get_mut().take()
+            && !entry.done.get()
+        {
+            let cleanup = entry.cleanup.clone();
+            // Same already-entered generation/physical receipt obligation.
+            // No StoreRef, Driver or CallOwner is captured by this queue job.
+            let failure = entry.failure.clone();
+            failure.attempt(|| {
+                cleanup.transfer_existing(CallEntryRetirement {
+                    entry: Some(entry),
+                    running: None,
+                })
+            });
         }
     }
 }
@@ -2033,9 +2037,7 @@ impl StoreRef {
             }
         };
         let weak_owner = Rc::downgrade(&erased);
-        let call: std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<Box<[Value]>, RuntimeError>> + '_>,
-        > = {
+        let call: NativeCallFuture<'_> = {
             #[cfg(feature = "wasi")]
             if let Some(entry) = &entry {
                 let entry = entry.clone();
@@ -7250,10 +7252,7 @@ mod tests {
             drop(first);
             assert_eq!(state.primary_drops.load(Ordering::SeqCst), 1);
             drop(settlement);
-            let leaf = state.leaf.borrow_mut().take();
-            drop(leaf);
-            drop(start);
-            drop(sibling);
+            let _ = state.leaf.borrow_mut().take();
             drop(instance);
             drop(imports);
             drop(module);

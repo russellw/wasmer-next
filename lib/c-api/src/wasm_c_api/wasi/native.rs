@@ -331,8 +331,7 @@ impl NativeWasi {
         self.endpoint
             .env
             .initialize_with_thread_abi(store, instance, binding, image_abi)?;
-        let previous = self.endpoint.selected_start.replace(selected);
-        drop(previous);
+        let _ = self.endpoint.selected_start.replace(selected);
         Ok(())
     }
 
@@ -1209,7 +1208,6 @@ mod tests {
         // Reuse also proves the entry reset did not strand its hook/parent loan.
         assert!(store.call(&start, vec![]).unwrap().is_empty());
         assert_eq!(calls.load(Ordering::SeqCst), 4);
-        drop(start);
         drop(instance);
         drop(wasi);
         drop(store);
@@ -1371,7 +1369,6 @@ mod tests {
             }
             assert!(store.call(&selected, vec![]).unwrap().is_empty());
             assert_eq!(a_calls.load(Ordering::SeqCst), 4);
-            drop(selected);
             drop(first);
             drop(second);
             drop(a);
@@ -1512,7 +1509,6 @@ mod tests {
         assert_eq!(rejects.load(Ordering::SeqCst), 3);
         assert_eq!(saved_original.load(Ordering::SeqCst), 1);
         probe_slot.borrow_mut().take();
-        drop(probe);
         drop(instance);
         drop(wasi);
         drop(store);
