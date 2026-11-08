@@ -488,8 +488,11 @@ mod reentry_tests {
     }
     fn call(function: &mut wasm_func_t) -> i32 {
         let args: wasm_val_vec_t = Vec::<wasm_val_t>::new().into();
+        call_with_args(function, &args)
+    }
+    fn call_with_args(function: &mut wasm_func_t, args: &wasm_val_vec_t) -> i32 {
         let mut result = result();
-        let trap = unsafe { wasm_func_call(Some(function), Some(&args), &mut result) };
+        let trap = unsafe { wasm_func_call(Some(function), Some(args), &mut result) };
         assert!(
             trap.is_none(),
             "public V8 call trapped: {:?}",
@@ -594,6 +597,7 @@ mod reentry_tests {
                 i32.const 16 i32.const 1 i32.store
                 i32.const 24 i64.const 50000000 i64.store
                 i32.const 32 i64.const 1 i64.store
+                i32.const 256 i32.const 0 i32.store
                 i32.const 0 i32.const 128 i32.const 1 i32.const 256 call $poll if unreachable end
                 i32.const 256 i32.load i32.const 1 i32.ne if unreachable end
                 i32.const 41))"#,
@@ -757,7 +761,8 @@ mod reentry_tests {
             &mut store,
             r#"(module
             (global $calls (mut i32) (i32.const 0))
-            (func (export "run") (result i32)
+            (func (export "run") (param i32) (result i32)
+                local.get 0 i32.const 29 i32.ne if unreachable end
                 global.get $calls i32.const 1 i32.add global.set $calls global.get $calls))"#,
         );
         let imports: wasm_extern_vec_t = Vec::<Option<Box<wasm_extern_t>>>::new().into();
@@ -800,18 +805,33 @@ mod reentry_tests {
                 });
             })
             .unwrap();
+        let args: wasm_val_vec_t = vec![wasm_val_t {
+            kind: wasm_valkind_enum::WASM_I32 as _,
+            of: wasm_val_inner { int32_t: 29 },
+        }]
+        .into();
+        let original_arguments = args.data;
         assert_eq!(
-            call(&mut run),
+            call_with_args(&mut run, &args),
             2,
-            "same guest root must be invoked exactly twice"
+            "both physical guest entries must receive the same nonempty argument"
         );
+        assert_eq!(args.data, original_arguments);
+        assert_eq!(args.size, 1);
+        assert_eq!(args.as_slice()[0].kind, wasm_valkind_enum::WASM_I32 as _);
+        assert_eq!(unsafe { args.as_slice()[0].of.int32_t }, 29);
         assert_eq!(callbacks.load(Ordering::SeqCst), 2);
         assert_eq!(nested_result.load(Ordering::SeqCst), 73);
         assert_eq!(
-            call(&mut run),
+            call_with_args(&mut run, &args),
             3,
             "one-shot callback and actual guard must be gone"
         );
+        assert_eq!(args.data, original_arguments);
+        assert_eq!(args.size, 1);
+        assert_eq!(args.as_slice()[0].kind, wasm_valkind_enum::WASM_I32 as _);
+        assert_eq!(unsafe { args.as_slice()[0].of.int32_t }, 29);
+        drop(args);
         drop(run);
         drop(exports);
         drop(instance);
