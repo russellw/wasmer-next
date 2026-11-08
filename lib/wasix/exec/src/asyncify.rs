@@ -34,7 +34,7 @@
 
 use std::{
     any::Any,
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     future::Future,
     ops::Range,
     pin::Pin,
@@ -375,6 +375,19 @@ pub(crate) trait Access<S: 'static> {
                             "native import belongs to a replaced entry binding",
                         ));
                     }
+                    if !env
+                        .asyncify
+                        .as_ref()
+                        .and_then(|a| a.entry_hook.as_ref())
+                        .is_some_and(|active| {
+                            active.row == snapshot.hook.row
+                                && active.token.same(&snapshot.hook.token)
+                        })
+                    {
+                        return Err(RuntimeError::new(
+                            "native import belongs to an inactive entry scope",
+                        ));
+                    }
                     Some(snapshot.hook.clone())
                 }
             };
@@ -500,7 +513,28 @@ pub struct HostEntryCleanup<S: 'static> {
     store: StoreAsync,
     token: HostEntryToken,
     rows: std::cell::RefCell<Vec<Rc<EntryRow<S>>>>,
+    retired: std::cell::RefCell<VecDeque<EntryRetired<S>>>,
     finished: std::cell::Cell<bool>,
+}
+
+// One callback-bearing resource per disposal action. Exact values stay in the
+// external finite cleanup across cancellation and notification/resource panics.
+enum EntryRetired<S: 'static> {
+    Tag(Tag),
+    Pages(Arc<dyn wasixv2_pages::SharedPages>),
+    Saved(Arc<Saved>),
+    Binding(Arc<dyn crate::AbiInstance<S>>),
+}
+
+impl<S: 'static> EntryRetired<S> {
+    fn dispose(self) {
+        match self {
+            Self::Tag(value) => drop(value),
+            Self::Pages(value) => drop(value),
+            Self::Saved(value) => drop(value),
+            Self::Binding(value) => drop(value),
+        }
+    }
 }
 
 struct EntryRow<S: 'static> {
@@ -543,6 +577,7 @@ impl<S: wasixv2_syscalls::Syscalls + wasixv2_syscalls::Control + Send + Sync + '
             store,
             token: HostEntryToken(Arc::new(())),
             rows: Default::default(),
+            retired: Default::default(),
             finished: Default::default(),
         }
     }
@@ -678,9 +713,16 @@ impl<S: wasixv2_syscalls::Syscalls + wasixv2_syscalls::Control + Send + Sync + '
                 .rows
                 .borrow()
                 .iter()
-                .map(|row| (row.environment.clone(), row.level, row.snapshot.clone()))
+                .map(|row| {
+                    (
+                        row.environment.clone(),
+                        row.level,
+                        row.snapshot.clone(),
+                        row.context.clone(),
+                    )
+                })
                 .collect::<Vec<_>>();
-            for (environment, level, snapshot) in rows {
+            for (environment, level, snapshot, context) in rows {
                 let Some(level) = level else {
                     continue;
                 };
@@ -693,27 +735,38 @@ impl<S: wasixv2_syscalls::Syscalls + wasixv2_syscalls::Control + Send + Sync + '
                     snapshot: snapshot.clone(),
                 };
                 let requested = cx
-                    .with_entry(|env, _, _| {
-                        env.asyncify.as_ref().is_some_and(|a| {
-                            if result.is_ok() {
-                                a.unwinding.is_some()
-                            } else {
-                                result
-                                    .as_ref()
-                                    .err()
-                                    .and_then(|err| err.downcast_ref::<Restore>())
-                                    .is_some_and(|restore| {
-                                        restore.saved.id.level == level
-                                            && a.saved
-                                                .get(&restore.saved.id.generation)
-                                                .is_some_and(|saved| {
-                                                    Arc::ptr_eq(saved, &restore.saved)
-                                                })
-                                    })
-                            }
-                        })
+                    .with(|env, _| {
+                        let binding = env.abi.as_ref().is_some_and(|binding| {
+                            std::sync::Weak::ptr_eq(&snapshot.binding, &Arc::downgrade(binding))
+                        });
+                        binding
+                            && env.contexts.ptr_eq(&context)
+                            && env.asyncify.as_ref().is_some_and(|a| {
+                                if !a.entry_hook.as_ref().is_some_and(|hook| {
+                                    hook.row == snapshot.hook.row
+                                        && hook.token.same(&snapshot.hook.token)
+                                }) {
+                                    return false;
+                                }
+                                if result.is_ok() {
+                                    a.unwinding.is_some()
+                                } else {
+                                    result
+                                        .as_ref()
+                                        .err()
+                                        .and_then(|err| err.downcast_ref::<Restore>())
+                                        .is_some_and(|restore| {
+                                            restore.saved.id.level == level
+                                                && a.saved
+                                                    .get(&restore.saved.id.generation)
+                                                    .is_some_and(|saved| {
+                                                        Arc::ptr_eq(saved, &restore.saved)
+                                                    })
+                                        })
+                                }
+                            })
                     })
-                    .await?;
+                    .await;
                 if requested {
                     if requester.is_some() {
                         return Err(RuntimeError::new(
@@ -744,18 +797,14 @@ impl<S: wasixv2_syscalls::Syscalls + wasixv2_syscalls::Control + Send + Sync + '
     /// Called only after ALL actual owned guest/helper futures have dropped and
     /// their physical/write-epoch observers settled. Replaced ABI states are not
     /// reset. The finite hook and all abandoned nested levels belong to this token.
-    pub async fn finish(&self) {
+    pub async fn finish(&self, mut dispose: impl FnMut(Box<dyn FnOnce()>)) {
         if self.finished.get() {
             return;
         }
         let rows = self.rows.borrow().clone();
-        if rows.is_empty() {
-            self.finished.set(true);
-            return;
-        }
-        let mut retired = Vec::new();
-        {
+        if !rows.is_empty() {
             let mut store = self.store.write_lock().await;
+            let mut bindings = Vec::new();
             for row in &rows {
                 let data = row.environment.as_mut(&mut store);
                 let same_image = data
@@ -763,6 +812,10 @@ impl<S: wasixv2_syscalls::Syscalls + wasixv2_syscalls::Control + Send + Sync + '
                     .as_ref()
                     .is_some_and(|actual| Arc::ptr_eq(actual, &row.binding))
                     && data.contexts.ptr_eq(&row.context);
+                let mut resources = VecDeque::new();
+                // Retain a last ABI reference in guarded disposal custody BEFORE
+                // any row can drop on unlock unwind or callback reentry.
+                bindings.push(EntryRetired::Binding(row.binding.clone()));
                 if same_image
                     && let Some(a) = &mut data.asyncify
                     && a.entry_hook
@@ -771,22 +824,41 @@ impl<S: wasixv2_syscalls::Syscalls + wasixv2_syscalls::Control + Send + Sync + '
                 {
                     a.depth = row.baseline;
                     a.entry_hook = row.previous.clone();
-                    let unwinding = a.unwinding.take();
-                    let resume = a.resume.take();
+                    if let Some(Request::Fork { tag, shared, .. }) = a.unwinding.take() {
+                        resources.push_back(EntryRetired::Tag(tag));
+                        for mapping in shared {
+                            resources.push_back(EntryRetired::Pages(mapping.pages));
+                        }
+                    }
+                    if let Some(Resume::Forked { tag, .. }) = a.resume.take() {
+                        resources.push_back(EntryRetired::Tag(tag));
+                    }
                     let saved = std::mem::take(&mut a.saved);
-                    let (keep, removed): (HashMap<_, _>, HashMap<_, _>) = saved
-                        .into_iter()
-                        .partition(|(_, saved)| saved.id.level <= row.baseline);
-                    a.saved = keep;
-                    retired.push((unwinding, resume, removed));
+                    for (generation, saved) in saved {
+                        if saved.id.level <= row.baseline {
+                            a.saved.insert(generation, saved);
+                        } else {
+                            resources.push_back(EntryRetired::Saved(saved));
+                        }
+                    }
                 }
+                self.retired.borrow_mut().extend(resources);
             }
-            // Every hook/reset commit precedes unlock or resource callbacks.
-            // The local metadata snapshot still owns each removed row.
+            self.retired.borrow_mut().extend(bindings);
+            // All resets and guarded resource custody commit BEFORE unlock.
             self.rows.borrow_mut().clear();
+            drop(store);
         }
-        drop(retired);
-        drop(rows);
+        drop(rows); // every callback-bearing binding still has queued custody
+        loop {
+            let next = self.retired.borrow_mut().pop_front();
+            let Some(next) = next else {
+                break;
+            };
+            // The CAPI caller catches/stamps at this ORIGINAL drop, before
+            // invoking any later destructor. No callback runs under a borrow.
+            dispose(Box::new(move || next.dispose()));
+        }
         self.finished.set(true);
     }
 }

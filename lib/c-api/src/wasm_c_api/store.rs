@@ -1476,7 +1476,11 @@ impl CallEntry {
                 drop(observer);
             }
         }
-        self.scope.finish().await;
+        self.scope
+            .finish(|exact| {
+                self.failure.attempt(exact);
+            })
+            .await;
         self.done.set(true);
     }
 }
