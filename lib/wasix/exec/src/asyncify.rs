@@ -1501,7 +1501,8 @@ mod tests {
         );
         let module = Module::new(
             &store,
-            br#"(module
+            wat::parse_str(
+                r#"(module
             (memory (export "memory") 1)
             (global (export "__stack_pointer") (mut i32) (i32.const 1024))
             (func (export "asyncify_start_unwind") (param i32))
@@ -1510,6 +1511,8 @@ mod tests {
             (func (export "asyncify_stop_rewind"))
             (func (export "_start"))
             (func (export "leaf") (result i32) i32.const 42))"#,
+            )
+            .unwrap(),
         )
         .unwrap();
         let instance = Instance::new(&mut store, &module, &wasmer::Imports::new()).unwrap();
@@ -1570,9 +1573,12 @@ mod tests {
         );
         let plain_module = Module::new(
             &raw,
-            br#"(module
+            wat::parse_str(
+                r#"(module
             (memory (export "memory") 1)
             (func (export "_start")) (func (export "leaf") (result i32) i32.const 42))"#,
+            )
+            .unwrap(),
         )
         .unwrap();
         let plain = Instance::new(&mut raw, &plain_module, &wasmer::Imports::new()).unwrap();
