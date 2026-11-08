@@ -2059,20 +2059,7 @@ impl StoreRef {
             unreachable!()
         };
         let handoff = native.finalization.borrow().upgrade().unwrap_or_else(|| {
-            let failure = native.cleanup_failure.as_ref().clone();
-            Rc::new(NativeStoreFinalizationHandoff {
-                pending: RefCell::default(),
-                failure,
-                _failures_receiver: native.failures_receiver.clone(),
-                scopes: native.scopes.clone(),
-                wake: owner.driver.wake.clone(),
-                ledger: native.ledger.clone(),
-                polling: std::cell::Cell::new(false),
-                blocked: std::cell::Cell::new(false),
-                complete: std::cell::Cell::new(false),
-                owner: owner.owner.clone(),
-                exit: None,
-            })
+            NativeStoreFinalizationHandoff::new(native, owner.driver.wake.clone())
         });
         *native.finalization.borrow_mut() = Rc::downgrade(&handoff);
         *native.scopes.finalization.borrow_mut() = Rc::downgrade(&handoff);
@@ -2458,7 +2445,6 @@ struct NativeStoreFinalizationHandoff {
     scopes: Rc<DriverScopes>,
     wake: std::sync::Arc<DriverWake>, // SAME original final-caller notification metadata
     ledger: Rc<RetirementLedger>,
-    #[cfg(feature = "wasi")]
     polling: std::cell::Cell<bool>,
     blocked: std::cell::Cell<bool>,
     complete: std::cell::Cell<bool>,
@@ -2467,12 +2453,28 @@ struct NativeStoreFinalizationHandoff {
 }
 #[cfg(feature = "sys")]
 impl NativeStoreFinalizationHandoff {
+    fn new(native: &ManagedStore, wake: std::sync::Arc<DriverWake>) -> Rc<Self> {
+        Rc::new(Self {
+            pending: RefCell::default(),
+            failure: native.cleanup_failure.as_ref().clone(),
+            _failures_receiver: native.failures_receiver.clone(),
+            #[cfg(feature = "wasi")]
+            scopes: native.scopes.clone(),
+            wake,
+            ledger: native.ledger.clone(),
+            polling: std::cell::Cell::new(false),
+            blocked: std::cell::Cell::new(false),
+            complete: std::cell::Cell::new(false),
+            owner: native.owner.clone(),
+            exit: None,
+        })
+    }
+
     fn notify(&self) {
         let wake = std::task::Waker::from(self.wake.clone());
         self.failure.attempt(|| wake.wake_by_ref());
         self.failure.attempt(|| drop(wake));
     }
-    #[cfg(feature = "wasi")]
     fn poll(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
         let _exit = self.owner.enter_exit_boundary();
         if self.complete.get() {
@@ -2537,6 +2539,106 @@ impl Drop for NativeStoreFinalizationHandoff {
         // receiver even when this particular handoff never published a phase.
     }
 }
+// Finalization-only custody on an original Native caller. This is not an
+// invocation receipt and never invents terminal/physical readiness bits.
+#[cfg(feature = "sys")]
+struct NativeStoreFinalizationTail {
+    subscription: Option<DriverSubscription>,
+    handoff: Option<Rc<NativeStoreFinalizationHandoff>>,
+    claim: Option<ServiceClaimLease>,
+    exit: Option<wasmer_api::sys::NativeCleanupExitBoundary>, // LAST through all fields
+}
+#[cfg(feature = "sys")]
+impl NativeStoreFinalizationTail {
+    fn enroll(handoff: Rc<NativeStoreFinalizationHandoff>) {
+        let tail = Box::pin(Self {
+            subscription: None,
+            claim: Some(ServiceClaimLease::new(handoff.ledger.clone())),
+            handoff: Some(handoff.clone()),
+            exit: None,
+        });
+        let unwinding = std::thread::panicking();
+        // Legal precommit steps in this existing API are metadata-only. The
+        // queue owns the job BEFORE its saved caller-Waker can invoke user code.
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            wasmer_api::sys::enroll_native_ancestry_tail(tail)
+        })) {
+            Ok(Ok(())) => (),
+            Ok(Err(exact)) => {
+                // The exact returned job makes ONE lexical transfer in Drop.
+                // Keep local H alive until that transfer; never take it again.
+                drop(exact);
+            }
+            Err(panic) => handoff.failure.record_caught(panic, unwinding),
+        }
+        // A missing actual Native ancestry retains the existing explicit outer
+        // fallback; active pure-Tokio progress remains MANDATORY OPEN.
+        drop(handoff);
+    }
+}
+#[cfg(feature = "sys")]
+impl std::future::Future for NativeStoreFinalizationTail {
+    type Output = ();
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        use std::task::Poll;
+        let this = self.get_mut();
+        let handoff = this.handoff.as_ref().unwrap();
+        if this.subscription.is_none() {
+            this.subscription = handoff
+                .failure
+                .attempt(|| DriverSubscription::new(handoff.wake.clone(), handoff.owner.clone()));
+        }
+        let Some(subscription) = this.subscription.as_ref() else {
+            handoff.failure.attempt(|| cx.waker().wake_by_ref());
+            return Poll::Pending;
+        };
+        let ready = handoff
+            .failure
+            .attempt(|| subscription.with_context(cx, |cx| handoff.poll(cx)));
+        if !matches!(ready, Some(Poll::Ready(()))) {
+            return Poll::Pending;
+        }
+        assert!(handoff.complete.get() && handoff.ledger.final_done.get());
+        handoff.failure.attempt(|| drop(this.subscription.take()));
+        if handoff.failure.has_unstamped_event() {
+            return Poll::Pending;
+        }
+        let first = handoff.failure.take(); // exact ownership BEFORE claim release
+        drop(this.claim.take()); // callback-free; no competing service claim
+        if let Some(first) = first {
+            // Existing core catches I BEFORE dropping this job and its H. A
+            // following final-caller metadata error Q therefore cannot replace I.
+            std::panic::resume_unwind(first);
+        }
+        Poll::Ready(())
+    }
+}
+#[cfg(feature = "sys")]
+impl Drop for NativeStoreFinalizationTail {
+    fn drop(&mut self) {
+        let handoff = self.handoff.take().unwrap();
+        self.exit = Some(handoff.owner.enter_exit_boundary());
+        handoff.failure.attempt(|| drop(self.subscription.take()));
+        let actual = handoff.pending.borrow_mut().take();
+        if let Some(actual) = actual {
+            let claim = self.claim.take();
+            self.exit.as_ref().unwrap().defer(Box::new(move || {
+                let _claim = claim;
+                actual.finish_blocking()
+            }));
+        } else {
+            assert!(handoff.complete.get() && handoff.ledger.final_done.get());
+            // H's existing terminal Drop transfers exact owned delivery into
+            // this LAST outer boundary, whose receiver spans every H field.
+            drop(self.claim.take());
+        }
+        drop(handoff);
+    }
+}
+
 #[cfg(feature = "sys")]
 #[derive(Clone, Copy)]
 enum StoreFinalizationPhase {
@@ -3003,7 +3105,7 @@ impl Drop for ManagedStore {
             return;
         };
         self.ledger.finalization_started.set(true); // BEFORE any callback/publication
-        let exit = self.owner.enter_exit_boundary();
+        let _exit = self.owner.enter_exit_boundary();
         let handoff = self.finalization.get_mut().upgrade();
         let failure = self.cleanup_failure.as_ref().clone();
         let no_driver = self.driver.get_mut().is_none();
@@ -3031,9 +3133,12 @@ impl Drop for ManagedStore {
             *handoff.pending.borrow_mut() = Some(actual);
             handoff.notify();
         } else {
-            // No producer is inferred. Direct active-R deletion WITHOUT an
-            // enrolled tail remains MANDATORY OPEN pending producer classification.
-            exit.defer(Box::new(move || actual.finish_blocking()));
+            let wake = actual.driver.as_ref().unwrap().wake.clone();
+            let handoff = NativeStoreFinalizationHandoff::new(self, wake);
+            *handoff.pending.borrow_mut() = Some(actual);
+            *self.finalization.get_mut() = Rc::downgrade(&handoff);
+            *self.scopes.finalization.borrow_mut() = Rc::downgrade(&handoff);
+            NativeStoreFinalizationTail::enroll(handoff);
         }
     }
 }
