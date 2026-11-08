@@ -1,0 +1,547 @@
+name: CAPI Darwin native v2 (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_ref:
+        description: Full reviewed candidate commit SHA (40 lowercase hex characters)
+        required: true
+        type: string
+      copying_fork_fixture_base64:
+        description: Reviewed original 763-byte imported-shared f06ec guest, base64 encoded
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  macos-arm64:
+    name: Public native CAPI on ARM64 macOS 15 (deployment target 13)
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Require an exact reviewed candidate SHA
+        env:
+          REQUESTED_CANDIDATE: ${{ inputs.candidate_ref }}
+        shell: bash
+        timeout-minutes: 1
+        run: |
+          python3 - <<'PY'
+          import os, re
+          if not re.fullmatch(r"[0-9a-f]{40}", os.environ["REQUESTED_CANDIDATE"]):
+              raise SystemExit("candidate_ref must be a full reviewed commit SHA")
+          PY
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        timeout-minutes: 3
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ inputs.candidate_ref }}
+          path: candidate
+          submodules: false
+          persist-credentials: false
+      - name: Verify candidate and create isolated build and evidence state
+        env:
+          REQUESTED_CANDIDATE: ${{ inputs.candidate_ref }}
+          COPYING_FORK_FIXTURE_BASE64: ${{ inputs.copying_fork_fixture_base64 }}
+        shell: bash
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, hashlib, json, os, subprocess, tomllib
+          from pathlib import Path
+
+          candidate = (Path(os.environ["GITHUB_WORKSPACE"]) / "candidate").resolve()
+          actual = subprocess.check_output(["git", "-C", str(candidate), "rev-parse", "HEAD"], text=True).strip()
+          if actual != os.environ["REQUESTED_CANDIDATE"]:
+              raise SystemExit("checkout does not match the reviewed candidate SHA")
+          subprocess.run(["git", "-C", str(candidate), "diff", "HEAD", "--exit-code"], check=True)
+          if subprocess.check_output(["uname", "-m"], text=True).strip() != "arm64":
+              raise SystemExit("this gate requires a native arm64 runner")
+          revision = "3da3b97b18bd51d1d241805d102d4d84a95dc750"
+          expected = "git+https://github.com/wasmerio/wlk?branch=main#" + revision
+          manifest = tomllib.loads((candidate / "Cargo.toml").read_text())
+          declared = {name: value for name, value in manifest["workspace"]["dependencies"].items()
+                      if isinstance(value, dict) and value.get("git") == "https://github.com/wasmerio/wlk"}
+          packages = tomllib.loads((candidate / "Cargo.lock").read_text())["package"]
+          locked = [p for p in packages if p.get("source", "").startswith("git+https://github.com/wasmerio/wlk")]
+          if len(declared) != 21 or any(v.get("branch") != "main" or "rev" in v or "tag" in v for v in declared.values()):
+              raise SystemExit("expected exactly 21 WLK Git-main declarations")
+          if len(locked) != 21 or any(p.get("source") != expected for p in locked) or set(declared) != {p["name"] for p in locked}:
+              raise SystemExit("expected the same 21 WLK lock packages at published 3da")
+          temporary = Path(os.environ["RUNNER_TEMP"])
+          paths = {"CARGO_HOME": temporary / "capi-cargo-home", "RUSTUP_HOME": temporary / "capi-rustup-home",
+                   "CARGO_TARGET_DIR": temporary / "capi-target", "CAPI_CARGO_CONTEXT": temporary / "capi-cargo-context",
+                   "CAPI_EVIDENCE": temporary / "capi-evidence"}
+          for path in paths.values():
+              path.mkdir(mode=0o700, exist_ok=False)
+          evidence = paths["CAPI_EVIDENCE"]
+          (evidence / "Cargo.lock.before").write_bytes((candidate / "Cargo.lock").read_bytes())
+          guest = base64.b64decode(os.environ["COPYING_FORK_FIXTURE_BASE64"], validate=True)
+          guest_sha = hashlib.sha256(guest).hexdigest()
+          if len(guest) != 763 or guest_sha != "f06ec42755c8b76a79f0890e0222b9cc4d48f529383ec5ded9d36f2b4d9b09a9":
+              raise SystemExit("manual fixture is not the exact reviewed original imported-shared guest")
+          fixture = temporary / "capi-copying-fork.wasm"
+          with fixture.open("xb") as output:
+              output.write(guest)
+          fixture.chmod(0o444)
+          identity = {"candidate_sha": actual, "tree": subprocess.check_output(["git", "-C", str(candidate), "rev-parse", "HEAD^{tree}"], text=True).strip(),
+                      "cargo_lock_sha256": hashlib.sha256((candidate / "Cargo.lock").read_bytes()).hexdigest(),
+                      "wlk_revision": revision, "wlk_declared": declared, "wlk_locked": locked,
+                      "fixture_bytes": len(guest), "fixture_sha256": guest_sha,
+                      "fixture_provenance": "Root-supplied exact original reviewed imported-shared B9; OLD and native CURRENT positive",
+                      "target": "aarch64-apple-darwin", "features": "cranelift,wasi; no default features"}
+          (evidence / "candidate.json").write_text(json.dumps(identity, indent=2) + "\n")
+          with open(os.environ["GITHUB_ENV"], "a") as output:
+              for name, path in paths.items():
+                  output.write(f"{name}={path}\n")
+              output.write(f"CANDIDATE_DIR={candidate}\nWASMER_COPYING_FORK_FIXTURE={fixture}\n")
+          print(json.dumps(identity, indent=2))
+          PY
+          cat > "$RUNNER_TEMP/capi-disk-guard.py" <<'PY'
+          import os, sys
+          from pathlib import Path
+          mode, phase, raw_limit = sys.argv[1:]
+          limit, reserve = int(raw_limit), 2 * 1024**3
+          stats = os.statvfs(os.environ["RUNNER_TEMP"])
+          available = stats.f_bavail * stats.f_frsize
+          marker = Path(os.environ["RUNNER_TEMP"]) / f"capi-disk-{phase}.bytes"
+          if mode == "before":
+              print(f"disk_phase={phase} available={available} max_growth={limit} reserve={reserve}")
+              if available < limit + reserve:
+                  raise SystemExit(88)
+              marker.write_text(str(available))
+          elif mode == "after":
+              initial = int(marker.read_text())
+              growth = max(0, initial - available)
+              print(f"disk_phase={phase} initial={initial} available={available} growth={growth} max_growth={limit} reserve={reserve}")
+              if growth > limit or available < reserve:
+                  raise SystemExit(88)
+              marker.unlink()
+          else:
+              raise SystemExit("unknown disk guard mode")
+          PY
+      - name: Install repository Rust toolchain in task-local state
+        shell: bash
+        working-directory: ${{ runner.temp }}/capi-cargo-context
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          toolchain="$(python3 - "$CANDIDATE_DIR/rust-toolchain.toml" <<'PY'
+          import sys, tomllib
+          print(tomllib.load(open(sys.argv[1], "rb"))["toolchain"]["channel"])
+          PY
+          )"
+          rustup_bin="$(command -v rustup)"
+          python3 "$RUNNER_TEMP/capi-disk-guard.py" before rustup 1073741824 | tee "$CAPI_EVIDENCE/disk-rustup.txt"
+          "$rustup_bin" toolchain install "$toolchain" --profile minimal --no-self-update
+          cargo_bin="$("$rustup_bin" which --toolchain "$toolchain" cargo)"
+          toolchain_bin="$(dirname "$cargo_bin")"
+          "$toolchain_bin/rustc" -Vv | tee "$CAPI_EVIDENCE/toolchain.txt"
+          grep -Fx 'host: aarch64-apple-darwin' "$CAPI_EVIDENCE/toolchain.txt"
+          "$cargo_bin" -V | tee -a "$CAPI_EVIDENCE/toolchain.txt"
+          echo "$toolchain_bin" >> "$GITHUB_PATH"
+          printf 'RUSTUP_TOOLCHAIN=%s\n' "$toolchain" >> "$GITHUB_ENV"
+          python3 "$RUNNER_TEMP/capi-disk-guard.py" after rustup 1073741824 | tee -a "$CAPI_EVIDENCE/disk-rustup.txt"
+          {
+            sw_vers
+            uname -a
+            xcrun --sdk macosx --show-sdk-version
+            xcrun clang --version
+          } | tee "$CAPI_EVIDENCE/runner.txt"
+      - name: Fetch locked private dependencies with temporary read-only credentials
+        env:
+          WLK_CI_READ_SSH_KEY: ${{ secrets.WLK_CI_READ_SSH_KEY }}
+        shell: bash
+        working-directory: ${{ runner.temp }}/capi-cargo-context
+        timeout-minutes: 7
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "${WLK_CI_READ_SSH_KEY:-}"
+          python3 "$RUNNER_TEMP/capi-disk-guard.py" before fetch 4294967296 | tee "$CAPI_EVIDENCE/disk-fetch.txt"
+          key_file="$RUNNER_TEMP/capi-wlk-readonly-key"
+          known_hosts="$RUNNER_TEMP/capi-wlk-known-hosts"
+          git_config="$RUNNER_TEMP/capi-gitconfig"
+          trap 'rm -f -- "$key_file" "$known_hosts" "$git_config"' EXIT
+          printf '%s\n' "$WLK_CI_READ_SSH_KEY" > "$key_file"
+          unset WLK_CI_READ_SSH_KEY
+          chmod 600 "$key_file"
+          curl --fail --silent --show-error --proto '=https' --tlsv1.2 https://api.github.com/meta | python3 -c '
+          import json, sys
+          keys = json.load(sys.stdin)["ssh_keys"]
+          if not keys:
+              raise SystemExit("GitHub meta returned no SSH host keys")
+          for key in keys:
+              print("github.com " + key)
+              print("ssh.github.com " + key)
+              print("[ssh.github.com]:443 " + key)
+          ' > "$known_hosts"
+          chmod 600 "$known_hosts"
+          git config --file "$git_config" 'url.ssh://git@ssh.github.com:443/wasmerio/wlk.insteadOf' https://github.com/wasmerio/wlk
+          export GIT_CONFIG_GLOBAL="$git_config" GIT_CONFIG_NOSYSTEM=1 CARGO_NET_GIT_FETCH_WITH_CLI=true
+          export GIT_SSH_COMMAND="ssh -F /dev/null -i \"$key_file\" -p 443 -o IdentitiesOnly=yes -o IdentityAgent=none -o BatchMode=yes -o StrictHostKeyChecking=yes -o GlobalKnownHostsFile=/dev/null -o UserKnownHostsFile=\"$known_hosts\" -o UpdateHostKeys=no"
+          set +e
+          cargo fetch --manifest-path "$CANDIDATE_DIR/lib/c-api/Cargo.toml" --locked --target aarch64-apple-darwin > "$CAPI_EVIDENCE/fetch.log" 2>&1
+          status=$?
+          set -e
+          cat "$CAPI_EVIDENCE/fetch.log"
+          python3 "$RUNNER_TEMP/capi-disk-guard.py" after fetch 4294967296 | tee -a "$CAPI_EVIDENCE/disk-fetch.txt"
+          exit "$status"
+      - name: Remove fetch credentials even after failure or cancellation
+        if: always()
+        shell: bash
+        timeout-minutes: 1
+        run: rm -f -- "$RUNNER_TEMP/capi-wlk-readonly-key" "$RUNNER_TEMP/capi-wlk-known-hosts" "$RUNNER_TEMP/capi-gitconfig"
+      - name: Record the exact CAPI package and normal dependency closure
+        shell: bash
+        working-directory: ${{ runner.temp }}/capi-cargo-context
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          cargo metadata --manifest-path "$CANDIDATE_DIR/Cargo.toml" --locked --offline --no-deps --format-version=1 > "$CAPI_EVIDENCE/metadata.json"
+          cargo tree --manifest-path "$CANDIDATE_DIR/Cargo.toml" --locked --offline -p wasmer-c-api --no-default-features --features cranelift,wasi --target aarch64-apple-darwin --edges normal --prefix none > "$CAPI_EVIDENCE/normal-dependencies.txt"
+          python3 - <<'PY'
+          import json, os, re
+          from pathlib import Path
+          evidence = Path(os.environ["CAPI_EVIDENCE"])
+          manifest = Path(os.environ["CANDIDATE_DIR"]) / "lib/c-api/Cargo.toml"
+          selected = [p for p in json.loads((evidence / "metadata.json").read_text())["packages"]
+                      if Path(p["manifest_path"]).resolve() == manifest.resolve() and p["name"] == "wasmer-c-api"]
+          if len(selected) != 1:
+              raise SystemExit("expected exactly one actual candidate CAPI package")
+          (evidence / "capi-package-id.txt").write_text(selected[0]["id"] + "\n")
+          for line in (evidence / "normal-dependencies.txt").read_text().splitlines():
+              if re.match(r"^(wasmer-wasix|wasmer-wasix-types|wasmer-journal|virtual-fs|virtual-net|virtual-mio)\s", line):
+                  raise SystemExit("legacy dependency in the normal native CAPI closure: " + line)
+          PY
+      - name: Build the actual native CAPI dynamic library first
+        shell: bash
+        working-directory: ${{ runner.temp }}/capi-cargo-context
+        timeout-minutes: 25
+        run: |
+          set -euo pipefail
+          python3 "$RUNNER_TEMP/capi-disk-guard.py" before build 8589934592 | tee "$CAPI_EVIDENCE/disk-build.txt"
+          set +e
+          cargo build --manifest-path "$CANDIDATE_DIR/Cargo.toml" --locked --offline -p wasmer-c-api --no-default-features --features cranelift,wasi --target aarch64-apple-darwin --lib > "$CAPI_EVIDENCE/build.log" 2>&1
+          status=$?
+          set -e
+          cat "$CAPI_EVIDENCE/build.log"
+          python3 "$RUNNER_TEMP/capi-disk-guard.py" after build 8589934592 | tee -a "$CAPI_EVIDENCE/disk-build.txt"
+          exit "$status"
+      - name: Compile CAPI tests once and select their exact executable from Cargo JSON
+        shell: bash
+        working-directory: ${{ runner.temp }}/capi-cargo-context
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          test -f "$CARGO_TARGET_DIR/aarch64-apple-darwin/debug/libwasmer.dylib"
+          python3 "$RUNNER_TEMP/capi-disk-guard.py" before tests 6442450944 | tee "$CAPI_EVIDENCE/disk-tests.txt"
+          set +e
+          cargo test --manifest-path "$CANDIDATE_DIR/Cargo.toml" --locked --offline -p wasmer-c-api --no-default-features --features cranelift,wasi --target aarch64-apple-darwin --lib --no-run --message-format=json > "$CAPI_EVIDENCE/test-build.jsonl" 2> "$CAPI_EVIDENCE/test-build.log"
+          status=$?
+          set -e
+          cat "$CAPI_EVIDENCE/test-build.log"
+          test "$status" = 0 || exit "$status"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          evidence = Path(os.environ["CAPI_EVIDENCE"])
+          package = (evidence / "capi-package-id.txt").read_text().strip()
+          profile = (Path(os.environ["CARGO_TARGET_DIR"]) / "aarch64-apple-darwin/debug").resolve()
+          messages = [json.loads(line) for line in (evidence / "test-build.jsonl").read_text().splitlines()]
+          metadata = json.loads((evidence / "metadata.json").read_text())
+          package_metadata = next(p for p in metadata["packages"] if p["id"] == package)
+          targets = [t for t in package_metadata["targets"] if t["name"] == "wasmer"
+                     and set(t["crate_types"]) == {"rlib", "staticlib", "cdylib"}
+                     and Path(t["src_path"]).resolve() == (Path(os.environ["CANDIDATE_DIR"]) / "lib/c-api/src/lib.rs").resolve()]
+          if len(targets) != 1:
+              raise SystemExit("expected exactly one candidate CAPI library target")
+          target = targets[0]
+          candidates = [m for m in messages if m.get("reason") == "compiler-artifact" and m.get("package_id") == package
+                        and all(m.get("target", {}).get(k) == target[k] for k in ("name", "kind", "crate_types", "src_path"))
+                        and m.get("profile", {}).get("test") and m.get("executable")]
+          if len(candidates) != 1:
+              raise SystemExit(f"expected one actual CAPI lib test executable; found {len(candidates)}")
+          binary = Path(candidates[0]["executable"]).resolve()
+          if not binary.is_file() or not binary.is_relative_to(profile / "deps"):
+              raise SystemExit("CAPI test executable is outside the fresh target profile")
+          scripts = [m for m in messages if m.get("reason") == "build-script-executed"
+                     and m.get("package_id") == package and m.get("out_dir")
+                     and Path(m["out_dir"]).is_absolute() and Path(m["out_dir"]).resolve().is_dir()
+                     and Path(m["out_dir"]).resolve().is_relative_to(profile / "build")
+                     and len(Path(m["out_dir"]).resolve().relative_to(profile / "build").parts) >= 2
+                     and Path(m["out_dir"]).resolve().name == "out"]
+          if len(scripts) != 1:
+              raise SystemExit("expected one exact target CAPI build-script output and runtime environment")
+          flags = {k: v for k, v in dict(scripts[0]["env"]).items() if k.startswith("INLINE_C_RS_")}
+          include = Path(os.environ["CANDIDATE_DIR"]) / "lib/c-api"
+          if flags.get("INLINE_C_RS_CFLAGS") != f"-I{include} -L{profile} -D_DEBUG -D_CRT_SECURE_NO_WARNINGS":
+              raise SystemExit("CAPI build-script CFLAGS do not name the actual include/profile")
+          if flags.get("INLINE_C_RS_LDFLAGS") != f"-rpath,{profile} {profile}/libwasmer.dylib":
+              raise SystemExit("CAPI build-script Apple LDFLAGS do not name the actual dylib")
+          (evidence / "inline-c-runtime-env.json").write_text(json.dumps(flags, indent=2) + "\n")
+          (evidence / "test-executable.txt").write_text(str(binary) + "\n")
+          print("exact_capi_test_executable=" + str(binary))
+          PY
+      - name: Audit Mach-O outputs and install the runtime-only C compiler auditor
+        shell: bash
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          # Helpers live only under RUNNER_TEMP. CC changes only during DIRECT test execution.
+          cat > "$RUNNER_TEMP/capi_macho.py" <<'PY'
+          import hashlib, re, subprocess
+          from pathlib import Path
+          def audit(path):
+              path = Path(path).resolve()
+              def output(*args):
+                  return subprocess.check_output(args, text=True)
+              kind = output("file", str(path))
+              arch = output("lipo", "-archs", str(path)).strip()
+              build = output("xcrun", "vtool", "-show-build", str(path))
+              uuids = output("xcrun", "dwarfdump", "--uuid", str(path))
+              matches = re.findall(r"UUID: ([0-9A-Fa-f-]+) \(arm64\)", uuids)
+              if arch != "arm64" or "Mach-O" not in kind or len(matches) != 1:
+                  raise RuntimeError("not a single-architecture arm64 Mach-O: " + str(path))
+              if not re.search(r"^\s*minos 13\.0\s*$", build, re.M) or not re.search(r"^\s*platform MACOS\s*$", build, re.M):
+                  raise RuntimeError("expected macOS minos13.0: " + str(path))
+              return {"path": str(path), "bytes": path.stat().st_size, "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                      "uuid": matches[0].lower(), "file": kind, "arch": arch, "build": build,
+                      "uuids": uuids, "linked": output("otool", "-L", str(path))}
+          PY
+          cat > "$RUNNER_TEMP/capi-cc-audit.py" <<'PY'
+          #!/usr/bin/env python3
+          # AI-authored workflow-only auditor: forward exact compiler argv, never modify flags.
+          import json, os, shutil, subprocess, sys
+          from pathlib import Path
+          from capi_macho import audit
+          args = sys.argv[1:]
+          status = subprocess.run([os.environ["CAPI_REAL_CC"], *args]).returncode
+          if status:
+              raise SystemExit(status if status > 0 else 128 - status)
+          # cc-rs also invokes version/preprocessor/object probes, not just links.
+          if "-o" in args:
+              path = Path(args[args.index("-o") + 1])
+              if path.is_file():
+                  kind = subprocess.check_output(["file", str(path)], text=True)
+                  if "Mach-O" in kind and "executable" in kind:
+                      record = audit(path)
+                      directory = Path(os.environ["CAPI_TEST_EVIDENCE"])
+                      saved = directory / ("c-executable-" + record["sha256"])
+                      shutil.copy2(path, saved)
+                      record.update({"saved": str(saved), "argv": args})
+                      (directory / (saved.name + ".json")).write_text(json.dumps(record, indent=2) + "\n")
+          PY
+          chmod 700 "$RUNNER_TEMP/capi-cc-audit.py"
+          export CAPI_REAL_CC="$(xcrun --find clang)"
+          printf 'CAPI_REAL_CC=%s\n' "$CAPI_REAL_CC" >> "$GITHUB_ENV"
+          python3 - <<'PY'
+          import json, os, shutil, sys
+          from pathlib import Path
+          sys.path.insert(0, os.environ["RUNNER_TEMP"])
+          from capi_macho import audit
+          evidence = Path(os.environ["CAPI_EVIDENCE"])
+          library = Path(os.environ["CARGO_TARGET_DIR"]) / "aarch64-apple-darwin/debug/libwasmer.dylib"
+          binary = Path((evidence / "test-executable.txt").read_text().strip())
+          records = [audit(library), audit(binary)]
+          for path in (library, binary):
+              shutil.copy2(path, evidence / path.name)
+          (evidence / "native-binaries.json").write_text(json.dumps(records, indent=2) + "\n")
+          print(json.dumps(records, indent=2))
+          PY
+      - name: Execute fourteen exact native CAPI gates with actual loader receipts
+        shell: bash
+        timeout-minutes: 25
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, re, signal, subprocess, time
+          from pathlib import Path
+
+          evidence = Path(os.environ["CAPI_EVIDENCE"])
+          candidate = Path(os.environ["CANDIDATE_DIR"])
+          binary = Path((evidence / "test-executable.txt").read_text().strip())
+          library = (Path(os.environ["CARGO_TARGET_DIR"]) / "aarch64-apple-darwin/debug/libwasmer.dylib").resolve()
+          native = json.loads((evidence / "native-binaries.json").read_text())
+          library_record = next(record for record in native if record["path"] == str(library))
+          flags = json.loads((evidence / "inline-c-runtime-env.json").read_text())
+          # Full exact names, never substring filters. The boolean marks actual compiled-C tests.
+          tests = [
+              ("wasm_c_api::wasi::tests::test_wasi_instance_initialization_is_host_only_and_reactor_calls_return", True, False),
+              ("wasm_c_api::wasi::tests::test_wasi_attaches_an_ordinary_same_store_instance_and_keeps_pure_functions_alive", True, False),
+              ("wasm_c_api::wasi::tests::test_wasi_environments_are_independent_in_one_store", True, False),
+              ("wasm_c_api::wasi::tests::test_wasi_reinitializing_one_environment_uses_the_latest_instance_memory", True, False),
+              ("wasm_c_api::wasi::native::tests::public_remote_memory_selection_uses_distinct_shared_backings_and_preserves_private_boundary", False, False),
+              ("wasm_c_api::store::tests::borrowed_public_cross_store_a_b_a_returns_values_and_restores_parents", False, False),
+              ("wasm_c_api::store::tests::borrowed_public_cross_store_a_b_a_trap_unwinds_and_preserves_store_reuse", False, False),
+              ("wasm_c_api::wasi::tests::test_wasi_native_exec_retains_configured_capture_after_child_fd1_closes", True, False),
+              ("wasm_c_api::wasi::native::tests::public_nonleader_detached_exec_cancels_pending_successor_on_environment_delete", False, False),
+              ("wasm_c_api::wasi::native::tests::active_caller_tail_drives_last_public_store_destructor_cleanup", False, False),
+              ("wasm_c_api::store::tests::active_foreign_caller_without_target_tail_drives_last_public_store_cleanup", False, False),
+              ("wasm_c_api::store::tests::pure_tokio_last_public_store_preserves_live_source_callback_and_wasi_cleanup", False, False),
+              ("wasm_c_api::store::tests::initialized_start_dynamic_helper_cancel_preserves_first_panic_and_original_driver", False, False),
+              ("wasm_c_api::wasi::tests::public_initialized_start_copying_fork_rewinds_reaps_and_preserves_private_memory", True, True),
+          ]
+          interrupted = None
+          def note_signal(signum, _frame):
+              # Do not lose the owned Popen in its spawn/assignment window or interrupt reap.
+              global interrupted
+              interrupted = signum
+          previous = {}
+          def run_owned(args, log, env):
+              child, completed = None, False
+              try:
+                  if interrupted is not None:
+                      raise RuntimeError(f"interrupted by signal{interrupted}")
+                  child = subprocess.Popen(args, cwd=candidate / "lib/c-api", env=env,
+                                           stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+                  deadline = time.monotonic() + 180
+                  while True:
+                      if interrupted is not None:
+                          raise RuntimeError(f"interrupted by signal{interrupted}")
+                      remaining = deadline - time.monotonic()
+                      if remaining <= 0:
+                          raise RuntimeError("owned CAPI test exceeded180s")
+                      try:
+                          result = child.wait(timeout=min(0.2, remaining))
+                      except subprocess.TimeoutExpired:
+                          continue
+                      completed = result == 0
+                      return result
+              finally:
+                  if child is not None and not completed:
+                      try:
+                          os.killpg(child.pid, signal.SIGKILL)
+                      except ProcessLookupError:
+                          pass
+                      finally:
+                          child.wait()
+          results = []
+          try:
+              for sig in (signal.SIGINT, signal.SIGTERM):
+                  previous[sig] = signal.signal(sig, note_signal)
+              environment = os.environ.copy()
+              environment.update(flags)  # Cargo's EXACT recorded build-script env for direct execution.
+              with (evidence / "test-list.txt").open("xb") as listing:
+                  if run_owned([str(binary), "--list"], listing, environment):
+                      raise RuntimeError("CAPI test listing failed")
+              names = (evidence / "test-list.txt").read_text().splitlines()
+              for name, _, _ in tests:
+                  if names.count(name + ": test") != 1:
+                      raise RuntimeError("expected exactly one listed CAPI test: " + name)
+              for ordinal, (name, inline_c, ignored) in enumerate(tests, 1):
+                  directory = evidence / f"test-{ordinal:02d}"
+                  directory.mkdir(exist_ok=False)
+                  (directory / "name.txt").write_text(name + "\n")
+                  env = environment.copy()
+                  env.update({"CC": str(Path(os.environ["RUNNER_TEMP"]) / "capi-cc-audit.py"),
+                              "CAPI_TEST_EVIDENCE": str(directory),
+                              "INLINE_C_RS_DYLD_PRINT_LIBRARIES": "1",
+                              "INLINE_C_RS_DYLD_PRINT_TO_FILE": str(directory / "dyld.log"),
+                              "INLINE_C_RS_DYLD_LIBRARY_PATH": str(library.parent)})
+                  args = [str(binary), "--exact", name, "--nocapture", "--test-threads=1"]
+                  if ignored:
+                      args.append("--ignored")
+                  with (directory / "test.log").open("xb") as log:
+                      status = run_owned(args, log, env)
+                  text = (directory / "test.log").read_text()
+                  print(text, flush=True)
+                  if status or not re.search(r"^test result: ok\. 1 passed; 0 failed; 0 ignored;", text, re.M):
+                      raise RuntimeError(f"exact test failed/nonpositive count: {name}; status={status}")
+                  if inline_c:
+                      trace = directory / "dyld.log"
+                      if not trace.is_file() or not trace.stat().st_size:
+                          raise RuntimeError("missing actual inline-C loader file: " + name)
+                      loaded = trace.read_text().lower()
+                      # /var and /private/var may name the same runner file.
+                      paths = re.findall(r"(/[^\n]*libwasmer\.dylib)", trace.read_text())
+                      if not any(Path(path.strip()).resolve() == library for path in paths) or library_record["uuid"] not in loaded:
+                          raise RuntimeError("loader trace does not identify the exact candidate dylib: " + name)
+                      audits = list(directory.glob("c-executable-*.json"))
+                      if not audits:
+                          raise RuntimeError("no actual inline-C executable audit: " + name)
+                      for path in audits:
+                          record = json.loads(path.read_text())
+                          if record["uuid"] not in loaded:
+                              raise RuntimeError("audited C executable was not observed by dyld: " + record["path"])
+                          if hashlib.sha256(Path(record["saved"]).read_bytes()).hexdigest() != record["sha256"]:
+                              raise RuntimeError("audited C executable changed")
+                  if hashlib.sha256(library.read_bytes()).hexdigest() != library_record["sha256"]:
+                      raise RuntimeError("candidate dylib changed during tests")
+                  results.append({"name": name, "passed": 1, "ignored": 0, "inline_c": inline_c})
+                  (evidence / "results.json").write_text(json.dumps(results, indent=2) + "\n")
+              if len(results) != 14 or sum(r["inline_c"] for r in results) != 6:
+                  raise RuntimeError("incomplete native CAPI gate map")
+              print("CAPI_ARM64_EXACT_GATES_PASSED=14 INLINE_C_LOADER_GATES=6", flush=True)
+          finally:
+              for sig, handler in previous.items():
+                  signal.signal(sig, handler)
+          PY
+      - name: Verify disk growth and unchanged candidate after the runtime gate
+        if: always()
+        shell: bash
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          if test -f "$RUNNER_TEMP/capi-disk-tests.bytes"; then
+            python3 "$RUNNER_TEMP/capi-disk-guard.py" after tests 6442450944 | tee -a "$CAPI_EVIDENCE/disk-tests.txt"
+          fi
+          if test -n "${CAPI_EVIDENCE:-}" && test -f "$CAPI_EVIDENCE/candidate.json"; then
+            python3 - <<'PY'
+          import hashlib, json, os, subprocess, tomllib
+          from collections import Counter
+          from pathlib import Path
+          evidence = Path(os.environ["CAPI_EVIDENCE"])
+          candidate = Path(os.environ["CANDIDATE_DIR"])
+          before = json.loads((evidence / "candidate.json").read_text())
+          original = (evidence / "Cargo.lock.before").read_bytes()
+          current = (candidate / "Cargo.lock").read_bytes()
+          after = hashlib.sha256(current).hexdigest()
+          lock_receipt = {"before_sha256": before["cargo_lock_sha256"], "after_sha256": after, "restored_package_order_only": False}
+          if after != before["cargo_lock_sha256"]:
+              (evidence / "Cargo.lock.after").write_bytes(current)
+              old, new = tomllib.loads(original.decode()), tomllib.loads(current.decode())
+              old_packages, new_packages = old.pop("package"), new.pop("package")
+              tables = lambda packages: Counter(json.dumps(p, sort_keys=True, separators=(",", ":")) for p in packages)
+              # Complete TOML fields, list order and multiplicity must match. No dependency normalization.
+              if old != new or tables(old_packages) != tables(new_packages) or old_packages == new_packages:
+                  (evidence / "lock-receipt.json").write_text(json.dumps(lock_receipt, indent=2) + "\n")
+                  raise SystemExit("candidate Cargo.lock changed beyond package-table order")
+              (candidate / "Cargo.lock").write_bytes(original)
+              lock_receipt["restored_package_order_only"] = True
+          lock_receipt["final_sha256"] = hashlib.sha256((candidate / "Cargo.lock").read_bytes()).hexdigest()
+          (evidence / "lock-receipt.json").write_text(json.dumps(lock_receipt, indent=2) + "\n")
+          if subprocess.check_output(["git", "-C", str(candidate), "rev-parse", "HEAD"], text=True).strip() != before["candidate_sha"]:
+              raise SystemExit("candidate HEAD changed")
+          subprocess.run(["git", "-C", str(candidate), "diff", "HEAD", "--exit-code"], check=True)
+          (evidence / "candidate-unchanged.txt").write_text("tracked source and exact Cargo.lock unchanged\n")
+          PY
+          fi
+      - name: Upload bounded native public CAPI evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        timeout-minutes: 3
+        with:
+          name: capi-macos-arm64-native-v2-evidence
+          path: ${{ runner.temp }}/capi-evidence
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Remove only task-local credentials and build state
+        if: always()
+        shell: bash
+        timeout-minutes: 2
+        run: |
+          rm -f -- "$RUNNER_TEMP/capi-wlk-readonly-key" "$RUNNER_TEMP/capi-wlk-known-hosts" "$RUNNER_TEMP/capi-gitconfig" \
+            "$RUNNER_TEMP/capi-copying-fork.wasm" "$RUNNER_TEMP/capi-disk-guard.py" \
+            "$RUNNER_TEMP/capi-cc-audit.py" "$RUNNER_TEMP/capi_macho.py" "$RUNNER_TEMP"/capi-disk-*.bytes
+          rm -rf -- "$RUNNER_TEMP/capi-cargo-home" "$RUNNER_TEMP/capi-rustup-home" \
+            "$RUNNER_TEMP/capi-target" "$RUNNER_TEMP/capi-cargo-context"
