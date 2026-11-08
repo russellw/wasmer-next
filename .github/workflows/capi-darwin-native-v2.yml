@@ -11,6 +11,11 @@ on:
         description: Reviewed original 763-byte imported-shared f06ec guest, base64 encoded
         required: true
         type: string
+      diagnose_first_failure:
+        description: Diagnostic only; run the known first case and use LLDB on its captured failure
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -370,7 +375,161 @@ jobs:
           (evidence / "native-binaries.json").write_text(json.dumps(records, indent=2) + "\n")
           print(json.dumps(records, indent=2))
           PY
+      - name: Prepare the optional bounded first-failure debugger
+        if: ${{ inputs.diagnose_first_failure }}
+        shell: bash
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/capi_lldb.py" <<'PY'
+          # AI-authored workflow-only diagnostic. No lldbinit, permission or signal-policy changes.
+          import json, os, re, signal, subprocess, time
+          from pathlib import Path
+          import lldb
+
+          def run(debugger):
+              payload = json.loads(Path(os.environ["CAPI_LLDB_PAYLOAD"]).read_text())
+              directory = Path(payload["directory"])
+              cancel = directory / "cancel"
+              def save(name, value):
+                  path = directory / name
+                  temporary = path.with_suffix(path.suffix + ".tmp")
+                  temporary.write_text(json.dumps(value, indent=2) + "\n")
+                  temporary.replace(path)
+              def command(text):
+                  result = lldb.SBCommandReturnObject()
+                  debugger.GetCommandInterpreter().HandleCommand(text, result)
+                  return {"command": text, "output": result.GetOutput() or "", "error": result.GetError() or ""}
+              def capture(process, phase):
+                  threads = []
+                  for index in range(process.GetNumThreads()):
+                      thread = process.GetThreadAtIndex(index)
+                      frame = thread.GetFrameAtIndex(0)
+                      process.SetSelectedThread(thread)
+                      threads.append({"id": thread.GetThreadID(), "reason": thread.GetStopReason(),
+                                      "description": thread.GetStopDescription(2048) or "",
+                                      "data": [thread.GetStopReasonDataAtIndex(i) for i in range(thread.GetStopReasonDataCount())],
+                                      "pc": hex(frame.GetPC()) if frame.IsValid() else None,
+                                      "registers": command("register read --all")})
+                  value = {"phase": phase, "state": process.GetState(), "pid": process.GetProcessID(),
+                           "exit_status": process.GetExitStatus(), "exit_description": process.GetExitDescription() or "",
+                           "threads": threads, "backtraces": command("thread backtrace all"),
+                           "images": command("image list -o -f"),
+                           "interpretation": "observed debugger state/stop; not automatically a fatal original failure"}
+                  save(phase + ".json", value)
+                  return threads
+              def identity(pid):
+                  result = subprocess.run(["ps", "-ww", "-p", str(pid), "-o", "pid=", "-o", "lstart=", "-o", "args="],
+                                          capture_output=True, text=True, timeout=2)
+                  match = re.fullmatch(r"\s*(\d+)\s+(\w{3}\s+\w{3}\s+\d{1,2}\s+\d\d:\d\d:\d\d\s+\d{4})\s+(.+?)\s*", result.stdout)
+                  if result.returncode == 1 and not result.stdout.strip() and not result.stderr.strip():
+                      return None
+                  if result.returncode or not match:
+                      raise RuntimeError("cannot read the inferior's actual ps identity")
+                  return {"pid": int(match[1]), "start": " ".join(match[2].split()), "command": match[3]}
+              target, process = None, None
+              summary = {"continued": False, "launch_attempted": False, "cleanup_confirmed": False}
+              deadline = time.monotonic() + 85
+              debugger.SetAsync(True)
+              listener = lldb.SBListener("capi-first-failure")
+              event = lldb.SBEvent()
+              terminal = (lldb.eStateExited, lldb.eStateDetached, lldb.eStateInvalid, lldb.eStateUnloaded)
+              def state():
+                  return process.GetState()
+              def wait_for_stop():
+                  while state() not in (lldb.eStateStopped, lldb.eStateCrashed, *terminal):
+                      if cancel.exists() or time.monotonic() >= deadline:
+                          raise RuntimeError("diagnostic canceled or reached its soft deadline")
+                      listener.WaitForEvent(1, event)
+                  return state()
+              try:
+                  target = debugger.CreateTarget(payload["executable"])
+                  if not target.IsValid():
+                      raise RuntimeError("LLDB could not create the exact captured target")
+                  launch = lldb.SBLaunchInfo([])
+                  launch.SetExecutableFile(target.GetExecutable(), True)
+                  launch.SetListener(listener)
+                  launch.SetWorkingDirectory(payload["cwd"])
+                  inferior_env = os.environ.copy()
+                  inferior_env.update(payload["overrides"])
+                  # Explicit entries restore DYLD values even if SIP filtered debugger inheritance.
+                  launch.SetEnvironmentEntries([key + "=" + value for key, value in inferior_env.items()], False)
+                  # SBLaunchInfo defaults include DisableASLR; preserve the original normal ASLR.
+                  launch.SetLaunchFlags(lldb.eLaunchFlagDebug | lldb.eLaunchFlagStopAtEntry)
+                  error = lldb.SBError()
+                  summary["launch_attempted"] = True
+                  process = target.Launch(launch, error)
+                  summary["launch_error"] = str(error)
+                  if error.Fail() or not process.IsValid():
+                      raise RuntimeError("LLDB launch refused: " + str(error))
+                  initial = wait_for_stop()
+                  threads = capture(process, "initial-launch-stop")
+                  if initial in terminal or initial == lldb.eStateCrashed:
+                      summary["outcome"] = "terminal or crashed before the artificial entry stop could resume"
+                      return
+                  # Preserve pre-entry faults; SIGSTOP/SIGTRAP can be the launch's artificial stop.
+                  faults = [t for t in threads if t["reason"] == lldb.eStopReasonException or
+                            (t["reason"] == lldb.eStopReasonSignal and t["data"] and
+                             t["data"][0] not in (signal.SIGSTOP, signal.SIGTRAP))]
+                  if faults:
+                      summary["outcome"] = "natural pre-entry fault retained without Continue"
+                      return
+                  pid = process.GetProcessID()
+                  owned = identity(pid)
+                  if pid <= 1 or not owned or owned["command"] != payload["executable"]:
+                      raise RuntimeError("cannot certify the stopped inferior's PID/start/executable custody")
+                  owned.update({"executable": payload["executable"], "sha256": payload["sha256"], "uuid": payload["uuid"]})
+                  save("inferior-custody.json", owned)
+                  if cancel.exists() or time.monotonic() >= deadline:
+                      raise RuntimeError("diagnostic canceled before Continue")
+                  initial_stop_id = process.GetStopID()
+                  summary["initial_stop_id"] = initial_stop_id
+                  error = process.Continue()
+                  if error.Fail():
+                      raise RuntimeError("LLDB Continue refused: " + str(error))
+                  summary["continued"] = True
+                  # Queued launch/running events cannot certify a new stop after Continue.
+                  while True:
+                      current = state()
+                      if current == lldb.eStateExited or (current in (lldb.eStateStopped, lldb.eStateCrashed) and process.GetStopID() != initial_stop_id):
+                          break
+                      if current in terminal:
+                          summary["outcome"] = "process became unobservable without a certified new stop or exit"
+                          summary["terminal_state"] = current
+                          return
+                      if cancel.exists() or time.monotonic() >= deadline:
+                          raise RuntimeError("diagnostic did not reach a different stop or terminal exit")
+                      listener.WaitForEvent(1, event)
+                  capture(process, "natural-stop-or-exit")
+                  summary["outcome"] = "one natural stop/exit observed; no automatic fatal or acceptance inference"
+              except BaseException as error:
+                  summary["error"] = repr(error)
+              finally:
+                  try:
+                      if target is not None and target.IsValid():
+                          current = target.GetProcess()
+                          if current.IsValid():
+                              process = current
+                      if process is not None and process.IsValid():
+                          summary["cleanup_pid"] = process.GetProcessID()
+                          if process.GetState() not in (lldb.eStateExited, lldb.eStateInvalid, lldb.eStateUnloaded):
+                              summary["kill_error"] = str(process.Kill())
+                          end = time.monotonic() + 8
+                          while process.GetState() not in terminal and time.monotonic() < end:
+                              listener.WaitForEvent(1, event)
+                          summary["cleanup_state"] = process.GetState()
+                          summary["cleanup_confirmed"] = process.GetState() in (lldb.eStateExited, lldb.eStateInvalid, lldb.eStateUnloaded)
+                      elif not summary["launch_attempted"]:
+                          summary["cleanup_confirmed"] = True
+                  except BaseException as error:
+                      summary["cleanup_error"] = repr(error)
+                  save("lldb-result.json", summary)
+                  if target is not None and target.IsValid():
+                      debugger.DeleteTarget(target)
+          PY
       - name: Execute fourteen exact native CAPI gates with actual loader receipts
+        env:
+          CAPI_DIAGNOSE_FIRST_FAILURE: ${{ inputs.diagnose_first_failure }}
         shell: bash
         timeout-minutes: 25
         run: |
@@ -403,6 +562,146 @@ jobs:
               ("wasm_c_api::store::tests::initialized_start_dynamic_helper_cancel_preserves_first_panic_and_original_driver", False, False),
               ("wasm_c_api::wasi::tests::public_initialized_start_copying_fork_rewinds_reaps_and_preserves_private_memory", True, True),
           ]
+          diagnostic_only = os.environ.get("CAPI_DIAGNOSE_FIRST_FAILURE") == "true"
+          first_case = "wasm_c_api::wasi::tests::test_wasi_instance_initialization_is_host_only_and_reactor_calls_return"
+          if tests[0][0] != first_case:
+              raise RuntimeError("diagnostic first-case identity changed")
+          selected_tests = tests[:1] if diagnostic_only else tests
+          def diagnose_first_failure(directory, original_env, original_status):
+              diagnostic = directory / "diagnostic"
+              diagnostic.mkdir(exist_ok=False)
+              # No full environment file or dump; only the known public C runtime overrides.
+              result = {"original_test_status": original_status, "mode": "diagnostic-only", "inferior_cleanup_confirmed": False}
+              def save_result():
+                  (diagnostic / "supervisor-result.json").write_text(json.dumps(result, indent=2) + "\n")
+              child = None
+              executable = None
+              started = time.monotonic()
+              def identity(pid):
+                  output = subprocess.run(["ps", "-ww", "-p", str(pid), "-o", "pid=", "-o", "lstart=", "-o", "args="],
+                                          capture_output=True, text=True, timeout=min(2, max(0.05, 118 - (time.monotonic() - started))))
+                  match = re.fullmatch(r"\s*(\d+)\s+(\w{3}\s+\w{3}\s+\d{1,2}\s+\d\d:\d\d:\d\d\s+\d{4})\s+(.+?)\s*", output.stdout)
+                  if output.returncode == 1 and not output.stdout.strip() and not output.stderr.strip():
+                      return None
+                  if output.returncode or not match:
+                      raise RuntimeError("cannot read the inferior's actual ps identity")
+                  return {"pid": int(match[1]), "start": " ".join(match[2].split()), "command": match[3]}
+              def cleanup_inferior():
+                  custody_file = diagnostic / "inferior-custody.json"
+                  custody = json.loads(custody_file.read_text()) if custody_file.exists() else None
+                  if custody is not None:
+                      if custody["executable"] != str(executable) or custody["sha256"] != record["sha256"] or custody["uuid"] != record["uuid"]:
+                          raise RuntimeError("inferior custody metadata does not match the selected private executable")
+                      live = identity(custody["pid"])
+                      if live is None:
+                          result["inferior_cleanup_confirmed"] = True
+                          return
+                      if any(live[k] != custody[k] for k in ("pid", "start", "command")):
+                          result["cleanup_note"] = "owned PID identity changed; never signal the replacement"
+                          return
+                  else:
+                      # Launch can stall before SBProcess PID publication. Match ONLY this private image.
+                      output = subprocess.run(["ps", "-axww", "-o", "pid=", "-o", "lstart=", "-o", "args="],
+                                              capture_output=True, text=True, timeout=min(2, max(0.05, 118 - (time.monotonic() - started))), check=True)
+                      matches = []
+                      for line in output.stdout.splitlines():
+                          match = re.fullmatch(r"\s*(\d+)\s+(\w{3}\s+\w{3}\s+\d{1,2}\s+\d\d:\d\d:\d\d\s+\d{4})\s+(.+?)\s*", line)
+                          if match and match[3] == str(executable):
+                              matches.append({"pid": int(match[1]), "start": " ".join(match[2].split()), "command": match[3]})
+                      if len(matches) != 1:
+                          result["cleanup_note"] = "launch gap: no unique safely identified inferior; cleanup unconfirmed"
+                          return
+                      live = matches[0]
+                      result["launch_gap_owned_identity"] = live
+                  if live["pid"] <= 1 or live["pid"] in (os.getpid(), child.pid) or live["command"] != str(executable):
+                      raise RuntimeError("refuse an unsafe inferior cleanup identity")
+                  current = identity(live["pid"])
+                  if current != live:
+                      result["cleanup_note"] = "inferior identity changed before fallback; no signal sent"
+                      return
+                  os.kill(live["pid"], signal.SIGKILL)
+                  result["fallback_killed_identity"] = live
+                  end = min(started + 118, time.monotonic() + 2)
+                  while time.monotonic() < end:
+                      if identity(live["pid"]) is None:
+                          result["inferior_cleanup_confirmed"] = True
+                          break
+                      time.sleep(0.1)
+              try:
+                  audits = list(directory.glob("c-executable-*.json"))
+                  if len(audits) != 1:
+                      raise RuntimeError("diagnostic needs exactly one captured failed C executable")
+                  record = json.loads(audits[0].read_text())
+                  executable = Path(record["saved"]).resolve(strict=True)
+                  if not executable.is_relative_to(directory.resolve()) or hashlib.sha256(executable.read_bytes()).hexdigest() != record["sha256"]:
+                      raise RuntimeError("captured C executable path/hash changed")
+                  if str(Path(record["path"]).resolve()) != record["path"] or library_record["path"] != str(library):
+                      raise RuntimeError("captured executable/library paths are not the audited canonical paths")
+                  for audited in (record, library_record):
+                      if audited.get("arch") != "arm64" or not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", audited["uuid"]):
+                          raise RuntimeError("invalid previously audited ARM64/UUID metadata")
+                      if not re.search(r"^\s*minos 13\.0\s*$", audited["build"], re.M) or not re.search(r"^\s*platform MACOS\s*$", audited["build"], re.M):
+                          raise RuntimeError("invalid previously audited macOS minos13.0 metadata")
+                  # Exact current bytes preserve the original Mach-O audit; no external preflight tools.
+                  if hashlib.sha256(library.read_bytes()).hexdigest() != library_record["sha256"]:
+                      raise RuntimeError("exact candidate dylib bytes changed")
+                  loads = {}
+                  for pid, uuid, path in re.findall(r"dyld\[(\d+)\]: <([0-9A-Fa-f-]+)> ([^\n]+)", (directory / "dyld.log").read_text()):
+                      loads.setdefault(pid, set()).add((uuid.lower(), str(Path(path.strip()).resolve())))
+                  wanted = {(record["uuid"], str(Path(record["path"]).resolve())), (library_record["uuid"], str(library))}
+                  if sum(wanted.issubset(images) for images in loads.values()) != 1:
+                      raise RuntimeError("original trace does not correlate one C process and exact candidate dylib")
+                  keys = ("CFLAGS", "LDFLAGS", "DYLD_LIBRARY_PATH", "DYLD_PRINT_LIBRARIES", "DYLD_PRINT_TO_FILE")
+                  overrides = {key: original_env["INLINE_C_RS_" + key] for key in keys}
+                  overrides["SDKROOT"] = original_env["SDKROOT"]
+                  overrides["DYLD_PRINT_TO_FILE"] = str(diagnostic / "inferior-dyld.log")
+                  payload = {"directory": str(diagnostic), "executable": str(executable), "sha256": record["sha256"],
+                             "uuid": record["uuid"], "cwd": str(candidate / "lib/c-api"), "overrides": overrides,
+                             "library": library_record, "original_test_status": original_status}
+                  payload_path = diagnostic / "launch.json"
+                  payload_path.write_text(json.dumps(payload, indent=2) + "\n")
+                  debugger_env = original_env.copy()
+                  debugger_env["CAPI_LLDB_PAYLOAD"] = str(payload_path)
+                  script = Path(os.environ["RUNNER_TEMP"]) / "capi_lldb.py"
+                  args = ["xcrun", "lldb", "--batch", "--no-lldbinit", "-o", "command script import " + json.dumps(str(script)),
+                          "-o", "script capi_lldb.run(lldb.debugger)"]
+                  if interrupted is not None or time.monotonic() - started >= 90:
+                      raise RuntimeError("diagnostic preflight reached its soft deadline; no debugger launched")
+                  with (diagnostic / "lldb.log").open("xb") as log:
+                      child = subprocess.Popen(args, cwd=candidate / "lib/c-api", env=debugger_env,
+                                               stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+                      fallback_done = False
+                      while child.poll() is None:
+                          elapsed = time.monotonic() - started
+                          if interrupted is not None or elapsed >= 90:
+                              (diagnostic / "cancel").touch()
+                          if elapsed >= 105 and not fallback_done:
+                              cleanup_inferior()
+                              fallback_done = True
+                          if interrupted is not None or elapsed >= 110:
+                              break
+                          time.sleep(0.2)
+                      result["lldb_status_before_cleanup"] = child.poll()
+              except BaseException as error:
+                  result["diagnostic_error"] = repr(error)
+              finally:
+                  (diagnostic / "cancel").touch()
+                  if child is not None:
+                      try:
+                          cleanup_inferior()
+                      except BaseException as error:
+                          result["inferior_cleanup_error"] = repr(error)
+                      try:
+                          if child.poll() is None or child.returncode != 0:
+                              try:
+                                  os.killpg(child.pid, signal.SIGKILL)
+                              except ProcessLookupError:
+                                  pass
+                          result["lldb_final_status"] = child.wait(timeout=max(0.1, 120 - (time.monotonic() - started)))
+                      except BaseException as error:
+                          result["lldb_cleanup_error"] = repr(error)
+                  result["elapsed_seconds"] = time.monotonic() - started
+                  save_result()
           interrupted = None
           def note_signal(signum, _frame):
               # Do not lose the owned Popen in its spawn/assignment window or interrupt reap.
@@ -451,7 +750,7 @@ jobs:
               for name, _, _ in tests:
                   if names.count(name + ": test") != 1:
                       raise RuntimeError("expected exactly one listed CAPI test: " + name)
-              for ordinal, (name, inline_c, ignored) in enumerate(tests, 1):
+              for ordinal, (name, inline_c, ignored) in enumerate(selected_tests, 1):
                   directory = evidence / f"test-{ordinal:02d}"
                   directory.mkdir(exist_ok=False)
                   (directory / "name.txt").write_text(name + "\n")
@@ -469,6 +768,12 @@ jobs:
                   text = (directory / "test.log").read_text()
                   print(text, flush=True)
                   if status or not re.search(r"^test result: ok\. 1 passed; 0 failed; 0 ignored;", text, re.M):
+                      if diagnostic_only:
+                          try:
+                              diagnose_first_failure(directory, env, status)
+                          except BaseException as error:
+                              # Diagnostics never replace or hide the original test failure/status.
+                              (directory / "diagnostic-error.txt").write_text(repr(error) + "\n")
                       raise RuntimeError(f"exact test failed/nonpositive count: {name}; status={status}")
                   if inline_c:
                       trace = directory / "dyld.log"
@@ -492,9 +797,12 @@ jobs:
                       raise RuntimeError("candidate dylib changed during tests")
                   results.append({"name": name, "passed": 1, "ignored": 0, "inline_c": inline_c})
                   (evidence / "results.json").write_text(json.dumps(results, indent=2) + "\n")
-              if len(results) != 14 or sum(r["inline_c"] for r in results) != 6:
-                  raise RuntimeError("incomplete native CAPI gate map")
-              print("CAPI_ARM64_EXACT_GATES_PASSED=14 INLINE_C_LOADER_GATES=6", flush=True)
+              if diagnostic_only:
+                  print("DIAGNOSTIC_ONLY_FIRST_CASE_PASSED=1 FULL_14_GATE_SUITE_NOT_RUN=1", flush=True)
+              else:
+                  if len(results) != 14 or sum(r["inline_c"] for r in results) != 6:
+                      raise RuntimeError("incomplete native CAPI gate map")
+                  print("CAPI_ARM64_EXACT_GATES_PASSED=14 INLINE_C_LOADER_GATES=6", flush=True)
           finally:
               for sig, handler in previous.items():
                   signal.signal(sig, handler)
@@ -555,6 +863,6 @@ jobs:
         run: |
           rm -f -- "$RUNNER_TEMP/capi-wlk-readonly-key" "$RUNNER_TEMP/capi-wlk-known-hosts" "$RUNNER_TEMP/capi-gitconfig" \
             "$RUNNER_TEMP/capi-copying-fork.wasm" "$RUNNER_TEMP/capi-disk-guard.py" \
-            "$RUNNER_TEMP/capi-cc-audit.py" "$RUNNER_TEMP/capi_macho.py" "$RUNNER_TEMP"/capi-disk-*.bytes
+            "$RUNNER_TEMP/capi-cc-audit.py" "$RUNNER_TEMP/capi_macho.py" "$RUNNER_TEMP/capi_lldb.py" "$RUNNER_TEMP"/capi-disk-*.bytes
           rm -rf -- "$RUNNER_TEMP/capi-cargo-home" "$RUNNER_TEMP/capi-rustup-home" \
             "$RUNNER_TEMP/capi-target" "$RUNNER_TEMP/capi-cargo-context"
