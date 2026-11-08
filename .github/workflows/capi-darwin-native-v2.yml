@@ -180,16 +180,19 @@ jobs:
           printf '%s\n' "$WLK_CI_READ_SSH_KEY" > "$key_file"
           unset WLK_CI_READ_SSH_KEY
           chmod 600 "$key_file"
-          curl --fail --silent --show-error --proto '=https' --tlsv1.2 https://api.github.com/meta | python3 -c '
+          curl --fail --silent --show-error --proto '=https' --tlsv1.2 \
+            --retry 3 --retry-all-errors --retry-delay 2 --retry-max-time 60 \
+            --connect-timeout 10 --max-time 20 --output "$CAPI_EVIDENCE/github-meta.json" https://api.github.com/meta
+          python3 -c '
           import json, sys
-          keys = json.load(sys.stdin)["ssh_keys"]
+          keys = json.load(open(sys.argv[1], "rb"))["ssh_keys"]
           if not keys:
               raise SystemExit("GitHub meta returned no SSH host keys")
           for key in keys:
               print("github.com " + key)
               print("ssh.github.com " + key)
               print("[ssh.github.com]:443 " + key)
-          ' > "$known_hosts"
+          ' "$CAPI_EVIDENCE/github-meta.json" > "$known_hosts"
           chmod 600 "$known_hosts"
           git config --file "$git_config" 'url.ssh://git@ssh.github.com:443/wasmerio/wlk.insteadOf' https://github.com/wasmerio/wlk
           export GIT_CONFIG_GLOBAL="$git_config" GIT_CONFIG_NOSYSTEM=1 CARGO_NET_GIT_FETCH_WITH_CLI=true
