@@ -1582,11 +1582,11 @@ mod tests {
             .unwrap();
         futures::executor::block_on(factory.call_async(&cap, vec![])).unwrap();
         let original_handle = saved.borrow_mut().take().unwrap();
-        let old = original_handle.upgrade().unwrap();
+        let mut old = original_handle.upgrade().unwrap();
         let snapshot = old.native_import_snapshot().unwrap();
         assert!(Arc::ptr_eq(
             &snapshot,
-            &old.clone().native_import_snapshot().unwrap()
+            &old.as_mut().native_import_snapshot().unwrap()
         ));
         assert!(Arc::ptr_eq(
             &snapshot,
