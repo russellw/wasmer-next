@@ -5353,6 +5353,264 @@ mod tests {
         );
     }
 
+    #[cfg(all(unix, feature = "wasi"))]
+    #[test]
+    fn active_foreign_caller_without_target_tail_drives_last_public_store_cleanup() {
+        use std::{future::Future, io::Write, task::Poll};
+        use wasmer_api::sys::{NativeAncestrySettlement, WeakNativeInvocation};
+        const CHILD: &str = "WASMER_CAPI_FOREIGN_NO_TAIL_FINAL_STORE_CHILD";
+        const TEST: &str = "wasm_c_api::store::tests::active_foreign_caller_without_target_tail_drives_last_public_store_cleanup";
+        struct Directory(std::path::PathBuf);
+        impl Drop for Directory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        #[derive(Clone)]
+        struct Trace(std::sync::Arc<std::path::PathBuf>);
+        impl Trace {
+            fn record(&self, stage: &str) {
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(self.0.as_path())
+                    .unwrap();
+                writeln!(file, "{stage}").unwrap();
+            }
+        }
+        let directory = if let Some(path) = std::env::var_os(CHILD) {
+            std::path::PathBuf::from(path)
+        } else {
+            // Match the existing public active-caller oracle: only this owned
+            // child is killed/reaped if synchronous deletion blocks its caller.
+            struct OwnedChild(std::process::Child);
+            impl Drop for OwnedChild {
+                fn drop(&mut self) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+            let directory = Directory(std::env::temp_dir().join(format!(
+                "wasmer-capi-foreign-no-tail-final-store-{}",
+                std::process::id()
+            )));
+            std::fs::create_dir(&directory.0).unwrap();
+            let mut child = OwnedChild(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", TEST, "--nocapture"])
+                    .env(CHILD, &directory.0)
+                    .spawn()
+                    .unwrap(),
+            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    let stages = std::fs::read_to_string(directory.0.join("stages"))
+                        .unwrap_or_else(|e| format!("no stages: {e}"));
+                    assert!(
+                        status.success(),
+                        "no-tail final Store cleanup failed: {status}\n{stages}"
+                    );
+                    assert!(
+                        stages.contains("all-no-tail-final-store-fences-completed"),
+                        "child must execute the actual complete oracle: {stages}"
+                    );
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child.0.kill().unwrap();
+                    let status = child.0.wait().unwrap();
+                    let stages = std::fs::read_to_string(directory.0.join("stages"))
+                        .unwrap_or_else(|e| format!("no stages: {e}"));
+                    panic!(
+                        "no-tail final Store cleanup did not complete in 15s: {status}\n{stages}"
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        let trace = Trace(std::sync::Arc::new(directory.join("stages")));
+        trace.record("child-started");
+        struct CleanupOnDrop {
+            owner: wasmer_api::sys::NativeCleanupOwner,
+            store: WeakStoreRef,
+            trace: Trace,
+            name: &'static str,
+            complete: Rc<std::cell::Cell<bool>>,
+        }
+        impl Drop for CleanupOnDrop {
+            fn drop(&mut self) {
+                assert!(self.store.upgrade().is_none());
+                self.trace
+                    .record(&format!("{}-destructor-weak-expired", self.name));
+                let trace = self.trace.clone();
+                let name = self.name;
+                let complete = self.complete.clone();
+                self.owner
+                    .try_retain(async move {
+                        trace.record(&format!("{name}-before-yield-1"));
+                        tokio::task::yield_now().await;
+                        trace.record(&format!("{name}-after-yield-1-before-timer"));
+                        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                        trace.record(&format!("{name}-after-timer-before-yield-2"));
+                        tokio::task::yield_now().await;
+                        complete.set(true);
+                        trace.record(&format!("{name}-completed"));
+                    })
+                    .unwrap_or_else(|_| panic!("actual resource destructor cleanup refused"));
+            }
+        }
+        unsafe extern "C" fn callback(
+            _: *mut std::ffi::c_void,
+            _: &wasm_val_vec_t,
+            _: &mut wasm_val_vec_t,
+        ) -> Option<Box<wasm_trap_t>> {
+            None
+        }
+        unsafe extern "C" fn finalize(data: *mut std::ffi::c_void) {
+            drop(unsafe { Box::from_raw(data.cast::<CleanupOnDrop>()) });
+        }
+        let engine = crate::wasm_c_api::engine::wasm_engine_new();
+        let mut target = unsafe { wasm_store_new(Some(&engine)) }.unwrap();
+        let weak_target = target.inner.downgrade();
+        let owner = target.inner.cleanup_owner().unwrap();
+        let local_completed = Rc::new(std::cell::Cell::new(false));
+        let vm_completed = Rc::new(std::cell::Cell::new(false));
+        let started = Rc::new(std::cell::Cell::new(false));
+        let local = CleanupOnDrop {
+            owner: owner.clone(),
+            store: weak_target.clone(),
+            trace: trace.clone(),
+            name: "local",
+            complete: local_completed.clone(),
+        };
+        let task_started = started.clone();
+        let task_trace = trace.clone();
+        // Seed one real T LocalSet resource before R starts. This helper neither
+        // enrolls retirement nor exports a private Driver to the caller.
+        target
+            .inner
+            .run_host(async move {
+                tokio::task::spawn_local(async move {
+                    let _local = local;
+                    task_started.set(true);
+                    task_trace.record("local-task-actually-started");
+                    std::future::pending::<()>().await;
+                });
+                tokio::task::yield_now().await;
+            })
+            .unwrap();
+        assert!(started.get());
+        let data = Box::into_raw(Box::new(CleanupOnDrop {
+            owner: owner.clone(),
+            store: weak_target.clone(),
+            trace: trace.clone(),
+            name: "vm",
+            complete: vm_completed.clone(),
+        }));
+        let ty = wasm_functype_t::new(wasmer_api::FunctionType::new([], []));
+        let function = unsafe {
+            wasm_func_new_with_env(
+                Some(&mut target),
+                Some(&ty),
+                Some(callback),
+                data.cast(),
+                Some(finalize),
+            )
+        }
+        .unwrap();
+        drop(function); // only T's actual VM arena retains this public environment
+        assert!(!vm_completed.get());
+        let target = Rc::new(RefCell::new(Some(target)));
+        let deletion_slot = target.clone();
+        let deletion_trace = trace.clone();
+        let deletion_weak = weak_target.clone();
+        let ancestry = Rc::new(RefCell::new(None));
+        let capture_ancestry = ancestry.clone();
+        let mut source = Store::default();
+        // R owns this exact ordinary public call_async future on S. Its native
+        // callback deletes unrelated T; no target call or retirement precedes it.
+        let caller = Function::new_async(
+            &mut source,
+            wasmer_api::FunctionType::new([], [wasmer_api::Type::I32]),
+            move |_| {
+                let deletion_slot = deletion_slot.clone();
+                let trace = deletion_trace.clone();
+                let weak = deletion_weak.clone();
+                let capture_ancestry = capture_ancestry.clone();
+                let actual = WeakNativeInvocation::current().expect("actual original S root");
+                assert!(actual.is_current());
+                let physical = NativeAncestrySettlement::current(None).expect("actual S ancestry");
+                *capture_ancestry.borrow_mut() = Some(physical);
+                let store = deletion_slot.borrow_mut().take().unwrap();
+                assert_eq!(store.inner.strong_handles_for_test(), 1);
+                let StoreMode::Native(native) = &store.inner.inner.mode else {
+                    unreachable!()
+                };
+                assert!(native.driver.borrow().is_some());
+                assert!(
+                    native.ledger.snapshot().is_empty(),
+                    "T has no enrolled retirement"
+                );
+                assert!(
+                    native.finalization.borrow().upgrade().is_none(),
+                    "no pre-enrolled T handoff"
+                );
+                trace.record("actual-S-root-no-T-tail-delete-sole-public-store-before");
+                unsafe { wasm_store_delete(Some(store)) };
+                assert!(weak.upgrade().is_none());
+                trace.record("public-delete-returned-weak-expired");
+                std::future::ready(Ok(vec![Value::I32(37)]))
+            },
+        );
+        let asynchronous = source.into_async();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut polls = 0;
+        let result = runtime
+            .block_on(async {
+                // A real scheduler yield precedes the call. R's original future is
+                // kept alive and polled in place, never replaced by a cleanup task.
+                tokio::task::yield_now().await;
+                let mut original = Box::pin(caller.call_async(&asynchronous, vec![]));
+                std::future::poll_fn(|cx| {
+                    polls += 1;
+                    trace.record(&format!("R-poll-original-caller-{polls}"));
+                    let result = original.as_mut().poll(cx);
+                    if result.is_ready() {
+                        trace.record("original-caller-completed");
+                    }
+                    result
+                })
+                .await
+            })
+            .unwrap();
+        assert_eq!(result[0].i32(), Some(37));
+        assert!(target.borrow().is_none() && weak_target.upgrade().is_none());
+        assert!(
+            local_completed.get(),
+            "actual LocalSet destructor cleanup finished"
+        );
+        assert!(
+            vm_completed.get(),
+            "actual VM environment destructor cleanup finished"
+        );
+        assert!(owner.is_idle());
+        let mut physical = ancestry.borrow_mut().take().unwrap();
+        assert!(runtime.block_on(std::future::poll_fn(|cx| {
+            match std::pin::Pin::new(&mut physical).poll(cx) {
+                Poll::Ready(()) => Poll::Ready(true),
+                Poll::Pending => Poll::Pending,
+            }
+        })));
+        drop(physical);
+        drop(caller);
+        drop(asynchronous);
+        trace.record("all-no-tail-final-store-fences-completed");
+    }
+
     #[test]
     fn entered_runtime_final_store_retirement_drains_timer_cleanup_from_both_drop_phases() {
         struct TimerOnDrop {
