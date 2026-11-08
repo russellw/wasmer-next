@@ -6748,7 +6748,7 @@ mod tests {
     }
     #[cfg(feature = "wasi")]
     #[test]
-    fn initialized_start_escaped_helper_cancellation_preserves_first_panic_and_original_driver() {
+    fn initialized_start_dynamic_helper_cancel_preserves_first_panic_and_original_driver() {
         use crate::wasm_c_api::{
             module::wasm_module_new,
             types::wasm_byte_vec_t,
@@ -6771,8 +6771,8 @@ mod tests {
         use wasmer_api::sys::{NativeAncestrySettlement, NativeFrameGuard, WeakNativeInvocation};
         use wasmer_api::{AsyncFunctionEnvMut, FunctionEnv, FunctionType, Type};
         type Env = AsyncFunctionEnvMut<wasixv2_exec::ExecEnv<wasixv2::MachineSyscalls>>;
-        const TEST: &str = "wasm_c_api::store::tests::initialized_start_escaped_helper_cancellation_preserves_first_panic_and_original_driver";
-        const CHILD: &str = "WASMER_CAPI_ESCAPED_ENTRY_CHILD";
+        const TEST: &str = "wasm_c_api::store::tests::initialized_start_dynamic_helper_cancel_preserves_first_panic_and_original_driver";
+        const CHILD: &str = "WASMER_CAPI_DYNAMIC_ESCAPED_ENTRY_CHILD";
         let directory = match std::env::var_os(CHILD) {
             Some(path) => std::path::PathBuf::from(path),
             None => {
@@ -6790,7 +6790,7 @@ mod tests {
                     }
                 }
                 let directory = Directory(std::env::temp_dir().join(format!(
-                    "wasmer-entry-escaped-{}-{:?}",
+                    "wasmer-entry-dynamic-escaped-{}-{:?}",
                     std::process::id(),
                     std::thread::current().id()
                 )));
@@ -6808,7 +6808,7 @@ mod tests {
                         assert!(status.success(), "escaped helper child failed: {status}");
                         assert_eq!(
                             std::fs::read_to_string(directory.0.join("complete")).unwrap(),
-                            "both-physical-profiles-completed"
+                            "both-dynamic-physical-profiles-completed"
                         );
                         return;
                     }
@@ -6884,7 +6884,7 @@ mod tests {
             _drop: BodyDrop,
         }
         impl Future for PendingHelper {
-            type Output = Result<(), RuntimeError>;
+            type Output = Result<Vec<Value>, RuntimeError>;
             fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
                 let this = self.get_mut();
                 if std::mem::take(&mut this.first) {
@@ -7035,10 +7035,11 @@ mod tests {
                         wasixv2_exec::asyncify::capture_host_entry::<wasixv2::MachineSyscalls>,
                     );
                     let helper_weak = weak.clone();
-                    let helper = Function::new_typed_with_env_async_captured(
+                    let helper = Function::new_with_env_async(
                         actual,
                         environment.environment(),
-                        move |env: Env| -> Pin<Box<dyn Future<Output = Result<(), RuntimeError>>>> {
+                        FunctionType::new([], []),
+                        move |env: Env, _args: &[Value]| {
                             let state = helper_weak.upgrade().unwrap();
                             let root = WeakNativeInvocation::current().unwrap();
                             assert!(
@@ -7084,7 +7085,11 @@ mod tests {
                             state
                                 .primary_pointer
                                 .set((&*primary as *const Primary) as usize);
-                            Box::pin(PendingHelper {
+                            // Return this CONCRETE future directly. The probe
+                            // touches no Exec state: its canonical caller is
+                            // still scoped/observed. Core owns Drop Q when poll I
+                            // unwinds, before any typed await-adapter drop glue.
+                            PendingHelper {
                                 state: helper_weak.clone(),
                                 root,
                                 first: true,
@@ -7093,9 +7098,8 @@ mod tests {
                                     body: state.helper_drops.clone(),
                                     secondary: secondary.then(|| state.secondary_drops.clone()),
                                 },
-                            })
+                            }
                         },
-                        wasixv2_exec::asyncify::capture_host_entry::<wasixv2::MachineSyscalls>,
                     );
                     let sibling_weak = weak.clone();
                     let sibling = Function::new_async(
@@ -7271,7 +7275,7 @@ mod tests {
         }
         std::fs::write(
             directory.join("complete"),
-            "both-physical-profiles-completed",
+            "both-dynamic-physical-profiles-completed",
         )
         .unwrap();
     }
