@@ -1484,6 +1484,315 @@ pub mod import {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "sys")]
+    fn entry_fixture() -> (
+        wasmer::Store,
+        crate::HostEnvironment<crate::process::tests::Recorder>,
+        Instance,
+    ) {
+        use crate::Abi;
+        let mut store = wasmer::Store::default();
+        let environment = crate::HostEnvironment::new(
+            &mut store.as_store_mut(),
+            Arc::new(crate::process::tests::Recorder::default()),
+            TaskId(1),
+            Arc::new(crate::process::tests::NoThreads),
+            Arc::new(crate::Abis::wasixv2()),
+        );
+        let module = Module::new(
+            &store,
+            br#"(module
+            (memory (export "memory") 1)
+            (global (export "__stack_pointer") (mut i32) (i32.const 1024))
+            (func (export "asyncify_start_unwind") (param i32))
+            (func (export "asyncify_stop_unwind"))
+            (func (export "asyncify_start_rewind") (param i32))
+            (func (export "asyncify_stop_rewind"))
+            (func (export "_start"))
+            (func (export "leaf") (result i32) i32.const 42))"#,
+        )
+        .unwrap();
+        let instance = Instance::new(&mut store, &module, &wasmer::Imports::new()).unwrap();
+        let binding = crate::Wasixv2
+            .bind(
+                &instance,
+                &mut store.as_store_mut(),
+                TaskId(1),
+                crate::Role::Process,
+            )
+            .unwrap();
+        environment
+            .initialize(&mut store.as_store_mut(), &instance, binding)
+            .unwrap();
+        (store, environment, instance)
+    }
+
+    // This component probe isolates binding/token checks. Real CAPI owner
+    // authorization is exercised by the native actual-request control.
+    #[cfg(feature = "sys")]
+    fn component_authorize(
+        _: Option<Weak<dyn Any>>,
+        _: &HostEntryToken,
+        _: usize,
+    ) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+
+    #[cfg(feature = "sys")]
+    fn unexpected_entry_factory(
+        _: Function,
+        _: StoreAsync,
+        _: Vec<Value>,
+        _: Option<Weak<dyn Any>>,
+        _: HostEntryToken,
+        _: usize,
+    ) -> HostEntryFuture {
+        Box::pin(async { Err(RuntimeError::new("unexpected observed root factory")) })
+    }
+
+    #[cfg(feature = "sys")]
+    #[test]
+    fn captured_entry_snapshot_rejects_replaced_and_same_binding_successor_scopes() {
+        use crate::Abi;
+        type Recorder = crate::process::tests::Recorder;
+        let (mut raw, environment, original) = entry_fixture();
+        let _generation = wasmer::sys::NativeInvocationScope::bind(&mut raw).unwrap();
+        let saved = Rc::new(std::cell::RefCell::new(None));
+        let capture = saved.clone();
+        let factory = Function::new_typed_with_env_async_captured(
+            &mut raw,
+            environment.environment(),
+            move |env: AsyncFunctionEnvMut<ExecEnv<Recorder>>| {
+                *capture.borrow_mut() = Some(env.downgrade().unwrap());
+                async { Ok::<(), RuntimeError>(()) }
+            },
+            capture_host_entry::<Recorder>,
+        );
+        let plain_module = Module::new(
+            &raw,
+            br#"(module
+            (memory (export "memory") 1)
+            (func (export "_start")) (func (export "leaf") (result i32) i32.const 42))"#,
+        )
+        .unwrap();
+        let plain = Instance::new(&mut raw, &plain_module, &wasmer::Imports::new()).unwrap();
+        let cap = raw.into_async();
+        let a = HostEntryCleanup::new(vec![environment.clone()], cap.store());
+        futures::executor::block_on(a.enter(unexpected_entry_factory, component_authorize))
+            .unwrap();
+        futures::executor::block_on(factory.call_async(&cap, vec![])).unwrap();
+        let original_handle = saved.borrow_mut().take().unwrap();
+        let old = original_handle.upgrade().unwrap();
+        let snapshot = old.native_import_snapshot().unwrap();
+        assert!(Arc::ptr_eq(
+            &snapshot,
+            &old.clone().native_import_snapshot().unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            &snapshot,
+            &original_handle
+                .clone()
+                .upgrade()
+                .unwrap()
+                .native_import_snapshot()
+                .unwrap()
+        ));
+
+        // Same ABI, fresh B token. A's weak binding still matches, so the exact
+        // active token check must prevent A from growing memory/mutating B.
+        futures::executor::block_on(a.finish(|action| action()));
+        let b = HostEntryCleanup::new(vec![environment.clone()], cap.store());
+        futures::executor::block_on(b.enter(unexpected_entry_factory, component_authorize))
+            .unwrap();
+        let error =
+            futures::executor::block_on(unwind(&old, Request::Save { slot: 64 })).unwrap_err();
+        assert_eq!(
+            error.message(),
+            "native import belongs to an inactive entry scope"
+        );
+        futures::executor::block_on(async {
+            let store = cap.read_lock().await;
+            let data = environment.environment().as_ref(&store);
+            let state = data.asyncify.as_ref().unwrap();
+            assert_eq!(state.depth, 1);
+            assert!(state.unwinding.is_none());
+            assert_eq!(
+                data.memory.as_ref().unwrap().view(&store).data_size(),
+                65536
+            );
+        });
+        futures::executor::block_on(b.finish(|action| action()));
+
+        // A genuinely unfinished entry then a public image replacement with no
+        // asyncify. New factory B gets None; old factory A forever retains SomeA.
+        let a = HostEntryCleanup::new(vec![environment.clone()], cap.store());
+        futures::executor::block_on(a.enter(unexpected_entry_factory, component_authorize))
+            .unwrap();
+        futures::executor::block_on(factory.call_async(&cap, vec![])).unwrap();
+        let old = saved.borrow_mut().take().unwrap().upgrade().unwrap();
+        futures::executor::block_on(async {
+            let mut store = cap.write_lock().await;
+            let binding = crate::Wasixv2
+                .bind(
+                    &plain,
+                    &mut store.as_store_mut(),
+                    TaskId(1),
+                    crate::Role::Process,
+                )
+                .unwrap();
+            environment
+                .initialize(&mut store.as_store_mut(), &plain, binding)
+                .unwrap();
+        });
+        futures::executor::block_on(factory.call_async(&cap, vec![])).unwrap();
+        let fresh = saved.borrow_mut().take().unwrap().upgrade().unwrap();
+        assert!(fresh.native_import_snapshot().is_none());
+        assert_eq!(
+            futures::executor::block_on(crate::call_guest(
+                &fresh,
+                plain.exports.get_function("leaf").unwrap(),
+                &[]
+            ))
+            .unwrap()
+            .as_ref(),
+            &[Value::I32(42)]
+        );
+        let error =
+            futures::executor::block_on(unwind(&old, Request::Save { slot: 64 })).unwrap_err();
+        assert_eq!(
+            error.message(),
+            "native import belongs to a replaced entry binding"
+        );
+        futures::executor::block_on(a.finish(|action| action()));
+        assert!(fresh.native_import_snapshot().is_none());
+
+        // Reinitialize back to an instrumented image. Old A cleanup cannot clear
+        // B's new active token or reset B's depth in the replacement binding.
+        let a = HostEntryCleanup::new(vec![environment.clone()], cap.store());
+        futures::executor::block_on(a.enter(unexpected_entry_factory, component_authorize))
+            .unwrap();
+        futures::executor::block_on(async {
+            let mut store = cap.write_lock().await;
+            let binding = crate::Wasixv2
+                .bind(
+                    &original,
+                    &mut store.as_store_mut(),
+                    TaskId(1),
+                    crate::Role::Process,
+                )
+                .unwrap();
+            environment
+                .initialize(&mut store.as_store_mut(), &original, binding)
+                .unwrap();
+        });
+        let b = HostEntryCleanup::new(vec![environment.clone()], cap.store());
+        futures::executor::block_on(b.enter(unexpected_entry_factory, component_authorize))
+            .unwrap();
+        futures::executor::block_on(a.finish(|action| action()));
+        futures::executor::block_on(async {
+            let store = cap.read_lock().await;
+            let state = environment
+                .environment()
+                .as_ref(&store)
+                .asyncify
+                .as_ref()
+                .unwrap();
+            assert_eq!(state.depth, 1);
+            assert!(state.entry_hook.as_ref().unwrap().token.same(&b.token));
+        });
+        futures::executor::block_on(b.finish(|action| action()));
+    }
+
+    #[cfg(feature = "sys")]
+    #[test]
+    fn finite_entry_reset_disposes_each_actual_tag_at_its_original_catch() {
+        use std::sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct TagDrop {
+            name: &'static str,
+            drops: Arc<AtomicUsize>,
+            order: Arc<Mutex<Vec<&'static str>>>,
+        }
+        impl Drop for TagDrop {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+                self.order.lock().unwrap().push(self.name);
+                std::panic::panic_any(self.name);
+            }
+        }
+        let (mut raw, environment, _) = entry_fixture();
+        let _generation = wasmer::sys::NativeInvocationScope::bind(&mut raw).unwrap();
+        let cap = raw.into_async();
+        let scope = HostEntryCleanup::new(vec![environment.clone()], cap.store());
+        futures::executor::block_on(scope.enter(unexpected_entry_factory, component_authorize))
+            .unwrap();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let order = Arc::new(Mutex::new(Vec::new()));
+        futures::executor::block_on(async {
+            let mut store = cap.write_lock().await;
+            let state = environment
+                .environment()
+                .as_mut(&mut store)
+                .asyncify
+                .as_mut()
+                .unwrap();
+            state.unwinding = Some(Request::Fork {
+                child: TaskId(2),
+                shared: vec![],
+                wiped: vec![],
+                tag: Arc::new(TagDrop {
+                    name: "request-I",
+                    drops: drops.clone(),
+                    order: order.clone(),
+                }),
+            });
+            state.resume = Some(Resume::Forked {
+                child: None,
+                tag: Arc::new(TagDrop {
+                    name: "resume-Q",
+                    drops: drops.clone(),
+                    order: order.clone(),
+                }),
+            });
+            // Nested abandoned levels are owned by this exact entry reset.
+            state.depth = 2;
+        });
+        let mut first = None;
+        futures::executor::block_on(scope.finish(|action| {
+            if let Err(exact) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(action)) {
+                // Record the ORIGINAL catch before attempting the next action.
+                order.lock().unwrap().push("caught");
+                if first.is_none() {
+                    first = Some(exact);
+                } else {
+                    drop(exact);
+                }
+            }
+        }));
+        assert_eq!(first.unwrap().downcast_ref::<&str>(), Some(&"request-I"));
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            *order.lock().unwrap(),
+            ["request-I", "caught", "resume-Q", "caught"]
+        );
+        assert!(scope.finished.get());
+        futures::executor::block_on(async {
+            let store = cap.read_lock().await;
+            let state = environment
+                .environment()
+                .as_ref(&store)
+                .asyncify
+                .as_ref()
+                .unwrap();
+            assert_eq!(state.depth, 0);
+            assert!(
+                state.entry_hook.is_none() && state.unwinding.is_none() && state.resume.is_none()
+            );
+        });
+    }
+
     fn saved(slot: u32, stack_pointer: i32, len: usize) -> Saved {
         Saved {
             id: StackId {

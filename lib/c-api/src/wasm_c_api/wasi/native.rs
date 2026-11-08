@@ -1213,6 +1213,301 @@ mod tests {
         drop(store);
     }
 
+    fn canonical_entry_child(test: &str) -> bool {
+        const CHILD: &str = "WASMER_CAPI_CANONICAL_ENTRY_CHILD";
+        if std::env::var(CHILD).ok().as_deref() == Some(test) {
+            return true;
+        }
+        struct OwnedChild(std::process::Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = OwnedChild(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test, "--nocapture"])
+                .env(CHILD, test)
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                assert!(status.success(), "canonical entry child failed: {status}");
+                return false;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "canonical entry did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    const CANONICAL_SAVE_ENTRY: &str = r#"(module
+        (import "test" "save" (func $save))
+        (memory (export "memory") 1)
+        (global (export "__stack_pointer") (mut i32) (i32.const 1024))
+        (global $controls (export "controls") (mut i32) (i32.const 0))
+        (func $control (global.set $controls (i32.add (global.get $controls) (i32.const 1))))
+        (func (export "asyncify_start_unwind") (param i32) call $control)
+        (func (export "asyncify_stop_unwind") call $control)
+        (func (export "asyncify_start_rewind") (param i32) call $control)
+        (func (export "asyncify_stop_rewind") call $control)
+        (func (export "_start") call $save)
+        (func (export "plain") (result i32) i32.const 37)
+        (func (export "trap") unreachable))"#;
+
+    #[test]
+    fn initialized_start_scopes_all_equal_environments_and_only_real_requester_settles() {
+        if !canonical_entry_child(
+            "wasm_c_api::wasi::native::tests::initialized_start_scopes_all_equal_environments_and_only_real_requester_settles",
+        ) {
+            return;
+        }
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        fn instance(store: &StoreRef, wasi: &NativeWasi, calls: Arc<AtomicUsize>) -> Instance {
+            store
+                .with_mut(|actual| {
+                    let save = Function::new_typed_with_env_async_captured(
+                        actual,
+                        wasi.environment().environment(),
+                        move |env| {
+                            let calls = calls.clone();
+                            async move {
+                                calls.fetch_add(1, Ordering::SeqCst);
+                                if wasixv2_exec::asyncify::import::resumed(&env)
+                                    .await?
+                                    .is_none()
+                                {
+                                    wasixv2_exec::asyncify::import::save(&env, 64).await?;
+                                }
+                                Ok::<(), RuntimeError>(())
+                            }
+                        },
+                        wasixv2_exec::asyncify::capture_host_entry::<MachineSyscalls>,
+                    );
+                    let module = Module::new(actual, CANONICAL_SAVE_ENTRY).unwrap();
+                    Instance::new(
+                        actual,
+                        &module,
+                        &wasmer_api::imports! { "test" => { "save" => save }},
+                    )
+                    .unwrap()
+                })
+                .unwrap()
+        }
+        for same_instance in [true, false] {
+            let store = StoreRef::new(wasmer_api::Store::default()).unwrap();
+            // B registers first: neither first-candidate selection nor the
+            // initial root's row number identifies the actual imports' owner.
+            let b =
+                NativeWasi::new(&store, vec!["b".into()], vec![], vec![], false, false).unwrap();
+            let a =
+                NativeWasi::new(&store, vec!["a".into()], vec![], vec![], false, false).unwrap();
+            let a_calls = Arc::new(AtomicUsize::new(0));
+            let b_calls = Arc::new(AtomicUsize::new(0));
+            let first = instance(&store, &a, a_calls.clone());
+            let second = if same_instance {
+                first.clone()
+            } else {
+                instance(&store, &b, b_calls.clone())
+            };
+            store
+                .with_mut(|actual| {
+                    a.initialize(actual, &first).unwrap();
+                    b.initialize(actual, &second).unwrap();
+                })
+                .unwrap();
+            let selected = first.exports.get_function("_start").unwrap().clone();
+            assert!(store.call(&selected.clone(), vec![]).unwrap().is_empty());
+            assert_eq!(a_calls.load(Ordering::SeqCst), 2);
+            assert_eq!(b_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                store
+                    .with_mut(|actual| first.exports.get_global("controls").unwrap().get(actual))
+                    .unwrap(),
+                wasmer_api::Value::I32(4)
+            );
+            assert_eq!(
+                store
+                    .call(first.exports.get_function("plain").unwrap(), vec![])
+                    .unwrap()
+                    .as_ref(),
+                &[wasmer_api::Value::I32(37)]
+            );
+            assert!(
+                store
+                    .call(first.exports.get_function("trap").unwrap(), vec![])
+                    .unwrap_err()
+                    .message()
+                    .contains("unreachable")
+            );
+            if !same_instance {
+                assert_eq!(
+                    store
+                        .with_mut(|actual| second
+                            .exports
+                            .get_global("controls")
+                            .unwrap()
+                            .get(actual))
+                        .unwrap(),
+                    wasmer_api::Value::I32(0)
+                );
+                assert!(
+                    store
+                        .call(second.exports.get_function("_start").unwrap(), vec![])
+                        .unwrap()
+                        .is_empty()
+                );
+                assert_eq!(b_calls.load(Ordering::SeqCst), 2);
+            }
+            assert!(store.call(&selected, vec![]).unwrap().is_empty());
+            assert_eq!(a_calls.load(Ordering::SeqCst), 4);
+            drop(selected);
+            drop(first);
+            drop(second);
+            drop(a);
+            drop(b);
+            drop(store);
+        }
+    }
+
+    #[test]
+    fn initialized_start_rejects_missing_wrong_dead_owners_before_replacing_real_request() {
+        if !canonical_entry_child(
+            "wasm_c_api::wasi::native::tests::initialized_start_rejects_missing_wrong_dead_owners_before_replacing_real_request",
+        ) {
+            return;
+        }
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let store = StoreRef::new(wasmer_api::Store::default()).unwrap();
+        let wasi =
+            NativeWasi::new(&store, vec!["owner".into()], vec![], vec![], false, false).unwrap();
+        let probe_slot = Rc::new(RefCell::new(None::<Function>));
+        let dead_slot = Rc::new(RefCell::new(None::<std::rc::Weak<dyn std::any::Any>>));
+        let weak_dead = Rc::downgrade(&dead_slot);
+        let rejects = Arc::new(AtomicUsize::new(0));
+        let saved_original = Arc::new(AtomicUsize::new(0));
+        let (instance, probe) = store
+            .with_mut(|actual| {
+                let probe = Function::new_typed_with_env_async_captured(
+                    actual,
+                    wasi.environment().environment(),
+                    move |env| {
+                        let dead = weak_dead.upgrade().unwrap();
+                        async move {
+                            if env.native_import_snapshot().is_none() {
+                                // Capture a REAL prior CAPI CallOwner, whose final strong
+                                // invocation custody disappears before the main call.
+                                *dead.borrow_mut() = env.native_local_owner();
+                                return Ok::<(), RuntimeError>(());
+                            }
+                            wasixv2_exec::asyncify::import::save(&env, 128).await
+                        }
+                    },
+                    wasixv2_exec::asyncify::capture_host_entry::<MachineSyscalls>,
+                );
+                let weak_probe = Rc::downgrade(&probe_slot);
+                let weak_dead = Rc::downgrade(&dead_slot);
+                let rejected = rejects.clone();
+                let original = saved_original.clone();
+                let save = Function::new_typed_with_env_async_captured(
+                    actual,
+                    wasi.environment().environment(),
+                    move |env| {
+                        let weak_probe = weak_probe.clone();
+                        let weak_dead = weak_dead.clone();
+                        let rejected = rejected.clone();
+                        let original = original.clone();
+                        async move {
+                            if let Some(wasixv2_exec::asyncify::import::Resumed::Saved(id)) =
+                                wasixv2_exec::asyncify::import::resumed(&env).await?
+                            {
+                                if id.slot != 64 {
+                                    return Err(RuntimeError::new(
+                                        "invalid owner replaced the real request",
+                                    ));
+                                }
+                                original.fetch_add(1, Ordering::SeqCst);
+                                return Ok::<(), RuntimeError>(());
+                            }
+                            wasixv2_exec::asyncify::import::save(&env, 64).await?;
+                            let probe = weak_probe
+                                .upgrade()
+                                .unwrap()
+                                .borrow()
+                                .as_ref()
+                                .unwrap()
+                                .clone();
+                            let cap = env.as_store_async().store();
+                            let wrong: Rc<dyn std::any::Any> = Rc::new(99_u32);
+                            let dead = weak_dead
+                                .upgrade()
+                                .unwrap()
+                                .borrow()
+                                .as_ref()
+                                .unwrap()
+                                .clone();
+                            let none = probe.call_async(&cap, vec![]).await;
+                            let wrong = wasmer_api::sys::call_async_with_local_owner(
+                                &probe,
+                                &cap,
+                                vec![],
+                                Rc::downgrade(&wrong),
+                            )
+                            .await;
+                            let dead = wasmer_api::sys::call_async_with_local_owner(
+                                &probe,
+                                &cap,
+                                vec![],
+                                dead,
+                            )
+                            .await;
+                            for result in [none, wrong, dead] {
+                                let error = result
+                                    .expect_err("invalid owner must refuse before helper mutation");
+                                if !error.message().contains("no live matching owner") {
+                                    return Err(error);
+                                }
+                                rejected.fetch_add(1, Ordering::SeqCst);
+                            }
+                            Ok(())
+                        }
+                    },
+                    wasixv2_exec::asyncify::capture_host_entry::<MachineSyscalls>,
+                );
+                let module = Module::new(actual, CANONICAL_SAVE_ENTRY).unwrap();
+                let instance = Instance::new(
+                    actual,
+                    &module,
+                    &wasmer_api::imports! { "test" => { "save" => save }},
+                )
+                .unwrap();
+                wasi.initialize(actual, &instance).unwrap();
+                (instance, probe)
+            })
+            .unwrap();
+        *probe_slot.borrow_mut() = Some(probe.clone());
+        store.call(&probe, vec![]).unwrap();
+        assert!(dead_slot.borrow().as_ref().unwrap().upgrade().is_none());
+        assert!(
+            store
+                .call(instance.exports.get_function("_start").unwrap(), vec![])
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(rejects.load(Ordering::SeqCst), 3);
+        assert_eq!(saved_original.load(Ordering::SeqCst), 1);
+        probe_slot.borrow_mut().take();
+        drop(probe);
+        drop(instance);
+        drop(wasi);
+        drop(store);
+    }
+
     #[test]
     fn native_exit_trap_preserves_legacy_status_and_message_bytes() {
         assert_eq!(exit_trap(0).message(), "WASI exited with code: ExitCode::0");
