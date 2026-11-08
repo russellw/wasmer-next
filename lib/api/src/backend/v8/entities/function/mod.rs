@@ -17,7 +17,10 @@ use crate::{
     vm::{VMExtern, VMExternFunction},
 };
 
-use crate::backend::v8::origin::{Handle, Origin};
+use crate::backend::v8::{
+    origin::{Handle, Origin},
+    references::{OwnedValue, Values},
+};
 
 use super::{super::error::Trap, check_isolate, store::StoreHandle};
 use itertools::Itertools;
@@ -169,7 +172,15 @@ impl Function {
         }
 
         Self {
-            handle: Handle::new(wasm_function, origin),
+            handle: Handle::new(
+                store
+                    .inner
+                    .store
+                    .as_v8()
+                    .reference_roots
+                    .function(wasm_function),
+                origin,
+            ),
         }
     }
 
@@ -248,7 +259,15 @@ impl Function {
         }
 
         Self {
-            handle: Handle::new(wasm_function, origin),
+            handle: Handle::new(
+                store
+                    .inner
+                    .store
+                    .as_v8()
+                    .reference_roots
+                    .function(wasm_function),
+                origin,
+            ),
         }
     }
 
@@ -335,7 +354,15 @@ impl Function {
         }
 
         Self {
-            handle: Handle::new(wasm_function, origin),
+            handle: Handle::new(
+                store
+                    .inner
+                    .store
+                    .as_v8()
+                    .reference_roots
+                    .function(wasm_function),
+                origin,
+            ),
         }
     }
 
@@ -414,33 +441,14 @@ impl Function {
 
         // let wasm_func_param_arity(self.handle)
 
-        let mut args = unsafe {
-            let mut wasm_params = params
-                .iter()
-                .map(|v| IntoCApiValue::into_cv(v.clone()))
-                .collect::<Vec<_>>()
-                .into_boxed_slice();
-            let mut vec = Default::default();
-            wasm_val_vec_new(&mut vec, wasm_params.len(), wasm_params.as_ptr());
-            vec
-        };
-
-        let size = unsafe { wasm_func_result_arity(self.handle.raw()) };
-
-        let mut results = {
-            unsafe {
-                let mut vec = Default::default();
-                wasm_val_vec_new_uninitialized(&mut vec, size);
-                vec
-            }
-        };
+        let args = Values::from_values(params);
+        let mut results = Values::empty(signature.results().len());
 
         let mut trap;
 
         loop {
-            trap = unsafe {
-                wasm_func_call(self.handle.raw(), &mut args as _, &mut results as *mut _)
-            };
+            results.clear();
+            trap = unsafe { wasm_func_call(self.handle.raw(), &args.0, &mut results.0) };
             let store_mut = store.as_store_mut();
             if let Some(callback) = store_mut.inner.on_called.take() {
                 match callback(store_mut) {
@@ -463,14 +471,12 @@ impl Function {
             return Err(Into::<Trap>::into(trap).into());
         }
 
-        let values = unsafe {
-            let results = std::ptr::slice_from_raw_parts(results.data, results.size);
-            (*results)
-                .iter()
-                .map(|v| IntoWasmerValue::into_wv(*v, &self.handle.origin))
-                .collect::<Vec<_>>()
-                .into_boxed_slice()
-        };
+        let values = results
+            .as_slice()
+            .iter()
+            .map(|value| (*value).into_wv(store))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         Ok(values)
     }
 
@@ -724,18 +730,18 @@ unsafe fn invoke_sync_callback<F>(
     let outcome = panic::catch_unwind(AssertUnwindSafe(|| -> Result<(), RuntimeError> {
         let mut store = scope.store();
         let arguments = unsafe { &*arguments };
-        let values = unsafe { std::slice::from_raw_parts(arguments.data, arguments.size) }
+        let values = crate::backend::v8::references::borrowed_values(arguments)
             .iter()
-            .map(|value| (*value).into_wv(&descriptor.origin))
+            .map(|value| (*value).into_wv(&store))
             .collect::<Vec<_>>();
         let output = callback(&mut store, &values)?;
         let results = unsafe { &mut *results };
         if output.len() != results.size || output.iter().any(|value| !value.is_from_store(&store)) {
             return Err(RuntimeError::new("invalid V8 synchronous host results"));
         }
-        let results = unsafe { std::slice::from_raw_parts_mut(results.data, results.size) };
+        let results = crate::backend::v8::references::borrowed_values_mut(results);
         for (slot, value) in results.iter_mut().zip(output) {
-            *slot = value.into_cv();
+            OwnedValue::copy(&value.into_cv()).replace(slot);
         }
         Ok(())
     }));

@@ -68,35 +68,29 @@ macro_rules! impl_native_traits {
                  if !self.func.is_from_store(store) {
                      return Err(RuntimeError::new("V8 typed function belongs to another Store"));
                  }
-                 let origin = crate::backend::v8::origin::Origin::of(store)?;
+
                  // // let store_ptr = Value::I64(store.as_store_mut().as_raw() as _).as_jsvalue(store);
                  #[allow(unused_unsafe)]
                  let params_list: Vec<_> = unsafe {
                      vec![ $( {
                          let raw = $x.to_native().into_raw(store);
                          let value = Value::from_raw(&mut store, <$x::Native as NativeWasmType>::WASM_TYPE, raw);
-                         value.into_cv()
+                         value
                      } ),* ]
                  };
 
-                 let mut results = {
-                    unsafe {
-                        let mut ret = std::mem::zeroed();
-                        wasm_val_vec_new_uninitialized(&mut ret, Rets::wasm_types().len());
-                        ret
-                    }
-                };
+                 let mut results = crate::backend::v8::references::Values::empty(Rets::wasm_types().len());
 
 
                  let func = unsafe { wasm_extern_as_func(self.func.to_vm_extern().unwrap_v_8().raw()) };
 
-                let mut params = unsafe {std::mem::zeroed()};
-                unsafe {wasm_val_vec_new(&mut params, params_list.len(), params_list.as_ptr())};
+                let params = crate::backend::v8::references::Values::from_values(&params_list);
 
                  let mut trap;
 
                  loop {
-                    trap = unsafe { wasm_func_call(func, &params, &mut results) };
+                    results.clear();
+                    trap = unsafe { wasm_func_call(func, &params.0, &mut results.0) };
 
                     let store_mut = store.as_store_mut();
                     if let Some(callback) = store_mut.inner.on_called.take() {
@@ -126,14 +120,14 @@ macro_rules! impl_native_traits {
                     match Rets::size() {
                         0 => {},
                         1 => {
-                            let val = (*results.data.wrapping_add(0)).clone();
-                            let val = val.into_wv(&origin);
+                            let val = (*results.0.data.wrapping_add(0)).clone();
+                            let val = val.into_wv(store);
                             *mut_rets = val.as_raw(&mut store);
                         }
                         _n => {
                             for (i, ret_type) in Rets::wasm_types().iter().enumerate() {
-                                    let val = (*results.data.wrapping_add(i)).clone();
-                                    let val = val.into_wv(&origin);
+                                    let val = (*results.0.data.wrapping_add(i)).clone();
+                                    let val = val.into_wv(store);
                                     let slot = mut_rets.add(i);
                                     *slot = val.as_raw(&mut store);
                             }
