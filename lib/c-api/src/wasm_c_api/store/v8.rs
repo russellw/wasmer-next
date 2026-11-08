@@ -568,18 +568,27 @@ impl Entry<'_> {
                 .notified
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = false;
-            let next = attempt(&self.first, || {
+            // Own the actual result outside BOTH callback-bearing catches.
+            // A job panic must be committed before disposing a ready output.
+            let mut next = None;
+            attempt(&self.first, || {
                 subscription.wake.with_context(
                     subscription.token,
                     &mut Context::from_waker(&waker),
-                    |cx| {
-                        let output = future.as_mut().poll(cx);
-                        self.driver.poll_jobs(cx, &self.first);
-                        output
-                    },
+                    |cx| next = Some(future.as_mut().poll(cx)),
                 )
             });
+            if next.is_some() {
+                attempt(&self.first, || {
+                    subscription.wake.with_context(
+                        subscription.token,
+                        &mut Context::from_waker(&waker),
+                        |cx| self.driver.poll_jobs(cx, &self.first),
+                    )
+                });
+            }
             if next.is_none() || (halt_on_panic && self.first.borrow().is_some()) {
+                attempt(&self.first, || drop(next.take()));
                 return None;
             }
             if let Some(Poll::Ready(output)) = next {
@@ -635,6 +644,121 @@ impl Drop for Entry<'_> {
             } else {
                 resume_unwind(panic);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn ready_output_drop_preserves_the_actual_admitted_job_panic() {
+        const TEST: &str = "wasm_c_api::store::v8::tests::ready_output_drop_preserves_the_actual_admitted_job_panic";
+        const CHILD: &str = "WASMER_CAPI_V8_READY_OUTPUT_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            struct OwnedChild(std::process::Child);
+            impl Drop for OwnedChild {
+                fn drop(&mut self) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+            let mut child = OwnedChild(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", TEST, "--nocapture"])
+                    .env(CHILD, "1")
+                    .spawn()
+                    .unwrap(),
+            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                match child.0.try_wait() {
+                    Ok(Some(status)) => {
+                        assert!(status.success(), "V8 output custody child failed: {status}");
+                        return;
+                    }
+                    Ok(None) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    status => panic!("V8 output custody did not finish: {status:?}"),
+                }
+            }
+        }
+        #[derive(Debug)]
+        struct Payload(Arc<AtomicUsize>);
+        impl Drop for Payload {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        #[derive(Debug)]
+        struct Output {
+            drops: Arc<AtomicUsize>,
+            secondary: Option<Payload>,
+        }
+        impl Drop for Output {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+                if let Some(secondary) = self.secondary.take() {
+                    resume_unwind(Box::new(secondary));
+                }
+            }
+        }
+        for secondary in [false, true] {
+            let managed = ManagedStore::new(Store::new(wasmer_api::v8::V8::new()));
+            let function = managed
+                .with_mut(|store| Function::new_typed_async(store, || async { 37i32 }))
+                .unwrap();
+            let driver = managed.driver().unwrap();
+            let first_drops = Arc::new(AtomicUsize::new(0));
+            let secondary_drops = Arc::new(AtomicUsize::new(0));
+            let output_drops = Arc::new(AtomicUsize::new(0));
+            let main_polls = Arc::new(AtomicUsize::new(0));
+            let job_polls = Arc::new(AtomicUsize::new(0));
+            let first = Box::new(Payload(first_drops.clone()));
+            let identity = first.as_ref() as *const Payload;
+            let entry = driver.entry().unwrap();
+            let jobs = job_polls.clone();
+            // Actual admission into the SAME queue polled by Entry.drive.
+            Sink(Rc::downgrade(&driver)).retain(Box::pin(async move {
+                jobs.fetch_add(1, Ordering::SeqCst);
+                resume_unwind(first);
+            }));
+            let mut output = Some(Output {
+                drops: output_drops.clone(),
+                secondary: secondary.then(|| Payload(secondary_drops.clone())),
+            });
+            let caught = catch_unwind(AssertUnwindSafe(|| {
+                entry.root(poll_fn(|_| {
+                    main_polls.fetch_add(1, Ordering::SeqCst);
+                    Poll::Ready(output.take().unwrap())
+                }))
+            }))
+            .expect_err("the actual admitted job must propagate its first panic");
+            drop(entry);
+            assert!(std::ptr::eq(
+                caught.downcast_ref::<Payload>().unwrap(),
+                identity
+            ));
+            assert_eq!(main_polls.load(Ordering::SeqCst), 1);
+            assert_eq!(job_polls.load(Ordering::SeqCst), 1);
+            assert_eq!(output_drops.load(Ordering::SeqCst), 1);
+            assert_eq!(first_drops.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                secondary_drops.load(Ordering::SeqCst),
+                usize::from(secondary)
+            );
+            assert!(driver.jobs.borrow().is_empty());
+            drop(caught);
+            assert_eq!(first_drops.load(Ordering::SeqCst), 1);
+            let result = managed.call(&function, vec![]).unwrap();
+            assert_eq!(result[0].i32(), Some(37));
+            drop(result);
+            drop(function);
+            drop(driver);
+            drop(managed);
         }
     }
 }

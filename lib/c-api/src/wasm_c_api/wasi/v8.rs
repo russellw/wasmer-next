@@ -192,8 +192,8 @@ mod tests {
             wasm_config_new, wasm_config_set_backend, wasm_engine_new_with_config, wasmer_backend_t,
         },
         externals::{
-            wasm_extern_as_memory, wasm_extern_vec_t, wasm_func_call, wasm_memory_copy,
-            wasm_memory_data,
+            wasm_extern_as_func, wasm_extern_as_memory, wasm_extern_vec_t, wasm_func_call,
+            wasm_func_copy, wasm_memory_copy, wasm_memory_data,
         },
         instance::{wasm_instance_exports, wasm_instance_new},
         module::wasm_module_new,
@@ -290,7 +290,19 @@ mod tests {
                 i32.const 512 i32.const 1024 i32.store
                 i32.const 516 i32.const 13 i32.store
                 i32.const 1 i32.const 512 i32.const 1 i32.const 520 call $write if unreachable end
-                i32.const 37))"#).unwrap().into();
+                i32.const 37)
+            (func (export "timer_only") (result i32)
+                i32.const 304 i32.const 3 i32.store
+                i32.const 256 i32.const 0 i32.store
+                i32.const 0 i64.const 73 i64.store
+                i32.const 8 i32.const 0 i32.store8
+                i32.const 16 i32.const 1 i32.store
+                i32.const 24 i64.const 250000000 i64.store
+                i32.const 32 i64.const 1 i64.store
+                i32.const 40 i32.const 0 i32.store16
+                i32.const 0 i32.const 128 i32.const 1 i32.const 256 call $poll if unreachable end
+                i32.const 304 i32.const 4 i32.store
+                i32.const 41))"#).unwrap().into();
         let module = unsafe { wasm_module_new(Some(&mut store), Some(&guest)) }.unwrap();
         let mut imports = wasm_extern_vec_t::default();
         assert!(unsafe {
@@ -353,6 +365,21 @@ mod tests {
             unsafe { wasi_env_read_stdout(&mut env, captured.as_mut_ptr().cast(), captured.len()) };
         assert_eq!(read, 13);
         assert_eq!(&captured[..13], b"v8-canonical\n");
+        // This export has ONLY the real timer import, so another import's
+        // Pending cannot satisfy the timer-specific progress oracle.
+        let mut timer =
+            wasm_func_copy(wasm_extern_as_func(exports.as_slice()[2].as_deref()).unwrap());
+        let before_timer = driver.pending_imports();
+        assert!(unsafe { wasm_func_call(Some(&mut timer), Some(&args), &mut results) }.is_none());
+        assert_eq!(unsafe { results.as_slice()[0].of.int32_t }, 41);
+        assert!(driver.pending_imports() > before_timer);
+        let bytes =
+            unsafe { std::slice::from_raw_parts(wasm_memory_data(Some(&mut memory)), 2048) };
+        assert_eq!(u32::from_le_bytes(bytes[304..308].try_into().unwrap()), 4);
+        assert_eq!(u32::from_le_bytes(bytes[256..260].try_into().unwrap()), 1);
+        assert_eq!(u64::from_le_bytes(bytes[128..136].try_into().unwrap()), 73);
+        assert_eq!(u16::from_le_bytes(bytes[136..138].try_into().unwrap()), 0);
+        drop(timer);
         drop(start);
         drop(memory);
         drop(exports);
