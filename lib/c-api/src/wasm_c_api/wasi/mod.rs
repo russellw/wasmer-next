@@ -3,6 +3,8 @@
 //! This API will be superseded by a standard WASI API when/if such a standard is created.
 
 #[cfg(feature = "sys")]
+mod canonical;
+#[cfg(feature = "sys")]
 mod native;
 
 pub use super::unstable::wasi::wasi_get_unordered_imports;
