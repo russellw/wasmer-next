@@ -743,6 +743,7 @@ jobs:
               environment = os.environ.copy()
               environment.update(flags)  # Cargo's EXACT recorded build-script env for direct execution.
               environment["SDKROOT"] = json.loads((evidence / "runtime-sdk.json").read_text())["path"]
+              environment["WASMER_CAPI_CONFIG"] = "cranelift"
               with (evidence / "test-list.txt").open("xb") as listing:
                   if run_owned([str(binary), "--list"], listing, environment):
                       raise RuntimeError("CAPI test listing failed")
