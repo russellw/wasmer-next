@@ -1620,6 +1620,10 @@ impl StoreRef {
         else {
             return Err(RuntimeError::new("Store has no available host loan"));
         };
+        // Reject changed actual IDs BEFORE parked's general current-ID check.
+        if guard.as_store_mut().objects_mut().id() != self.inner.id {
+            return Err(RuntimeError::new("host loan belongs to another Store"));
+        }
         // Validate the ACTUAL guard's Box through its derived parked row too;
         // never inspect expected.inner behind that write guard or trust ID alone.
         guard.as_store_mut().parked(|| {
