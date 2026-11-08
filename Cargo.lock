@@ -7633,6 +7633,7 @@ dependencies = [
  "anyhow",
  "bindgen",
  "bytes",
+ "cc",
  "cmake",
  "corosensei",
  "crossbeam-channel",
