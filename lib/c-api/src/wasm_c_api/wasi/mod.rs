@@ -337,10 +337,10 @@ pub unsafe extern "C" fn wasi_env_new(
             !config.inherit_stdout,
             !config.inherit_stderr,
         ));
-        return Some(Box::new(wasi_env_t {
+        Some(Box::new(wasi_env_t {
             inner: WasiBackend::V8(env),
             store: store.clone(),
-        }));
+        }))
     }
     #[cfg(not(feature = "v8"))]
     {

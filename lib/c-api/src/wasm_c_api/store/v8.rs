@@ -159,6 +159,7 @@ impl ManagedStore {
             }
         })
     }
+    #[allow(clippy::result_large_err)]
     pub(super) fn instantiate(
         &self,
         module: &Module,
