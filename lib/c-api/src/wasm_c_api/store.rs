@@ -6498,6 +6498,208 @@ mod tests {
         drop(store);
     }
 
+    #[cfg(all(feature = "wasi", unix))]
+    #[test]
+    fn borrowed_foreign_lookup_cancels_real_unclaimed_exec_after_original_frame_aborts() {
+        use crate::wasm_c_api::{
+            module::wasm_module_new,
+            types::wasm_byte_vec_t,
+            wasi::{
+                wasi_config_capture_stdout, wasi_config_mapdir, wasi_config_new, wasi_env_delete,
+                wasi_env_initialize_instance, wasi_env_new, wasi_env_read_stdout, wasi_get_imports,
+            },
+        };
+        use std::{cell::Cell, os::unix::fs::PermissionsExt};
+        struct Directory(std::path::PathBuf);
+        impl Drop for Directory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let directory = Directory(std::env::temp_dir().join(format!(
+            "wasmer-borrowed-real-handoff-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        )));
+        std::fs::create_dir(&directory.0).unwrap();
+        let child = wat::parse_str(
+            r#"(module
+              (import "wasix_32v1" "fd_write" (func $write (param i32 i32 i32 i32) (result i32)))
+              (import "wasix_32v1" "proc_exit2" (func $exit (param i32)))
+              (memory (export "memory") 1) (data (i32.const 100) "child-ran")
+              (func (export "_start")
+                i32.const 0 i32.const 100 i32.store
+                i32.const 4 i32.const 9 i32.store
+                i32.const 1 i32.const 0 i32.const 1 i32.const 8 call $write drop
+                i32.const 0 call $exit unreachable))"#,
+        )
+        .unwrap();
+        std::fs::write(directory.0.join("child.wasm"), child).unwrap();
+        std::fs::set_permissions(
+            directory.0.join("child.wasm"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let engine = crate::wasm_c_api::engine::wasm_engine_new();
+        let mut store = unsafe { wasm_store_new(Some(&engine)) }.unwrap();
+        let foreign = unsafe { wasm_store_new(Some(&engine)) }.unwrap();
+        let mut config =
+            unsafe { wasi_config_new(std::ffi::CString::new("borrowed-exec").unwrap().as_ptr()) }
+                .unwrap();
+        wasi_config_capture_stdout(&mut config);
+        assert!(unsafe {
+            wasi_config_mapdir(
+                &mut config,
+                std::ffi::CString::new("prog").unwrap().as_ptr(),
+                std::ffi::CString::new(directory.0.to_str().unwrap())
+                    .unwrap()
+                    .as_ptr(),
+            )
+        });
+        let mut environment = unsafe { wasi_env_new(Some(&mut store), config) }.unwrap();
+        let bytes: wasm_byte_vec_t = wat::parse_str(
+            r#"(module
+              (import "wasix_32v1" "proc_exec3"
+                (func $exec (param i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+              (memory (export "memory") 1)
+              (global (export "resumed") (mut i32) (i32.const 0))
+              (data (i32.const 1000) "/prog/child.wasm")
+              (data (i32.const 1040) "child\0a")
+              (func (export "run")
+                i32.const 1000 i32.const 16 i32.const 1040 i32.const 6
+                i32.const 0 i32.const 0 i32.const 0 i32.const 0 i32.const 0 call $exec drop
+                i32.const 1 global.set 0))"#,
+        )
+        .unwrap()
+        .into();
+        let module = unsafe { wasm_module_new(Some(&mut store), Some(&bytes)) }.unwrap();
+        let mut imports: wasm_extern_vec_t = Vec::<Option<Box<wasm_extern_t>>>::new().into();
+        assert!(unsafe {
+            wasi_get_imports(
+                Some(&store),
+                Some(&mut environment),
+                Some(&module),
+                &mut imports,
+            )
+        });
+        let mut instance =
+            unsafe { wasm_instance_new(Some(&mut store), Some(&module), Some(&imports), None) }
+                .unwrap();
+        assert!(unsafe {
+            wasi_env_initialize_instance(&mut environment, &mut store, &mut instance)
+        });
+        let function = instance.inner.exports.get_function("run").unwrap().clone();
+        let base = store.inner.async_store().unwrap();
+        // Obtain the REAL exec marker through its existing async producer OUTSIDE
+        // foreign R. This does not claim a bare-R suspended exec can run a worker.
+        let error = store
+            .inner
+            .run_host(function.call_async(&base, Vec::new()))
+            .unwrap()
+            .unwrap_err();
+        assert!(wasixv2_exec::is_call_handoff(&error));
+        let states = Rc::new(RefCell::new(Vec::new()));
+        let captured_states = states.clone();
+        let called = Rc::new(Cell::new(false));
+        let observed = called.clone();
+        let source = store.inner.downgrade();
+        let other = foreign.inner.downgrade();
+        let probe = store
+            .inner
+            .with_mut(|view| {
+                Function::new_async(
+                    view,
+                    wasmer_api::FunctionType::new([], [wasmer_api::Type::I32]),
+                    move |_| {
+                        let source = source.upgrade().unwrap();
+                        let other = other.upgrade().unwrap();
+                        let result = Store::with_current(|parent| {
+                            parent.parked(|| {
+                                other
+                                    .with_mut(|middle| {
+                                        let id = middle.objects_mut().id();
+                                        let result = middle.parked(|| {
+                                            assert!(!wasmer_api::sys::native_invocation_active());
+                                            // Revalidate the SAME actual generation/backing BEFORE
+                                            // endpoint lookup; no worker/successor has been claimed.
+                                            source.with_mut(|_| ()).unwrap();
+                                            source.forward_handoff(&error, None)?;
+                                            *captured_states.borrow_mut() =
+                                                source.retirement_states_for_test();
+                                            observed.set(true);
+                                            Ok(vec![Value::I32(71)])
+                                        });
+                                        assert_eq!(middle.objects_mut().id(), id);
+                                        result
+                                    })
+                                    .and_then(|result| result)
+                            })
+                        })
+                        .unwrap();
+                        std::future::ready(result)
+                    },
+                )
+            })
+            .unwrap();
+        let mut probe = wasm_func_t {
+            extern_: wasm_extern_t::new(store.inner.clone(), probe.into()),
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (error, value) = borrowed_capi_result(&mut probe);
+            assert!(error.is_none(), "checked foreign handoff lookup failed");
+            assert_eq!(value, 71);
+            assert!(called.get());
+            assert!(Store::with_current(|_| ()).is_none());
+            assert!(!wasmer_api::sys::native_invocation_active());
+        });
+        let owner = store.inner.cleanup_owner().unwrap();
+        store
+            .inner
+            .run_host(std::future::poll_fn(|cx| owner.poll_idle(cx)))
+            .unwrap();
+        let states = states.borrow();
+        assert!(
+            !states.is_empty(),
+            "actual cancelled continuation was registered"
+        );
+        for state in states.iter() {
+            assert!(state.terminal_done.get() && state.tail_receipt_released.get());
+            assert!(state.delivery_ack.get());
+        }
+        assert!(store.inner.retirement_states_for_test().is_empty());
+        assert_eq!(
+            store
+                .inner
+                .with_mut(|view| instance
+                    .inner
+                    .exports
+                    .get_global("resumed")
+                    .unwrap()
+                    .get(view)
+                    .i32())
+                .unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            unsafe { wasi_env_read_stdout(&mut environment, [0i8; 16].as_mut_ptr(), 16) },
+            0,
+            "unclaimed replacement must never execute"
+        );
+        drop(states);
+        drop(probe);
+        drop(instance);
+        drop(imports);
+        drop(module);
+        drop(base);
+        wasi_env_delete(Some(environment));
+        drop(store);
+        drop(foreign);
+    }
+
     #[cfg(feature = "wasi")]
     fn borrowed_public_foreign_chain(trap: bool) {
         use std::sync::{
