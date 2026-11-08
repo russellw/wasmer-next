@@ -2598,8 +2598,15 @@ impl std::future::Future for NativeStoreFinalizationTail {
         let ready = handoff
             .failure
             .attempt(|| subscription.with_context(cx, |cx| handoff.poll(cx)));
-        if !matches!(ready, Some(Poll::Ready(()))) {
-            return Poll::Pending;
+        match ready {
+            None => {
+                // Clone/replacement Drop may fail BEFORE H or its observer is
+                // polled. Preserve that first event, then request a real retry.
+                handoff.failure.attempt(|| cx.waker().wake_by_ref());
+                return Poll::Pending;
+            }
+            Some(Poll::Pending) => return Poll::Pending,
+            Some(Poll::Ready(())) => (),
         }
         assert!(handoff.complete.get() && handoff.ledger.final_done.get());
         handoff.failure.attempt(|| drop(this.subscription.take()));
