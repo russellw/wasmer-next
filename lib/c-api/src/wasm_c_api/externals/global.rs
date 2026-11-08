@@ -34,7 +34,12 @@ pub unsafe extern "C" fn wasm_global_new(
     let val = val?;
 
     let global_type = &global_type.inner().global_type;
-    let wasm_val = val.try_into().ok()?;
+    let wasm_val: Value = val.try_into().ok()?;
+    let belongs = c_try!(store.inner.with_mut(|store| wasm_val.is_from_store(store)));
+    if !belongs {
+        update_last_error("global initializer belongs to another Store");
+        return None;
+    }
     let global = c_try!(
         store
             .inner

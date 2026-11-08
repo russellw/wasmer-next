@@ -125,3 +125,20 @@ for runtime work. These checks do not establish legacy removal parity.
 removed; the unchanged nested QuickJS gitlink is registered at the repository
 root. See [NAPI provenance](../lib/napi/SOURCE.md). This source ownership change
 does not waive the NAPI lifecycle and consumer execution gates above.
+
+
+### V8 VM export provenance
+
+V8 VM export payloads now use an opaque handle carrying owner-thread and weak
+Store identity metadata. The C ABI and generated headers are unchanged. Rust
+code constructing `VMExtern::V8(raw_pointer)` must instead use the explicitly
+unsafe `VMExtern::from_raw_v8_unchecked` constructor with a live raw extern from
+that exact Store. It does not infer ownership from the raw address or StoreId.
+
+`Extern::from_vm_extern` and `VMExternToExtern::to_extern` retain their infallible
+signatures and panic on invalid V8 provenance before querying the raw handle.
+Use `Extern::try_from_vm_extern` for checked conversion returning `RuntimeError`.
+Normal typed export/copy conversions preserve existing provenance. Metadata
+clone and Drop remain inert after expiration and on another thread; invocation
+still requires the original Store thread. This source change does not claim
+completion of the V8 CAPI WASI migration or its runtime acceptance gates.
