@@ -5458,6 +5458,242 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "wasi")]
+    struct LateTailFixture {
+        target: Box<wasm_store_t>,
+        owner: wasmer_api::sys::NativeCleanupOwner,
+        ledger: Rc<RetirementLedger>,
+        weak: WeakStoreRef,
+        driver: Weak<Driver>,
+        local: Rc<std::cell::Cell<usize>>,
+        vm: Rc<std::cell::Cell<usize>>,
+    }
+    #[cfg(feature = "wasi")]
+    fn late_tail_fixture(first: Option<RetirementPanic>) -> LateTailFixture {
+        struct Resource {
+            owner: wasmer_api::sys::NativeCleanupOwner,
+            weak: WeakStoreRef,
+            completed: Rc<std::cell::Cell<usize>>,
+            first: Option<RetirementPanic>,
+        }
+        impl Drop for Resource {
+            fn drop(&mut self) {
+                assert!(self.weak.upgrade().is_none());
+                let completed = self.completed.clone();
+                let first = self.first.take();
+                self.owner
+                    .try_retain(async move {
+                        tokio::task::yield_now().await;
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                        completed.set(completed.get() + 1);
+                        if let Some(first) = first {
+                            std::panic::resume_unwind(first);
+                        }
+                    })
+                    .unwrap_or_else(|_| panic!("actual destructor cleanup refused"));
+            }
+        }
+        unsafe extern "C" fn callback(
+            _: *mut std::ffi::c_void,
+            _: &wasm_val_vec_t,
+            _: &mut wasm_val_vec_t,
+        ) -> Option<Box<wasm_trap_t>> {
+            None
+        }
+        unsafe extern "C" fn finalize(data: *mut std::ffi::c_void) {
+            drop(unsafe { Box::from_raw(data.cast::<Resource>()) });
+        }
+        let engine = crate::wasm_c_api::engine::wasm_engine_new();
+        let mut target = unsafe { wasm_store_new(Some(&engine)) }.unwrap();
+        let owner = target.inner.cleanup_owner().unwrap();
+        let weak = target.inner.downgrade();
+        let local = Rc::new(std::cell::Cell::new(0));
+        let vm = Rc::new(std::cell::Cell::new(0));
+        let started = Rc::new(std::cell::Cell::new(false));
+        let resource = Resource {
+            owner: owner.clone(),
+            weak: weak.clone(),
+            completed: local.clone(),
+            first,
+        };
+        let task_started = started.clone();
+        target
+            .inner
+            .run_host(async move {
+                tokio::task::spawn_local(async move {
+                    let _resource = resource;
+                    task_started.set(true);
+                    std::future::pending::<()>().await;
+                });
+                tokio::task::yield_now().await;
+            })
+            .unwrap();
+        assert!(started.get());
+        let data = Box::into_raw(Box::new(Resource {
+            owner: owner.clone(),
+            weak: weak.clone(),
+            completed: vm.clone(),
+            first: None,
+        }));
+        let ty = wasm_functype_t::new(wasmer_api::FunctionType::new([], []));
+        let function = unsafe {
+            wasm_func_new_with_env(
+                Some(&mut target),
+                Some(&ty),
+                Some(callback),
+                data.cast(),
+                Some(finalize),
+            )
+        }
+        .unwrap();
+        drop(function);
+        assert_eq!(vm.get(), 0);
+        let StoreMode::Native(native) = &target.inner.inner.mode else {
+            unreachable!()
+        };
+        let driver = Rc::downgrade(native.driver.borrow().as_ref().unwrap());
+        let ledger = native.ledger.clone();
+        assert!(ledger.snapshot().is_empty() && native.finalization.borrow().upgrade().is_none());
+        LateTailFixture {
+            target,
+            owner,
+            ledger,
+            weak,
+            driver,
+            local,
+            vm,
+        }
+    }
+    #[cfg(feature = "wasi")]
+    #[test]
+    fn late_finalization_refusal_without_native_ancestry_transfers_the_actual_phase_once() {
+        assert!(wasmer_api::sys::WeakNativeInvocation::current().is_none());
+        assert!(wasmer_api::sys::NativeAncestrySettlement::current(None).is_none());
+        let LateTailFixture {
+            target,
+            owner,
+            ledger,
+            weak,
+            driver,
+            local,
+            vm,
+        } = late_tail_fixture(None);
+        // No Native R exists: existing API returns the EXACT unpublished job;
+        // its Drop makes the ONE lexical transfer at this legal outer boundary.
+        unsafe { wasm_store_delete(Some(target)) };
+        assert!(weak.upgrade().is_none() && driver.upgrade().is_none());
+        assert_eq!((local.get(), vm.get()), (1, 1));
+        assert!(ledger.final_done.get() && ledger.snapshot().is_empty());
+        assert_eq!(ledger.service_claims.get(), 0);
+        assert!(owner.is_idle() && owner.is_sealed());
+    }
+    #[cfg(feature = "wasi")]
+    fn late_tail_original_caller_cancel_profile(active_primary: bool) {
+        use std::{
+            future::Future,
+            sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            },
+            task::Poll,
+        };
+        struct Payload(&'static str, Arc<AtomicUsize>);
+        impl Drop for Payload {
+            fn drop(&mut self) {
+                self.1.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let i_drops = Arc::new(AtomicUsize::new(0));
+        let i = Box::new(Payload("cleanup I", i_drops.clone()));
+        let address = (&*i) as *const Payload;
+        let LateTailFixture {
+            target,
+            owner,
+            ledger,
+            weak,
+            driver,
+            local,
+            vm,
+        } = late_tail_fixture(Some(i));
+        let target = Rc::new(RefCell::new(Some(target)));
+        let deleting = target.clone();
+        let mut source = Store::default();
+        let callback = Function::new_async(
+            &mut source,
+            wasmer_api::FunctionType::new([], []),
+            move |_| {
+                assert!(
+                    wasmer_api::sys::WeakNativeInvocation::current()
+                        .unwrap()
+                        .is_current()
+                );
+                let target = deleting.borrow_mut().take().unwrap();
+                assert_eq!(target.inner.strong_handles_for_test(), 1);
+                unsafe { wasm_store_delete(Some(target)) };
+                std::future::ready(Ok(Vec::new()))
+            },
+        );
+        let asynchronous = source.into_async();
+        let mut original = Box::pin(callback.call_async(&asynchronous, vec![]));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(std::future::poll_fn(|cx| {
+            assert!(original.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        }));
+        assert!(target.borrow().is_none() && weak.upgrade().is_none());
+        assert!(!ledger.final_done.get());
+        assert_eq!(ledger.service_claims.get(), 1);
+        assert_eq!((local.get(), vm.get()), (0, 0));
+        // Original R returned; dropping its SAME live call now uses the existing
+        // legal outer lexical fallback, without another driver or recovery poll.
+        let p_drops = Arc::new(AtomicUsize::new(0));
+        let exact = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if active_primary {
+                let _original = original;
+                std::panic::resume_unwind(Box::new(Payload("Rust P", p_drops.clone())));
+            } else {
+                drop(original);
+            }
+        }))
+        .unwrap_err();
+        assert_eq!(
+            exact.downcast_ref::<Payload>().unwrap().0,
+            if active_primary {
+                "Rust P"
+            } else {
+                "cleanup I"
+            }
+        );
+        if !active_primary {
+            assert_eq!(
+                exact.downcast_ref::<Payload>().unwrap() as *const _,
+                address
+            );
+        }
+        assert!(driver.upgrade().is_none());
+        assert_eq!((local.get(), vm.get()), (1, 1));
+        assert!(ledger.final_done.get() && ledger.snapshot().is_empty());
+        assert_eq!(ledger.service_claims.get(), 0);
+        assert!(owner.is_idle() && owner.is_sealed());
+        assert_eq!(i_drops.load(Ordering::SeqCst), usize::from(active_primary));
+        drop(exact);
+        assert_eq!(i_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(p_drops.load(Ordering::SeqCst), usize::from(active_primary));
+    }
+    #[cfg(feature = "wasi")]
+    #[test]
+    fn late_finalization_original_caller_drop_retains_actual_cleanup_and_first_value() {
+        late_tail_original_caller_cancel_profile(false);
+    }
+    #[cfg(feature = "wasi")]
+    #[test]
+    fn late_finalization_original_caller_drop_preserves_active_rust_primary() {
+        late_tail_original_caller_cancel_profile(true);
+    }
+
     #[cfg(all(unix, feature = "wasi"))]
     #[test]
     fn active_foreign_caller_without_target_tail_drives_last_public_store_cleanup() {
