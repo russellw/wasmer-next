@@ -1550,6 +1550,12 @@ impl StoreRef {
         &self,
         f: impl FnOnce(&mut StoreMut<'_>) -> R,
     ) -> Result<R, RuntimeError> {
+        #[cfg(feature = "sys")]
+        if let StoreMode::Native(native) = &self.inner.mode
+            && !wasmer_api::sys::native_invocation_active()
+        {
+            return self.with_borrowed_mut(native, f);
+        }
         let mut f = Some(f);
         if let Some(Some(result)) = Store::with_current(|current| {
             (current.objects_mut().id() == self.inner.id).then(|| f.take().unwrap()(current))
@@ -1587,12 +1593,63 @@ impl StoreRef {
         }
     }
 
+    #[cfg(feature = "sys")]
+    fn with_borrowed_mut<R>(
+        &self,
+        native: &ManagedStore,
+        f: impl FnOnce(&mut StoreMut<'_>) -> R,
+    ) -> Result<R, RuntimeError> {
+        use std::{
+            future::Future,
+            task::{Context, Poll, Waker},
+        };
+        use wasmer_api::AsStoreAsync;
+        let expected = native.store.as_ref().unwrap();
+        let mut f = Some(f);
+        let mut checked = |store: &mut StoreMut<'_>| {
+            if store.objects_mut().id() != self.inner.id {
+                return Err(RuntimeError::new("host loan belongs to another Store"));
+            }
+            Ok(f.take().unwrap()(store))
+        };
+        if let Some(result) = wasmer_api::sys::with_borrowed_native_store(expected, &mut checked)? {
+            return result;
+        }
+        let mut lock = std::pin::pin!(expected.write_lock());
+        let Poll::Ready(mut guard) = lock.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+        else {
+            return Err(RuntimeError::new("Store has no available host loan"));
+        };
+        // Validate the ACTUAL guard's Box through its derived parked row too;
+        // never inspect expected.inner behind that write guard or trust ID alone.
+        guard.as_store_mut().parked(|| {
+            wasmer_api::sys::with_borrowed_native_store(expected, checked)?.ok_or_else(|| {
+                RuntimeError::new("actual borrowed Store installation disappeared")
+            })?
+        })
+    }
+
     pub(crate) fn call(
         &self,
         function: &Function,
         args: Vec<Value>,
     ) -> Result<Box<[Value]>, RuntimeError> {
         let _keepalive = self.clone();
+        #[cfg(feature = "sys")]
+        if matches!(&self.inner.mode, StoreMode::Native(_))
+            && tokio::runtime::Handle::try_current().is_ok()
+            && !wasmer_api::sys::native_invocation_active()
+        {
+            let result = Store::with_current(|current| {
+                current.parked(|| self.with_mut(|store| function.call(store, &args)))
+            })
+            .unwrap_or_else(|| self.with_mut(|store| function.call(store, &args)))?;
+            #[cfg(feature = "wasi")]
+            if let Err(error) = &result {
+                self.forward_handoff(error, None)?;
+            }
+            return result;
+        }
         if let Some(result) = Store::with_current(|current| {
             if current.objects_mut().id() == self.inner.id {
                 function.call(current, &args)
