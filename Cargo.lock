@@ -8550,7 +8550,6 @@ dependencies = [
  "wasmer-compiler-singlepass",
  "wasmer-middlewares",
  "wasmer-types",
- "wasmer-wasix",
  "wasmer-wast",
 ]
 
