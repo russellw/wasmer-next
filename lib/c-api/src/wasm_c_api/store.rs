@@ -6599,58 +6599,116 @@ mod tests {
             .unwrap_err();
         assert!(wasixv2_exec::is_call_handoff(&error));
         let states = Rc::new(RefCell::new(Vec::new()));
-        let captured_states = states.clone();
         let called = Rc::new(Cell::new(false));
-        let observed = called.clone();
-        let source = store.inner.downgrade();
-        let other = foreign.inner.downgrade();
-        let probe = store
-            .inner
-            .with_mut(|view| {
-                Function::new_async(
-                    view,
-                    wasmer_api::FunctionType::new([], [wasmer_api::Type::I32]),
-                    move |_| {
-                        let source = source.upgrade().unwrap();
-                        let other = other.upgrade().unwrap();
-                        let result = Store::with_current(|parent| {
-                            parent.parked(|| {
-                                other
-                                    .with_mut(|middle| {
-                                        let id = middle.objects_mut().id();
-                                        let result = middle.parked(|| {
-                                            assert!(!wasmer_api::sys::native_invocation_active());
-                                            // Revalidate the SAME actual generation/backing BEFORE
-                                            // endpoint lookup; no worker/successor has been claimed.
-                                            source.with_mut(|_| ()).unwrap();
-                                            source.forward_handoff(&error, None)?;
-                                            *captured_states.borrow_mut() =
-                                                source.retirement_states_for_test();
-                                            observed.set(true);
-                                            Ok(vec![Value::I32(71)])
-                                        });
-                                        assert_eq!(middle.objects_mut().id(), id);
-                                        result
-                                    })
-                                    .and_then(|result| result)
+        let caught = Rc::new(RefCell::new(None));
+        struct Probe {
+            source: WeakStoreRef,
+            other: WeakStoreRef,
+            error: RuntimeError,
+            states: Rc<RefCell<Vec<Rc<NativeRetirementState>>>>,
+            called: Rc<Cell<bool>>,
+            caught: Rc<RefCell<Option<RetirementPanic>>>,
+        }
+        unsafe extern "C" fn probe(
+            data: *mut std::ffi::c_void,
+            _: &wasm_val_vec_t,
+            results: &mut wasm_val_vec_t,
+        ) -> Option<Box<wasm_trap_t>> {
+            let data = unsafe { &*data.cast::<Probe>() };
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let source = data
+                    .source
+                    .upgrade()
+                    .ok_or_else(|| RuntimeError::new("probe source Store disappeared"))?;
+                let other = data
+                    .other
+                    .upgrade()
+                    .ok_or_else(|| RuntimeError::new("probe foreign Store disappeared"))?;
+                Store::with_current(|parent| {
+                    parent.parked(|| {
+                        other
+                            .with_mut(|middle| {
+                                let id = middle.objects_mut().id();
+                                let result = middle.parked(|| {
+                                    if wasmer_api::sys::native_invocation_active() {
+                                        return Err(RuntimeError::new(
+                                            "probe entered Native ancestry",
+                                        ));
+                                    }
+                                    // Revalidate the SAME actual generation/backing BEFORE
+                                    // endpoint lookup; no worker/successor has been claimed.
+                                    source.with_mut(|_| ())?;
+                                    source.forward_handoff(&data.error, None)?;
+                                    *data.states.borrow_mut() = source.retirement_states_for_test();
+                                    data.called.set(true);
+                                    Ok(())
+                                });
+                                if middle.objects_mut().id() != id {
+                                    return Err(RuntimeError::new("probe foreign parent changed"));
+                                }
+                                result
                             })
-                        })
-                        .unwrap();
-                        std::future::ready(result)
-                    },
-                )
-            })
-            .unwrap();
-        let mut probe = wasm_func_t {
-            extern_: wasm_extern_t::new(store.inner.clone(), probe.into()),
-        };
+                            .and_then(|result| result)
+                    })
+                })
+                .ok_or_else(|| RuntimeError::new("public callback did not park source Store"))?
+            }));
+            match result {
+                Ok(Ok(())) => {
+                    results.as_uninit_slice()[0].write(wasm_val_t {
+                        kind: crate::wasm_c_api::types::wasm_valkind_enum::WASM_I32 as u8,
+                        of: crate::wasm_c_api::value::wasm_val_inner { int32_t: 71 },
+                    });
+                    None
+                }
+                Ok(Err(error)) => Some(Box::new(error.into())),
+                Err(exact) => {
+                    // Preserve unexpected proof failures for the OUTER Rust
+                    // assertion boundary, never unwind across this C callback.
+                    *data.caught.borrow_mut() = Some(exact);
+                    Some(Box::new(RuntimeError::new("handoff probe panicked").into()))
+                }
+            }
+        }
+        unsafe extern "C" fn finalize_probe(data: *mut std::ffi::c_void) {
+            drop(unsafe { Box::from_raw(data.cast::<Probe>()) });
+        }
+        let data = Box::into_raw(Box::new(Probe {
+            source: store.inner.downgrade(),
+            other: foreign.inner.downgrade(),
+            error,
+            states: states.clone(),
+            called: called.clone(),
+            caught: caught.clone(),
+        }));
+        let ty = wasm_functype_t::new(wasmer_api::FunctionType::new([], [wasmer_api::Type::I32]));
+        // The PUBLIC C shim parks its exact FunctionEnvMut Store borrow before
+        // invoking this callback. A raw new_async factory intentionally does not.
+        let mut probe = unsafe {
+            wasm_func_new_with_env(
+                Some(&mut store),
+                Some(&ty),
+                Some(probe),
+                data.cast(),
+                Some(finalize_probe),
+            )
+        }
+        .unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         runtime.block_on(async {
             let (error, value) = borrowed_capi_result(&mut probe);
-            assert!(error.is_none(), "checked foreign handoff lookup failed");
+            let exact = caught.borrow_mut().take();
+            if let Some(exact) = exact {
+                std::panic::resume_unwind(exact);
+            }
+            assert!(
+                error.is_none(),
+                "checked foreign handoff lookup failed: {:?}",
+                error.as_ref().map(|error| error.inner.message())
+            );
             assert_eq!(value, 71);
             assert!(called.get());
             assert!(Store::with_current(|_| ()).is_none());
