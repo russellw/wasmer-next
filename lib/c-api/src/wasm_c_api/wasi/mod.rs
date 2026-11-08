@@ -627,6 +627,7 @@ mod tests {
     )]
     #[cfg_attr(coverage_nightly, coverage(off))]
     #[test]
+    #[ignore = "requires the reviewed original asyncified B9 guest via WASMER_COPYING_FORK_FIXTURE"]
     fn public_initialized_start_copying_fork_rewinds_reaps_and_preserves_private_memory() {
         // The independently built B9 v1 fixture is selected explicitly so the
         // SAME bytes can be linked against a retained old or current C library.
