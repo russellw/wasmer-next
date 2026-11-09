@@ -12,7 +12,8 @@ use wasixv2_abi::{
     Usize, UsizePtr,
 };
 use wasixv2_syscalls::{
-    Caller, CpuAccount, Errno, GuestAction, Image, Resume, SysResult, TaskId, WorkFlag, write_value,
+    Caller, CpuAccount, Errno, ExecutionFault, GuestAction, Image, Resume, SysResult, TaskId,
+    WorkFlag, write_value,
 };
 use wasixv2_wait::{Interrupted, NoInterrupt, PollMask, WaitQueue, wait_event};
 
@@ -553,16 +554,47 @@ impl Kernel {
     /// blocked in an interruptible wait notice; the others unwind on their next return to the
     /// guest or preemption point, each through its own [`Kernel::exit_mm`].
     pub(crate) fn do_group_exit(&self, task: TaskId, status: i32) {
+        self.claim_group_exit(task, status, None);
+    }
+
+    pub(crate) fn do_fatal_group_exit(
+        &self,
+        task: TaskId,
+        signal: i32,
+        fault: Option<ExecutionFault>,
+    ) -> bool {
+        self.claim_group_exit(task, 128 + signal, Some((signal, fault)))
+    }
+
+    fn claim_group_exit(
+        &self,
+        task: TaskId,
+        status: i32,
+        fatal: Option<(i32, Option<ExecutionFault>)>,
+    ) -> bool {
         // Linux keeps only the low byte of the status.
         let status = status & 0xff;
         let mut state = self.state.lock_or_recover();
-        let process = state.tasks[&task].process.clone();
-        let status = *process
-            .group
-            .state
-            .lock_or_recover()
-            .exit
-            .get_or_insert(status);
+        let Some(process) = state.tasks.get(&task).map(|task| task.process.clone()) else {
+            return false;
+        };
+        let (status, won) = {
+            let mut group = process.group.state.lock_or_recover();
+            match group.exit {
+                Some(_) if fatal.is_some() => return false,
+                Some(status) => (status, false),
+                None => {
+                    group.exit = Some(status);
+                    (status, true)
+                }
+            }
+        };
+        // The kernel state lock serializes every group-exit writer and completion
+        // publisher. Release the group lock before entering the process tree:
+        // wait's tree -> ident and coredump's ident -> group must not form a cycle.
+        if won && let Some((signal, fault)) = fatal {
+            self.procs.claim_fatal_exit(process.pid.0, signal, fault);
+        }
         let mut others = false;
         let mut unstarted = Vec::new();
         for (&id, t) in state.tasks.iter_mut() {
@@ -588,6 +620,7 @@ impl Kernel {
         process.group.released.wake(PollMask::empty());
         self.exit_notify(&process);
         self.pid_ns_progress();
+        true
     }
 
     /// `exit_notify` once the group has exited, none of its threads is left but the leader

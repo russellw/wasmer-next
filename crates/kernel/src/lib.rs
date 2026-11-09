@@ -4714,6 +4714,15 @@ impl Control for Kernel {
         self.force_fatal_signal(task, signal)
     }
 
+    fn fault_with_cause(
+        &self,
+        task: TaskId,
+        signal: i32,
+        cause: wasixv2_syscalls::ExecutionFault,
+    ) -> bool {
+        self.force_fatal_signal_with_cause(task, signal, Some(cause))
+    }
+
     /// `put_task_struct`, or `release_task` for a task its reaper has not unhashed.
     fn release(&self, task: TaskId) {
         self.release_task(task);
