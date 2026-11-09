@@ -1,7 +1,8 @@
 //! Worker-local transport boundary. Implementations must bound their own JS/WebSocket queues.
 use std::{
-    net::SocketAddr,
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     task::{Context, Poll},
+    time::Duration,
 };
 use wasixv2_abi::Errno;
 use wasixv2_vnet::{Found, Lookup, LookupError, Shutdown};
@@ -35,6 +36,9 @@ pub struct Capabilities {
     /// Unbound uplink connections report a real provider local address. Browser
     /// WISP leaves this false; Node host and capable Classic profiles opt in.
     pub selected_external: bool,
+    /// Actual option transactions require owned completion on this profile.
+    /// Default/native/local behavior is unchanged unless explicitly selected.
+    pub async_options: bool,
 }
 
 impl Capabilities {
@@ -75,9 +79,45 @@ impl Capabilities {
     }
 }
 
+/// Supported stock relay socket controls. These are host transport records,
+/// never a guest syscall ABI or new relay tag. Datagrams/groups remain codec
+/// primitives until the caller has its own admitted canonical setter path.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SocketControl {
+    Ttl(u32),
+    Linger(Option<Duration>),
+    NoDelay(bool),
+    KeepAlive(bool),
+    Broadcast(bool),
+    MulticastLoopV4(bool),
+    MulticastLoopV6(bool),
+    MulticastTtlV4(u32),
+    JoinMulticastV4 {
+        multiaddr: Ipv4Addr,
+        iface: Ipv4Addr,
+    },
+    LeaveMulticastV4 {
+        multiaddr: Ipv4Addr,
+        iface: Ipv4Addr,
+    },
+    JoinMulticastV6 {
+        multiaddr: Ipv6Addr,
+        iface: u32,
+    },
+    LeaveMulticastV6 {
+        multiaddr: Ipv6Addr,
+        iface: u32,
+    },
+}
+
 /// One ordered request. IDs are never reused within a backend, including across reconnects.
 #[derive(Clone, Debug)]
 pub enum Command {
+    SetOption {
+        request: Option<u64>,
+        socket: u64,
+        control: SocketControl,
+    },
     /// A bind-only stream, or a direct unbound listen according to `bind.purpose`.
     BindStream {
         request: u64,
@@ -306,10 +346,12 @@ pub trait Transport {
     fn poll_send(&mut self, cx: &mut Context<'_>, command: &Command) -> Poll<Result<(), Errno>>;
     fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Result<Event, Errno>>;
     /// Selected close completion may progress past a full receive frame using
-    /// the transport's existing bounded queue. Only ProviderCloseAck and the
-    /// explicit LocalCloseUnconfirmed disposition are permitted; payload/EOF
-    /// order must stay unchanged. The latter requires a joined local session,
-    /// never an invented remote response.
+    /// the transport's existing bounded queue. Exact accepted Send/SendError,
+    /// Writable, and option Complete receipts may also progress so normal close
+    /// can drain accepted TX despite unrelated full RX. Driver validates the
+    /// same pending operation/flow before mutation. Payload/EOF order stays
+    /// unchanged. LocalCloseUnconfirmed requires a joined local session, never
+    /// an invented remote response.
     /// Implementations also drive completed close-dispatch calls here so their
     /// reserved admission slot is released independently of physical cleanup.
     fn poll_recv_close(&mut self, _cx: &mut Context<'_>) -> Poll<Result<Event, Errno>> {
@@ -360,6 +402,9 @@ impl<T: FrameTransport> Transport for Classic<T> {
         self.capabilities
     }
     fn poll_send(&mut self, cx: &mut Context<'_>, command: &Command) -> Poll<Result<(), Errno>> {
+        if matches!(command, Command::SetOption { .. }) && !self.capabilities.async_options {
+            return Poll::Ready(Err(Errno::EOPNOTSUPP));
+        }
         if matches!(
             command,
             Command::BindStream { .. }

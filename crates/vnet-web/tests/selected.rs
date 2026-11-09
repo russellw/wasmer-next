@@ -80,10 +80,11 @@ impl Transport for Mock {
     }
     fn poll_recv_close(&mut self, _: &mut Context<'_>) -> Poll<Result<Event, Errno>> {
         let Some(index) = self.events.iter().position(|event| {
-            matches!(
-                event,
-                Event::ProviderCloseAck { .. } | Event::LocalCloseUnconfirmed { .. }
-            )
+            matches!(event, Event::ProviderCloseAck { .. } | Event::LocalCloseUnconfirmed { .. }
+                | Event::Sent { .. } | Event::SendError { .. } | Event::Writable { .. })
+                || matches!(event, Event::Complete { request, .. } if self.sent.iter().any(|command| matches!(command,
+                    Command::SetOption { request: Some(actual), .. } | Command::CloseSelected { request: actual, .. }
+                    if actual == request)))
         }) else {
             return Poll::Pending;
         };
@@ -114,7 +115,11 @@ impl Harness {
         Self::limited(bind, external, 8)
     }
     fn limited(bind: bool, external: bool, limit: usize) -> Self {
+        Self::configured(bind, external, limit, false)
+    }
+    fn configured(bind: bool, external: bool, limit: usize, async_options: bool) -> Self {
         let caps = Capabilities {
+            async_options,
             selected_endpoints: true,
             selected_bind: bind,
             selected_external: external,
@@ -1922,4 +1927,321 @@ fn local_unconfirmed_result_requires_the_exact_admitted_close_request() {
         ),
         Poll::Ready(Err(Errno::EPROTO))
     );
+}
+
+#[test]
+fn selected_close_drains_inflight_send_past_unrelated_live_full_receive() {
+    let mut h = Harness::new(true);
+    let (full, full_socket) = selected_stream(&mut h);
+    let (closing, close_socket) = selected_stream(&mut h);
+    assert_eq!(closing.write(b"accepted"), Ok(8));
+    h.pump();
+    let send =
+        h.io.sent
+            .iter()
+            .find_map(|command| match command {
+                Command::Send {
+                    request,
+                    socket,
+                    data,
+                } if *socket == close_socket => {
+                    assert_eq!(data, b"accepted");
+                    Some(*request)
+                }
+                _ => None,
+            })
+            .unwrap();
+    for _ in 0..5 {
+        h.event(Event::Data {
+            socket: full_socket,
+            data: vec![7; 65536],
+        });
+    }
+    drop(closing);
+    h.pump();
+    assert!(!h.io.sent.iter().any(|command| matches!(command, Command::CloseSelected { socket, .. } if *socket == close_socket)),
+        "normal close must first drain its accepted TX");
+    h.event(Event::Sent {
+        request: send,
+        socket: close_socket,
+        amount: 8,
+    });
+    let close = h.io.sent.iter().find_map(|command| match command {
+        Command::CloseSelected { request, socket } if *socket == close_socket => Some(*request),
+        _ => None,
+    }).expect("the exact accepted Send receipt must progress without requiring the unrelated live sibling to read");
+    assert!(
+        !h.io
+            .sent
+            .iter()
+            .any(|command| matches!(command, Command::Reset { socket } if *socket == close_socket)),
+        "normal accepted-prefix drain is not owner cancellation"
+    );
+    h.event(Event::ProviderCloseAck {
+        request: close,
+        socket: close_socket,
+        accept_pending: false,
+        result: Ok(()),
+    });
+    assert_eq!(full.state(), wasixv2_vnet::StreamState::Established);
+    let mut prefix = vec![0; 256 * 1024];
+    assert_eq!(full.read(&mut prefix, false), Ok(prefix.len()));
+    assert!(prefix.iter().all(|byte| *byte == 7));
+    h.pump();
+    let mut remainder = vec![0; 65536];
+    assert_eq!(full.read(&mut remainder, false), Ok(remainder.len()));
+    assert!(remainder.iter().all(|byte| *byte == 7));
+    assert_eq!(full.write(b"healthy"), Ok(7));
+}
+
+#[test]
+fn selected_normal_close_retries_eagain_after_actual_writable_past_full_sibling_rx() {
+    let mut h = Harness::new(true);
+    let (full, full_socket) = selected_stream(&mut h);
+    let (stream, socket) = selected_stream(&mut h);
+    stream.write(b"accepted").unwrap();
+    h.pump();
+    let send = |h: &Harness| {
+        h.io.sent
+            .iter()
+            .rev()
+            .find_map(|command| match command {
+                Command::Send {
+                    request,
+                    socket: actual,
+                    data,
+                } if *actual == socket => Some((*request, data.clone())),
+                _ => None,
+            })
+            .unwrap()
+    };
+    let first = send(&h);
+    assert_eq!(first.1, b"accepted");
+    for _ in 0..5 {
+        h.event(Event::Data {
+            socket: full_socket,
+            data: vec![7; 65536],
+        });
+    }
+    drop(stream);
+    h.pump();
+    h.event(Event::SendError {
+        request: first.0,
+        socket,
+        error: Errno::EAGAIN,
+    });
+    assert_eq!(
+        send(&h).0,
+        first.0,
+        "EAGAIN waits actual writable; it does not spin or replay accepted bytes"
+    );
+    h.event(Event::Writable { socket });
+    let second = send(&h);
+    assert_ne!(second.0, first.0);
+    assert_eq!(second.1, b"accepted");
+    h.event(Event::Sent {
+        request: second.0,
+        socket,
+        amount: 4,
+    });
+    let third = send(&h);
+    assert_ne!(third.0, second.0);
+    assert_eq!(third.1, b"pted");
+    h.event(Event::Sent {
+        request: third.0,
+        socket,
+        amount: 4,
+    });
+    let close = selected_close_request(&h, socket);
+    assert!(
+        !h.io.sent.iter().any(
+            |command| matches!(command, Command::Reset { socket: actual } if *actual == socket)
+        )
+    );
+    h.event(Event::ProviderCloseAck {
+        request: close,
+        socket,
+        accept_pending: false,
+        result: Ok(()),
+    });
+    let mut prefix = vec![0; 256 * 1024];
+    assert_eq!(full.read(&mut prefix, false), Ok(prefix.len()));
+    assert!(prefix.iter().all(|byte| *byte == 7));
+    h.pump();
+    let mut suffix = vec![0; 65536];
+    assert_eq!(full.read(&mut suffix, false), Ok(suffix.len()));
+    assert!(suffix.iter().all(|byte| *byte == 7));
+    assert_eq!(full.write(b"healthy"), Ok(7));
+}
+
+#[test]
+fn exact_option_completion_error_and_canceled_late_ack_progress_past_full_live_sibling_rx() {
+    use std::sync::Mutex;
+    use wasixv2_abi::{SocketLevel, TcpOption};
+    let mut h = Harness::configured(true, false, 8, true);
+    let (full, full_socket) = selected_stream(&mut h);
+    let (stream, socket) = selected_stream(&mut h);
+    for _ in 0..5 {
+        h.event(Event::Data {
+            socket: full_socket,
+            data: vec![7; 65536],
+        });
+    }
+    let results = Arc::new(Mutex::new(Vec::new()));
+    let mut last = 0;
+    let mut previous = None;
+    for result in [Some(Ok(())), Some(Err(Errno::EPERM)), None] {
+        let completed = results.clone();
+        stream
+            .start_options(
+                vec![(
+                    SocketLevel::SOL_TCP.0,
+                    TcpOption::TCP_NODELAY.0,
+                    1i32.to_le_bytes().to_vec(),
+                )],
+                Box::new(move |result| completed.lock().unwrap().push(result)),
+            )
+            .unwrap();
+        h.pump();
+        last =
+            h.io.sent
+                .iter()
+                .rev()
+                .find_map(|command| match command {
+                    Command::SetOption {
+                        request: Some(request),
+                        socket: actual,
+                        ..
+                    } if *actual == socket => Some(*request),
+                    _ => None,
+                })
+                .unwrap();
+        if let Some(request) = previous {
+            let before = results.lock().unwrap().len();
+            h.event(Event::Complete {
+                request,
+                result: Ok(()),
+            });
+            assert_eq!(
+                results.lock().unwrap().len(),
+                before,
+                "duplicate completed option cannot complete the new pending batch"
+            );
+        }
+        if let Some(result) = result {
+            h.event(Event::Complete {
+                request: last,
+                result,
+            });
+            previous = Some(last);
+        }
+    }
+    assert_eq!(*results.lock().unwrap(), vec![Ok(()), Err(Errno::EPERM)]);
+    drop(stream);
+    h.pump();
+    assert_eq!(
+        *results.lock().unwrap(),
+        vec![Ok(()), Err(Errno::EPERM), Err(Errno::ECANCELED)]
+    );
+    h.event(Event::Complete {
+        request: last,
+        result: Ok(()),
+    });
+    assert_eq!(
+        results.lock().unwrap().len(),
+        3,
+        "late ACK cannot complete a canceled or replacement batch"
+    );
+    let close = selected_close_request(&h, socket);
+    h.event(Event::ProviderCloseAck {
+        request: close,
+        socket,
+        accept_pending: false,
+        result: Ok(()),
+    });
+    let mut prefix = vec![0; 256 * 1024];
+    assert_eq!(full.read(&mut prefix, false), Ok(prefix.len()));
+    h.pump();
+    let mut suffix = vec![0; 65536];
+    assert_eq!(full.read(&mut suffix, false), Ok(suffix.len()));
+    assert!(prefix.iter().chain(&suffix).all(|byte| *byte == 7));
+    assert_eq!(full.state(), wasixv2_vnet::StreamState::Established);
+}
+
+#[test]
+fn captured_writable_before_terminal_eagain_does_not_lose_the_only_edge_or_hang_normal_close() {
+    let mut h = Harness::new(true);
+    let (full, full_socket) = selected_stream(&mut h);
+    let (stream, socket) = selected_stream(&mut h);
+    stream.write(b"accepted").unwrap();
+    h.pump();
+    let send = |h: &Harness| {
+        h.io.sent
+            .iter()
+            .rev()
+            .find_map(|command| match command {
+                Command::Send {
+                    request,
+                    socket: actual,
+                    data,
+                } if *actual == socket => Some((*request, data.clone())),
+                _ => None,
+            })
+            .unwrap()
+    };
+    let first = send(&h);
+    // Arming readiness for the actual send must not reduce existing local
+    // bounded-buffer writability while a provider receipt is merely pending.
+    assert!(stream.poll(None).contains(PollMask::OUT));
+    for _ in 0..5 {
+        h.event(Event::Data {
+            socket: full_socket,
+            data: vec![7; 65536],
+        });
+    }
+    drop(stream);
+    h.pump();
+    // The actual JS Writable notification can beat decoding of an EAGAIN
+    // already delivered into Rpc. There may be NO second Writable edge.
+    h.event(Event::Writable { socket });
+    assert_eq!(
+        send(&h).0,
+        first.0,
+        "a readiness edge does not complete the actual inflight send"
+    );
+    h.event(Event::SendError {
+        request: first.0,
+        socket,
+        error: Errno::EAGAIN,
+    });
+    let retry = send(&h);
+    assert_ne!(
+        retry.0, first.0,
+        "terminal EAGAIN must preserve the later readiness edge"
+    );
+    assert_eq!(retry.1, b"accepted");
+    h.event(Event::Sent {
+        request: retry.0,
+        socket,
+        amount: 8,
+    });
+    let close = selected_close_request(&h, socket);
+    assert!(
+        !h.io.sent.iter().any(
+            |command| matches!(command, Command::Reset { socket: actual } if *actual == socket)
+        )
+    );
+    h.event(Event::ProviderCloseAck {
+        request: close,
+        socket,
+        accept_pending: false,
+        result: Ok(()),
+    });
+    let mut prefix = vec![0; 256 * 1024];
+    assert_eq!(full.read(&mut prefix, false), Ok(prefix.len()));
+    h.pump();
+    let mut suffix = vec![0; 65536];
+    assert_eq!(full.read(&mut suffix, false), Ok(suffix.len()));
+    assert!(prefix.iter().chain(&suffix).all(|byte| *byte == 7));
+    assert_eq!(full.write(b"healthy"), Ok(7));
 }

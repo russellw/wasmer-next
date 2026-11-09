@@ -1962,3 +1962,350 @@ fn provider_ambiguous_bridge_and_unbridge_cannot_recover_from_getters_after_reco
         assert!(uplink_up(&net));
     }
 }
+
+#[test]
+fn option_batch_waits_for_each_actual_ack_and_callbacks_can_reenter() {
+    use wasixv2_abi::{SocketLevel, SocketOption, TcpOption};
+    use wasixv2_vnet_web::SocketControl;
+    let mut h = Harness::with_capabilities(Capabilities {
+        async_options: true,
+        ..Capabilities::classic(true)
+    });
+    let (stream, socket) = h.connect();
+    let completed = Arc::new(Mutex::new(Vec::new()));
+    let results = completed.clone();
+    let reentrant = stream.clone();
+    stream
+        .start_options(
+            vec![
+                (
+                    SocketLevel::SOL_TCP.0,
+                    TcpOption::TCP_NODELAY.0,
+                    1i32.to_le_bytes().to_vec(),
+                ),
+                (
+                    SocketLevel::SOL_SOCKET.0,
+                    SocketOption::SO_KEEPALIVE.0,
+                    1i32.to_le_bytes().to_vec(),
+                ),
+            ],
+            Box::new(move |result| {
+                assert_eq!(reentrant.state(), StreamState::Established);
+                results.lock().unwrap().push(result);
+            }),
+        )
+        .unwrap();
+    assert!(h.pump().is_pending());
+    let first = match h.transport.commands.last().unwrap() {
+        Command::SetOption {
+            request: Some(request),
+            socket: actual,
+            control: SocketControl::NoDelay(true),
+        } => {
+            assert_eq!(*actual, socket);
+            *request
+        }
+        other => panic!("expected actual NODELAY request, got {other:?}"),
+    };
+    assert!(completed.lock().unwrap().is_empty());
+    h.event(Event::Complete {
+        request: first,
+        result: Ok(()),
+    });
+    let second = match h.transport.commands.last().unwrap() {
+        Command::SetOption {
+            request: Some(request),
+            control: SocketControl::KeepAlive(true),
+            ..
+        } => *request,
+        other => panic!("expected actual KEEPALIVE request, got {other:?}"),
+    };
+    assert_ne!(first, second);
+    assert!(completed.lock().unwrap().is_empty());
+    h.event(Event::Complete {
+        request: second,
+        result: Ok(()),
+    });
+    assert_eq!(*completed.lock().unwrap(), vec![Ok(())]);
+    assert!(h.pump().is_pending());
+    assert_eq!(*completed.lock().unwrap(), vec![Ok(())]);
+}
+
+#[test]
+fn option_batch_preserves_first_physical_error_without_replaying_prefix() {
+    use wasixv2_abi::{SocketLevel, SocketOption, TcpOption};
+    let mut h = Harness::with_capabilities(Capabilities {
+        async_options: true,
+        ..Capabilities::classic(true)
+    });
+    let (stream, _) = h.connect();
+    let completed = Arc::new(Mutex::new(Vec::new()));
+    let results = completed.clone();
+    stream
+        .start_options(
+            vec![
+                (
+                    SocketLevel::SOL_TCP.0,
+                    TcpOption::TCP_NODELAY.0,
+                    1i32.to_le_bytes().to_vec(),
+                ),
+                (
+                    SocketLevel::SOL_SOCKET.0,
+                    SocketOption::SO_KEEPALIVE.0,
+                    1i32.to_le_bytes().to_vec(),
+                ),
+                (
+                    SocketLevel::SOL_TCP.0,
+                    TcpOption::TCP_NODELAY.0,
+                    0i32.to_le_bytes().to_vec(),
+                ),
+            ],
+            Box::new(move |result| results.lock().unwrap().push(result)),
+        )
+        .unwrap();
+    assert!(h.pump().is_pending());
+    let first = match h.transport.commands.last().unwrap() {
+        Command::SetOption {
+            request: Some(request),
+            ..
+        } => *request,
+        _ => unreachable!(),
+    };
+    h.event(Event::Complete {
+        request: first,
+        result: Ok(()),
+    });
+    let second = match h.transport.commands.last().unwrap() {
+        Command::SetOption {
+            request: Some(request),
+            ..
+        } => *request,
+        _ => unreachable!(),
+    };
+    h.event(Event::Complete {
+        request: second,
+        result: Err(Errno::EPERM),
+    });
+    assert_eq!(*completed.lock().unwrap(), vec![Err(Errno::EPERM)]);
+    assert_eq!(
+        h.transport
+            .commands
+            .iter()
+            .filter(|command| matches!(command, Command::SetOption { .. }))
+            .count(),
+        2
+    );
+    assert_eq!(stream.state(), StreamState::Established);
+}
+
+#[test]
+fn blocked_option_is_withdrawn_on_close_and_late_ack_cannot_complete_again() {
+    use wasixv2_abi::{SocketLevel, TcpOption};
+    let mut h = Harness::with_capabilities(Capabilities {
+        async_options: true,
+        ..Capabilities::classic(true)
+    });
+    let (stream, _) = h.connect();
+    let completed = Arc::new(Mutex::new(Vec::new()));
+    let results = completed.clone();
+    stream
+        .start_options(
+            vec![(
+                SocketLevel::SOL_TCP.0,
+                TcpOption::TCP_NODELAY.0,
+                1i32.to_le_bytes().to_vec(),
+            )],
+            Box::new(move |result| results.lock().unwrap().push(result)),
+        )
+        .unwrap();
+    h.transport.blocked = true;
+    assert!(h.pump().is_pending());
+    drop(stream);
+    h.transport.blocked = false;
+    assert!(h.pump().is_pending());
+    assert_eq!(*completed.lock().unwrap(), vec![Err(Errno::ECANCELED)]);
+    assert!(
+        !h.transport
+            .commands
+            .iter()
+            .any(|command| matches!(command, Command::SetOption { .. }))
+    );
+
+    let (stream, _) = h.connect();
+    let results = completed.clone();
+    stream
+        .start_options(
+            vec![(
+                SocketLevel::SOL_TCP.0,
+                TcpOption::TCP_NODELAY.0,
+                0i32.to_le_bytes().to_vec(),
+            )],
+            Box::new(move |result| results.lock().unwrap().push(result)),
+        )
+        .unwrap();
+    assert!(h.pump().is_pending());
+    let request = match h.transport.commands.last().unwrap() {
+        Command::SetOption {
+            request: Some(request),
+            ..
+        } => *request,
+        _ => unreachable!(),
+    };
+    drop(stream);
+    assert!(h.pump().is_pending());
+    assert_eq!(*completed.lock().unwrap(), vec![Err(Errno::ECANCELED); 2]);
+    h.event(Event::Complete {
+        request,
+        result: Ok(()),
+    });
+    assert_eq!(*completed.lock().unwrap(), vec![Err(Errno::ECANCELED); 2]);
+}
+
+#[test]
+fn default_stream_does_not_admit_async_options_and_disconnect_joins_accepted_batch() {
+    use wasixv2_abi::{SocketLevel, TcpOption};
+    let mut h = Harness::new();
+    let (stream, _) = h.connect();
+    assert!(!stream.async_options());
+    assert_eq!(
+        stream.start_options(Vec::new(), Box::new(|_| panic!("unaccepted callback"))),
+        Err(Errno::EOPNOTSUPP)
+    );
+    let mut h = Harness::with_capabilities(Capabilities {
+        async_options: true,
+        ..Capabilities::classic(true)
+    });
+    let (stream, _) = h.connect();
+    let completed = Arc::new(Mutex::new(Vec::new()));
+    let results = completed.clone();
+    stream
+        .start_options(
+            vec![(
+                SocketLevel::SOL_TCP.0,
+                TcpOption::TCP_NODELAY.0,
+                1i32.to_le_bytes().to_vec(),
+            )],
+            Box::new(move |result| results.lock().unwrap().push(result)),
+        )
+        .unwrap();
+    assert!(h.pump().is_pending());
+    h.transport.error = Some(Errno::ENETDOWN);
+    assert_eq!(h.pump(), Poll::Ready(Err(Errno::ENETDOWN)));
+    assert_eq!(*completed.lock().unwrap(), vec![Err(Errno::ENETDOWN)]);
+}
+
+#[test]
+fn stock_socket_control_tags_and_field_order_match_original_wire_bytes() {
+    use std::{
+        net::{Ipv4Addr, Ipv6Addr},
+        time::Duration,
+    };
+    use wasixv2_vnet_web::{SocketControl, codec};
+    // Original virtual-net meta::RequestType discriminants and fixed-width
+    // serde fields; no new relay variants are assigned by this adapter.
+    let multi6: Ipv6Addr = "ff02::1234".parse().unwrap();
+    let mut scoped6 = multi6.octets().to_vec();
+    scoped6.extend(7u32.to_le_bytes());
+    let mut linger = vec![1];
+    linger.extend(5u64.to_le_bytes());
+    linger.extend(7u32.to_le_bytes());
+    let controls = [
+        (27u32, SocketControl::Ttl(37), 37u32.to_le_bytes().to_vec()),
+        (30, SocketControl::Linger(Some(Duration::new(5, 7))), linger),
+        (30, SocketControl::Linger(None), vec![0]),
+        (38, SocketControl::NoDelay(true), vec![1]),
+        (40, SocketControl::KeepAlive(false), vec![0]),
+        (46, SocketControl::Broadcast(true), vec![1]),
+        (48, SocketControl::MulticastLoopV4(false), vec![0]),
+        (50, SocketControl::MulticastLoopV6(true), vec![1]),
+        (
+            52,
+            SocketControl::MulticastTtlV4(11),
+            11u32.to_le_bytes().to_vec(),
+        ),
+        (
+            54,
+            SocketControl::JoinMulticastV4 {
+                multiaddr: Ipv4Addr::new(239, 1, 2, 3),
+                iface: Ipv4Addr::new(192, 0, 2, 1),
+            },
+            vec![239, 1, 2, 3, 192, 0, 2, 1],
+        ),
+        (
+            55,
+            SocketControl::LeaveMulticastV4 {
+                multiaddr: Ipv4Addr::new(239, 1, 2, 3),
+                iface: Ipv4Addr::new(192, 0, 2, 1),
+            },
+            vec![239, 1, 2, 3, 192, 0, 2, 1],
+        ),
+        (
+            56,
+            SocketControl::JoinMulticastV6 {
+                multiaddr: multi6,
+                iface: 7,
+            },
+            scoped6.clone(),
+        ),
+        (
+            57,
+            SocketControl::LeaveMulticastV6 {
+                multiaddr: multi6,
+                iface: 7,
+            },
+            scoped6,
+        ),
+    ];
+    for (tag, control, value) in controls {
+        for request in [None, Some(19u64)] {
+            let mut expected = 1u32.to_le_bytes().to_vec();
+            expected.extend(9u64.to_le_bytes());
+            expected.extend(tag.to_le_bytes());
+            expected.extend(&value);
+            expected.push(u8::from(request.is_some()));
+            if let Some(request) = request {
+                expected.extend(request.to_le_bytes());
+            }
+            assert_eq!(
+                codec::encode(&Command::SetOption {
+                    request,
+                    socket: 9,
+                    control: control.clone()
+                })
+                .unwrap(),
+                expected,
+                "{control:?}/{request:?}"
+            );
+        }
+    }
+    // The original None/Error responses carry the actual option ACK/error.
+    let mut success = 0u32.to_le_bytes().to_vec();
+    success.extend(19u64.to_le_bytes());
+    success.extend(0u32.to_le_bytes());
+    assert!(matches!(
+        codec::decode(&success),
+        Ok(Event::Complete {
+            request: 19,
+            result: Ok(())
+        })
+    ));
+    let mut denied = 0u32.to_le_bytes().to_vec();
+    denied.extend(19u64.to_le_bytes());
+    denied.extend(1u32.to_le_bytes());
+    denied.extend(17u32.to_le_bytes());
+    assert!(matches!(
+        codec::decode(&denied),
+        Ok(Event::Complete {
+            request: 19,
+            result: Err(Errno::EACCES)
+        })
+    ));
+    for frame in [&success, &denied] {
+        for end in 0..frame.len() {
+            assert!(matches!(codec::decode(&frame[..end]), Err(Errno::EPROTO)));
+        }
+        let mut trailing = frame.to_vec();
+        trailing.push(0);
+        assert!(matches!(codec::decode(&trailing), Err(Errno::EPROTO)));
+    }
+}

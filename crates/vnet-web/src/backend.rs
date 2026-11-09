@@ -93,6 +93,7 @@ pub(crate) struct Packet {
     pub addr: SocketAddr,
 }
 pub(crate) struct Flow {
+    pub options: Option<crate::options::Batch>,
     pub kind: Kind,
     pub binding: Option<Arc<Binding>>,
     pub selected: Option<Arc<crate::endpoints::Resource>>,
@@ -139,6 +140,7 @@ impl Flow {
     }
     pub fn new(kind: Kind, peer: SocketAddr, wq: WaitQueue) -> Self {
         Self {
+            options: None,
             kind,
             binding: None,
             selected: None,
@@ -208,7 +210,12 @@ impl Flow {
         if self.rx.readable(1, self.oob_inline) || self.read_shut {
             mask |= PollMask::READABLE;
         }
-        if (self.tx.len() < config.buffer_bytes && !self.send_blocked) || self.write_shut {
+        // The selected callback profile arms send_blocked at dispatch as a
+        // readiness latch. While that send is still inflight, guest writes may
+        // keep filling the SAME bounded queue just as before; only a terminal
+        // EAGAIN with no later Writable suppresses OUT.
+        let can_buffer = !self.send_blocked || self.inflight.is_some_and(|(_, size)| size > 0);
+        if (self.tx.len() < config.buffer_bytes && can_buffer) || self.write_shut {
             mask |= PollMask::WRITABLE;
         }
         if self.read_shut {
@@ -306,10 +313,12 @@ impl Backend for WebBackend {
         }
         family_allowed(inner.capabilities, peer)?;
         let id = inner.id()?;
+        let async_options = inner.capabilities.async_options;
         inner.flows.insert(id, Flow::new(Kind::Stream, peer, wq));
         drop(inner);
         self.shared.wake.wake();
         Ok(Arc::new(Stream {
+            async_options,
             shared: self.shared.clone(),
             id,
             peer,
@@ -388,6 +397,7 @@ pub(crate) fn unbound(domain: Domain) -> SocketAddr {
 }
 
 pub(crate) struct Stream {
+    pub async_options: bool,
     pub shared: Arc<Shared>,
     pub id: u64,
     pub peer: SocketAddr,
@@ -445,6 +455,41 @@ impl Stream {
     }
 }
 impl BackendStream for Stream {
+    fn async_options(&self) -> bool {
+        self.async_options
+    }
+    fn start_options(
+        &self,
+        options: Vec<(i32, i32, Vec<u8>)>,
+        done: crate::options::Done,
+    ) -> Result<(), Errno> {
+        if !self.async_options {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        let batch = crate::options::Batch::prepare(options, done)?;
+        let mut inner = self.shared.inner.lock().unwrap();
+        if !inner.online {
+            return Err(Errno::ENETDOWN);
+        }
+        let flow = inner.flows.get_mut(&self.id).ok_or(Errno::ECANCELED)?;
+        if flow.released
+            || flow.reset
+            || flow.state == StreamState::Closed
+            || flow.selected.as_ref().is_some_and(|resource| {
+                let state = resource.state.lock().unwrap();
+                state.close_requested || state.closing || state.close.is_some()
+            })
+        {
+            return Err(Errno::ECANCELED);
+        }
+        if flow.options.is_some() {
+            return Err(Errno::EAGAIN);
+        }
+        flow.options = Some(batch);
+        drop(inner);
+        self.shared.wake.wake();
+        Ok(())
+    }
     fn provider_local_addr(&self) -> Option<Result<SocketAddr, Errno>> {
         let inner = self.shared.inner.lock().unwrap();
         inner
@@ -742,7 +787,7 @@ pub(crate) fn release(shared: &Arc<Shared>, id: u64) {
     flow.incoming.clear();
     flow.incoming_bytes = 0;
     flow.write_shut = true;
-    if !flow.remote && flow.state == StreamState::Closed {
+    if !flow.remote && flow.state == StreamState::Closed && flow.options.is_none() {
         inner.flows.remove(&id);
     }
     drop(inner);
