@@ -7,10 +7,12 @@
 mod backend;
 pub mod codec;
 mod driver;
+mod endpoints;
 mod provider;
 mod publication;
 pub mod transport;
 
 pub use backend::{Config, WebBackend};
 pub use driver::Driver;
+pub use endpoints::SelectedCloseReport;
 pub use transport::{Capabilities, Classic, Command, Event, FrameTransport, Transport};
