@@ -351,6 +351,9 @@ test("copy worker is coordinator-created pure JS and terminated with normal/fata
     assert.equal(service.messages.at(-1).type, "retire");
     assert(!service.terminated, "normal pure-JS retirement must run on its event loop");
     assert(root.terminated);
+    assert(!h.output.some(data => data.type === "stopped"), "parent retains copy owner until cleanup ACK");
+    service.send({ type: "retired" });
+    assert(service.terminated);
     assert.equal(h.output.at(-1).type, "stopped");
 
     const failed = await setup({ memoryCopyUrl: "copy-worker.js" });
@@ -531,6 +534,9 @@ test("copy realm replacement routes new clients only after direct handoff readin
     next.send({ type: "ready" });
     assert.equal(old.messages.at(-1).type, "retire");
     assert(!old.terminated);
+    assert.equal(next.messages.at(-1).type, "restore", "new clients wait for outgoing cleanup ACK");
+    old.send({ type: "retired" });
+    assert(old.terminated);
     assert.equal(next.messages.at(-1).type, "connect");
     assert.equal(vm.runInContext("copyRotation", h.context), null);
     assert.equal(vm.runInContext("copyRotations", h.context), 1);
@@ -538,8 +544,9 @@ test("copy realm replacement routes new clients only after direct handoff readin
     assert(next.terminated);
 });
 
-for (const mode of ["failure", "shutdown", "timeout"]) {
+for (const mode of ["failure", "shutdown-old-first", "shutdown-next-first", "timeout"]) {
     test(`copy realm ${mode} reclaims both realms, deadline and queued endpoints`, async () => {
+        const shutdown = mode.startsWith("shutdown");
         const h = await setup({ memoryCopyUrl: "copy-worker.js", admissionTimeout: 20 });
         const old = h.instances[0];
         old.send({ type: "rotate" });
@@ -547,19 +554,93 @@ for (const mode of ["failure", "shutdown", "timeout"]) {
         const queued = { close() { this.closed = true; } };
         vm.runInContext("copyRotation.ports", h.context).push(queued);
         if (mode === "failure") next.onerror({ preventDefault() {}, message: "replacement died" });
-        else if (mode === "shutdown") { await h.context.onmessage({ data: { type: "shutdown" } }); await flush(); }
+        else if (shutdown) { await h.context.onmessage({ data: { type: "shutdown" } }); await flush(); }
         else await new Promise((resolve) => setTimeout(resolve, 40));
         for (const worker of [old, next]) {
-            if (mode === "shutdown") {
+            if (shutdown) {
                 assert.equal(worker.messages.at(-1).type, "retire");
                 assert(!worker.terminated);
             } else assert(worker.terminated);
         }
+        if (shutdown) {
+            assert(!h.output.some(data => data.type === "stopped"));
+            next.send({ type: "ready" });
+            const order = mode === "shutdown-old-first" ? [old, next] : [next, old];
+            order[0].send({ type: "retired" });
+            assert(!h.output.some(data => data.type === "stopped"), "both captured owners must acknowledge");
+            order[1].send({ type: "retired" });
+        }
         assert(queued.closed);
         assert.equal(vm.runInContext("copyRotation", h.context), null);
-        assert.equal(h.output.at(-1).type, mode === "shutdown" ? "stopped" : "fatal");
+        assert.equal(h.output.at(-1).type, shutdown ? "stopped" : "fatal");
     });
 }
+
+test("restored copy owner has a fresh cleanup deadline after near-deadline readiness", async () => {
+    const h = await setup({ memoryCopyUrl: "copy-worker.js", admissionTimeout: 20 });
+    let now = 0, identity = 0;
+    const timers = new Map();
+    h.context.setTimeout = (callback, delay) => { const id = ++identity; timers.set(id, { at: now + delay, callback }); return id; };
+    h.context.clearTimeout = id => timers.delete(id);
+    const advance = delta => {
+        now += delta;
+        for (const [id, timer] of [...timers]) if (timer.at <= now) { timers.delete(id); timer.callback(); }
+    };
+    const old = h.instances[0];
+    old.send({ type: "rotate" });
+    const next = h.instances[3];
+    advance(19);
+    next.send({ type: "ready" });
+    advance(2);
+    assert(!h.output.some(data => data.type === "fatal"), "completed handoff deadline cannot interrupt cleanup");
+    assert(!old.terminated);
+    advance(17);
+    old.send({ type: "retired" });
+    assert.equal(vm.runInContext("memoryCopies", h.context), next);
+    assert.equal(timers.size, 0);
+    h.instances[1].send({ type: "fatal", error: "test finished" });
+});
+
+test("copy retirement deadline fails and hard-terminates the captured owner", async () => {
+    const h = await setup({ memoryCopyUrl: "copy-worker.js", admissionTimeout: 20 });
+    const copy = h.instances[0];
+    await h.context.onmessage({ data: { type: "shutdown" } });
+    await flush();
+    assert(!copy.terminated);
+    await new Promise(resolve => setTimeout(resolve, 40));
+    assert.equal(h.output.at(-1).type, "fatal");
+    assert.match(h.output.at(-1).error, /memory-copy retirement timed out/);
+    assert(copy.terminated);
+    assert.equal(vm.runInContext("memoryCopies", h.context), null);
+});
+
+test("rotation preserves receiver's deferred rotation and ignores the retired sender's late reply", async () => {
+    const h = await setup({ memoryCopyUrl: "copy-worker.js" });
+    const old = h.instances[0];
+    old.send({ type: "rotate" });
+    const next = h.instances[3];
+    next.send({ type: "ready" });
+    next.send({ type: "rotate" });
+    const stale = old.onmessage;
+    old.send({ type: "retired" });
+    assert(old.terminated);
+    assert.equal(vm.runInContext("memoryCopies", h.context), next);
+    assert.equal(h.instances[4].messages[0].type, "restore");
+    assert.equal(next.messages.at(-1).type, "handoff");
+    stale({ data: { type: "retired" } });
+    assert(!h.output.some(data => data.type === "fatal"));
+    h.instances[1].send({ type: "fatal", error: "test finished" });
+    assert(next.terminated);
+    assert(h.instances[4].terminated);
+});
+
+test("unrequested copy retirement cannot acknowledge current ownership", async () => {
+    const h = await setup({ memoryCopyUrl: "copy-worker.js" });
+    h.instances[0].send({ type: "retired" });
+    assert.equal(h.output.at(-1).type, "fatal");
+    assert.match(h.output.at(-1).error, /unrequested memory-copy retirement/);
+    assert(h.instances.every(worker => worker.terminated));
+});
 
 test("quiescent pool sweeps every object consumer and late replies preserve new admissions", async () => {
     const h = await setup({ prewarm: 2, servicePrewarm: 1, ioModuleUrl: "io-driver.js" });
