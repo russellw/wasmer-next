@@ -18,8 +18,9 @@ use wasixv2_abi::{
 use wasixv2_wait::{PollMask, PollTable, Pollable, WaitQueue, poll_wait};
 
 use crate::{
-    Accepted, BackendDatagram, Control, Domain, NetResult, PortEntry, Publication, QueuedError,
-    RecvMsg, SendMsg, Shutdown, Socket, SocketKind,
+    Accepted, BackendDatagram, Control, DatagramReadback, DatagramReadbackAdmission,
+    DatagramReadbackValue, Domain, NetResult, PortEntry, Publication, QueuedError, RecvMsg,
+    SendMsg, Shutdown, Socket, SocketKind,
     addr::{canonical, canonical_ip, present, sockaddr_bytes, unbound},
     bpf::{Arrival, PACKET_BROADCAST, PACKET_HOST, PACKET_LOOPBACK, PACKET_MULTICAST, SockFilter},
     cmsg::{self, SendCtl},
@@ -152,6 +153,9 @@ struct Inner {
     bind_pending: Option<EndpointSourceId>,
     bind_admission: Weak<crate::endpoint::bind::Admission>,
     endpoint_bound: Option<Arc<dyn EndpointBound>>,
+    /// Explicit source-only role captured ONCE from the admitted bound Arc.
+    /// Ordinary backend presence never grants this capability.
+    peer_datagram: Option<Arc<dyn BackendDatagram>>,
     /// `inet_rcv_saddr` of a bind that took no port (`IP_BIND_ADDRESS_NO_PORT`): the address
     /// the port taken later by `connect` or a send goes with.
     saddr: Option<IpAddr>,
@@ -212,6 +216,154 @@ pub struct UdpSocket {
     auto_publication: Mutex<Option<Box<dyn Publication>>>,
 }
 
+/// The admitted callback owns the exact provider resource until terminal
+/// completion. The subscription owns no guest memory and does not keep the
+/// canonical socket alive after an interrupted syscall releases its fd owner.
+struct ReadbackTxn {
+    socket: Weak<UdpSocket>,
+    bound: Arc<dyn EndpointBound>,
+    backend: Arc<dyn BackendDatagram>,
+    source: EndpointSourceId,
+    query: DatagramReadback,
+    domain: Domain,
+    queue: WaitQueue,
+    state: Mutex<ReadbackState>,
+}
+#[derive(Default)]
+struct ReadbackState {
+    started: bool,
+    accepted: bool,
+    result: Option<NetResult<DatagramReadbackValue>>,
+}
+struct ReadbackSubscription(Arc<ReadbackTxn>);
+impl ReadbackTxn {
+    fn current(&self) -> bool {
+        let Some(socket) = self.socket.upgrade() else {
+            return false;
+        };
+        let g = socket.lock();
+        socket.endpoint.source() == self.source
+            && g.endpoint_bound
+                .as_ref()
+                .is_some_and(|bound| Arc::ptr_eq(bound, &self.bound))
+            && g.peer_datagram
+                .as_ref()
+                .is_some_and(|backend| Arc::ptr_eq(backend, &self.backend))
+    }
+    fn finish(&self, result: NetResult<DatagramReadbackValue>) {
+        // A physical error is authoritative. Only a successful stale result
+        // becomes cancellation; neither path can publish into a replacement.
+        let result = result.and_then(|value| {
+            if !self.query.accepts(value) {
+                return Err(Errno::EPROTO);
+            }
+            if !self.current() {
+                return Err(Errno::ECANCELED);
+            }
+            let address = |address: SocketAddr| {
+                let address = if self.domain == Domain::Inet {
+                    canonical(address)
+                } else {
+                    address
+                };
+                if self.domain == Domain::Inet && !address.is_ipv4() {
+                    return Err(Errno::EPROTO);
+                }
+                // present maps v4 to v6-mapped for an AF_INET6 owner, and
+                // leaves native IPv6 scope/flowinfo untouched.
+                Ok(present(self.domain, address))
+            };
+            Ok(match value {
+                DatagramReadbackValue::Local(value) => {
+                    DatagramReadbackValue::Local(address(value)?)
+                }
+                DatagramReadbackValue::Peer(value) => {
+                    DatagramReadbackValue::Peer(value.map(address).transpose()?)
+                }
+                value => value,
+            })
+        });
+        let wake = {
+            let mut state = self.state.lock().unwrap();
+            if state.result.is_none() {
+                state.result = Some(result);
+            }
+            state.accepted
+        };
+        if wake {
+            self.queue.wake(PollMask::OUT | PollMask::ERR);
+        }
+    }
+    fn drive(self: &Arc<Self>) {
+        {
+            let mut state = self.state.lock().unwrap();
+            if state.started {
+                return;
+            }
+            state.started = true;
+        }
+        if !self.current() {
+            let mut state = self.state.lock().unwrap();
+            state.accepted = true;
+            state.result = Some(Err(Errno::ECANCELED));
+            drop(state);
+            self.queue.wake(PollMask::ERR);
+            return;
+        }
+        let completed = self.clone();
+        // No transaction, socket, namespace or endpoint-control guard crosses
+        // this call. Its FnOnce callback may complete INLINE safely.
+        let admission = self
+            .backend
+            .start_readback(self.query, Box::new(move |result| completed.finish(result)));
+        {
+            let mut state = self.state.lock().unwrap();
+            match admission {
+                Some(Ok(())) => {}
+                Some(Err(error)) => {
+                    state.result = Some(Err(if state.result.is_some() {
+                        Errno::EPROTO
+                    } else {
+                        error
+                    }));
+                }
+                None => {
+                    // peer_datagram selected this explicit source-only profile.
+                    // Unavailable actual readback cannot become a cached value.
+                    state.result = Some(Err(if state.result.is_some() {
+                        Errno::EPROTO
+                    } else {
+                        Errno::EOPNOTSUPP
+                    }));
+                }
+            }
+            state.accepted = true;
+        }
+        self.queue.wake(PollMask::OUT | PollMask::ERR);
+    }
+    fn result(&self) -> Option<NetResult<DatagramReadbackValue>> {
+        let state = self.state.lock().unwrap();
+        state.accepted.then_some(state.result).flatten()
+    }
+}
+impl Pollable for ReadbackSubscription {
+    fn poll(&self, mut table: Option<&mut PollTable<'_>>) -> PollMask {
+        poll_wait(&mut table, &self.0.queue);
+        self.0.drive();
+        match self.0.result() {
+            Some(Ok(_)) => PollMask::OUT,
+            Some(Err(_)) => PollMask::ERR,
+            None => PollMask::empty(),
+        }
+    }
+}
+impl DatagramReadbackAdmission for ReadbackSubscription {
+    fn complete_result(&self) -> Option<NetResult<DatagramReadbackValue>> {
+        self.0.drive();
+        self.0.result()
+    }
+}
+
 impl UdpSocket {
     pub(crate) fn new(net: Arc<Net>, domain: Domain, uid: u32) -> Arc<Self> {
         let id = net.next_id();
@@ -233,6 +385,7 @@ impl UdpSocket {
                 bind_pending: None,
                 bind_admission: Weak::new(),
                 endpoint_bound: None,
+                peer_datagram: None,
                 saddr: None,
                 addr_locked: false,
                 port_locked: false,
@@ -425,6 +578,7 @@ impl UdpSocket {
             self.net.state().udp.unbind(self.id, local.port());
         }
         g.endpoint_bound = None;
+        g.peer_datagram = None;
         g.peer = None;
         g.policy_peer = None;
         g.requested_bind = None;
@@ -583,6 +737,7 @@ impl UdpSocket {
                 self.wq.clone(),
                 move |actual, bound| {
                     let socket = commit.upgrade().ok_or(Errno::ECANCELED)?;
+                    let peer_backend = bound.peer_datagram();
                     let _control = socket.endpoint_control.lock().unwrap();
                     let actual = crate::endpoint::bind::validate(request, actual)?;
                     let options = {
@@ -633,6 +788,10 @@ impl UdpSocket {
                         g.opts.mc.admit_provider(&bound);
                     }
                     g.endpoint_bound = Some(bound);
+                    g.peer_datagram = peer_backend.clone();
+                    if let Some(backend) = peer_backend {
+                        g.backend = Some(backend);
+                    }
                     socket.claim_publication(&mut g, None);
                     socket.endpoint_join(&g, actual);
                     let group = socket.endpoint.group();
@@ -1176,6 +1335,9 @@ impl UdpSocket {
     /// The endpoint for traffic leaving the namespace, made on first use. It wakes this
     /// socket's queue, so waiters registered before it existed hear its datagrams.
     fn backend_endpoint(&self, g: &mut Inner) -> NetResult<Arc<dyn BackendDatagram>> {
+        if let Some(peer) = &g.peer_datagram {
+            return Ok(peer.clone());
+        }
         if let Some(b) = &g.backend {
             return Ok(b.clone());
         }
@@ -1195,6 +1357,9 @@ impl UdpSocket {
     /// Takes a publication that reaches the socket's bound address, if one is free (`id`, or
     /// any). The socket's lock is held.
     fn claim_publication(&self, g: &mut Inner, id: Option<u64>) -> bool {
+        if g.peer_datagram.is_some() {
+            return false;
+        }
         let Some(local) = g.local.filter(|_| g.published.is_none()) else {
             return false;
         };
@@ -1249,6 +1414,9 @@ impl UdpSocket {
     /// peer), it is the socket's way in and out; connected inside the namespace, nothing from
     /// outside is for the socket, so the endpoint drops what arrives.
     fn activate_publication(&self, g: &mut Inner) {
+        if g.peer_datagram.is_some() {
+            return;
+        }
         let Some((_, ep)) = g.published.clone() else {
             return;
         };
@@ -2820,7 +2988,7 @@ impl Socket for UdpSocket {
             ConnectRoute::External { .. } | ConnectRoute::Namespace(Path::Backend { .. })
                 if provider_selected =>
             {
-                g.backend = None;
+                g.backend = g.peer_datagram.clone();
                 if let Some((_, ep)) = &g.published {
                     let _ = ep.attach(None);
                 }
@@ -2835,7 +3003,7 @@ impl Socket for UdpSocket {
             ConnectRoute::Namespace(
                 Path::Local { .. } | Path::Dns { .. } | Path::Nowhere { .. },
             ) => {
-                g.backend = None;
+                g.backend = g.peer_datagram.clone();
                 if let Some((_, ep)) = &g.published {
                     let _ = ep.attach(None);
                 }
@@ -3146,6 +3314,62 @@ impl Socket for UdpSocket {
 
     fn graft(&self, ino: u64) {
         self.ino.store(ino, Ordering::Relaxed);
+    }
+
+    fn datagram_readback_admission(
+        &self,
+        query: DatagramReadback,
+    ) -> NetResult<Option<Box<dyn DatagramReadbackAdmission>>> {
+        let (bound, backend, source, domain) = {
+            let g = self.lock();
+            // The old connected UDP peer is canonical first. Querying the
+            // remote provider instead would lose the original logical peer.
+            if query == DatagramReadback::Peer && g.peer.is_some() {
+                return Ok(None);
+            }
+            let Some(bound) = g.endpoint_bound.clone() else {
+                return Ok(None);
+            };
+            let Some(backend) = g.peer_datagram.clone() else {
+                return Ok(None);
+            };
+            (bound, backend, self.endpoint.source(), self.domain())
+        };
+        // The bound hook ran ONCE during bind capture. Readbacks validate the
+        // captured role, never call a live capability selector again.
+        if let Some((level, name)) = query.option_key() {
+            // Reuse the existing canonical scalar validation (no SO_ERROR or
+            // other consuming getter is in this closed set). No duplicate
+            // getter runs on the default-None path.
+            self.get_option(level, name, &mut [0; 4])?;
+        }
+        {
+            let g = self.lock();
+            if self.endpoint.source() != source
+                || !g
+                    .endpoint_bound
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &bound))
+                || !g
+                    .peer_datagram
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &backend))
+            {
+                return Err(Errno::ECANCELED);
+            }
+        }
+        Ok(Some(Box::new(ReadbackSubscription(Arc::new(
+            ReadbackTxn {
+                socket: self.me.clone(),
+                bound,
+                backend,
+                source,
+                query,
+                domain,
+                queue: self.wq.clone(),
+                state: Mutex::new(ReadbackState::default()),
+            },
+        )))))
     }
 
     fn get_option(&self, level: i32, name: i32, out: &mut [u8]) -> NetResult<usize> {
