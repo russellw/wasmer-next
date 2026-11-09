@@ -147,6 +147,10 @@ impl Driver {
                     Poll::Pending => {}
                 }
             }
+            if self.stopped {
+                transport.close();
+                return Poll::Ready(Ok(()));
+            }
             if self.input.is_none() {
                 match transport.poll_recv(cx) {
                     Poll::Ready(Ok(event)) => {
