@@ -1080,12 +1080,19 @@ impl Driver {
                     request, socket, ..
                 },
             ) => {
+                let accepting = |resource: &Arc<Resource>| {
+                    let state = resource.state.lock().unwrap();
+                    resource.generation == self.generation
+                        && !state.close_requested
+                        && !state.closing
+                        && state.close.is_none()
+                };
                 self.pending.contains_key(request)
-                    && (inner.flows.get(socket).is_some_and(|flow| !flow.released)
-                        || inner
-                            .listeners
-                            .get(socket)
-                            .is_some_and(|listener| !listener.released))
+                    && (inner.flows.get(socket).is_some_and(|flow| {
+                        !flow.released && flow.selected.as_ref().is_some_and(accepting)
+                    }) || inner.listeners.get(socket).is_some_and(|listener| {
+                        !listener.released && listener.selected.as_ref().is_some_and(accepting)
+                    }))
             }
             Some(
                 Command::Send {
