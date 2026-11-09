@@ -54,6 +54,11 @@ impl Pollable for PendingStream {
     }
 }
 impl BackendStream for PendingStream {
+    fn tcp_option_policy(&self) -> Option<crate::TcpOptionPolicy> {
+        self.stream()
+            .ok()
+            .and_then(|stream| stream.tcp_option_policy())
+    }
     fn async_options(&self) -> bool {
         self.stream().is_ok_and(|stream| stream.async_options())
     }

@@ -379,6 +379,43 @@ fn backend_option(opts: &SockOpts, level: i32, name: i32) -> Option<(i32, i32, V
 }
 
 impl TcpSocket {
+    fn fixed_option(level: i32, name: i32) -> bool {
+        (level, name) == (SocketLevel::SOL_TCP.0, TcpOption::TCP_NODELAY.0)
+            || (level, name) == (SocketLevel::SOL_SOCKET.0, SocketOption::SO_KEEPALIVE.0)
+            || (level, name) == (SocketLevel::SOL_SOCKET.0, SocketOption::SO_LINGER.0)
+    }
+
+    fn option_policy(g: &Inner) -> Option<crate::TcpOptionPolicy> {
+        match &g.state {
+            State::Connecting(Transport::Remote(stream), _)
+            | State::Connected(Transport::Remote(stream), _) => stream.tcp_option_policy(),
+            _ => Some(crate::TcpOptionPolicy::Canonical),
+        }
+    }
+
+    fn normalize_options(
+        opts: &mut SockOpts,
+        policy: Option<crate::TcpOptionPolicy>,
+        bound: bool,
+    ) -> NetResult<()> {
+        if policy == Some(crate::TcpOptionPolicy::FixedTcpDefaults) {
+            opts.set(
+                SocketLevel::SOL_TCP.0,
+                TcpOption::TCP_NODELAY.0,
+                &1i32.to_le_bytes(),
+                bound,
+            )?;
+            opts.set(
+                SocketLevel::SOL_SOCKET.0,
+                SocketOption::SO_KEEPALIVE.0,
+                &0i32.to_le_bytes(),
+                bound,
+            )?;
+            opts.linger = None;
+        }
+        Ok(())
+    }
+
     pub(crate) fn new(net: Arc<Net>, domain: Domain, uid: u32) -> Arc<Self> {
         Self::with_state(
             net,
@@ -575,12 +612,20 @@ impl TcpSocket {
             txn.wake();
             return;
         }
+        let policy = result.is_ok().then(|| Self::option_policy(&g)).flatten();
         let mut push = None;
         if let Some((level, name, value)) = &txn.request
             && result.is_ok()
         {
             let bound = g.local.is_some();
-            result = g.opts.set(*level, *name, value, bound).map(|_| ());
+            let mut candidate = g.opts.clone();
+            result = candidate.set(*level, *name, value, bound).map(|_| ());
+            if result.is_ok() {
+                result = Self::normalize_options(&mut candidate, policy, bound);
+            }
+            if result.is_ok() {
+                g.opts = candidate;
+            }
             if result.is_ok()
                 && *level == SocketLevel::SOL_TCP.0
                 && *name == TcpOption::TCP_NODELAY.0
@@ -599,6 +644,14 @@ impl TcpSocket {
         }
         let mut close = None;
         if txn.request.is_none() {
+            if result.is_ok() {
+                let bound = g.local.is_some();
+                let mut candidate = g.opts.clone();
+                result = Self::normalize_options(&mut candidate, policy, bound);
+                if result.is_ok() {
+                    g.opts = candidate;
+                }
+            }
             g.option_startup = false;
             if let Err(error) = result {
                 g.option_startup_error = Some(error);
@@ -1175,7 +1228,9 @@ impl TcpSocket {
         if let Some(namespace) = self.net.endpoints() {
             self.endpoint.renew(&namespace);
         }
-        let abort = abort || g.opts.linger == Some(0);
+        let abort = abort
+            || (g.opts.linger == Some(0)
+                && Self::option_policy(&g) == Some(crate::TcpOptionPolicy::Canonical));
         let old = std::mem::replace(&mut g.state, State::Closed);
         if let Some(local) = g.local.take() {
             self.net.state().tcp.unbind(self.id, local.port());
@@ -2187,6 +2242,17 @@ impl Socket for TcpSocket {
 
     fn get_option(&self, level: i32, name: i32, out: &mut [u8]) -> NetResult<usize> {
         let mut g = self.lock();
+        if Self::fixed_option(level, name)
+            && Self::option_policy(&g) == Some(crate::TcpOptionPolicy::FixedTcpDefaults)
+        {
+            let mut fixed = g.opts.clone();
+            Self::normalize_options(
+                &mut fixed,
+                Some(crate::TcpOptionPolicy::FixedTcpDefaults),
+                g.local.is_some(),
+            )?;
+            return fixed.get(level, name, out);
+        }
         if crate::mcast::handles(level, name) {
             return g.opts.get_mcast(&self.net, level, name, out);
         }
@@ -2323,6 +2389,7 @@ mod option_tests {
     struct DeferredStream {
         pending: Mutex<VecDeque<(Batch, Done)>>,
         synchronous: bool,
+        policy: Mutex<Option<crate::TcpOptionPolicy>>,
         sync_calls: Mutex<usize>,
         inline: bool,
         on_start: Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -2334,6 +2401,7 @@ mod option_tests {
             Arc::new(Self {
                 pending: Mutex::default(),
                 synchronous: false,
+                policy: Mutex::new(Some(crate::TcpOptionPolicy::Canonical)),
                 sync_calls: Mutex::new(0),
                 inline: false,
                 on_start: Mutex::new(None),
@@ -2355,6 +2423,9 @@ mod option_tests {
     }
 
     impl BackendStream for DeferredStream {
+        fn tcp_option_policy(&self) -> Option<crate::TcpOptionPolicy> {
+            *self.policy.lock().unwrap()
+        }
         fn async_options(&self) -> bool {
             !self.synchronous
         }
@@ -2709,6 +2780,7 @@ mod option_tests {
         let stream = Arc::new(DeferredStream {
             pending: Mutex::default(),
             synchronous: true,
+            policy: Mutex::new(Some(crate::TcpOptionPolicy::Canonical)),
             sync_calls: Mutex::new(0),
             inline: false,
             on_start: Mutex::new(None),
@@ -2741,6 +2813,7 @@ mod option_tests {
         let stream = Arc::new(DeferredStream {
             pending: Mutex::default(),
             synchronous: false,
+            policy: Mutex::new(Some(crate::TcpOptionPolicy::Canonical)),
             sync_calls: Mutex::new(0),
             inline: true,
             on_start: Mutex::new(None),
@@ -2844,5 +2917,273 @@ mod option_tests {
         assert!(matches!(g.state, State::Closed));
         assert!(g.option_active.is_none());
         assert!(!g.option_startup);
+    }
+
+    fn profiled(policy: Option<crate::TcpOptionPolicy>) -> Arc<DeferredStream> {
+        let stream = DeferredStream::new();
+        *stream.policy.lock().unwrap() = policy;
+        stream
+    }
+
+    fn profile_startup(socket: &Arc<TcpSocket>, stream: &Arc<DeferredStream>) -> Arc<OptionTxn> {
+        let (txn, batch) = {
+            let mut g = socket.inner.lock().unwrap();
+            let target: Arc<dyn BackendStream> = stream.clone();
+            socket
+                .prepare_options(&mut g, &target, Weak::new())
+                .unwrap()
+        };
+        TcpSocket::dispatch_options(txn.clone(), stream.clone(), batch);
+        txn
+    }
+
+    fn profile_get(socket: &dyn Socket, level: i32, name: i32) -> Vec<u8> {
+        let mut value = [0xaa; 8];
+        let n = socket.get_option(level, name, &mut value).unwrap();
+        value[..n].to_vec()
+    }
+
+    #[test]
+    fn fixed_profile_initial_getters_and_empty_startup_preserve_layout_before_publication() {
+        let stream = profiled(Some(crate::TcpOptionPolicy::FixedTcpDefaults));
+        let socket = connected(stream.clone());
+        assert_eq!(nodelay(&*socket), 1);
+        assert_eq!(
+            profile_get(
+                &*socket,
+                SocketLevel::SOL_SOCKET.0,
+                SocketOption::SO_KEEPALIVE.0
+            ),
+            0i32.to_le_bytes()
+        );
+        assert_eq!(
+            profile_get(
+                &*socket,
+                SocketLevel::SOL_SOCKET.0,
+                SocketOption::SO_LINGER.0
+            ),
+            [0; 8]
+        );
+        let mut short = [0xaa; 2];
+        assert_eq!(
+            socket.get_option(SocketLevel::SOL_TCP.0, TcpOption::TCP_NODELAY.0, &mut short),
+            Ok(2)
+        );
+        assert_eq!(short, [1, 0]);
+        let txn = profile_startup(&socket, &stream);
+        assert_eq!(txn.result(), None);
+        assert!(socket.inner.lock().unwrap().option_startup);
+        assert_eq!(
+            socket
+                .inner
+                .lock()
+                .unwrap()
+                .opts
+                .int(SocketLevel::SOL_TCP.0, TcpOption::TCP_NODELAY.0),
+            0
+        );
+        assert!(stream.complete(Ok(())).is_empty());
+        assert_eq!(txn.result(), Some(Ok(())));
+        let g = socket.inner.lock().unwrap();
+        assert!(!g.option_startup);
+        assert_eq!(
+            g.opts.int(SocketLevel::SOL_TCP.0, TcpOption::TCP_NODELAY.0),
+            1
+        );
+        assert_eq!(
+            g.opts
+                .int(SocketLevel::SOL_SOCKET.0, SocketOption::SO_KEEPALIVE.0),
+            0
+        );
+        assert_eq!(g.opts.linger, None);
+    }
+
+    #[test]
+    fn fixed_profile_inherited_startup_and_requested_updates_keep_actual_channel_values() {
+        let parent = TcpSocket::new(Net::new(NetConfig::default(), None), Domain::Inet, 1);
+        parent
+            .set_option(
+                SocketLevel::SOL_TCP.0,
+                TcpOption::TCP_NODELAY.0,
+                &0i32.to_le_bytes(),
+            )
+            .unwrap();
+        parent
+            .set_option(
+                SocketLevel::SOL_SOCKET.0,
+                SocketOption::SO_KEEPALIVE.0,
+                &1i32.to_le_bytes(),
+            )
+            .unwrap();
+        parent
+            .set_option(
+                SocketLevel::SOL_SOCKET.0,
+                SocketOption::SO_LINGER.0,
+                &[1, 0, 0, 0, 0, 0, 0, 0],
+            )
+            .unwrap();
+        let stream = profiled(Some(crate::TcpOptionPolicy::FixedTcpDefaults));
+        let socket = parent.new_child(
+            addr("127.0.0.1:12345"),
+            addr("127.0.0.1:23456"),
+            WaitQueue::new(),
+            |_, _| Transport::Remote(stream.clone()),
+        );
+        let txn = profile_startup(&socket, &stream);
+        assert_eq!(stream.complete(Ok(())).len(), 3);
+        assert_eq!(txn.result(), Some(Ok(())));
+        assert_eq!(parent.inner.lock().unwrap().opts.linger, Some(0));
+        for (level, name, value) in [
+            (
+                SocketLevel::SOL_TCP.0,
+                TcpOption::TCP_NODELAY.0,
+                0i32.to_le_bytes().to_vec(),
+            ),
+            (
+                SocketLevel::SOL_SOCKET.0,
+                SocketOption::SO_KEEPALIVE.0,
+                1i32.to_le_bytes().to_vec(),
+            ),
+            (
+                SocketLevel::SOL_SOCKET.0,
+                SocketOption::SO_LINGER.0,
+                vec![1, 0, 0, 0, 0, 0, 0, 0],
+            ),
+        ] {
+            let update = socket
+                .set_option_admission(level, name, &value)
+                .unwrap()
+                .unwrap();
+            assert_eq!(update.complete_result(), None);
+            stream.complete(Ok(()));
+            assert_eq!(update.complete_result(), Some(Ok(())));
+        }
+        assert_eq!(nodelay(&*socket), 1);
+        assert_eq!(
+            profile_get(
+                &*socket,
+                SocketLevel::SOL_SOCKET.0,
+                SocketOption::SO_KEEPALIVE.0
+            ),
+            0i32.to_le_bytes()
+        );
+        assert_eq!(
+            profile_get(
+                &*socket,
+                SocketLevel::SOL_SOCKET.0,
+                SocketOption::SO_LINGER.0
+            ),
+            [0; 8]
+        );
+        socket.release_inner(false);
+        assert_eq!(*stream.sync_calls.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn stored_profile_keeps_requested_metadata_without_linger_derived_close() {
+        let stream = profiled(Some(crate::TcpOptionPolicy::StoredLingerWithoutClose));
+        let socket = connected(stream.clone());
+        for (level, name, value) in [
+            (
+                SocketLevel::SOL_TCP.0,
+                TcpOption::TCP_NODELAY.0,
+                1i32.to_le_bytes().to_vec(),
+            ),
+            (
+                SocketLevel::SOL_SOCKET.0,
+                SocketOption::SO_KEEPALIVE.0,
+                1i32.to_le_bytes().to_vec(),
+            ),
+            (
+                SocketLevel::SOL_SOCKET.0,
+                SocketOption::SO_LINGER.0,
+                vec![1, 0, 0, 0, 0, 0, 0, 0],
+            ),
+        ] {
+            let update = socket
+                .set_option_admission(level, name, &value)
+                .unwrap()
+                .unwrap();
+            assert_eq!(update.complete_result(), None);
+            stream.complete(Ok(()));
+            assert_eq!(update.complete_result(), Some(Ok(())));
+            assert_eq!(profile_get(&*socket, level, name), value);
+        }
+        socket.release_inner(false);
+        assert_eq!(*stream.sync_calls.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn profile_unknown_and_metadata_do_not_fabricate_normal_abort_but_explicit_abort_is_retained() {
+        for (policy, normal) in [
+            (None, 0),
+            (Some(crate::TcpOptionPolicy::FixedTcpDefaults), 0),
+            (Some(crate::TcpOptionPolicy::StoredLingerWithoutClose), 0),
+            (Some(crate::TcpOptionPolicy::Canonical), 1),
+        ] {
+            for abort in [false, true] {
+                let stream = profiled(policy);
+                let socket = connected(stream.clone());
+                socket.inner.lock().unwrap().opts.linger = Some(0);
+                socket.release_inner(abort);
+                assert_eq!(
+                    *stream.sync_calls.lock().unwrap(),
+                    if abort { 1 } else { normal }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fixed_profile_failed_completion_and_invalid_request_preserve_storage_and_original_error() {
+        let stream = profiled(Some(crate::TcpOptionPolicy::FixedTcpDefaults));
+        let socket = connected(stream.clone());
+        assert!(matches!(
+            socket.set_option_admission(
+                SocketLevel::SOL_SOCKET.0,
+                SocketOption::SO_LINGER.0,
+                &[1, 0, 0, 0]
+            ),
+            Err(Errno::EINVAL)
+        ));
+        assert!(stream.pending.lock().unwrap().is_empty());
+        let update = admission(&socket, 0);
+        assert_eq!(update.complete_result(), None);
+        stream.complete(Err(Errno::EACCES));
+        assert_eq!(update.complete_result(), Some(Err(Errno::EACCES)));
+        assert_eq!(
+            socket
+                .inner
+                .lock()
+                .unwrap()
+                .opts
+                .int(SocketLevel::SOL_TCP.0, TcpOption::TCP_NODELAY.0),
+            0
+        );
+        assert_eq!(nodelay(&*socket), 1);
+        assert!(socket.inner.lock().unwrap().option_active.is_none());
+    }
+
+    #[test]
+    fn fixed_profile_late_old_resource_completion_cannot_normalize_replacement() {
+        let old = profiled(Some(crate::TcpOptionPolicy::FixedTcpDefaults));
+        let socket = connected(old.clone());
+        let update = admission(&socket, 0);
+        assert_eq!(update.complete_result(), None);
+        let replacement = DeferredStream::new();
+        socket.inner.lock().unwrap().state =
+            State::Connected(Transport::Remote(replacement), addr("192.0.2.1:81"));
+        old.complete(Ok(()));
+        assert_eq!(update.complete_result(), Some(Err(Errno::ECANCELED)));
+        assert_eq!(nodelay(&*socket), 0);
+        assert_eq!(
+            socket
+                .inner
+                .lock()
+                .unwrap()
+                .opts
+                .int(SocketLevel::SOL_TCP.0, TcpOption::TCP_NODELAY.0),
+            0
+        );
     }
 }

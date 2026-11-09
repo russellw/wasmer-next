@@ -1086,6 +1086,17 @@ pub enum StreamState {
     Closed,
 }
 
+/// Immutable option semantics of the same actual stream resource.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TcpOptionPolicy {
+    #[default]
+    Canonical,
+    /// Channel-backed streams ignore these setters and expose fixed values.
+    FixedTcpDefaults,
+    /// Linger is requested metadata, without a derived close action.
+    StoredLingerWithoutClose,
+}
+
 /// A stream through the backend, non-blocking like a guest socket. `poll` reports what
 /// `tcp_poll` would for the guest socket it carries; it registers nothing, since the stream
 /// wakes the guest socket's queue (see [`Backend`]), with `PRI` for a new urgent mark.
@@ -1093,6 +1104,13 @@ pub enum StreamState {
 /// Urgent data follows `tcp_recvmsg` and `tcp_recv_urg` as [`crate::RecvQueue`] keeps them,
 /// with the guest's `SO_OOBINLINE`, which arrives through `set_option`.
 pub trait BackendStream: Pollable {
+    /// Pure, bounded metadata; never performs I/O or reenters a socket/backend.
+    /// None means the actual stream has not yet been classified. A provider
+    /// publishes its immutable policy before completing startup/readiness.
+    fn tcp_option_policy(&self) -> Option<TcpOptionPolicy> {
+        Some(TcpOptionPolicy::Canonical)
+    }
+
     /// Whether physical options require owned completion. This getter is bounded
     /// and nonreentrant; it may run under a socket lock. The physical stream's
     /// capability is immutable; a reserved PendingStream returns false until it
