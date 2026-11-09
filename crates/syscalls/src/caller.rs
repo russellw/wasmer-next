@@ -1,4 +1,54 @@
+use crate::control::ExecutionFault;
 use crate::memory::UserMemory;
+use std::sync::Mutex;
+use wasixv2_abi::SiCode;
+
+/// Host-only metadata copied from the exact completion selected by `waitid`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WaitCompletion {
+    /// The selected child's pid in the waiting caller's namespace.
+    pub pid: u32,
+    /// The same reason written to the caller's `siginfo`.
+    pub code: SiCode,
+    /// The same exit status or signal written to the caller's `siginfo`.
+    pub status: i32,
+    /// Execution provenance, never inferred from a fatal signal number.
+    pub fault: Option<ExecutionFault>,
+}
+
+#[derive(Clone, Copy, Default)]
+enum WaitCompletionState {
+    #[default]
+    Empty,
+    One(WaitCompletion),
+    Ambiguous,
+}
+
+/// A fresh, borrowed output for one wait call, with no process or kernel custody.
+/// Repeated publication permanently makes the optional provenance unavailable.
+#[derive(Default)]
+pub struct WaitCompletionSlot(Mutex<WaitCompletionState>);
+
+impl WaitCompletionSlot {
+    /// Publishes once; duplicate publication invalidates the slot without a guest error.
+    pub fn publish(&self, completion: WaitCompletion) {
+        let mut state = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
+        *state = match *state {
+            WaitCompletionState::Empty => WaitCompletionState::One(completion),
+            WaitCompletionState::One(_) | WaitCompletionState::Ambiguous => {
+                WaitCompletionState::Ambiguous
+            }
+        };
+    }
+
+    /// The one unambiguous completion after the wait returns, if the provider supplied it.
+    pub fn get(&self) -> Option<WaitCompletion> {
+        match *self.0.lock().unwrap_or_else(|poison| poison.into_inner()) {
+            WaitCompletionState::One(completion) => Some(completion),
+            WaitCompletionState::Empty | WaitCompletionState::Ambiguous => None,
+        }
+    }
+}
 
 /// Identifies a task (a thread, in Linux terms) inside one kernel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -13,6 +63,7 @@ pub struct Caller<'a> {
     installations: Option<crate::DescriptorInstallations>,
     functions: Option<&'a dyn crate::FunctionOperations>,
     process_fork_allowed: bool,
+    wait_completion: Option<&'a WaitCompletionSlot>,
 }
 
 impl<'a> Caller<'a> {
@@ -25,6 +76,7 @@ impl<'a> Caller<'a> {
             installations: None,
             functions: None,
             process_fork_allowed: true,
+            wait_completion: None,
         }
     }
 
@@ -61,6 +113,17 @@ impl<'a> Caller<'a> {
 
     pub fn task(&self) -> TaskId {
         self.task
+    }
+
+    /// Borrows a fresh output for this exact wait invocation through ordinary dispatch.
+    pub fn with_wait_completion(mut self, slot: &'a WaitCompletionSlot) -> Self {
+        self.wait_completion = Some(slot);
+        self
+    }
+
+    /// The optional host-only completion output; the kernel must not retain the borrow.
+    pub fn wait_completion(&self) -> Option<&'a WaitCompletionSlot> {
+        self.wait_completion
     }
 
     pub fn memory(&self) -> &'a dyn UserMemory {

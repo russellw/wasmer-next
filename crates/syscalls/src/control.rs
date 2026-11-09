@@ -16,6 +16,13 @@ use crate::{
     memory::{LocalFuture, PageAccess},
 };
 
+/// Execution-owned provenance of a fault that won a process's group exit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecutionFault {
+    /// An actual guest invocation returned an unhandled WebAssembly trap.
+    WasmTrap,
+}
+
 /// Work the execution layer must do before control returns to the guest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GuestAction {
@@ -327,6 +334,13 @@ pub trait Control:
     fn fault(&self, task: TaskId, signal: i32) -> bool {
         let _ = (task, signal);
         true
+    }
+
+    /// Like [`Self::fault`], with provenance supplied only by the guest invocation.
+    /// Providers without completion provenance retain their ordinary fault behavior.
+    fn fault_with_cause(&self, task: TaskId, signal: i32, cause: ExecutionFault) -> bool {
+        let _ = cause;
+        self.fault(task, signal)
     }
 
     /// The execution layer is done with `task`: its instance ended, or the vfork child stopped

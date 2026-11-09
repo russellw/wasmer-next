@@ -21,9 +21,9 @@ use wasixv2_abi::{
     Siginfo, SiginfoPtr, Signal, Ulong, Uptr, Usize, WaitOptions,
 };
 use wasixv2_syscalls::{
-    BINPRM_BUF_SIZE, Binfmt, Caller, CpuAccount, CpuTimes, CstrError, Errno, Fd, GroupCpu,
-    GuestAction, Image, LocalFuture, Resume, SysErr, SysResult, TaskId, VforkParent, WorkFlag,
-    read_cstr, read_value, write_value,
+    BINPRM_BUF_SIZE, Binfmt, Caller, CpuAccount, CpuTimes, CstrError, Errno, ExecutionFault, Fd,
+    GroupCpu, GuestAction, Image, LocalFuture, Resume, SysErr, SysResult, TaskId, VforkParent,
+    WaitCompletion, WorkFlag, read_cstr, read_value, write_value,
 };
 use wasixv2_vfs::{Cap, FileType, LookupFlags, MAY_EXEC, OpenHow, Path};
 use wasixv2_wait::{PollMask, PollTable, Pollable, WaitQueue, poll_wait, wait_event};
@@ -199,6 +199,8 @@ pub(crate) struct Node {
     forked: bool,
     /// The signal whose default action killed the process.
     killed_by: Option<i32>,
+    /// Claimed with the first group exit, never inferred from the signal number.
+    execution_fault: Option<ExecutionFault>,
     /// Set once the process exited; it is a zombie until reaped.
     exit: Option<Exit>,
     /// `EXIT_TRACE`: only the ptracer may consume this zombie until it detaches/reaps.
@@ -286,6 +288,7 @@ pub(crate) struct Exit {
     pub(crate) status: i32,
     /// The process's real uid when it exited.
     pub(crate) uid: Kuid,
+    pub(crate) execution_fault: Option<ExecutionFault>,
 }
 
 impl Exit {
@@ -334,6 +337,7 @@ impl Procs {
                 did_exec: false,
                 forked,
                 killed_by: None,
+                execution_fault: None,
                 exit: None,
                 ptrace_hidden: false,
                 pidfs: None,
@@ -347,6 +351,18 @@ impl Procs {
         let tree = self.tree.lock_or_recover();
         if let Some(attr) = tree.nodes.get(&pid).and_then(|node| node.pidfs.as_ref()) {
             let _ = attr.coredump.set(how);
+        }
+    }
+
+    /// Called only by the winning group-exit claim, with its state lock held.
+    pub(crate) fn claim_fatal_exit(&self, pid: u32, signal: i32, fault: Option<ExecutionFault>) {
+        let mut tree = self.tree.lock_or_recover();
+        if let Some(node) = tree.nodes.get_mut(&pid)
+            && node.exit.is_none()
+            && node.killed_by.is_none()
+        {
+            node.killed_by = Some(signal);
+            node.execution_fault = fault;
         }
     }
 
@@ -669,20 +685,14 @@ impl Kernel {
 
     /// The signal whose default action killed the process `pid`, if one did.
     pub(crate) fn killed_by(&self, pid: u32) -> Option<i32> {
-        let tree = self.procs.tree.lock_or_recover();
-        tree.nodes.get(&pid).and_then(|node| node.killed_by)
+        self.fatal_completion(pid).map(|(signal, _)| signal)
     }
 
-    /// Records that a signal's default action is killing the process `task` belongs to, so its
-    /// parent sees `WIFSIGNALED`.
-    pub(crate) fn note_killed(&self, task: TaskId, sig: i32) {
-        let pid = self.process(task).pid.0;
-        let mut tree = self.procs.tree.lock_or_recover();
-        if let Some(node) = tree.nodes.get_mut(&pid)
-            && node.exit.is_none()
-        {
-            node.killed_by.get_or_insert(sig);
-        }
+    pub(crate) fn fatal_completion(&self, pid: u32) -> Option<(i32, Option<ExecutionFault>)> {
+        let tree = self.procs.tree.lock_or_recover();
+        tree.nodes
+            .get(&pid)
+            .and_then(|node| node.killed_by.map(|signal| (signal, node.execution_fault)))
     }
 
     /// The end of `zap_pid_ns_processes` after a `reboot` in the pid namespace whose init is
@@ -693,6 +703,7 @@ impl Kernel {
             && node.exit.is_none()
         {
             node.killed_by = Some(sig);
+            node.execution_fault = None;
         }
     }
 
@@ -770,11 +781,13 @@ impl Kernel {
                     },
                     status: sig,
                     uid,
+                    execution_fault: node.execution_fault,
                 },
                 None => Exit {
                     code: SiCode::CLD_EXITED,
                     status: status & 0xff,
                     uid,
+                    execution_fault: None,
                 },
             };
             node.exit = Some(exit);
@@ -1022,6 +1035,7 @@ impl Kernel {
                 code: why,
                 status,
                 uid,
+                execution_fault: None,
             };
             // SIGCHLD needs no room in a queue.
             let ns = self.user_ns_of(parent);
@@ -2327,11 +2341,23 @@ impl Kernel {
         self.unhash_reaped();
         self.pid_ns_progress();
         let ready = found.is_some();
-        let (info, usage) = match found {
+        let (info, usage, completion) = match found {
             Some((pid, exit, child)) => {
                 let usage = child.usage_both();
                 let ns = self.cred(caller).user_ns.clone();
-                (child_info(Signal::SIGCHLD.0, pid, exit, &ns), usage)
+                (
+                    child_info(Signal::SIGCHLD.0, pid, exit, &ns),
+                    usage,
+                    u32::try_from(pid)
+                        .ok()
+                        .filter(|pid| *pid != 0)
+                        .map(|pid| WaitCompletion {
+                            pid,
+                            code: exit.code,
+                            status: exit.status,
+                            fault: exit.execution_fault,
+                        }),
+                )
             }
             None => (
                 Siginfo {
@@ -2341,6 +2367,7 @@ impl Kernel {
                     sifields: [0; 116],
                 },
                 Rusage::default(),
+                None,
             ),
         };
         if !ready && !report_empty {
@@ -2356,6 +2383,9 @@ impl Kernel {
         // explicit WNOHANG reports zero. sys_waitid still copies siginfo on EAGAIN.
         if !ready && nonblocking_pidfd && !requested_nohang {
             return Err(Errno::EAGAIN.into());
+        }
+        if let (Some(slot), Some(completion)) = (caller.wait_completion(), completion) {
+            slot.publish(completion);
         }
         Ok(ready)
     }
@@ -2453,12 +2483,14 @@ impl Kernel {
                 code: SiCode::CLD_STOPPED,
                 status: sig,
                 uid,
+                execution_fault: None,
             });
         }
         let continued = Exit {
             code: SiCode::CLD_CONTINUED,
             status: Signal::SIGCONT.0,
             uid,
+            execution_fault: None,
         };
         (options & WaitOptions::WCONTINUED.0 != 0 && signals.wait_continued(nowait))
             .then_some(continued)
