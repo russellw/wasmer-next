@@ -482,6 +482,21 @@ fn set(fd: RawFd, termios: &libc::termios, when: libc::c_int) -> io::Result<()> 
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
+    fn get(fd: RawFd) -> io::Result<libc::termios> {
+        // These fixtures never write PTY input. The raw-libc control below proves
+        // that XNU's deferred PENDIN clears after FIONREAD on an empty PTY, leaving
+        // every original termios field intact. Keep this observer test-local;
+        // tests with queued input must not use an empty-snapshot assertion.
+        let mut available: libc::c_int = -1;
+        // SAFETY: FIONREAD writes one int through the test's live PTY descriptor.
+        if unsafe { libc::ioctl(fd, libc::FIONREAD, &mut available) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        assert_eq!(available, 0, "termios snapshots require an empty test PTY");
+        super::get(fd)
+    }
+
     type SetHook = Box<dyn FnOnce() -> io::Result<()> + Send>;
     pub(super) static SET_HOOK: Mutex<Option<SetHook>> = Mutex::new(None);
     pub(super) static WAITS: std::sync::atomic::AtomicUsize =
