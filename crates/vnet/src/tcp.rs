@@ -281,6 +281,9 @@ struct ListenerInner {
     syn: VecDeque<(Arc<TcpSocket>, Arc<Conn>, SocketAddr)>,
 }
 
+type OptionBatch = Vec<(i32, i32, Vec<u8>)>;
+type OptionStartup = (Arc<OptionTxn>, OptionBatch);
+
 /// One option waiter or startup batch. Admitted callbacks retain this owner, not
 /// the socket, transport or namespace. A dropped subscriber cannot drop accepted work.
 struct OptionTxn {
@@ -481,7 +484,7 @@ impl TcpSocket {
         g: &mut Inner,
         stream: &Arc<dyn BackendStream>,
         listener: Weak<Listener>,
-    ) -> Option<(Arc<OptionTxn>, Vec<(i32, i32, Vec<u8>)>)> {
+    ) -> Option<OptionStartup> {
         if !stream.async_options() {
             return None;
         }
@@ -492,11 +495,7 @@ impl TcpSocket {
         Some((txn, batch))
     }
 
-    fn dispatch_options(
-        txn: Arc<OptionTxn>,
-        stream: Arc<dyn BackendStream>,
-        batch: Vec<(i32, i32, Vec<u8>)>,
-    ) {
+    fn dispatch_options(txn: Arc<OptionTxn>, stream: Arc<dyn BackendStream>, batch: OptionBatch) {
         if txn.result().is_some() {
             return;
         }
@@ -512,10 +511,10 @@ impl TcpSocket {
                 }
             }),
         );
-        if let Err(error) = result {
-            if let Some(socket) = txn.socket.upgrade() {
-                socket.finish_option(&txn, Err(error));
-            }
+        if let Err(error) = result
+            && let Some(socket) = txn.socket.upgrade()
+        {
+            socket.finish_option(&txn, Err(error));
         }
     }
 
@@ -577,23 +576,23 @@ impl TcpSocket {
             return;
         }
         let mut push = None;
-        if let Some((level, name, value)) = &txn.request {
-            if result.is_ok() {
-                let bound = g.local.is_some();
-                result = g.opts.set(*level, *name, value, bound).map(|_| ());
-                if result.is_ok()
-                    && *level == SocketLevel::SOL_TCP.0
-                    && *name == TcpOption::TCP_NODELAY.0
-                    && g.opts.flag(*level, *name)
-                {
-                    if let State::Connected(t, _) = &g.state {
-                        push = Some(t.clone());
-                    }
-                    if g.cork_armed {
-                        g.cork_armed = false;
-                        if let Some(arm) = &g.cork_timer {
-                            arm(false);
-                        }
+        if let Some((level, name, value)) = &txn.request
+            && result.is_ok()
+        {
+            let bound = g.local.is_some();
+            result = g.opts.set(*level, *name, value, bound).map(|_| ());
+            if result.is_ok()
+                && *level == SocketLevel::SOL_TCP.0
+                && *name == TcpOption::TCP_NODELAY.0
+                && g.opts.flag(*level, *name)
+            {
+                if let State::Connected(t, _) = &g.state {
+                    push = Some(t.clone());
+                }
+                if g.cork_armed {
+                    g.cork_armed = false;
+                    if let Some(arm) = &g.cork_timer {
+                        arm(false);
                     }
                 }
             }
