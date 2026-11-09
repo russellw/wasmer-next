@@ -646,16 +646,6 @@ pub(crate) enum ErrorOrigin {
     Other,
 }
 
-impl ErrorOrigin {
-    pub(crate) fn guest_result(result: &Result<(), RuntimeError>) -> Self {
-        if result.is_err() {
-            Self::GuestInvocation
-        } else {
-            Self::Other
-        }
-    }
-}
-
 fn guest_trap(origin: ErrorOrigin, error: &RuntimeError) -> bool {
     matches!(origin, ErrorOrigin::GuestInvocation)
         && !error.is_host_abort()
@@ -1337,8 +1327,7 @@ impl<S: Syscalls + Control + Send + Sync + 'static> Ready<S> {
                     }),
                 )
                 .await;
-                let origin = ErrorOrigin::guest_result(&result);
-                (result, origin)
+                (result, ErrorOrigin::GuestInvocation)
             }
             Err(e) => (Err(e), ErrorOrigin::Other),
         };
@@ -1410,8 +1399,7 @@ impl<S: Syscalls + Control + Send + Sync + 'static> Ready<S> {
                     }),
                 )
                 .await;
-                let origin = ErrorOrigin::guest_result(&result);
-                (result, origin)
+                (result, ErrorOrigin::GuestInvocation)
             }
             Err(err) => (Err(err), ErrorOrigin::Other),
         };

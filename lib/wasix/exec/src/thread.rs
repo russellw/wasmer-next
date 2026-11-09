@@ -659,8 +659,7 @@ where
                     }),
                 )
                 .await;
-                let origin = crate::ErrorOrigin::guest_result(&result);
-                (result, origin)
+                (result, crate::ErrorOrigin::GuestInvocation)
             }
             Err(err) => (Err(err), crate::ErrorOrigin::Other),
         };
