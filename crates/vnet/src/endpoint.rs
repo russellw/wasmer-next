@@ -104,6 +104,14 @@ pub struct EndpointBindRequest {
 pub trait EndpointBound: Pollable + Any {
     fn local_addr(&self) -> Result<SocketAddr, Errno>;
 
+    /// Optional source-only datagram interface on this SAME admitted resource.
+    /// A pure immutable capability getter: clone ONE stored Arc, never bind,
+    /// call user policy, start callbacks, or construct a release-on-Drop wrapper.
+    /// Strict DatagramInfo providers keep None and their existing ingress path.
+    fn peer_datagram(&self) -> Option<Arc<dyn crate::BackendDatagram>> {
+        None
+    }
+
     /// Applies an option to this exact admitted resource. Bounded and nonreentrant like
     /// transport data methods: never enter ANY WLK namespace, socket or ingress. The caller
     /// holds no network/socket state lock, but may serialize control operations separately.
