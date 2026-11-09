@@ -1926,6 +1926,26 @@ async fn return_to_guest<S: Syscalls + Control + 'static, R: From<i32>>(
 #[cfg(all(test, feature = "sys"))]
 mod loader_binding_tests {
     #[test]
+    fn only_an_actual_guest_error_can_supply_execution_fault_provenance() {
+        let trap = super::unreachable_trap().unwrap_err();
+        assert!(super::guest_trap(
+            super::ErrorOrigin::GuestInvocation,
+            &trap
+        ));
+        assert!(!super::guest_trap(super::ErrorOrigin::Other, &trap));
+        assert!(!super::guest_trap(
+            super::ErrorOrigin::GuestInvocation,
+            &wasmer::RuntimeError::new("unreachable")
+        ));
+        let abort = wasmer::RuntimeError::host_abort(Box::new(super::InstructionTrap(
+            super::TrapCode::UnreachableCodeReached,
+        )));
+        assert!(!super::guest_trap(
+            super::ErrorOrigin::GuestInvocation,
+            &abort
+        ));
+    }
+    #[test]
     fn registered_store_lives_exactly_as_long_as_its_execution_frame() {
         use wasixv2_syscalls::{LoaderGate, TaskId};
         let gate = LoaderGate::new(77);
