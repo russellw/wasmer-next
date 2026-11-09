@@ -7,6 +7,14 @@ on:
         description: Exact private WLK candidate commit
         required: true
         type: string
+      mode:
+        description: Original terminal acceptance or isolated native empty-PTY control
+        required: true
+        default: acceptance
+        type: choice
+        options:
+          - acceptance
+          - diagnostic
 
 permissions:
   contents: read
@@ -33,6 +41,7 @@ jobs:
         timeout-minutes: 24
         env:
           EXPECTED_CANDIDATE: ${{ inputs.candidate_ref }}
+          TERMINAL_TEST_MODE: ${{ inputs.mode }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -140,11 +149,22 @@ jobs:
           def command(subcommand, *args):
               return [base[0], subcommand, *base[1:], "--locked", *args]
           profile = ["-p", "wasixv2-host", "--no-default-features", "--features", "terminal"]
-          text = run("terminal-tests", command("test", *profile, "--lib", "terminal::tests", "--", "--nocapture"), 600, 1024**3)
+          mode = env["TERMINAL_TEST_MODE"]
+          if mode not in {"acceptance", "diagnostic"}:
+              raise RuntimeError("unknown terminal test mode")
+          test_filter = "terminal::tests"
+          test_options = ["--nocapture"]
+          if mode == "diagnostic":
+              test_filter = "terminal::tests::macos_native_empty_pty_reinput_query_preserves_termios_snapshot"
+              listing = run("terminal-list", command("test", *profile, "--lib", test_filter, "--", "--exact", "--list"), 600, 1024**3)
+              if listing.splitlines().count(test_filter + ": test") != 1:
+                  raise RuntimeError("expected exactly one native empty-PTY control")
+              test_options.append("--exact")
+          text = run("terminal-tests", command("test", *profile, "--lib", test_filter, "--", *test_options), 600, 1024**3)
           counts = [int(n) for n in re.findall(r"test result: ok\. (\d+) passed", text)]
           if not counts or sum(counts) == 0:
               raise RuntimeError("terminal profile executed no passing tests")
-          (evidence / "tests.json").write_text(json.dumps({"terminal": counts}, indent=2))
+          (evidence / "tests.json").write_text(json.dumps({"mode": mode, "filter": test_filter, "terminal": counts}, indent=2))
           run("terminal-clippy", command("clippy", *profile, "--all-targets", "--", "-D", "clippy::all"), 600, 2 * 1024**3)
           if fingerprint() != source_hash:
               raise RuntimeError("final candidate source fingerprint changed")
@@ -162,7 +182,7 @@ jobs:
           source = root / "evidence"
           output = root / "upload"
           output.mkdir(parents=True, exist_ok=True)
-          phases = ["toolchain", "terminal-tests", "terminal-clippy"]
+          phases = ["toolchain", "terminal-list", "terminal-tests", "terminal-clippy"]
           names = [p + ".log" for p in phases] + ["source.json", "runs.json", "rust.txt", "tests.json"]
           for name in names:
               path = source / name
