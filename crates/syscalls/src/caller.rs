@@ -202,6 +202,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn wait_completion_is_fresh_and_any_duplicate_permanently_invalidates_it() {
+        let completion = WaitCompletion {
+            pid: 7,
+            code: SiCode::CLD_KILLED,
+            status: 4,
+            fault: Some(ExecutionFault::WasmTrap),
+        };
+        let slot = WaitCompletionSlot::default();
+        assert_eq!(slot.get(), None);
+        slot.publish(completion);
+        assert_eq!(slot.get(), Some(completion));
+        slot.publish(completion);
+        assert_eq!(
+            slot.get(),
+            None,
+            "even an identical second publication is ambiguous"
+        );
+        slot.publish(WaitCompletion {
+            pid: 8,
+            ..completion
+        });
+        assert_eq!(slot.get(), None, "ambiguity cannot be overwritten");
+        assert_eq!(WaitCompletionSlot::default().get(), None);
+    }
+
+    #[test]
     fn a_task_is_current_only_while_its_run_is_polled() {
         assert_eq!(current_task(), None);
         let inner = as_task(TaskId(7), async { current_task() });
