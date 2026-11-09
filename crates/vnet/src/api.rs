@@ -600,8 +600,18 @@ pub trait BindAdmission: Pollable {
     }
 }
 
+/// An owned, optional socket-option operation. Dropping a waiter does not cancel
+/// a physical operation which its transport has already accepted.
+pub trait OptionAdmission: Pollable {
+    /// `None` while pending, including while another option owns the transport.
+    /// A completed `EAGAIN` is a result, rather than a request to replay work.
+    fn complete_result(&self) -> Option<Result<(), Errno>>;
+}
+
 pub trait Socket: Pollable {
     /// Kernel timer hook for TCP's 200 ms cork ceiling (TCP_RTO_MIN).
+    /// Like the existing synchronous setter, option commit may call this hook
+    /// under the socket lock; it must be bounded and must not reenter a socket.
     fn set_cork_timer(&self, arm: Box<dyn Fn(bool) + Send + Sync>) {
         let _ = arm;
     }
@@ -710,6 +720,19 @@ pub trait Socket: Pollable {
     /// The kernel handles `SO_TYPE`, `SO_PROTOCOL`, `SO_DOMAIN`, `SO_ERROR`, `SO_RCVTIMEO*`,
     /// `SO_SNDTIMEO*` and every `SOL_SOCKET` option that only describes the descriptor.
     fn set_option(&self, level: i32, name: i32, value: &[u8]) -> Result<(), Errno>;
+
+    /// Apply synchronously (`None`) or return owned completion before a backend
+    /// option becomes canonical. `None` means COMPLETED, not a request to call
+    /// set_option again. The default invokes the original setter exactly once.
+    fn set_option_admission(
+        &self,
+        level: i32,
+        name: i32,
+        value: &[u8],
+    ) -> Result<Option<Box<dyn OptionAdmission>>, Errno> {
+        self.set_option(level, name, value)?;
+        Ok(None)
+    }
 
     /// `getsockopt`: writes the value in guest layout to the start of `out` (whose length is
     /// the guest's `optlen`, at most what the kernel copies back) and returns its length;
@@ -986,6 +1009,31 @@ pub enum StreamState {
 /// Urgent data follows `tcp_recvmsg` and `tcp_recv_urg` as [`crate::RecvQueue`] keeps them,
 /// with the guest's `SO_OOBINLINE`, which arrives through `set_option`.
 pub trait BackendStream: Pollable {
+    /// Whether physical options require owned completion. This getter is bounded
+    /// and nonreentrant; it may run under a socket lock. The physical stream's
+    /// capability is immutable; a reserved PendingStream returns false until it
+    /// can forward its actual Ready target. The socket's startup gate covers that
+    /// transition. Ordinary native and local transports stay synchronous.
+    fn async_options(&self) -> bool {
+        false
+    }
+
+    /// Apply an owned batch in order. `Ok` transfers the callback to this exact
+    /// transport until actual completion; `Err` accepts neither work nor callback.
+    /// Invoke the callback once, outside transport locks, with the first physical
+    /// error. A successful prefix is not rolled back or replayed on failure.
+    ///
+    /// Callers publish custody before entry: completion may be synchronous and
+    /// reentrant. Startup batches use `SockOpts::backend_options` ordering.
+    fn start_options(
+        &self,
+        options: Vec<(i32, i32, Vec<u8>)>,
+        done: Box<dyn FnOnce(Result<(), Errno>) + Send>,
+    ) -> Result<(), Errno> {
+        let _ = (options, done);
+        Err(Errno::EOPNOTSUPP)
+    }
+
     /// Actual local address of an opted-in endpoint stream. EAGAIN means it is not ready.
     /// None preserves the ordinary namespace source. Bounded and nonreentrant like read.
     fn provider_local_addr(&self) -> Option<Result<SocketAddr, Errno>> {
