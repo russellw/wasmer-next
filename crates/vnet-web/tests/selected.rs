@@ -33,6 +33,7 @@ struct Mock {
     open_limit: Option<usize>,
     opening: BTreeSet<u64>,
     revoked: BTreeSet<u64>,
+    blocked_open: Option<Command>,
 }
 impl Transport for Mock {
     fn capabilities(&self) -> Capabilities {
@@ -63,6 +64,7 @@ impl Transport for Mock {
             && let Some(limit) = self.open_limit
         {
             if self.opening.len() >= limit {
+                self.blocked_open = Some(command.clone());
                 return Poll::Pending;
             }
             assert!(
@@ -146,6 +148,7 @@ impl Harness {
                 open_limit: None,
                 opening: BTreeSet::new(),
                 revoked: BTreeSet::new(),
+                blocked_open: None,
             },
         }
     }
@@ -324,6 +327,144 @@ fn explicit_bind_connect_transfers_same_id_and_updates_actual_address() {
             .iter()
             .any(|command| matches!(command, Command::CloseSelected { .. }))
     );
+}
+
+#[test]
+fn selected_close_seal_prevents_a_cached_bound_connect_across_driver_yields() {
+    for (count, close_error) in [(70, None), (1, None), (70, Some(Errno::EIO))] {
+        let mut h = Harness::limited(true, false, 128);
+        let provider = h.provider();
+        let original = request(EndpointBindPurpose::Bind);
+        let mut bindings = Vec::new();
+        for index in 0..count {
+            let bound = provider.bind(original, WaitQueue::new()).unwrap().unwrap();
+            h.pump();
+            let (request, socket) = match h.io.sent.last().unwrap() {
+                Command::BindStream {
+                    request, socket, ..
+                } => (*request, *socket),
+                other => panic!("not an actual accepted bind: {other:?}"),
+            };
+            h.event(Event::StreamBound {
+                request,
+                socket,
+                result: Ok(SocketAddr::from(([0, 0, 0, 0], 42000 + index as u16))),
+            });
+            bindings.push(bound);
+        }
+        // All resources already exist remotely. Hold the first subsequent
+        // ConnectFrom in Driver::command; later connects remain queued.
+        h.io.open_limit = Some(0);
+        let mut streams = Vec::new();
+        for bound in &bindings {
+            let local = bound.local_addr().unwrap();
+            let query = EndpointQuery {
+                kind: EndpointKind::Stream,
+                source_id: original.source_id,
+                bound: Some(local),
+                requested_bind: Some(original.requested),
+                binding: Some(bound.clone()),
+                effective_source: None,
+                destination: addr("127.0.0.1:8080"),
+                local_binding: true,
+            };
+            let EndpointChoice::Provider(target) = provider.select(&query).unwrap() else {
+                panic!("missing same bound resource");
+            };
+            streams.push(
+                provider
+                    .connect(
+                        target,
+                        original.source_id,
+                        local,
+                        query.destination,
+                        WaitQueue::new(),
+                    )
+                    .unwrap(),
+            );
+            h.pump();
+        }
+        assert!(matches!(
+            h.io.blocked_open,
+            Some(Command::ConnectFrom { .. })
+        ));
+        let backend = h.backend.clone();
+        let mut closing = Box::pin(backend.close_endpoints());
+        let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+        assert!(closing.as_mut().poll(&mut cx).is_pending());
+        // A provider close now opens transport capacity while its ACK remains
+        // pending. The old cached command must not reopen that same resource.
+        h.io.open_limit = None;
+        h.pump();
+        if count > 64 {
+            let closes =
+                h.io.sent
+                    .iter()
+                    .filter(|command| matches!(command, Command::CloseSelected { .. }))
+                    .count();
+            assert!(
+                closes > 0 && closes < count,
+                "the first poll must exercise the bounded yield"
+            );
+        }
+        for _ in 0..4 {
+            h.pump();
+        }
+        assert!(
+            !h.io
+                .sent
+                .iter()
+                .any(|command| matches!(command, Command::ConnectFrom { .. })),
+            "a cached opening was accepted after the selected close seal"
+        );
+        let closes: Vec<_> =
+            h.io.sent
+                .iter()
+                .filter_map(|command| match command {
+                    Command::CloseSelected { request, socket } => Some((*request, *socket)),
+                    _ => None,
+                })
+                .collect();
+        assert_eq!(closes.len(), count);
+        assert_eq!(
+            closes
+                .iter()
+                .map(|(_, socket)| *socket)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            count
+        );
+        assert!(closing.as_mut().poll(&mut cx).is_pending());
+        for (index, (request, socket)) in closes.into_iter().enumerate() {
+            h.event(Event::ProviderCloseAck {
+                request,
+                socket,
+                accept_pending: false,
+                result: if index == 0 {
+                    close_error.map_or(Ok(()), Err)
+                } else {
+                    Ok(())
+                },
+            });
+            if index == 0 {
+                // A duplicate of this actual consumed receipt remains scoped
+                // to the closed resource and cannot settle its live siblings.
+                h.event(Event::ProviderCloseAck {
+                    request,
+                    socket,
+                    accept_pending: false,
+                    result: close_error.map_or(Ok(()), Err),
+                });
+            }
+            if index + 1 < count {
+                assert!(closing.as_mut().poll(&mut cx).is_pending());
+            }
+        }
+        let expected =
+            close_error.map_or(Ok(wasixv2_vnet_web::SelectedCloseReport::default()), Err);
+        assert_eq!(closing.as_mut().poll(&mut cx), Poll::Ready(expected));
+        assert_eq!(streams.len(), count);
+    }
 }
 
 #[test]
