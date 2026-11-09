@@ -901,10 +901,10 @@ impl Driver {
                         && state.phase == Phase::Listening
                         && inner.flows.get(child).is_some_and(|flow| !flow.released)
                 } else {
-                    !inner
+                    inner
                         .flows
                         .get(child)
-                        .is_some_and(|flow| flow.selected.is_some())
+                        .is_none_or(|flow| flow.selected.is_none())
                 }
             }
             Some(
@@ -1101,10 +1101,9 @@ impl Driver {
         | Command::ConnectFrom { socket, .. }
         | Command::ListenFrom { socket, .. }
         | Command::ListenReserved { socket, .. } = &command
+            && let Some(flow) = self.shared.inner.lock().unwrap().flows.get_mut(socket)
         {
-            if let Some(flow) = self.shared.inner.lock().unwrap().flows.get_mut(socket) {
-                flow.remote = true;
-            }
+            flow.remote = true;
         }
         if let Command::SendTo { socket, .. } = command {
             let wq = {
@@ -1210,20 +1209,18 @@ impl Driver {
                 socket,
                 child,
                 peer,
-            } => {
-                if matches!(self.pending.get(child), Some(Pending::SelectedAccept { listener, .. }) if listener == socket)
-                    || self
-                        .shared
-                        .inner
-                        .lock()
-                        .unwrap()
-                        .listeners
-                        .get(socket)
-                        .is_some_and(|listener| listener.selected.is_some())
-                {
-                    self.selected_accept_event(*socket, *child, *peer, None)?;
-                    return Ok(true);
-                }
+            } if matches!(self.pending.get(child), Some(Pending::SelectedAccept { listener, .. }) if listener == socket)
+                || self
+                    .shared
+                    .inner
+                    .lock()
+                    .unwrap()
+                    .listeners
+                    .get(socket)
+                    .is_some_and(|listener| listener.selected.is_some()) =>
+            {
+                self.selected_accept_event(*socket, *child, *peer, None)?;
+                return Ok(true);
             }
             _ => {}
         }
