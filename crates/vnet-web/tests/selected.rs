@@ -2245,3 +2245,236 @@ fn captured_writable_before_terminal_eagain_does_not_lose_the_only_edge_or_hang_
     assert!(prefix.iter().chain(&suffix).all(|byte| *byte == 7));
     assert_eq!(full.write(b"healthy"), Ok(7));
 }
+
+#[test]
+fn actual_accepted_fixed_policy_precedes_empty_startup_and_inherited_option_publication() {
+    use wasixv2_abi::{SocketLevel, SocketOption, TcpOption};
+    use wasixv2_vnet::TcpOptionPolicy;
+    for inherited in [false, true] {
+        let mut h = Harness::configured(false, true, 8, true);
+        let net = h.net();
+        let listener = net.socket(Domain::Inet, SocketKind::Stream, 0, 1).unwrap();
+        if inherited {
+            listener
+                .set_option(
+                    SocketLevel::SOL_TCP.0,
+                    TcpOption::TCP_NODELAY.0,
+                    &0i32.to_le_bytes(),
+                )
+                .unwrap();
+            listener
+                .set_option(
+                    SocketLevel::SOL_SOCKET.0,
+                    SocketOption::SO_KEEPALIVE.0,
+                    &1i32.to_le_bytes(),
+                )
+                .unwrap();
+            let mut linger = 1i32.to_le_bytes().to_vec();
+            linger.extend(0i32.to_le_bytes());
+            listener
+                .set_option(
+                    SocketLevel::SOL_SOCKET.0,
+                    SocketOption::SO_LINGER.0,
+                    &linger,
+                )
+                .unwrap();
+        }
+        listener.bind(addr("127.0.0.1:43109"), false).unwrap();
+        listener.listen(1).unwrap();
+        h.pump();
+        let Command::ListenReserved {
+            request, socket, ..
+        } = h.io.sent.last().unwrap().clone()
+        else {
+            panic!()
+        };
+        h.event(Event::StreamListening {
+            request,
+            socket,
+            result: Ok(addr("127.0.0.1:43109")),
+        });
+        let Command::Accept {
+            socket: parent,
+            child,
+        } = h.io.sent.last().unwrap().clone()
+        else {
+            panic!()
+        };
+        assert_eq!(parent, socket);
+        h.event(Event::AcceptedToWithPolicy {
+            socket,
+            child,
+            peer: addr("127.0.0.1:40010"),
+            local: addr("127.0.0.1:43109"),
+            policy: TcpOptionPolicy::FixedTcpDefaults,
+        });
+        // The existing owned startup may replay inherited setters. Each completion
+        // still goes through the same Driver and actual option batch, not a test
+        // shortcut to mutate canonical SockOpts.
+        let mut completed = BTreeSet::new();
+        for _ in 0..4 {
+            let pending = h.io.sent.iter().rev().find_map(|command| match command {
+                Command::SetOption {
+                    request: Some(request),
+                    socket: id,
+                    ..
+                } if *id == child && !completed.contains(request) => Some(*request),
+                _ => None,
+            });
+            if let Some(request) = pending {
+                completed.insert(request);
+                h.event(Event::Complete {
+                    request,
+                    result: Ok(()),
+                });
+            } else {
+                break;
+            }
+        }
+        let accepted = listener.accept().unwrap();
+        let accepted_id = child;
+        let child = accepted.socket;
+        let mut scalar = [0; 4];
+        child
+            .get_option(
+                SocketLevel::SOL_TCP.0,
+                TcpOption::TCP_NODELAY.0,
+                &mut scalar,
+            )
+            .unwrap();
+        assert_eq!(i32::from_le_bytes(scalar), 1);
+        child
+            .get_option(
+                SocketLevel::SOL_SOCKET.0,
+                SocketOption::SO_KEEPALIVE.0,
+                &mut scalar,
+            )
+            .unwrap();
+        assert_eq!(i32::from_le_bytes(scalar), 0);
+        let mut linger = [0xff; 8];
+        child
+            .get_option(
+                SocketLevel::SOL_SOCKET.0,
+                SocketOption::SO_LINGER.0,
+                &mut linger,
+            )
+            .unwrap();
+        assert_eq!(linger, [0; 8]);
+        drop(child);
+        h.pump();
+        assert!(
+            !h.io
+                .sent
+                .iter()
+                .any(|command| matches!(command,Command::Reset {socket} if *socket==accepted_id)),
+            "ignored inherited linger0 did not derive an abort"
+        );
+        let request =
+            h.io.sent
+                .iter()
+                .find_map(|command| match command {
+                    Command::CloseSelected { request, socket } if *socket == accepted_id => {
+                        Some(*request)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+        h.event(Event::ProviderCloseAck {
+            request,
+            socket: accepted_id,
+            accept_pending: false,
+            result: Ok(()),
+        });
+    }
+}
+
+#[test]
+fn actual_close_overtakes_owned_profiled_lifecycle_past_full_rx_without_poisoning_live_sibling() {
+    use wasixv2_vnet::TcpOptionPolicy;
+    let mut h = Harness::configured(true, true, 8, true);
+    let (full, full_socket) = selected_stream(&mut h);
+    let provider = h.provider();
+    let query = EndpointQuery {
+        kind: EndpointKind::Stream,
+        source_id: EndpointSourceId(199),
+        bound: None,
+        requested_bind: None,
+        binding: None,
+        effective_source: Some(addr("127.0.0.1:43066")),
+        destination: addr("127.0.0.1:8080"),
+        local_binding: false,
+    };
+    let EndpointChoice::Provider(target) = provider.select(&query).unwrap() else {
+        panic!()
+    };
+    let opening = provider
+        .connect(
+            target,
+            query.source_id,
+            addr("127.0.0.1:43066"),
+            query.destination,
+            WaitQueue::new(),
+        )
+        .unwrap();
+    h.pump();
+    let (request, socket) =
+        h.io.sent
+            .iter()
+            .rev()
+            .find_map(|command| match command {
+                Command::ConnectFrom {
+                    request, socket, ..
+                } => Some((*request, *socket)),
+                _ => None,
+            })
+            .unwrap();
+    assert_eq!(opening.tcp_option_policy(), None);
+    for _ in 0..5 {
+        h.event(Event::Data {
+            socket: full_socket,
+            data: vec![7; 65536],
+        });
+    }
+    // This terminal lifecycle is already owned by its producer. Ordinary
+    // publication cannot run while the unrelated sibling's RX frame is held.
+    h.io.events.push_back(Event::StreamConnectedWithPolicy {
+        request,
+        socket,
+        result: Ok((addr("127.0.0.1:43066"), TcpOptionPolicy::FixedTcpDefaults)),
+    });
+    drop(opening);
+    h.pump();
+    let close =
+        h.io.sent
+            .iter()
+            .find_map(|command| match command {
+                Command::CloseSelected {
+                    request,
+                    socket: id,
+                } if *id == socket => Some(*request),
+                _ => None,
+            })
+            .unwrap();
+    h.event(Event::ProviderCloseAck {
+        request: close,
+        socket,
+        accept_pending: false,
+        result: Ok(()),
+    });
+    assert!(
+        matches!(h.io.events.front(),Some(Event::StreamConnectedWithPolicy {request:actual,..}) if *actual==request),
+        "actual close overtook the owned ordinary lifecycle"
+    );
+    let mut prefix = vec![0; 256 * 1024];
+    assert_eq!(full.read(&mut prefix, false), Ok(prefix.len()));
+    h.pump(); // now delivers the late profiled result through the retired path
+    assert!(h.io.events.is_empty());
+    assert_eq!(full.tcp_option_policy(), Some(TcpOptionPolicy::Canonical));
+    assert_eq!(full.state(), wasixv2_vnet::StreamState::Established);
+    let mut suffix = vec![0; 65536];
+    assert_eq!(full.read(&mut suffix, false), Ok(suffix.len()));
+    assert!(prefix.iter().chain(&suffix).all(|byte| *byte == 7));
+    assert_eq!(full.write(b"healthy"), Ok(7));
+    h.pump();
+    assert!(h.io.sent.iter().any(|command|matches!(command,Command::Send {socket,data,..} if *socket==full_socket && data==b"healthy")));
+}

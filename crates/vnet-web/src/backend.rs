@@ -3,7 +3,7 @@ use futures_util::task::AtomicWaker;
 use std::{
     collections::{BTreeMap, VecDeque},
     net::SocketAddr,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
 };
 use wasixv2_abi::Errno;
 use wasixv2_vnet::{
@@ -93,6 +93,9 @@ pub(crate) struct Packet {
     pub addr: SocketAddr,
 }
 pub(crate) struct Flow {
+    /// SAME actual-resource metadata retained by every live Stream even after
+    /// map retirement. Never queries Page or reselects a provider.
+    pub tcp_policy: Arc<OnceLock<wasixv2_vnet::TcpOptionPolicy>>,
     pub options: Option<crate::options::Batch>,
     pub kind: Kind,
     pub binding: Option<Arc<Binding>>,
@@ -140,6 +143,7 @@ impl Flow {
     }
     pub fn new(kind: Kind, peer: SocketAddr, wq: WaitQueue) -> Self {
         Self {
+            tcp_policy: Arc::new(OnceLock::new()),
             options: None,
             kind,
             binding: None,
@@ -314,10 +318,13 @@ impl Backend for WebBackend {
         family_allowed(inner.capabilities, peer)?;
         let id = inner.id()?;
         let async_options = inner.capabilities.async_options;
-        inner.flows.insert(id, Flow::new(Kind::Stream, peer, wq));
+        let flow = Flow::new(Kind::Stream, peer, wq);
+        let tcp_policy = flow.tcp_policy.clone();
+        inner.flows.insert(id, flow);
         drop(inner);
         self.shared.wake.wake();
         Ok(Arc::new(Stream {
+            tcp_policy,
             async_options,
             shared: self.shared.clone(),
             id,
@@ -397,6 +404,7 @@ pub(crate) fn unbound(domain: Domain) -> SocketAddr {
 }
 
 pub(crate) struct Stream {
+    pub tcp_policy: Arc<OnceLock<wasixv2_vnet::TcpOptionPolicy>>,
     pub async_options: bool,
     pub shared: Arc<Shared>,
     pub id: u64,
@@ -455,6 +463,13 @@ impl Stream {
     }
 }
 impl BackendStream for Stream {
+    fn tcp_option_policy(&self) -> Option<wasixv2_vnet::TcpOptionPolicy> {
+        if self.async_options {
+            self.tcp_policy.get().copied()
+        } else {
+            Some(wasixv2_vnet::TcpOptionPolicy::Canonical)
+        }
+    }
     fn async_options(&self) -> bool {
         self.async_options
     }

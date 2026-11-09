@@ -1799,6 +1799,8 @@ impl Driver {
                     if let Some(flow) = inner.flows.get_mut(&socket) {
                         flow.opening = false;
                         if operation == Operation::Connect {
+                            flow.tcp_policy
+                                .get_or_init(|| wasixv2_vnet::TcpOptionPolicy::Canonical);
                             flow.state = StreamState::Established;
                         }
                     }
@@ -1956,6 +1958,8 @@ impl Driver {
                 return Ok(());
             }
             flow.peer = peer;
+            flow.tcp_policy
+                .get_or_init(|| wasixv2_vnet::TcpOptionPolicy::Canonical);
             flow.state = StreamState::Established;
             flow.opening = false;
             let resource = flow.selected.as_ref().ok_or(Errno::EPROTO)?;
@@ -1965,9 +1969,11 @@ impl Driver {
                 state.phase = Phase::Connected;
             }
             let queue = flow.wq.clone();
+            let tcp_policy = flow.tcp_policy.clone();
             let async_options = inner.capabilities.async_options;
             drop(inner);
             let stream = Arc::new(Stream {
+                tcp_policy,
                 async_options,
                 shared: self.shared.clone(),
                 id: child,
@@ -1997,7 +2003,204 @@ impl Driver {
         Ok(())
     }
 
+    /// Classify only the exact actual lifecycle result; publish no readiness
+    /// and consume no pending owner until all identity/type checks succeed.
+    fn profiled_event(&self, event: Event) -> Result<Event, Errno> {
+        use wasixv2_vnet::TcpOptionPolicy;
+        let (socket, policy, ordinary) = match &event {
+            Event::StreamOpenedWithPolicy {
+                request,
+                socket,
+                result,
+            } => {
+                match self.pending.get(request) {
+                    Some(Pending::Open(id)) if id == socket => {}
+                    Some(_) => return Err(Errno::EPROTO),
+                    None => {
+                        let inner = self.shared.inner.lock().unwrap();
+                        // A different live owner must never be reinterpreted as
+                        // this consumed opening. Ordinary consumed/retired opens
+                        // retain Complete's harmless disposition, with NO policy
+                        // classification or cell mutation.
+                        if inner.lookups.contains_key(request)
+                            || inner.controls.iter().any(|control| control.id == *request)
+                        {
+                            return Err(Errno::EPROTO);
+                        }
+                        return Ok(Event::Complete {
+                            request: *request,
+                            result: result.as_ref().map(|_| ()).map_err(|error| *error),
+                        });
+                    }
+                }
+                (*socket, result.as_ref().ok().copied(), true)
+            }
+            Event::StreamConnectedWithPolicy {
+                request,
+                socket,
+                result,
+            } => {
+                match self.pending.get(request) {
+                    Some(Pending::Selected(id, Operation::Connect)) if id == socket => {}
+                    Some(_) => return Err(Errno::EPROTO),
+                    None => {
+                        // Reuse selected_event's exact retired/closed result.
+                        // Close may overtake an already-owned terminal result
+                        // waiting on ordinary RX admission. No pending owner
+                        // means there is no authority to classify a policy.
+                        return Ok(Event::StreamConnected {
+                            request: *request,
+                            socket: *socket,
+                            result: result
+                                .as_ref()
+                                .map(|(actual, _)| *actual)
+                                .map_err(|error| *error),
+                        });
+                    }
+                }
+                (
+                    *socket,
+                    result.as_ref().ok().map(|(_, policy)| *policy),
+                    false,
+                )
+            }
+            Event::AcceptedToWithPolicy {
+                socket,
+                child,
+                peer,
+                local,
+                policy,
+            } => {
+                let Some(Pending::SelectedAccept {
+                    listener,
+                    child: expected,
+                    resource,
+                    local: bound,
+                    generation,
+                    ..
+                }) = self.pending.get(child)
+                else {
+                    return Err(Errno::EPROTO);
+                };
+                if listener != socket
+                    || expected != child
+                    || *generation != self.generation
+                    || local.port() != bound.port()
+                    || local.is_ipv4() != peer.is_ipv4()
+                    || local.ip().is_unspecified()
+                {
+                    return Err(Errno::EPROTO);
+                }
+                let inner = self.shared.inner.lock().unwrap();
+                let flow = inner.flows.get(child).ok_or(Errno::EPROTO)?;
+                if inner.generation != *generation
+                    || resource.generation != *generation
+                    || flow.kind != Kind::Stream
+                    || !flow
+                        .selected
+                        .as_ref()
+                        .is_some_and(|actual| Arc::ptr_eq(actual, resource))
+                {
+                    return Err(Errno::EPROTO);
+                }
+                if !inner.capabilities.async_options {
+                    return Err(Errno::EOPNOTSUPP);
+                }
+                if let Some(old) = flow.tcp_policy.get() {
+                    if *old != *policy {
+                        return Err(Errno::EPROTO);
+                    }
+                } else {
+                    flow.tcp_policy.set(*policy).map_err(|_| Errno::EPROTO)?;
+                }
+                return Ok(Event::AcceptedTo {
+                    socket: *socket,
+                    child: *child,
+                    peer: *peer,
+                    local: *local,
+                });
+            }
+            _ => return Ok(event),
+        };
+        let inner = self.shared.inner.lock().unwrap();
+        if inner.generation != self.generation || !inner.capabilities.async_options {
+            return Err(Errno::EPROTO);
+        }
+        let flow = inner.flows.get(&socket).ok_or(Errno::EPROTO)?;
+        if flow.kind != Kind::Stream {
+            return Err(Errno::EPROTO);
+        }
+        if ordinary {
+            if flow.selected.is_some() || !flow.remote || !flow.opening {
+                return Err(Errno::EPROTO);
+            }
+        } else {
+            let resource = flow.selected.as_ref().ok_or(Errno::EPROTO)?;
+            if resource.generation != self.generation {
+                return Err(Errno::EPROTO);
+            }
+            if let Event::StreamConnectedWithPolicy {
+                result: Ok((actual, _)),
+                ..
+            } = &event
+            {
+                if actual.port() == 0 || actual.is_ipv4() != flow.peer.is_ipv4() {
+                    return Err(Errno::EPROTO);
+                }
+                let state = resource.state.lock().unwrap();
+                let requested = resource
+                    .request
+                    .map(|request| request.requested)
+                    .or_else(|| {
+                        resource
+                            .reserved
+                            .as_ref()
+                            .map(|(member, _, _)| member.local)
+                    });
+                if requested.is_some_and(|requested| {
+                    actual.is_ipv4() != requested.is_ipv4()
+                        || requested.port() != 0 && requested.port() != actual.port()
+                        || !requested.ip().is_unspecified() && requested.ip() != actual.ip()
+                }) || state
+                    .actual
+                    .is_some_and(|bound| bound.port() != actual.port())
+                {
+                    return Err(Errno::EPROTO);
+                }
+            }
+        }
+        if let Some(policy) = policy {
+            if let Some(old) = flow.tcp_policy.get() {
+                if *old != policy {
+                    return Err(Errno::EPROTO);
+                }
+            } else {
+                flow.tcp_policy.set(policy).map_err(|_| Errno::EPROTO)?;
+            }
+        }
+        drop(inner);
+        Ok(match event {
+            Event::StreamOpenedWithPolicy {
+                request, result, ..
+            } => Event::Complete {
+                request,
+                result: result.map(|_: TcpOptionPolicy| ()),
+            },
+            Event::StreamConnectedWithPolicy {
+                request,
+                socket,
+                result,
+            } => Event::StreamConnected {
+                request,
+                socket,
+                result: result.map(|(actual, _)| actual),
+            },
+            _ => unreachable!(),
+        })
+    }
+
     fn event(&mut self, event: Event) -> Result<(), Errno> {
+        let event = self.profiled_event(event)?;
         if self.selected_event(&event)? {
             return Ok(());
         }
@@ -2013,7 +2216,10 @@ impl Driver {
         let mut inner = self.shared.inner.lock().unwrap();
         let async_options = inner.capabilities.async_options;
         match event {
-            Event::StreamBound { .. }
+            Event::StreamOpenedWithPolicy { .. }
+            | Event::StreamConnectedWithPolicy { .. }
+            | Event::AcceptedToWithPolicy { .. }
+            | Event::StreamBound { .. }
             | Event::StreamConnected { .. }
             | Event::StreamListening { .. }
             | Event::ProviderCloseAck { .. }
@@ -2054,7 +2260,12 @@ impl Driver {
                                         flow.opening = true;
                                         address_query = Some((id, true));
                                     }
-                                    Ok(()) => flow.state = StreamState::Established,
+                                    Ok(()) => {
+                                        flow.tcp_policy.get_or_init(|| {
+                                            wasixv2_vnet::TcpOptionPolicy::Canonical
+                                        });
+                                        flow.state = StreamState::Established;
+                                    }
                                     Err(error) => {
                                         if let Some(binding) = flow.binding.take() {
                                             binding_wakes.extend(binding.complete(Err(error)));
@@ -2357,9 +2568,12 @@ impl Driver {
                 if let Some(flow) = inner.flows.get_mut(&child) {
                     flow.opening = false;
                     flow.peer = peer;
+                    flow.tcp_policy
+                        .get_or_init(|| wasixv2_vnet::TcpOptionPolicy::Canonical);
                     flow.state = StreamState::Established;
                     if let Some(sink) = sink {
-                        incoming = Some((sink, child, peer, flow.wq.clone()));
+                        incoming =
+                            Some((sink, child, peer, flow.wq.clone(), flow.tcp_policy.clone()));
                     } else {
                         flow.released = true;
                         flow.reset = true;
@@ -2389,8 +2603,9 @@ impl Driver {
         if let Some((done, result)) = complete {
             done(result);
         }
-        if let Some((sink, id, peer, wq)) = incoming {
+        if let Some((sink, id, peer, wq, tcp_policy)) = incoming {
             let stream = Arc::new(Stream {
+                tcp_policy,
                 async_options,
                 shared: self.shared.clone(),
                 id,
@@ -2746,5 +2961,216 @@ mod control_tests {
             })
             .unwrap();
         assert_eq!(stream.output_len(), 0);
+    }
+    #[test]
+    fn actual_option_policy_is_unknown_until_classified_and_survives_flow_retirement() {
+        use wasixv2_vnet::TcpOptionPolicy;
+        let (backend, mut driver) = WebBackend::new(
+            Config::default(),
+            Capabilities {
+                async_options: true,
+                ..Capabilities::classic(true)
+            },
+        )
+        .unwrap();
+        let stream = backend
+            .connect("192.0.2.1:80".parse().unwrap(), WaitQueue::new())
+            .unwrap();
+        assert_eq!(stream.tcp_option_policy(), None);
+        let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+        let command = driver.next(&mut cx).unwrap().unwrap();
+        let Command::Connect {
+            request, socket, ..
+        } = command.clone()
+        else {
+            panic!()
+        };
+        driver.sent(command);
+        driver
+            .event(Event::StreamOpenedWithPolicy {
+                request,
+                socket,
+                result: Ok(TcpOptionPolicy::FixedTcpDefaults),
+            })
+            .unwrap();
+        assert_eq!(stream.state(), StreamState::Established);
+        assert_eq!(
+            stream.tcp_option_policy(),
+            Some(TcpOptionPolicy::FixedTcpDefaults)
+        );
+        // Exercise the actual map retirement operation. The immutable resource
+        // metadata must remain available to a retained handle, without a map
+        // lookup, another provider query, or reclassification on reconnect.
+        let retired = driver
+            .shared
+            .inner
+            .lock()
+            .unwrap()
+            .flows
+            .remove(&socket)
+            .unwrap();
+        drop(retired);
+        assert_eq!(
+            stream.tcp_option_policy(),
+            Some(TcpOptionPolicy::FixedTcpDefaults)
+        );
+        drop(stream);
+    }
+
+    #[test]
+    fn profiled_open_validation_does_not_remove_other_pending_or_reclassify_a_resource() {
+        use wasixv2_vnet::TcpOptionPolicy;
+        let (backend, mut driver) = WebBackend::new(
+            Config::default(),
+            Capabilities {
+                async_options: true,
+                ..Capabilities::classic(true)
+            },
+        )
+        .unwrap();
+        let stream = backend
+            .connect("192.0.2.1:80".parse().unwrap(), WaitQueue::new())
+            .unwrap();
+        let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+        let command = driver.next(&mut cx).unwrap().unwrap();
+        let Command::Connect {
+            request, socket, ..
+        } = command.clone()
+        else {
+            panic!()
+        };
+        driver.sent(command);
+        for wrong in [
+            Event::StreamOpenedWithPolicy {
+                request,
+                socket: socket + 100,
+                result: Ok(TcpOptionPolicy::FixedTcpDefaults),
+            },
+            Event::StreamConnectedWithPolicy {
+                request,
+                socket,
+                result: Ok((
+                    "192.0.2.10:40000".parse().unwrap(),
+                    TcpOptionPolicy::FixedTcpDefaults,
+                )),
+            },
+        ] {
+            assert!(matches!(driver.profiled_event(wrong), Err(Errno::EPROTO)));
+            assert!(matches!(driver.pending.get(&request),Some(Pending::Open(id)) if *id==socket));
+            assert_eq!(stream.tcp_option_policy(), None);
+        }
+        driver
+            .event(Event::StreamOpenedWithPolicy {
+                request,
+                socket,
+                result: Ok(TcpOptionPolicy::StoredLingerWithoutClose),
+            })
+            .unwrap();
+        assert_eq!(
+            stream.tcp_option_policy(),
+            Some(TcpOptionPolicy::StoredLingerWithoutClose)
+        );
+        driver
+            .event(Event::StreamOpenedWithPolicy {
+                request,
+                socket,
+                result: Ok(TcpOptionPolicy::FixedTcpDefaults),
+            })
+            .unwrap(); // consumed ordinary Complete remains a no-op
+        backend.lookup(Lookup::Name("live.invalid".into()), Box::new(|_| {}));
+        let lookup = *driver
+            .shared
+            .inner
+            .lock()
+            .unwrap()
+            .lookups
+            .keys()
+            .next()
+            .unwrap();
+        assert!(matches!(
+            driver.profiled_event(Event::StreamOpenedWithPolicy {
+                request: lookup,
+                socket,
+                result: Ok(TcpOptionPolicy::FixedTcpDefaults)
+            }),
+            Err(Errno::EPROTO)
+        ));
+        assert!(
+            driver
+                .shared
+                .inner
+                .lock()
+                .unwrap()
+                .lookups
+                .contains_key(&lookup)
+        );
+        assert_eq!(
+            stream.tcp_option_policy(),
+            Some(TcpOptionPolicy::StoredLingerWithoutClose)
+        );
+    }
+
+    #[test]
+    fn old_stock_open_is_canonical_and_actual_open_error_is_not_replaced_by_policy() {
+        use wasixv2_vnet::TcpOptionPolicy;
+        for owned in [false, true] {
+            let (backend, mut driver) = WebBackend::new(
+                Config::default(),
+                Capabilities {
+                    async_options: owned,
+                    ..Capabilities::classic(true)
+                },
+            )
+            .unwrap();
+            let stream = backend
+                .connect("192.0.2.1:80".parse().unwrap(), WaitQueue::new())
+                .unwrap();
+            assert_eq!(
+                stream.tcp_option_policy(),
+                (!owned).then_some(TcpOptionPolicy::Canonical)
+            );
+            let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+            let command = driver.next(&mut cx).unwrap().unwrap();
+            let Command::Connect { request, .. } = command.clone() else {
+                panic!()
+            };
+            driver.sent(command);
+            driver
+                .event(Event::Complete {
+                    request,
+                    result: Ok(()),
+                })
+                .unwrap();
+            assert_eq!(stream.tcp_option_policy(), Some(TcpOptionPolicy::Canonical));
+        }
+        let (backend, mut driver) = WebBackend::new(
+            Config::default(),
+            Capabilities {
+                async_options: true,
+                ..Capabilities::classic(true)
+            },
+        )
+        .unwrap();
+        let stream = backend
+            .connect("192.0.2.1:80".parse().unwrap(), WaitQueue::new())
+            .unwrap();
+        let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+        let command = driver.next(&mut cx).unwrap().unwrap();
+        let Command::Connect {
+            request, socket, ..
+        } = command.clone()
+        else {
+            panic!()
+        };
+        driver.sent(command);
+        driver
+            .event(Event::StreamOpenedWithPolicy {
+                request,
+                socket,
+                result: Err(Errno::ECONNREFUSED),
+            })
+            .unwrap();
+        assert_eq!(stream.take_error(), Some(Errno::ECONNREFUSED));
+        assert_eq!(stream.tcp_option_policy(), None);
     }
 }

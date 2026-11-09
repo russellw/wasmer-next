@@ -495,9 +495,11 @@ impl EndpointProvider for Provider {
             inner.flows.insert(id, flow);
             id
         };
+        let tcp_policy = inner.flows[&id].tcp_policy.clone();
         drop(inner);
         self.shared.wake.wake();
         Ok(Arc::new(Stream {
+            tcp_policy,
             async_options,
             shared: self.shared.clone(),
             id,

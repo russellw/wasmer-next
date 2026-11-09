@@ -220,6 +220,25 @@ pub enum Command {
 /// An asynchronous completion produced by the owning I/O worker.
 #[derive(Clone, Debug)]
 pub enum Event {
+    /// SDK-only lifecycle result. Policy belongs to this actual resource;
+    /// default/stock Complete retains its original canonical semantics.
+    StreamOpenedWithPolicy {
+        request: u64,
+        socket: u64,
+        result: Result<wasixv2_vnet::TcpOptionPolicy, Errno>,
+    },
+    StreamConnectedWithPolicy {
+        request: u64,
+        socket: u64,
+        result: Result<(SocketAddr, wasixv2_vnet::TcpOptionPolicy), Errno>,
+    },
+    AcceptedToWithPolicy {
+        socket: u64,
+        child: u64,
+        peer: SocketAddr,
+        local: SocketAddr,
+        policy: wasixv2_vnet::TcpOptionPolicy,
+    },
     StreamBound {
         request: u64,
         socket: u64,
