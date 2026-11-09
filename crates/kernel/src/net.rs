@@ -1634,14 +1634,27 @@ impl Kernel {
             {
                 return Err(Errno::EPERM.into());
             }
-            AnySock::Inet((_, sock)) => {
+            AnySock::Inet((file, sock)) => {
                 if level == SocketLevel::SOL_SOCKET
                     && unix::forcing_buffer(name)
                     && !self.cred(caller).capable(Cap::NetAdmin)
                 {
                     return Err(Errno::EPERM.into());
                 }
-                sock.socket.set_option(level.0, name, &value)?
+                if let Some(admission) = sock.socket.set_option_admission(level.0, name, &value)? {
+                    let interrupt = self.interrupt(caller);
+                    // Like bind, setsockopt acquires neither O_NONBLOCK nor
+                    // socket send-timeout semantics from its descriptor.
+                    let mut io = Self::io(caller, &*interrupt, &file);
+                    io.flags &= !OpenFlags::O_NONBLOCK;
+                    let mut wait = socket::Blocking::new(&*self.host, io, MsgFlags::empty(), None);
+                    wait.wait(
+                        WaitOn::Object(&*admission),
+                        PollMask::WRITABLE | PollMask::ERR,
+                        || admission.complete_result().ok_or(Errno::EAGAIN),
+                    )
+                    .await??;
+                }
             }
             // Unix sockets have no options of their own beyond `SOL_SOCKET`.
             AnySock::Unix(..) if level != SocketLevel::SOL_SOCKET => {

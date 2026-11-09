@@ -35,10 +35,10 @@ mod tests;
 pub use api::{
     Accepted, Answer, Backend, BackendDatagram, BackendStream, BindAdmission, Control, Domain,
     EchoIgnore, Found, GroupSources, IcmpEntry, InboundSink, Interface, Lookup, LookupContext,
-    LookupDone, LookupError, Network, NetworkPolicy, NewLink, NewLinkKind, PolicyDirection,
-    PortEntry, Publication, PublishedDatagram, QueuedError, RecvMsg, Room, SctpAssocEntry,
-    SctpEndpoint, SctpOps, SendMsg, Shutdown, Socket, SocketKind, StreamState, VsockInboundSink,
-    VsockPublication,
+    LookupDone, LookupError, Network, NetworkPolicy, NewLink, NewLinkKind, OptionAdmission,
+    PolicyDirection, PortEntry, Publication, PublishedDatagram, QueuedError, RecvMsg, Room,
+    SctpAssocEntry, SctpEndpoint, SctpOps, SendMsg, Shutdown, Socket, SocketKind, StreamState,
+    VsockInboundSink, VsockPublication,
 };
 pub use errors::DatagramErrors;
 pub use icmp::IcmpSocket;
