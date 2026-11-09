@@ -855,7 +855,7 @@ impl Driver {
                 if wrapper_released && state.close.is_some() && !receipt {
                     crate::options::cancel(
                         &mut self.option_results,
-                        &mut inner,
+                        inner,
                         id,
                         Errno::ECANCELED,
                     );
@@ -882,7 +882,7 @@ impl Driver {
                     if remove {
                         crate::options::cancel(
                             &mut self.option_results,
-                            &mut inner,
+                            inner,
                             id,
                             Errno::ECANCELED,
                         );
