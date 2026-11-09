@@ -63,43 +63,88 @@ function reply(request, status) {
 
 function stopMemoryCopies(graceful = false) {
     const stop = worker => {
-        if (graceful) worker?.postMessage({ type: "retire" });
-        else worker?.terminate();
+        if (!worker) return;
+        if (graceful) {
+            if (worker.copyRetirement) return;
+            worker.copyRetirement = setTimeout(() => fail("memory-copy retirement timed out"), options.admissionTimeout);
+            worker.postMessage({ type: "retire", acknowledge: true });
+        } else {
+            clearTimeout(worker.copyRetirement);
+            worker.terminate();
+        }
     };
     stop(memoryCopies);
-    memoryCopies = null;
     if (copyRotation) {
         clearTimeout(copyRotation.timer);
         stop(copyRotation.next);
         for (const port of copyRotation.ports) port.close();
-        copyRotation = null;
+        copyRotation.ports.length = 0;
     }
+    if (!graceful) { memoryCopies = null; copyRotation = null; }
+}
+
+function rotateMemoryCopies() {
+    const next = createMemoryCopies();
+    copyRotation = { next, ports: [], ready: false, rotate: false,
+        timer: setTimeout(() => fail("memory-copy handoff timed out"), options.admissionTimeout) };
+    const channel = new MessageChannel();
+    next.postMessage({ type: "restore", port: channel.port1 }, [channel.port1]);
+    memoryCopies.postMessage({ type: "handoff", port: channel.port2 }, [channel.port2]);
 }
 
 function createMemoryCopies() {
     const worker = new Worker(options.memoryCopyUrl, { type: "module" });
+    let retired = false;
     worker.onerror = (event) => { event.preventDefault(); fail(event.message); };
     worker.onmessageerror = () => fail("memory-copy message could not be decoded");
     worker.onmessage = ({ data }) => {
         try {
-            if (poisoned) return;
-            if (data.type === "rotate" && worker === memoryCopies && !stopping && !copyRotation) {
-                const next = createMemoryCopies();
-                const channel = new MessageChannel();
-                copyRotation = { next, ports: [], timer: setTimeout(() => fail("memory-copy handoff timed out"), options.admissionTimeout) };
-                next.postMessage({ type: "restore", port: channel.port1 }, [channel.port1]);
-                worker.postMessage({ type: "handoff", port: channel.port2 }, [channel.port2]);
+            if (poisoned || retired) return;
+            if (data.type === "rotate") {
+                if (stopping) return;
+                if (worker === memoryCopies && !copyRotation) rotateMemoryCopies();
+                // The restored receiver can reach its threshold before the
+                // outgoing realm acknowledges retirement. Keep that request.
+                else if (worker === copyRotation?.next && copyRotation.ready) copyRotation.rotate = true;
             } else if (data.type === "ready" && worker === copyRotation?.next) {
+                if (stopping) return;
+                if (copyRotation.ready) throw new Error("duplicate memory-copy handoff readiness");
                 clearTimeout(copyRotation.timer);
+                copyRotation.ready = true;
                 // The state is now owned by the receiver. Let the finite pure-JS
                 // sender close its ports on its own loop; interrupting port
                 // teardown can strand Firefox's worker shutdown.
-                memoryCopies.postMessage({ type: "retire" });
-                memoryCopies = worker;
-                for (const port of copyRotation.ports) memoryCopies.postMessage({ type: "connect", port }, [port]);
-                copyRotation = null;
-                ++copyRotations;
-            } else if (data.type !== "rotate") {
+                memoryCopies.copyRetirement = setTimeout(() => fail("memory-copy retirement timed out"), options.admissionTimeout);
+                memoryCopies.postMessage({ type: "retire", acknowledge: true });
+            } else if (data.type === "retired") {
+                if (!worker.copyRetirement || (worker !== memoryCopies && worker !== copyRotation?.next))
+                    throw new Error("unrequested memory-copy retirement");
+                clearTimeout(worker.copyRetirement);
+                worker.copyRetirement = null;
+                retired = true;
+                worker.onmessage = worker.onerror = worker.onmessageerror = null;
+                // Cleanup ACK is not an engine/native exit acknowledgement.
+                worker.terminate();
+                if (stopping) {
+                    if (worker === memoryCopies) memoryCopies = null;
+                    else copyRotation.next = null;
+                    if (!memoryCopies && !copyRotation?.next) {
+                        if (copyRotation) clearTimeout(copyRotation.timer);
+                        copyRotation = null;
+                        maybeStopped();
+                    }
+                } else {
+                    if (worker !== memoryCopies || !copyRotation?.ready)
+                        throw new Error("stale memory-copy retirement");
+                    const rotation = copyRotation;
+                    clearTimeout(rotation.timer);
+                    memoryCopies = rotation.next;
+                    for (const port of rotation.ports) memoryCopies.postMessage({ type: "connect", port }, [port]);
+                    copyRotation = null;
+                    ++copyRotations;
+                    if (rotation.rotate) rotateMemoryCopies();
+                }
+            } else {
                 throw new Error("unexpected memory-copy response");
             }
         } catch (error) { fail(error.stack ?? String(error)); }
@@ -136,12 +181,16 @@ function create(role) {
     workers.set(state.id, state);
     worker.onerror = (event) => {
         event.preventDefault();
+        if (workers.get(state.id) !== state) return;
         // Bootstrap may already be inside Rust TLS/allocator initialization. An
         // uncaught error cannot prove the shared heap safe for another admission.
         fail(`${state.role} worker ${state.id} (${state.status}): ${event.error?.stack ?? event.message}`);
     };
-    worker.onmessageerror = () => fail("worker message could not be decoded");
+    worker.onmessageerror = () => {
+        if (workers.get(state.id) === state) fail("worker message could not be decoded");
+    };
     worker.onmessage = ({ data }) => {
+        if (workers.get(state.id) !== state) return;
         try { receive(state, data); }
         catch (error) { fail(error.stack ?? String(error)); }
     };
@@ -232,7 +281,10 @@ async function prepare(source, data) {
 
 function maybeStopped() {
     if (stopping && workers.size === 0) {
-        stopMemoryCopies(true);
+        if (memoryCopies || copyRotation) {
+            stopMemoryCopies(true);
+            return;
+        }
         root = timerWorker = ioWorker = null;
         options = null;
         postMessage({ type: "stopped" });
@@ -347,6 +399,7 @@ function receive(state, data) {
         case "retired":
             for (const ticket of [...state.waits.keys()]) unwatch(state, ticket);
             workers.delete(state.id);
+            state.worker.onmessage = state.worker.onerror = state.worker.onmessageerror = null;
             state.worker.terminate();
             state.retirement?.resolve();
             state.retirement = null;
