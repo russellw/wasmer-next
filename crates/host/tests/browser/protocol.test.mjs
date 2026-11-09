@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import vm from "node:vm";
 import test from "node:test";
 import assert from "node:assert/strict";
+import { Worker as NativeWorker } from "node:worker_threads";
 
 const source = await readFile(new URL("../../src/browser/coordinator.js", import.meta.url), "utf8");
 const flush = () => new Promise((resolve) => setImmediate(resolve));
@@ -906,3 +907,332 @@ test("worker failure cannot claim owner abort attribution", async () => {
     assert.equal(h.output.at(-1).ownerAbort, undefined);
     assert(h.instances.every(worker => worker.terminated));
 });
+
+// Same bootstrap as the browser controls, without installing browser security,
+// location or Worker globals. These protocol fixtures do not claim native exit.
+async function hostBootstrapFixture() {
+    const bootstrap = await readFile(new URL("../../src/browser/bootstrap.js", import.meta.url), "utf8");
+    class Module {}
+    class Memory { constructor(buffer = new SharedArrayBuffer(4)) { this.buffer = buffer; } }
+    const context = vm.createContext({ WebAssembly: { Module, Memory }, SharedArrayBuffer,
+        URL, setTimeout, clearTimeout });
+    vm.runInContext(bootstrap.replace("export async function", "async function")
+        .replaceAll("import.meta.url", '"file:///runtime/bootstrap.js"'), context);
+    return { context, options: { module: new Module(), memory: new Memory(), bindingsUrl: "runtime.js",
+        taskLimit: 2, serviceLimit: 1, prewarm: 0, servicePrewarm: 0 }, Memory };
+}
+
+test("explicit host resolves URLs without browser globals and stays outside cloneable config", async () => {
+    const { context, options } = await hostBootstrapFixture();
+    let worker, created = 0;
+    const host = { baseURL: "file:///sdk/assets/", createWorker(url, settings) {
+        created++;
+        assert.equal(url.href, "file:///runtime/coordinator.js");
+        assert.equal(settings.type, "module");
+        worker = { messages: [], terminations: 0,
+            postMessage(data) {
+                this.messages.push(data);
+                queueMicrotask(() => this.onmessage({ data: { type: "ready" } }));
+            },
+            terminate() { this.terminations++; },
+        };
+        return worker;
+    } };
+    const returned = await context.startCoordinator({ ...options, ioModuleUrl: "io.js",
+        memoryCopyUrl: "memory/copy.js" }, () => {}, host);
+    assert.equal(returned, worker);
+    assert.equal(created, 1);
+    const config = worker.messages[0];
+    assert.equal(config.bindingsUrl, "file:///sdk/assets/runtime.js");
+    assert.equal(config.ioModuleUrl, "file:///sdk/assets/io.js");
+    assert.equal(config.memoryCopyUrl, "file:///sdk/assets/memory/copy.js");
+    assert.equal(config.memoryClientUrl, "file:///sdk/assets/memory/client.js");
+    for (const key of ["host", "baseURL", "createWorker"]) assert(!(key in config));
+    for (const key of ["location", "Worker", "isSecureContext", "crossOriginIsolated"]) {
+        assert.equal(vm.runInContext(`typeof ${key}`, context), "undefined");
+    }
+    worker.onmessage({ data: { type: "stopped" } });
+    assert.equal(worker.terminations, 1);
+});
+
+test("explicit host retains module, shared-memory, URL and capacity validation before factory admission", async () => {
+    const { context, options, Memory } = await hostBootstrapFixture();
+    let created = 0;
+    const host = { baseURL: "file:///sdk/", createWorker() { created++; throw new Error("unexpected factory admission"); } };
+    await assert.rejects(context.startCoordinator({ ...options, module: {} }, () => {}, host), /compiled runtime module/);
+    await assert.rejects(context.startCoordinator({ ...options, memory: new Memory(new ArrayBuffer(4)) }, () => {}, host), /shared runtime memory/);
+    await assert.rejects(context.startCoordinator({ ...options, taskLimit: -1 }, () => {}, host), /capacity/);
+    await assert.rejects(context.startCoordinator({ ...options, stackSize: 1 }, () => {}, host), /stack size/);
+    await assert.rejects(context.startCoordinator(options, () => {}, { ...host, baseURL: "relative/" }), /Invalid URL/);
+    await assert.rejects(context.startCoordinator(options, () => {}, {}), /Worker factory/);
+    assert.equal(created, 0);
+    const original = new Error("synchronous native constructor failure");
+    await assert.rejects(context.startCoordinator(options, () => {}, { ...host,
+        createWorker() { throw original; } }), error => error === original);
+});
+
+for (const failure of ["error", "messageerror", "fatal", "abort"]) {
+    test(`explicit host joins its owned retirement after bootstrap ${failure} and ignores stale reentry`, async () => {
+        const { context, options } = await hostBootstrapFixture();
+        const controller = new AbortController();
+        const original = new Error("original owner cancellation");
+        let release, worker;
+        const exited = new Promise(resolve => { release = resolve; });
+        const host = { baseURL: "file:///sdk/", createWorker() {
+            worker = { messages: [], terminations: 0, exited,
+                postMessage(data) { this.messages.push(data); },
+                terminate() { this.terminations++; return exited; },
+            };
+            return worker;
+        } };
+        const pending = context.startCoordinator({ ...options, signal: controller.signal }, () => {}, host);
+        let settled = false;
+        pending.then(() => { settled = true; }, () => { settled = true; });
+        const stale = worker.onmessage;
+        const staleError = worker.onerror;
+        if (failure === "error") worker.onerror({ message: "native worker failed" });
+        else if (failure === "messageerror") worker.onmessageerror();
+        else {
+            if (failure === "abort") controller.abort(original);
+            worker.onmessage({ data: { type: "fatal", error: "native worker failed", ownerAbort: failure === "abort" } });
+        }
+        assert.equal(worker.terminations, 1);
+        for (const name of ["onmessage", "onerror", "onmessageerror"]) assert.equal(worker[name], null);
+        stale({ data: { type: "ready" } });
+        staleError({ message: "stale reentrant error" });
+        controller.abort(original);
+        await flush();
+        assert.equal(settled, false, "requesting native termination is not its completion");
+        release(1);
+        await assert.rejects(pending, error => failure === "abort" ? error === original
+            : error.message === (failure === "messageerror" ? "coordinator message could not be decoded" : "native worker failed"));
+        assert.equal(worker.terminations, 1);
+    });
+}
+
+test("synchronous cleanup failure cannot replace the original bootstrap dispatch error", async () => {
+    const { context, options } = await hostBootstrapFixture();
+    const original = new Error("original init dispatch failure");
+    let worker;
+    const host = { baseURL: "file:///sdk/", createWorker() {
+        return worker = { terminations: 0,
+            postMessage() { throw original; },
+            terminate() { this.terminations++; throw new Error("secondary cleanup failure"); },
+        };
+    } };
+    await assert.rejects(context.startCoordinator(options, () => {}, host), error => error === original);
+    assert.equal(worker.terminations, 1);
+    assert.equal(worker.onmessage, null);
+});
+
+for (const ready of [false, true]) {
+    for (const code of [0, 1]) {
+        test(`native exit ${code} ${ready ? "after" : "before"} readiness cannot replace protocol shutdown`, async () => {
+            const { context, options } = await hostBootstrapFixture();
+            let exit, worker;
+            const exited = new Promise(resolve => { exit = resolve; });
+            const notices = [];
+            const host = { baseURL: "file:///sdk/", createWorker() {
+                return worker = { exited, terminations: 0,
+                    postMessage() {}, terminate() { this.terminations++; return exited; },
+                };
+            } };
+            const pending = context.startCoordinator(options, data => notices.push(data), host);
+            if (ready) {
+                worker.onmessage({ data: { type: "ready" } });
+                assert.equal(await pending, worker);
+            }
+            // Even exit zero with an intentional host-close marker is not the
+            // required B2 ready/stopped/ownerAbort acknowledgement.
+            exit(code);
+            if (!ready) await assert.rejects(pending, new RegExp(`before protocol shutdown with status ${code}`));
+            await flush();
+            assert.equal(worker.terminations, 1);
+            assert.equal(notices.at(-1).type, "fatal");
+            assert.match(notices.at(-1).error, /before protocol shutdown/);
+        });
+    }
+}
+
+test("a rejected native termination promise retains the original bootstrap failure", async () => {
+    const { context, options } = await hostBootstrapFixture();
+    const original = new Error("original dispatch error with asynchronous cleanup");
+    let worker;
+    const host = { baseURL: "file:///sdk/", createWorker() {
+        return worker = { terminations: 0,
+            postMessage() { throw original; },
+            terminate() { this.terminations++; return Promise.reject(new Error("secondary terminate rejection")); },
+        };
+    } };
+    await assert.rejects(context.startCoordinator(options, () => {}, host), error => error === original);
+    assert.equal(worker.terminations, 1);
+});
+
+for (const operation of ["throw", "dispatch-clone-error"]) {
+    test(`native host Ready callback ${operation} retains its actual worker until exit`, { timeout: 5000 }, async () => {
+        const { context, options } = await hostBootstrapFixture();
+        const asset = new URL(`data:text/javascript,${encodeURIComponent(`
+            import { parentPort } from 'node:worker_threads';
+            parentPort.on('message', () => parentPort.postMessage({ type: 'ready' }));
+        `)}`);
+        let owner, callbackError, exited = false;
+        const original = new Error("original Ready callback error");
+        const host = { baseURL: "file:///sdk/", createWorker(url) {
+            const native = new NativeWorker(url);
+            const exit = new Promise(resolve => native.once("exit", code => { exited = true; resolve(code); }));
+            owner = { exited: exit, terminations: 0,
+                postMessage(message) { native.postMessage(message); },
+                terminate() { this.terminations++; return native.terminate().then(() => exit); },
+            };
+            native.on("message", data => owner.onmessage?.({ data }));
+            native.on("error", error => owner.onerror?.({ error, message: error.message }));
+            return owner;
+        } };
+        try {
+            await assert.rejects(context.startCoordinator({ ...options, coordinatorUrl: asset.href }, data => {
+                if (data.type !== "ready") return;
+                try {
+                    if (operation === "throw") throw original;
+                    owner.postMessage(() => {});
+                } catch (error) { callbackError = error; throw error; }
+            }, host), error => error === callbackError);
+            assert.ok(callbackError);
+            if (operation === "throw") assert.equal(callbackError, original);
+            else assert.equal(callbackError.name, "DataCloneError");
+            assert.equal(exited, true, "failed bootstrap must join the real native worker exit");
+            assert.equal(owner.terminations, 1);
+        } finally { if (owner && !exited) await owner.terminate(); }
+    });
+}
+
+for (const operation of ["fatal", "abort"]) {
+    test(`explicit host Ready callback reentrant ${operation} cannot publish a healthy coordinator`, async () => {
+        const { context, options } = await hostBootstrapFixture();
+        const controller = new AbortController();
+        const original = new Error("reentrant owner cancellation");
+        let worker, release;
+        const exited = new Promise(resolve => { release = resolve; });
+        const host = { baseURL: "file:///sdk/", createWorker() {
+            return worker = { terminations: 0, messages: [], exited,
+                postMessage(data) { this.messages.push(data); },
+                terminate() { this.terminations++; return exited; },
+            };
+        } };
+        const pending = context.startCoordinator({ ...options, signal: controller.signal }, data => {
+            if (data.type !== "ready") return;
+            if (operation === "abort") controller.abort(original);
+            else worker.onmessage({ data: { type: "fatal", error: "reentrant infrastructure failure" } });
+        }, host);
+        let settled = false;
+        pending.then(() => { settled = true; }, () => { settled = true; });
+        worker.onmessage({ data: { type: "ready" } });
+        await flush();
+        assert.equal(settled, false);
+        if (operation === "abort") {
+            assert.equal(worker.terminations, 0);
+        }
+        if (operation === "abort") {
+            worker.onmessage({ data: { type: "fatal", ownerAbort: true, error: "runtime aborted by its owner" } });
+        }
+        release(0);
+        await assert.rejects(pending, error => operation === "abort" ? error === original
+            : error.message === "reentrant infrastructure failure");
+        assert.equal(worker.terminations, 1);
+    });
+}
+
+test("native coordinator exit zero without Ready rejects after actual native retirement", { timeout: 5000 }, async () => {
+    const { context, options } = await hostBootstrapFixture();
+    const asset = new URL(`data:text/javascript,${encodeURIComponent(`
+        import { parentPort } from 'node:worker_threads';
+        parentPort.once('message', () => process.exit(0));
+    `)}`);
+    let owner, observed;
+    const host = { baseURL: "file:///sdk/", createWorker(url) {
+        const native = new NativeWorker(url);
+        const exited = new Promise(resolve => native.once("exit", code => { observed = code; resolve(code); }));
+        owner = { exited, postMessage(data) { native.postMessage(data); },
+            terminate() { return native.terminate().then(() => exited); },
+        };
+        native.on("message", data => owner.onmessage?.({ data }));
+        native.on("error", error => owner.onerror?.({ error, message: error.message }));
+        return owner;
+    } };
+    try {
+        await assert.rejects(context.startCoordinator({ ...options, coordinatorUrl: asset.href }, () => {}, host),
+            /before protocol shutdown with status 0/);
+        assert.equal(observed, 0, "native success alone must not fabricate B2 readiness");
+    } finally { if (owner && observed === undefined) await owner.terminate(); }
+});
+
+test("terminate rejection cannot release an independently owned native exit before original failure", async () => {
+    const { context, options } = await hostBootstrapFixture();
+    const original = new Error("first dispatch failure");
+    let release;
+    const exited = new Promise(resolve => { release = resolve; });
+    const host = { baseURL: "file:///sdk/", createWorker() {
+        return { exited, postMessage() { throw original; },
+            terminate() { return Promise.reject(new Error("secondary terminate failure")); },
+        };
+    } };
+    const pending = context.startCoordinator(options, () => {}, host);
+    let settled = false;
+    pending.then(() => { settled = true; }, () => { settled = true; });
+    await flush();
+    assert.equal(settled, false);
+    release(1);
+    await assert.rejects(pending, error => error === original);
+});
+
+test("native fatal notification callback throw cannot escape or replace the original failure", { timeout: 5000 }, async () => {
+    const { context, options } = await hostBootstrapFixture();
+    const asset = new URL(`data:text/javascript,${encodeURIComponent(`
+        import { parentPort } from 'node:worker_threads';
+        parentPort.once('message', () => {
+            parentPort.postMessage({ type: 'fatal', error: 'original native protocol failure' });
+        });
+        parentPort.on('message', () => {});
+    `)}`);
+    let owner, nativeExited = false, callbacks = 0;
+    const host = { baseURL: "file:///sdk/", createWorker(url) {
+        const native = new NativeWorker(url);
+        const exited = new Promise(resolve => native.once("exit", code => { nativeExited = true; resolve(code); }));
+        owner = { exited, postMessage(data) { native.postMessage(data); },
+            terminate() { return native.terminate().then(() => exited); },
+        };
+        native.on("message", data => owner.onmessage?.({ data }));
+        native.on("error", error => owner.onerror?.({ error, message: error.message }));
+        return owner;
+    } };
+    try {
+        await assert.rejects(context.startCoordinator({ ...options, coordinatorUrl: asset.href }, data => {
+            assert.equal(data.type, "fatal"); callbacks++;
+            throw new Error("secondary fatal consumer callback failure");
+        }, host), /original native protocol failure/);
+        assert.equal(callbacks, 1);
+        assert.equal(nativeExited, true);
+    } finally { if (owner && !nativeExited) await owner.terminate(); }
+});
+
+for (const failure of ["error", "messageerror"]) {
+    test(`explicit host ${failure} preserves first failure through throwing notification and gated exit`, async () => {
+        const { context, options } = await hostBootstrapFixture();
+        let worker, release;
+        const exited = new Promise(resolve => { release = resolve; });
+        const host = { baseURL: "file:///sdk/", createWorker() {
+            return worker = { exited, postMessage() {}, terminate() { return exited; } };
+        } };
+        const pending = context.startCoordinator(options, () => {
+            throw new Error("secondary consumer callback failure");
+        }, host);
+        let settled = false;
+        pending.then(() => { settled = true; }, () => { settled = true; });
+        assert.doesNotThrow(() => failure === "error"
+            ? worker.onerror({ message: "original native event error" }) : worker.onmessageerror());
+        await flush();
+        assert.equal(settled, false);
+        release(1);
+        await assert.rejects(pending, error => error.message === (failure === "error"
+            ? "original native event error" : "coordinator message could not be decoded"));
+    });
+}
