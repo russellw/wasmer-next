@@ -39,6 +39,9 @@ impl Transport for Mock {
             .pop_front()
             .map_or(Poll::Pending, |event| Poll::Ready(Ok(event)))
     }
+    fn poll_closed(&mut self, _: &mut Context<'_>) -> Poll<Errno> {
+        Poll::Pending
+    }
     fn close(&mut self) {
         self.events.clear();
     }
