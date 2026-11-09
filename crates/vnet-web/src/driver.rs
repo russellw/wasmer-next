@@ -13,6 +13,8 @@ use wasixv2_vnet::{Answer, Lookup, LookupError, Room, Shutdown, StreamState};
 use wasixv2_wait::{PollMask, PollTable, WaitEntry, WaitQueue, WaitRegistration};
 
 enum Pending {
+    DatagramDispatch(crate::datagram::Dispatch),
+    DatagramReadback(crate::datagram::Readback),
     Selected(u64, Operation),
     SelectedAddress(u64, Operation),
     AcceptedAddress(u64, u64, std::net::SocketAddr),
@@ -227,6 +229,18 @@ impl Driver {
         }
         match &event {
             Event::ProviderCloseAck { .. } | Event::LocalCloseUnconfirmed { .. } => {}
+            Event::DatagramDispatched { request, .. } => match self.pending.get(request) {
+                None => return Ok(()),
+                Some(Pending::DatagramDispatch(_)) => {}
+                Some(_) => return Err(Errno::EPROTO),
+            },
+            Event::DatagramValue { request, .. } | Event::LocalAddr { request, .. } => {
+                match self.pending.get(request) {
+                    None => return Ok(()),
+                    Some(Pending::DatagramReadback(_)) => {}
+                    Some(_) => return Err(Errno::EPROTO),
+                }
+            }
             Event::Sent { request, .. } | Event::SendError { request, .. } => {
                 match self.pending.get(request) {
                     None => return Ok(()),
@@ -235,7 +249,11 @@ impl Driver {
                 }
             }
             Event::Complete { request, .. } => match self.pending.get(request) {
-                Some(Pending::Selected(_, Operation::Close) | Pending::OptionSet(_)) => {}
+                Some(
+                    Pending::Selected(_, Operation::Close)
+                    | Pending::OptionSet(_)
+                    | Pending::DatagramReadback(_),
+                ) => {}
                 None => return Ok(()),
                 _ => return Err(Errno::EPROTO),
             },
@@ -285,7 +303,11 @@ impl Driver {
                     let state = resource.state.lock().unwrap();
                     state.closing || state.close_requested || state.close.is_some()
                 });
-                (flow.options.is_some()
+                ((flow.options.is_some()
+                    || flow
+                        .outgoing
+                        .iter()
+                        .any(|output| matches!(output, crate::datagram::Output::Readback { .. })))
                     && (flow.released
                         || flow.reset
                         || flow.state == StreamState::Closed
@@ -295,6 +317,47 @@ impl Driver {
             .collect();
         for (id, error) in canceled {
             crate::options::cancel(&mut self.option_results, &mut inner, id, error);
+            if let Some(flow) = inner.flows.get_mut(&id) {
+                // Withdraw readonly entries in the SAME queue before they can
+                // become a post-seal RPC. Rotate one bounded original length;
+                // packet/setter order and accepted prefix remain unchanged.
+                for _ in 0..flow.outgoing.len() {
+                    let output = flow.outgoing.pop_front().unwrap();
+                    let charge = output.charge();
+                    if let crate::datagram::Output::Readback { done, .. } = output {
+                        flow.outgoing_bytes -= charge;
+                        self.option_results
+                            .push(crate::options::Completion::readback(done, Err(error)));
+                    } else {
+                        flow.outgoing.push_back(output);
+                    }
+                }
+            }
+        }
+        for (request, pending) in &mut self.pending {
+            if let Pending::DatagramReadback(read) = pending {
+                let canceled = inner.flows.get(&read.socket).is_none_or(|flow| {
+                    flow.released
+                        || flow.reset
+                        || flow.state == StreamState::Closed
+                        || flow.selected.as_ref().is_some_and(|resource| {
+                            let state = resource.state.lock().unwrap();
+                            state.closing || state.close_requested || state.close.is_some()
+                        })
+                });
+                if canceled && let Some(done) = read.done.take() {
+                    self.option_results
+                        .push(crate::options::Completion::readback(
+                            done,
+                            Err(Errno::ECANCELED),
+                        ));
+                    if let Some(flow) = inner.flows.get_mut(&read.socket)
+                        && flow.inflight == Some((*request, 0))
+                    {
+                        flow.inflight = None;
+                    }
+                }
+            }
         }
         drop(inner);
         self.flush_options()
@@ -504,11 +567,12 @@ impl Driver {
             if flow.reset || flow.state == StreamState::Closed {
                 continue;
             }
-            if flow
-                .selected
-                .as_ref()
-                .is_some_and(|resource| resource.state.lock().unwrap().phase != Phase::Connected)
-            {
+            if flow.selected.as_ref().is_some_and(|resource| {
+                !matches!(
+                    (flow.kind, resource.state.lock().unwrap().phase),
+                    (Kind::Stream, Phase::Connected) | (Kind::Datagram(_), Phase::Bound)
+                )
+            }) {
                 continue;
             }
             if flow.state == StreamState::Connecting && !flow.opening && !flow.released {
@@ -533,13 +597,87 @@ impl Driver {
                 continue;
             }
             if flow.kind != Kind::Stream {
-                if let Some(packet) = flow.outgoing.front() {
+                if flow.inflight.is_some() {
+                    continue;
+                }
+                let resource = flow.selected.clone();
+                let dispatch = match (flow.outgoing.front(), resource) {
+                    (Some(crate::datagram::Output::Packet(packet)), Some(resource)) => Some((
+                        resource,
+                        true,
+                        Command::SendDatagramQueued {
+                            dispatch: request,
+                            socket: id,
+                            data: packet.data.clone(),
+                            addr: packet.addr,
+                        },
+                    )),
+                    (Some(crate::datagram::Output::Control(control)), Some(resource)) => Some((
+                        resource,
+                        false,
+                        Command::SetDatagramQueued {
+                            dispatch: request,
+                            socket: id,
+                            control: control.clone(),
+                        },
+                    )),
+                    _ => None,
+                };
+                if let Some((resource, packet, command)) = dispatch {
+                    let source = resource.state.lock().unwrap().datagram_source;
+                    flow.inflight = Some((request, 0));
+                    self.pending.insert(
+                        request,
+                        Pending::DatagramDispatch(crate::datagram::Dispatch {
+                            socket: id,
+                            generation: self.generation,
+                            resource,
+                            source,
+                            packet,
+                        }),
+                    );
                     self.cursor = id;
-                    return Ok(Some(Command::SendTo {
+                    return Ok(Some(command));
+                }
+                let command = match flow.outgoing.front() {
+                    Some(crate::datagram::Output::Packet(packet)) => Some(Command::SendTo {
                         socket: id,
                         data: packet.data.clone(),
                         addr: packet.addr,
-                    }));
+                    }),
+                    Some(crate::datagram::Output::Control(control)) => Some(Command::SetOption {
+                        request: None,
+                        socket: id,
+                        control: control.clone(),
+                    }),
+                    Some(crate::datagram::Output::Readback { .. }) => {
+                        let output = flow.outgoing.pop_front().unwrap();
+                        flow.outgoing_bytes -= output.charge();
+                        let crate::datagram::Output::Readback { query, done } = output else {
+                            unreachable!()
+                        };
+                        flow.inflight = Some((request, 0));
+                        self.pending.insert(
+                            request,
+                            Pending::DatagramReadback(crate::datagram::Readback {
+                                socket: id,
+                                query,
+                                generation: self.generation,
+                                resource: flow.selected.clone(),
+                                done: Some(done),
+                            }),
+                        );
+                        Some(Command::DatagramReadback {
+                            request,
+                            socket: id,
+                            query,
+                        })
+                    }
+                    None => None,
+                };
+                if command.is_some() {
+                    self.cursor = id;
+                    return Ok(command);
                 }
                 continue;
             }
@@ -743,7 +881,8 @@ impl Driver {
     fn retire_unaccepted_selected(&mut self, socket: u64) {
         let owned = |command: &Command| match command {
             Command::Accept { child, .. } => *child == socket,
-            Command::BindStream { socket: id, .. }
+            Command::BindDatagram { socket: id, .. }
+            | Command::BindStream { socket: id, .. }
             | Command::ConnectFrom { socket: id, .. }
             | Command::ListenFrom { socket: id, .. }
             | Command::ListenReserved { socket: id, .. }
@@ -798,7 +937,10 @@ impl Driver {
                             flow.remote,
                             flow.peer,
                             0,
-                            flow.reset || (flow.tx.is_empty() && flow.inflight.is_none()),
+                            flow.reset
+                                || (flow.tx.is_empty()
+                                    && flow.outgoing.is_empty()
+                                    && flow.inflight.is_none()),
                         )
                     })
             })
@@ -838,10 +980,29 @@ impl Driver {
                 && flow.reset
             {
                 if let Some((request, _)) = flow.inflight.take() {
-                    self.pending.remove(&request);
+                    match self.pending.remove(&request) {
+                        Some(Pending::DatagramReadback(read)) => {
+                            if let Some(completion) = read.finish(Err(Errno::ECANCELED)) {
+                                self.option_results.push(completion);
+                            }
+                        }
+                        Some(Pending::DatagramDispatch(_)) | None => {}
+                        Some(other) => {
+                            self.pending.insert(request, other);
+                        }
+                    }
+                }
+                let outgoing = std::mem::take(&mut flow.outgoing);
+                for output in outgoing {
+                    if let crate::datagram::Output::Readback { done, .. } = output {
+                        self.option_results
+                            .push(crate::options::Completion::readback(
+                                done,
+                                Err(Errno::ECANCELED),
+                            ));
+                    }
                 }
                 flow.tx.clear();
-                flow.outgoing.clear();
                 flow.outgoing_bytes = 0;
             }
             let mut state = resource.state.lock().unwrap();
@@ -901,11 +1062,22 @@ impl Driver {
             };
             let request = inner.id()?;
             let command = match operation {
-                Operation::Bind => Command::BindStream {
-                    request,
-                    socket: id,
-                    bind: resource.request.ok_or(Errno::EPROTO)?,
-                },
+                Operation::Bind => {
+                    let bind = resource.request.ok_or(Errno::EPROTO)?;
+                    if bind.kind == wasixv2_vnet::endpoint::EndpointKind::Datagram {
+                        Command::BindDatagram {
+                            request,
+                            socket: id,
+                            bind,
+                        }
+                    } else {
+                        Command::BindStream {
+                            request,
+                            socket: id,
+                            bind,
+                        }
+                    }
+                }
                 Operation::Connect => Command::ConnectFrom {
                     request,
                     socket: id,
@@ -1015,6 +1187,26 @@ impl Driver {
     fn command_valid(&self) -> bool {
         let inner = self.shared.inner.lock().unwrap();
         match &self.command {
+            Some(
+                Command::SendDatagramQueued {
+                    dispatch, socket, ..
+                }
+                | Command::SetDatagramQueued {
+                    dispatch, socket, ..
+                },
+            ) => {
+                matches!(self.pending.get(dispatch),Some(Pending::DatagramDispatch(entry)) if entry.socket==*socket)
+                    && inner.flows.get(socket).is_some_and(|flow| {
+                        flow.inflight == Some((*dispatch, 0))
+                            && !flow.reset
+                            && flow.state != StreamState::Closed
+                    })
+            }
+            Some(Command::DatagramReadback {
+                request, socket, ..
+            }) => {
+                matches!(self.pending.get(request), Some(Pending::DatagramReadback(read)) if read.socket==*socket && read.done.is_some())
+            }
             Some(Command::SetOption {
                 request: Some(request),
                 socket,
@@ -1067,7 +1259,10 @@ impl Driver {
                 false
             }
             Some(
-                Command::BindStream {
+                Command::BindDatagram {
+                    request, socket, ..
+                }
+                | Command::BindStream {
                     request, socket, ..
                 }
                 | Command::ConnectFrom {
@@ -1124,6 +1319,43 @@ impl Driver {
         let command = self.command.take();
         let mut inner = self.shared.inner.lock().unwrap();
         match command {
+            Some(
+                Command::SendDatagramQueued {
+                    dispatch, socket, ..
+                }
+                | Command::SetDatagramQueued {
+                    dispatch, socket, ..
+                },
+            ) => {
+                if matches!(self.pending.get(&dispatch),Some(Pending::DatagramDispatch(entry)) if entry.socket==socket)
+                {
+                    self.pending.remove(&dispatch);
+                    if let Some(flow) = inner.flows.get_mut(&socket)
+                        && flow.inflight == Some((dispatch, 0))
+                    {
+                        flow.inflight = None;
+                    }
+                }
+            }
+            Some(Command::DatagramReadback {
+                request, socket, ..
+            }) => {
+                if matches!(self.pending.get(&request),Some(Pending::DatagramReadback(read)) if read.socket==socket && read.generation==self.generation)
+                {
+                    let Some(Pending::DatagramReadback(read)) = self.pending.remove(&request)
+                    else {
+                        unreachable!()
+                    };
+                    if let Some(completion) = read.finish(Err(Errno::ECANCELED)) {
+                        self.option_results.push(completion);
+                    }
+                }
+                if let Some(flow) = inner.flows.get_mut(&socket)
+                    && flow.inflight == Some((request, 0))
+                {
+                    flow.inflight = None;
+                }
+            }
             Some(Command::SetOption {
                 request: Some(request),
                 socket,
@@ -1170,7 +1402,10 @@ impl Driver {
                 }
             }
             Some(
-                Command::BindStream {
+                Command::BindDatagram {
+                    request, socket, ..
+                }
+                | Command::BindStream {
                     request, socket, ..
                 }
                 | Command::ConnectFrom {
@@ -1299,7 +1534,8 @@ impl Driver {
                 flow.send_blocked = true;
             }
         }
-        if let Command::BindStream { socket, .. }
+        if let Command::BindDatagram { socket, .. }
+        | Command::BindStream { socket, .. }
         | Command::ConnectFrom { socket, .. }
         | Command::ListenFrom { socket, .. }
         | Command::ListenReserved { socket, .. } = &command
@@ -1307,12 +1543,18 @@ impl Driver {
         {
             flow.remote = true;
         }
-        if let Command::SendTo { socket, .. } = command {
+        if let Command::SendTo { socket, .. }
+        | Command::SetOption {
+            request: None,
+            socket,
+            ..
+        } = command
+        {
             let wq = {
                 let mut inner = self.shared.inner.lock().unwrap();
                 inner.flows.get_mut(&socket).map(|flow| {
                     if let Some(packet) = flow.outgoing.pop_front() {
-                        flow.outgoing_bytes -= packet.data.len().max(1);
+                        flow.outgoing_bytes -= packet.charge();
                     }
                     flow.wq.clone()
                 })
@@ -1386,7 +1628,125 @@ impl Driver {
         failure.map_or(Ok(()), Err)
     }
 
+    fn datagram_event(&mut self, event: &Event) -> Result<bool, Errno> {
+        if let Event::DatagramDispatched {
+            request,
+            socket,
+            result,
+        } = event
+        {
+            let Some(pending) = self.pending.get(request) else {
+                return Ok(true);
+            };
+            let Pending::DatagramDispatch(entry) = pending else {
+                return Err(Errno::EPROTO);
+            };
+            if entry.socket != *socket {
+                return Err(Errno::EPROTO);
+            }
+            let mut inner = self.shared.inner.lock().unwrap();
+            if entry.generation != inner.generation {
+                return Err(Errno::ENETDOWN);
+            }
+            let flow = inner.flows.get_mut(socket).ok_or(Errno::ECANCELED)?;
+            if flow.inflight != Some((*request, 0))
+                || flow
+                    .selected
+                    .as_ref()
+                    .is_none_or(|resource| !Arc::ptr_eq(resource, &entry.resource))
+            {
+                return Err(Errno::EPROTO);
+            }
+            let source = entry.resource.state.lock().unwrap().datagram_source;
+            let current_source = source == entry.source;
+            if !matches!(
+                (entry.packet, flow.outgoing.front()),
+                (true, Some(crate::datagram::Output::Packet(_)))
+                    | (false, Some(crate::datagram::Output::Control(_)))
+            ) {
+                return Err(Errno::EPROTO);
+            }
+            // Validation precedes every destructive mutation. Transport admission
+            // alone did not dequeue/decharge these accepted bytes.
+            self.pending.remove(request);
+            flow.inflight = None;
+            let output = flow.outgoing.pop_front().unwrap();
+            flow.outgoing_bytes -= output.charge();
+            if current_source && let Err(error) = result {
+                flow.fail(*error);
+                flow.reset = true;
+            }
+            // A legitimate association/source renewal does not revoke already
+            // accepted old bytes. Retire only their exact local receipt/head;
+            // do not publish its error/peer state into the newer association.
+            let queue = flow.wq.clone();
+            let mask = flow.mask(self.shared.config);
+            self.selected_wakes.extend(flow.selected.clone());
+            drop(inner);
+            queue.wake(mask);
+            return Ok(true);
+        }
+        let request = match event {
+            Event::DatagramValue { request, .. }
+            | Event::LocalAddr { request, .. }
+            | Event::Complete { request, .. } => *request,
+            _ => return Ok(false),
+        };
+        let Some(Pending::DatagramReadback(read)) = self.pending.get(&request) else {
+            return if matches!(event, Event::DatagramValue { .. }) {
+                if self.pending.contains_key(&request) {
+                    Err(Errno::EPROTO)
+                } else {
+                    Ok(true)
+                }
+            } else {
+                Ok(false)
+            };
+        };
+        let result = match event {
+            Event::DatagramValue { value, .. } => Ok(value.readback(read.query)?),
+            Event::LocalAddr { addr, .. } => Ok(crate::datagram::address(read.query, *addr)?),
+            Event::Complete {
+                result: Err(error), ..
+            } => Err(*error),
+            _ => return Err(Errno::EPROTO),
+        };
+        let mut inner = self.shared.inner.lock().unwrap();
+        if read.generation != inner.generation {
+            return Err(Errno::ENETDOWN);
+        }
+        if read.done.is_some() {
+            let flow = inner.flows.get(&read.socket).ok_or(Errno::ECANCELED)?;
+            if flow.inflight != Some((request, 0))
+                || match (&read.resource, &flow.selected) {
+                    (Some(a), Some(b)) => !Arc::ptr_eq(a, b),
+                    (None, None) => false,
+                    _ => true,
+                }
+            {
+                return Err(Errno::EPROTO);
+            }
+        }
+        let Pending::DatagramReadback(read) = self.pending.remove(&request).unwrap() else {
+            unreachable!()
+        };
+        if let Some(flow) = inner.flows.get_mut(&read.socket)
+            && flow.inflight == Some((request, 0))
+        {
+            flow.inflight = None;
+            self.selected_wakes.extend(flow.selected.clone());
+        }
+        drop(inner);
+        if let Some(completion) = read.finish(result) {
+            self.option_results.push(completion);
+        }
+        Ok(true)
+    }
+
     fn selected_event(&mut self, event: &Event) -> Result<bool, Errno> {
+        if self.datagram_event(event)? {
+            return Ok(true);
+        }
         if let Event::LocalCloseUnconfirmed {
             request,
             socket,
@@ -1659,6 +2019,39 @@ impl Driver {
             return Ok(());
         }
         if operation == Operation::Close {
+            // Pending readonly RPCs may have been withdrawn before a terminal
+            // reply. THIS exact resource's close fence owns their retirement;
+            // no tombstones/Resource Arcs may accumulate until driver teardown.
+            let reads: Vec<_> = self
+                .pending
+                .iter()
+                .filter_map(|(&request, pending)| match pending {
+                    Pending::DatagramReadback(read)
+                        if read.socket == socket
+                            && read.generation == self.generation
+                            && read
+                                .resource
+                                .as_ref()
+                                .is_some_and(|owned| Arc::ptr_eq(owned, &resource)) =>
+                    {
+                        Some(request)
+                    }
+                    _ => None,
+                })
+                .collect();
+            for request in reads {
+                let Some(Pending::DatagramReadback(read)) = self.pending.remove(&request) else {
+                    unreachable!()
+                };
+                if let Some(completion) = read.finish(Err(Errno::ECANCELED)) {
+                    self.option_results.push(completion);
+                }
+                if let Some(flow) = inner.flows.get_mut(&socket)
+                    && flow.inflight == Some((request, 0))
+                {
+                    flow.inflight = None;
+                }
+            }
             let was_terminal = state.close.is_some();
             state.phase = Phase::Closed;
             state.close = Some(if local_cutoff {
@@ -1808,7 +2201,15 @@ impl Driver {
                         if operation == Operation::Connect {
                             flow.tcp_policy
                                 .get_or_init(|| wasixv2_vnet::TcpOptionPolicy::Canonical);
+                        }
+                        if operation == Operation::Connect
+                            || (operation == Operation::Bind
+                                && matches!(flow.kind, Kind::Datagram(_)))
+                        {
                             flow.state = StreamState::Established;
+                            if operation == Operation::Bind {
+                                flow.peer = actual;
+                            }
                         }
                     }
                     if let Some(listener) = inner.listeners.get_mut(&socket) {
@@ -2232,7 +2633,7 @@ impl Driver {
             | Event::ProviderCloseAck { .. }
             | Event::LocalCloseUnconfirmed { .. }
             | Event::AcceptedTo { .. } => return Err(Errno::EPROTO),
-            Event::Provider { .. } => return Err(Errno::EPROTO),
+            Event::Provider { .. } | Event::DatagramValue { .. } => return Err(Errno::EPROTO),
             Event::Complete { request, result } => {
                 if let Some(query) = inner.lookups.remove(&request) {
                     complete = Some((
@@ -2259,6 +2660,9 @@ impl Driver {
                         | Pending::SelectedAddress(..)
                         | Pending::AcceptedAddress(..)
                         | Pending::SelectedAccept { .. } => return Err(Errno::EPROTO),
+                        Pending::DatagramReadback(_) | Pending::DatagramDispatch(_) => {
+                            return Err(Errno::EPROTO);
+                        }
                         Pending::Open(id) => {
                             if let Some(flow) = inner.flows.get_mut(&id) {
                                 flow.opening = false;
@@ -2454,6 +2858,9 @@ impl Driver {
                         wakes.push((flow.wq.clone(), flow.mask(self.shared.config)));
                     }
                 }
+            }
+            Event::DatagramDispatched { .. } => {
+                unreachable!("qualified datagram dispatch handled before ordinary events")
             }
             Event::Data { .. } | Event::Urgent { .. } => {
                 unreachable!("data is copied through the bounded input slot")
@@ -2715,7 +3122,14 @@ impl Driver {
         self.stopped = true;
         self.command = None;
         self.input = None;
-        self.pending.clear();
+        let pending = std::mem::take(&mut self.pending);
+        for (_, pending) in pending {
+            if let Pending::DatagramReadback(read) = pending {
+                if let Some(completion) = read.finish(Err(error)) {
+                    self.option_results.push(completion);
+                }
+            }
+        }
         self.cleanup.clear();
         self.registrations.clear();
         let mut inner = self.shared.inner.lock().unwrap();
@@ -2727,6 +3141,14 @@ impl Driver {
         let mut binding_wakes = Vec::new();
         let mut selected = Vec::new();
         for flow in inner.flows.values_mut() {
+            let outgoing = std::mem::take(&mut flow.outgoing);
+            for output in outgoing {
+                if let crate::datagram::Output::Readback { done, .. } = output {
+                    self.option_results
+                        .push(crate::options::Completion::readback(done, Err(error)));
+                }
+            }
+            flow.outgoing_bytes = 0;
             if let Some(batch) = flow.options.take() {
                 self.option_results
                     .push(batch.complete(Err(cleanup_error.unwrap_or(error))));
@@ -3179,5 +3601,173 @@ mod control_tests {
             .unwrap();
         assert_eq!(stream.take_error(), Some(Errno::ECONNREFUSED));
         assert_eq!(stream.tcp_option_policy(), None);
+    }
+    #[test]
+    fn repeated_qualified_peer_closes_retire_actual_readback_records_before_driver_drop() {
+        use wasixv2_vnet::{DatagramReadback, Domain, Net, NetConfig, Network, SocketKind};
+        struct Io {
+            caps: Capabilities,
+            commands: Vec<Command>,
+        }
+        impl Transport for Io {
+            fn capabilities(&self) -> Capabilities {
+                self.caps
+            }
+            fn poll_send(
+                &mut self,
+                _: &mut Context<'_>,
+                command: &Command,
+            ) -> Poll<Result<(), Errno>> {
+                self.commands.push(command.clone());
+                Poll::Ready(Ok(()))
+            }
+            fn poll_recv(&mut self, _: &mut Context<'_>) -> Poll<Result<Event, Errno>> {
+                Poll::Pending
+            }
+            fn close(&mut self) {}
+        }
+        let caps = Capabilities {
+            selected_endpoints: true,
+            selected_bind: true,
+            selected_external: true,
+            ..Capabilities::classic(true)
+        };
+        let (backend, mut driver) = WebBackend::new(
+            Config {
+                max_sockets: 1,
+                ..Config::default()
+            },
+            caps,
+        )
+        .unwrap();
+        let net = Net::new(
+            NetConfig::host_default(),
+            Some(backend.with_namespace_endpoints()),
+        );
+        let mut io = Io {
+            caps,
+            commands: Vec::new(),
+        };
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        for cycle in 0..16 {
+            let socket = net
+                .socket(Domain::Inet, SocketKind::Datagram, 0, 1000)
+                .unwrap();
+            let bind = socket
+                .bind_admission("0.0.0.0:0".parse().unwrap(), false)
+                .unwrap()
+                .unwrap();
+            assert_eq!(bind.complete_result(), None);
+            assert!(driver.poll(&mut cx, &mut io).is_pending());
+            let Command::BindDatagram {
+                request,
+                socket: id,
+                ..
+            } = io.commands.last().unwrap().clone()
+            else {
+                panic!()
+            };
+            driver
+                .event(Event::Complete {
+                    request,
+                    result: Ok(()),
+                })
+                .unwrap();
+            assert!(driver.poll(&mut cx, &mut io).is_pending());
+            let Command::LocalAddr { request, .. } = io.commands.last().unwrap().clone() else {
+                panic!()
+            };
+            driver
+                .event(Event::LocalAddr {
+                    request,
+                    addr: format!("0.0.0.0:{}", 47000 + cycle).parse().unwrap(),
+                })
+                .unwrap();
+            assert_eq!(bind.complete_result(), Some(Ok(())));
+            drop(bind);
+            let read = socket
+                .datagram_readback_admission(DatagramReadback::Ttl)
+                .unwrap()
+                .unwrap();
+            assert_eq!(read.complete_result(), None);
+            assert!(driver.poll(&mut cx, &mut io).is_pending());
+            let Command::DatagramReadback { request: query, .. } =
+                io.commands.last().unwrap().clone()
+            else {
+                panic!()
+            };
+            let queued = socket
+                .datagram_readback_admission(DatagramReadback::Broadcast)
+                .unwrap()
+                .unwrap();
+            assert_eq!(queued.complete_result(), None);
+            let query_count = io
+                .commands
+                .iter()
+                .filter(|command| matches!(command, Command::DatagramReadback { .. }))
+                .count();
+            let weak = Arc::downgrade(
+                driver.shared.inner.lock().unwrap().flows[&id]
+                    .selected
+                    .as_ref()
+                    .unwrap(),
+            );
+            drop(socket);
+            // This is the adapter's existing owned close boundary (also used by
+            // Datagram::drop). The pending callback still owns its provider Arc.
+            crate::backend::release(&driver.shared, id);
+            assert!(driver.poll(&mut cx, &mut io).is_pending());
+            let Command::CloseSelected {
+                request,
+                socket: closed,
+            } = io.commands.last().unwrap().clone()
+            else {
+                panic!()
+            };
+            assert_eq!(closed, id);
+            driver
+                .event(Event::ProviderCloseAck {
+                    request,
+                    socket: id,
+                    accept_pending: false,
+                    result: Ok(()),
+                })
+                .unwrap();
+            assert!(driver.poll(&mut cx, &mut io).is_pending());
+            assert_eq!(read.complete_result(), Some(Err(Errno::ECANCELED)));
+            assert_eq!(read.complete_result(), Some(Err(Errno::ECANCELED)));
+            assert!(
+                !driver
+                    .pending
+                    .values()
+                    .any(|pending| matches!(pending, Pending::DatagramReadback(_))),
+                "cycle {cycle}: actual close must retire its exact pending record without waiting for a reply or Driver::drop"
+            );
+            assert!(driver.pending.is_empty());
+            assert_eq!(queued.complete_result(), Some(Err(Errno::ECANCELED)));
+            assert_eq!(
+                io.commands
+                    .iter()
+                    .filter(|command| matches!(command, Command::DatagramReadback { .. }))
+                    .count(),
+                query_count,
+                "queued readonly work cannot become post-seal RPC"
+            );
+            drop(queued);
+            drop(read);
+            assert!(
+                weak.upgrade().is_none(),
+                "cycle {cycle}: callback/record must release the actual Resource"
+            );
+            // A retained captured reply after the close cannot poison a later
+            // fd or consume its different pending operation.
+            driver
+                .control_event(Event::DatagramValue {
+                    request: query,
+                    value: crate::DatagramValue::Ttl(37),
+                })
+                .unwrap();
+        }
+        assert!(driver.shared.inner.lock().unwrap().online);
     }
 }

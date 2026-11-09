@@ -30,8 +30,8 @@ pub struct Capabilities {
     /// Opt-in same-resource stream binding/connection and acknowledged cleanup.
     /// Existing profiles leave this disabled unless their actual transport supports it.
     pub selected_endpoints: bool,
-    /// This profile actually admits prebound stream resources. False retains
-    /// canonical namespace reservation and creates the listener at publication.
+    /// This profile admits prebound stream or datagram resources. False retains
+    /// namespace reservation and creates stream listeners at publication.
     pub selected_bind: bool,
     /// Unbound uplink connections report a real provider local address. Browser
     /// WISP leaves this false; Node host and capable Classic profiles opt in.
@@ -113,10 +113,37 @@ pub enum SocketControl {
 /// One ordered request. IDs are never reused within a backend, including across reconnects.
 #[derive(Clone, Debug)]
 pub enum Command {
+    /// Local transport dispatch receipt only; stock SendTo still carries Some.
+    /// No remote Sent result is required or fabricated by this operation.
+    /// Stock UDP silently drops send errors. Non-stock transient Closed-interest
+    /// notifications need a separate delivery contract; no HUP/RST is inferred.
+    SendDatagramQueued {
+        dispatch: u64,
+        socket: u64,
+        data: Vec<u8>,
+        addr: SocketAddr,
+    },
+    /// Original queued setter uses wire request None; this identity is local only.
+    SetDatagramQueued {
+        dispatch: u64,
+        socket: u64,
+        control: SocketControl,
+    },
     SetOption {
         request: Option<u64>,
         socket: u64,
         control: SocketControl,
+    },
+    /// Same admitted source-only UDP resource; literal flags precede actual local readback.
+    BindDatagram {
+        request: u64,
+        socket: u64,
+        bind: wasixv2_vnet::endpoint::EndpointBindRequest,
+    },
+    DatagramReadback {
+        request: u64,
+        socket: u64,
+        query: wasixv2_vnet::DatagramReadback,
     },
     /// A bind-only stream, or a direct unbound listen according to `bind.purpose`.
     BindStream {
@@ -238,6 +265,16 @@ pub enum Event {
         peer: SocketAddr,
         local: SocketAddr,
         policy: wasixv2_vnet::TcpOptionPolicy,
+    },
+    /// SAME captured local WebSocket send returned, never a remote/physical ACK.
+    DatagramDispatched {
+        request: u64,
+        socket: u64,
+        result: Result<(), Errno>,
+    },
+    DatagramValue {
+        request: u64,
+        value: crate::DatagramValue,
     },
     StreamBound {
         request: u64,
@@ -426,7 +463,8 @@ impl<T: FrameTransport> Transport for Classic<T> {
         }
         if matches!(
             command,
-            Command::BindStream { .. }
+            Command::BindDatagram { .. }
+                | Command::BindStream { .. }
                 | Command::ConnectFrom { .. }
                 | Command::ListenFrom { .. }
                 | Command::ListenReserved { .. }

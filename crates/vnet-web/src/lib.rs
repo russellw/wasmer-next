@@ -6,6 +6,7 @@
 //! new flows only; old queued bytes are never replayed. See README.md for relay limitations.
 mod backend;
 pub mod codec;
+mod datagram;
 mod driver;
 mod endpoints;
 mod options;
@@ -19,3 +20,5 @@ pub use endpoints::SelectedCloseReport;
 pub use transport::{
     Capabilities, Classic, Command, Event, FrameTransport, SocketControl, Transport,
 };
+
+pub use datagram::Value as DatagramValue;

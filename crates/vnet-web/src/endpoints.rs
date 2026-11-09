@@ -51,6 +51,7 @@ pub(crate) enum Phase {
 
 pub(crate) struct State {
     pub phase: Phase,
+    pub datagram_source: Option<EndpointSourceId>,
     pub actual: Option<SocketAddr>,
     pub connect_local: Option<SocketAddr>,
     pub error: Option<Errno>,
@@ -83,6 +84,9 @@ impl Resource {
             reserved: None,
             state: Mutex::new(State {
                 phase: Phase::Queued(operation),
+                datagram_source: request
+                    .filter(|bind| bind.kind == EndpointKind::Datagram)
+                    .map(|bind| bind.source_id),
                 actual: None,
                 connect_local: None,
                 error: None,
@@ -109,6 +113,7 @@ impl Resource {
             reserved: Some((member, domain, v6only)),
             state: Mutex::new(State {
                 phase: Phase::Queued(Operation::Listen),
+                datagram_source: None,
                 actual: None,
                 connect_local: None,
                 error: None,
@@ -185,6 +190,7 @@ struct Bound {
     id: u64,
     resource: Arc<Resource>,
     identity: Weak<()>,
+    peer: Option<Arc<super::backend::Datagram>>,
 }
 impl Pollable for Bound {
     fn poll(&self, table: Option<&mut PollTable<'_>>) -> PollMask {
@@ -195,12 +201,66 @@ impl EndpointBound for Bound {
     fn local_addr(&self) -> Result<SocketAddr, Errno> {
         self.resource.address()
     }
+    fn peer_datagram(&self) -> Option<Arc<dyn BackendDatagram>> {
+        self.peer
+            .as_ref()
+            .map(|peer| peer.clone() as Arc<dyn BackendDatagram>)
+    }
+    fn set_option(&self, level: i32, name: i32, value: &[u8]) -> Result<(), Errno> {
+        self.peer
+            .as_ref()
+            .ok_or(Errno::EOPNOTSUPP)?
+            .set_option(level, name, value)
+    }
+    fn connect_datagram(
+        &self,
+        source: EndpointSourceId,
+        peer: Option<SocketAddr>,
+    ) -> Option<Result<(), Errno>> {
+        self.peer.as_ref()?;
+        Some((|| {
+            let mut inner = self.shared.inner.lock().unwrap();
+            if !inner.online || inner.generation != self.resource.generation {
+                return Err(Errno::ENETDOWN);
+            }
+            let flow = inner.flows.get_mut(&self.id).ok_or(Errno::ECANCELED)?;
+            if !flow
+                .selected
+                .as_ref()
+                .is_some_and(|resource| Arc::ptr_eq(resource, &self.resource))
+            {
+                return Err(Errno::ECANCELED);
+            }
+            let mut state = self.resource.state.lock().unwrap();
+            if state.close_requested || state.closing || state.close.is_some() {
+                return Err(Errno::ECANCELED);
+            }
+            // The stock relay has no physical UDP connect. Claim this exact
+            // source epoch BEFORE changing the same flow's logical association.
+            state.datagram_source = Some(source);
+            flow.connected_peer = peer;
+            Ok(())
+        })())
+    }
+    fn datagram_peer_addr(&self) -> Option<Result<Option<SocketAddr>, Errno>> {
+        self.peer.as_ref()?;
+        Some(
+            self.shared
+                .inner
+                .lock()
+                .unwrap()
+                .flows
+                .get(&self.id)
+                .map(|flow| flow.connected_peer)
+                .ok_or(Errno::ECANCELED),
+        )
+    }
 }
 impl Drop for Bound {
     fn drop(&mut self) {
         // A transferred child owns physical close; the old token owns only metadata.
         let transferred = self.resource.state.lock().unwrap().transferred;
-        if !transferred {
+        if self.peer.is_none() && !transferred {
             super::backend::release(&self.shared, self.id);
         }
     }
@@ -351,6 +411,31 @@ impl Provider {
         }
         Ok(bound)
     }
+    fn peer_members(
+        &self,
+        members: &[EndpointMember],
+    ) -> Result<(u64, Vec<EndpointSourceId>), Errno> {
+        let inner = self.shared.inner.lock().unwrap();
+        if !inner.online || inner.selected_close.is_some() {
+            return Err(Errno::ENETDOWN);
+        }
+        let mut sources = Vec::with_capacity(members.len());
+        for member in members {
+            let bound = self.bound(member.binding.as_ref().ok_or(Errno::ECANCELED)?)?;
+            let state = bound.resource.state.lock().unwrap();
+            if bound.peer.is_none()
+                || bound.resource.generation != inner.generation
+                || state.datagram_source != Some(member.source_id)
+                || state.closing
+                || state.close_requested
+                || state.close.is_some()
+            {
+                return Err(Errno::ECANCELED);
+            }
+            sources.push(member.source_id);
+        }
+        Ok((inner.generation, sources))
+    }
 }
 impl EndpointProvider for Provider {
     fn select_external(&self) -> bool {
@@ -361,22 +446,28 @@ impl EndpointProvider for Provider {
         if !inner.online || inner.selected_close.is_some() {
             return Err(Errno::ENETDOWN);
         }
-        Ok(request.kind == EndpointKind::Stream && inner.capabilities.selected_bind)
+        Ok(inner.capabilities.selected_bind
+            && match request.kind {
+                EndpointKind::Stream => inner.capabilities.tcp,
+                EndpointKind::Datagram => inner.capabilities.udp,
+            })
     }
     fn bind(
         &self,
         request: EndpointBindRequest,
         queue: WaitQueue,
     ) -> Result<Option<Arc<dyn EndpointBound>>, Errno> {
-        if request.kind != EndpointKind::Stream {
-            return Ok(None);
-        }
         let mut inner = self.shared.inner.lock().unwrap();
         if inner.selected_close.is_some() {
             return Err(Errno::ENETDOWN);
         }
         inner.room(self.shared.config)?;
-        if !inner.capabilities.selected_endpoints || !inner.capabilities.tcp {
+        if !inner.capabilities.selected_endpoints
+            || match request.kind {
+                EndpointKind::Stream => !inner.capabilities.tcp,
+                EndpointKind::Datagram => !inner.capabilities.udp,
+            }
+        {
             return Err(Errno::EOPNOTSUPP);
         }
         super::backend::family_allowed(inner.capabilities, request.requested)?;
@@ -392,7 +483,24 @@ impl EndpointProvider for Provider {
             queue.clone(),
             inner.generation,
         );
-        let flow = Flow::selected_stream(request.requested, queue, resource.clone());
+        let flow = if request.kind == EndpointKind::Datagram {
+            let mut flow = Flow::new(
+                super::backend::Kind::Datagram(request.domain),
+                request.requested,
+                queue,
+            );
+            flow.selected = Some(resource.clone());
+            flow
+        } else {
+            Flow::selected_stream(request.requested, queue, resource.clone())
+        };
+        let peer = (request.kind == EndpointKind::Datagram).then(|| {
+            Arc::new(super::backend::Datagram {
+                shared: self.shared.clone(),
+                id,
+                peer_only: true,
+            })
+        });
         inner.flows.insert(id, flow);
         drop(inner);
         self.shared.wake.wake();
@@ -401,6 +509,7 @@ impl EndpointProvider for Provider {
             id,
             resource,
             identity: Arc::downgrade(&self.identity),
+            peer,
         })))
     }
     fn select(&self, query: &EndpointQuery) -> Result<EndpointChoice, Errno> {
@@ -411,8 +520,31 @@ impl EndpointProvider for Provider {
             }
             (inner.generation, inner.capabilities.selected_external)
         };
-        if query.kind != EndpointKind::Stream {
-            return Ok(EndpointChoice::Namespace);
+        if query.kind == EndpointKind::Datagram {
+            let Some(binding) = &query.binding else {
+                return Ok(EndpointChoice::Namespace);
+            };
+            let bound = self.bound(binding)?;
+            if bound.peer.is_none() {
+                return Ok(EndpointChoice::Namespace);
+            }
+            let state = bound.resource.state.lock().unwrap();
+            if bound.resource.generation != generation
+                || state.datagram_source != Some(query.source_id)
+                || state.closing
+                || state.close_requested
+                || state.close.is_some()
+            {
+                return Err(Errno::ECANCELED);
+            }
+            return Ok(EndpointChoice::Provider(EndpointTarget::new(Target {
+                shared: Arc::downgrade(&self.shared),
+                identity: Arc::downgrade(&self.identity),
+                generation,
+                source: query.source_id,
+                binding: query.binding.clone(),
+                peer: query.destination,
+            })));
         }
         if let Some(binding) = &query.binding {
             let bound = self.bound(binding)?;
@@ -505,6 +637,62 @@ impl EndpointProvider for Provider {
             id,
             peer,
         }))
+    }
+    fn datagram(
+        &self,
+        source: wasixv2_vnet::endpoint::EndpointSource,
+        initial: wasixv2_vnet::endpoint::UdpTxConfig,
+        _queue: WaitQueue,
+    ) -> Result<Arc<dyn wasixv2_vnet::endpoint::EndpointDatagramTx>, Errno> {
+        let binding = source.binding.as_ref().ok_or(Errno::ECANCELED)?;
+        let bound = self.bound(binding)?;
+        let peer = bound.peer.clone().ok_or(Errno::EOPNOTSUPP)?;
+        let inner = self.shared.inner.lock().unwrap();
+        let state = bound.resource.state.lock().unwrap();
+        if !inner.online
+            || inner.selected_close.is_some()
+            || inner.generation != bound.resource.generation
+            || state.datagram_source != Some(source.id)
+            || state.close_requested
+            || state.closing
+            || state.close.is_some()
+        {
+            return Err(Errno::ECANCELED);
+        }
+        drop(state);
+        drop(inner);
+        let tx = Arc::new(PeerTx {
+            datagram: peer,
+            resource: bound.resource.clone(),
+            identity: Arc::downgrade(&self.identity),
+            source: source.id,
+            generation: bound.resource.generation,
+            config: Mutex::new(None),
+        });
+        wasixv2_vnet::endpoint::EndpointDatagramTx::configure(&*tx, initial);
+        Ok(tx)
+    }
+    fn publish_udp(
+        &self,
+        spec: EndpointGroupSpec,
+        _ingress: Arc<dyn wasixv2_vnet::endpoint::EndpointDatagramIngress>,
+        reporter: PublicationReporter,
+    ) -> Result<Arc<dyn EndpointLease>, Errno> {
+        let members = self.peer_members(&spec.members)?;
+        let lease = PeerLease {
+            shared: self.shared.clone(),
+            identity: Arc::downgrade(&self.identity),
+            generation: members.0,
+            reporter,
+            config: Mutex::new((spec.revision, spec.members.clone())),
+        };
+        // The existing physical UDP sockets already perform their own reuse/
+        // multicast receive selection. Core pulls SAME per-socket peer bytes.
+        // No strict destination/interface metadata or group fanout is invented.
+        for source in members.1 {
+            lease.reporter.ready_member(source);
+        }
+        Ok(Arc::new(lease))
     }
     fn publish_tcp(
         &self,
@@ -950,6 +1138,171 @@ impl InboundSink for MemberSink {
     fn incoming(&self, _stream: Arc<dyn BackendStream>, _queue: WaitQueue) -> bool {
         // Selected ingress always uses incoming_to with the actual destination.
         false
+    }
+}
+
+struct PeerLease {
+    shared: Arc<Shared>,
+    identity: Weak<()>,
+    generation: u64,
+    reporter: PublicationReporter,
+    config: Mutex<(u64, Arc<[EndpointMember]>)>,
+}
+impl Pollable for PeerLease {
+    fn poll(&self, table: Option<&mut PollTable<'_>>) -> PollMask {
+        self.reporter.poll(table)
+    }
+}
+impl EndpointLease for PeerLease {
+    fn reporter(&self) -> &PublicationReporter {
+        &self.reporter
+    }
+    fn update_members(&self, revision: u64, members: Arc<[EndpointMember]>) {
+        let Some(identity) = self.identity.upgrade() else {
+            return;
+        };
+        let provider = Provider {
+            shared: self.shared.clone(),
+            identity,
+        };
+        let valid = provider.peer_members(&members);
+        let Ok((generation, sources)) = valid else {
+            return;
+        };
+        if generation != self.generation {
+            return;
+        }
+        {
+            let mut config = self.config.lock().unwrap();
+            if revision <= config.0 {
+                return;
+            }
+            *config = (revision, members);
+        }
+        for source in sources {
+            self.reporter.ready_member(source);
+        }
+    }
+}
+struct PeerTx {
+    datagram: Arc<super::backend::Datagram>,
+    resource: Arc<Resource>,
+    identity: Weak<()>,
+    source: EndpointSourceId,
+    generation: u64,
+    config: Mutex<Option<wasixv2_vnet::endpoint::UdpTxConfig>>,
+}
+impl wasixv2_vnet::endpoint::EndpointDatagramTx for PeerTx {
+    fn configure(&self, next: wasixv2_vnet::endpoint::UdpTxConfig) {
+        if next.source_id != self.source {
+            return;
+        }
+        let mut config = self.config.lock().unwrap();
+        if config.is_some_and(|old| next.revision <= old.revision) {
+            return;
+        }
+        let mut inner = self.datagram.shared.inner.lock().unwrap();
+        let state = self.resource.state.lock().unwrap();
+        if inner.generation != self.generation
+            || state.datagram_source != Some(self.source)
+            || state.close_requested
+            || state.closing
+            || state.close.is_some()
+        {
+            return;
+        }
+        let Some(flow) = inner.flows.get_mut(&self.datagram.id) else {
+            return;
+        };
+        // Same existing error-filter bookkeeping. Stock relay UDP has no
+        // physical connect, so canonical association is never replayed here.
+        let _ = flow.datagram_errors.set_option(
+            wasixv2_abi::SocketLevel::SOL_IP.0,
+            wasixv2_abi::IpOption::IP_RECVERR.0,
+            &i32::from(next.recv_v4_errors).to_le_bytes(),
+        );
+        let _ = flow.datagram_errors.set_option(
+            wasixv2_abi::SocketLevel::SOL_IPV6.0,
+            wasixv2_abi::Ipv6Option::IPV6_RECVERR.0,
+            &i32::from(next.recv_v6_errors).to_le_bytes(),
+        );
+        *config = Some(next);
+    }
+    fn send_to(
+        &self,
+        revision: u64,
+        target: &EndpointTarget,
+        _source: SocketAddr,
+        destination: SocketAddr,
+        data: &[u8],
+    ) -> Result<usize, Errno> {
+        let config = self.config.lock().unwrap();
+        if config.is_none_or(|config| config.revision != revision) {
+            return Err(Errno::EAGAIN);
+        }
+        let target = target.downcast_ref::<Target>().ok_or(Errno::EINVAL)?;
+        if target.source != self.source
+            || target.generation != self.generation
+            || !Weak::ptr_eq(&target.identity, &self.identity)
+            || target.peer.ip().to_canonical() != destination.ip().to_canonical()
+            || target.peer.port() != destination.port()
+        {
+            return Err(Errno::ECANCELED);
+        }
+        let binding = target.binding.as_ref().ok_or(Errno::ECANCELED)?;
+        let bound = (binding.as_ref() as &dyn Any)
+            .downcast_ref::<Bound>()
+            .ok_or(Errno::ECANCELED)?;
+        if !Arc::ptr_eq(&bound.resource, &self.resource) {
+            return Err(Errno::ECANCELED);
+        }
+        self.datagram
+            .enqueue_to(data, destination, Some(self.source))
+    }
+    fn poll_tx(&self, revision: u64) -> PollMask {
+        let config = self.config.lock().unwrap();
+        if config.is_none_or(|config| config.revision != revision) {
+            return PollMask::empty();
+        }
+        let inner = self.datagram.shared.inner.lock().unwrap();
+        let state = self.resource.state.lock().unwrap();
+        if inner.generation != self.generation
+            || state.datagram_source != Some(self.source)
+            || state.closing
+            || state.close_requested
+            || state.close.is_some()
+        {
+            return PollMask::ERR;
+        }
+        inner
+            .flows
+            .get(&self.datagram.id)
+            .map_or(PollMask::ERR, |flow| {
+                flow.mask(self.datagram.shared.config) & !PollMask::READABLE
+            })
+    }
+    fn take_error(&self) -> Option<Errno> {
+        let mut inner = self.datagram.shared.inner.lock().unwrap();
+        let state = self.resource.state.lock().unwrap();
+        if inner.generation != self.generation || state.datagram_source != Some(self.source) {
+            return Some(Errno::ECANCELED);
+        }
+        let flow = inner.flows.get_mut(&self.datagram.id)?;
+        flow.error
+            .take()
+            .or_else(|| flow.datagram_errors.take_error())
+    }
+    fn take_queued_error(&self) -> Option<wasixv2_vnet::QueuedError> {
+        let mut inner = self.datagram.shared.inner.lock().unwrap();
+        let state = self.resource.state.lock().unwrap();
+        if inner.generation != self.generation || state.datagram_source != Some(self.source) {
+            return None;
+        }
+        inner
+            .flows
+            .get_mut(&self.datagram.id)?
+            .datagram_errors
+            .take_queued_error()
     }
 }
 

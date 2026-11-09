@@ -15,9 +15,15 @@ pub(crate) struct Batch {
     pub pending: Option<u64>,
     done: Done,
 }
-pub(crate) struct Completion {
-    batch: Batch,
-    result: Result<(), Errno>,
+pub(crate) enum Completion {
+    Option {
+        batch: Batch,
+        result: Result<(), Errno>,
+    },
+    Readback {
+        done: crate::datagram::Done,
+        result: Result<wasixv2_vnet::DatagramReadbackValue, Errno>,
+    },
 }
 impl Batch {
     pub fn prepare(options: Vec<(i32, i32, Vec<u8>)>, done: Done) -> Result<Self, Errno> {
@@ -62,17 +68,27 @@ impl Batch {
         })
     }
     pub fn complete(self, result: Result<(), Errno>) -> Completion {
-        Completion {
+        Completion::Option {
             batch: self,
             result,
         }
     }
 }
 impl Completion {
+    pub fn readback(
+        done: crate::datagram::Done,
+        result: Result<wasixv2_vnet::DatagramReadbackValue, Errno>,
+    ) -> Self {
+        Self::Readback { done, result }
+    }
+
     /// Always after releasing backend/flow locks; the canonical callback may
     /// reenter the same socket synchronously.
     pub fn run(self) {
-        (self.batch.done)(self.result);
+        match self {
+            Self::Option { batch, result } => (batch.done)(result),
+            Self::Readback { done, result } => done(result),
+        }
     }
 }
 
@@ -82,6 +98,21 @@ pub(crate) fn cancel(
     id: u64,
     error: Errno,
 ) {
+    if let Some(flow) = inner.flows.get_mut(&id) {
+        let outgoing = std::mem::take(&mut flow.outgoing);
+        for entry in outgoing {
+            if let crate::datagram::Output::Readback { done, .. } = entry {
+                completed.push(Completion::readback(done, Err(error)));
+            } else {
+                flow.outgoing.push_back(entry);
+            }
+        }
+        flow.outgoing_bytes = flow
+            .outgoing
+            .iter()
+            .map(crate::datagram::Output::charge)
+            .sum();
+    }
     if let Some(flow) = inner.flows.get_mut(&id)
         && let Some(batch) = flow.options.take()
     {

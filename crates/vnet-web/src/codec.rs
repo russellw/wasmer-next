@@ -25,6 +25,58 @@ fn pack(value: impl Serialize) -> Result<Vec<u8>, Errno> {
 /// configured resolver provider (e.g. DoH); the classic Resolve record only names a host.
 pub fn encode(command: &Command) -> Result<Vec<u8>, Errno> {
     let out = match command {
+        Command::SendDatagramQueued {
+            dispatch,
+            socket,
+            data,
+            addr,
+        } => {
+            // Stock server executes UDP ONLY with Some and normally emits no
+            // Sent. This local receipt identity is not an awaited wire result.
+            if data.len() > 65535 {
+                return Err(Errno::EMSGSIZE);
+            }
+            pack((3u32, socket, data, addr, Some(dispatch)))?
+        }
+        Command::SetDatagramQueued {
+            socket, control, ..
+        } => {
+            return encode(&Command::SetOption {
+                request: None,
+                socket: *socket,
+                control: control.clone(),
+            });
+        }
+        Command::BindDatagram {
+            request,
+            socket,
+            bind,
+        } => pack((
+            0u32,
+            17u32,
+            socket,
+            bind.requested,
+            bind.reuse_port,
+            bind.reuse_addr,
+            Some(request),
+        ))?,
+        Command::DatagramReadback {
+            request,
+            socket,
+            query,
+        } => {
+            use wasixv2_vnet::DatagramReadback as Q;
+            let tag = match query {
+                Q::Ttl => 28u32,
+                Q::Broadcast => 47,
+                Q::MulticastLoopV4 => 49,
+                Q::MulticastLoopV6 => 51,
+                Q::MulticastTtlV4 => 53,
+                Q::Local => 25,
+                Q::Peer => 26,
+            };
+            pack((1u32, socket, tag, Some(request)))?
+        }
         Command::SetOption {
             request,
             socket,
@@ -264,6 +316,14 @@ pub fn decode(frame: &[u8]) -> Result<Event, Errno> {
                     request,
                     result: Err(network_error(r.get()?)?),
                 },
+                4 => Event::DatagramValue {
+                    request,
+                    value: crate::DatagramValue::Flag(r.get()?),
+                },
+                13 => Event::DatagramValue {
+                    request,
+                    value: crate::DatagramValue::Ttl(r.get()?),
+                },
                 9 => Event::Provider {
                     request,
                     reply: Reply::Mac(r.get()?),
@@ -442,5 +502,33 @@ fn relay_errno(value: i32) -> Result<Errno, Errno> {
         Ok(Errno(value))
     } else {
         Err(Errno::EPROTO)
+    }
+}
+
+#[cfg(test)]
+mod queued_datagram_wire_tests {
+    use super::*;
+    #[test]
+    fn queued_packet_keeps_original_some_wire_identity_but_setter_keeps_none() {
+        let destination: SocketAddr = "192.0.2.1:9000".parse().unwrap();
+        let command = Command::SendDatagramQueued {
+            dispatch: 73,
+            socket: 11,
+            data: vec![1, 2, 3],
+            addr: destination,
+        };
+        assert_eq!(
+            encode(&command).unwrap(),
+            pack((3u32, 11u64, vec![1u8, 2, 3], destination, Some(73u64))).unwrap()
+        );
+        let setter = Command::SetDatagramQueued {
+            dispatch: 74,
+            socket: 11,
+            control: SocketControl::Broadcast(true),
+        };
+        assert_eq!(
+            encode(&setter).unwrap(),
+            pack((1u32, 11u64, 46u32, true, None::<u64>)).unwrap()
+        );
     }
 }

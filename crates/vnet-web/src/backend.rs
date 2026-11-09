@@ -119,7 +119,7 @@ pub(crate) struct Flow {
     pub attached: bool,
     pub tx: VecDeque<u8>,
     pub incoming: VecDeque<Packet>,
-    pub outgoing: VecDeque<Packet>,
+    pub outgoing: VecDeque<crate::datagram::Output>,
     pub incoming_bytes: usize,
     pub outgoing_bytes: usize,
     pub inflight: Option<(u64, usize)>,
@@ -186,8 +186,14 @@ impl Flow {
         self.read_shut = true;
         self.write_shut = true;
         self.tx.clear();
-        self.outgoing.clear();
-        self.outgoing_bytes = 0;
+        // Accepted readback callbacks are retired by the driver, outside ALL locks.
+        self.outgoing
+            .retain(|entry| matches!(entry, crate::datagram::Output::Readback { .. }));
+        self.outgoing_bytes = self
+            .outgoing
+            .iter()
+            .map(crate::datagram::Output::charge)
+            .sum();
         self.inflight = None;
     }
     pub fn mask(&self, config: Config) -> PollMask {
@@ -348,6 +354,7 @@ impl Backend for WebBackend {
         Ok(Arc::new(Datagram {
             shared: self.shared.clone(),
             id,
+            peer_only: false,
         }))
     }
     fn publish(
@@ -645,9 +652,10 @@ impl Drop for Stream {
     }
 }
 
-struct Datagram {
-    shared: Arc<Shared>,
-    id: u64,
+pub(crate) struct Datagram {
+    pub(crate) shared: Arc<Shared>,
+    pub(crate) id: u64,
+    pub(crate) peer_only: bool,
 }
 impl Pollable for Datagram {
     fn poll(&self, table: Option<&mut PollTable<'_>>) -> PollMask {
@@ -658,11 +666,35 @@ impl Pollable for Datagram {
         self.shared.inner.lock().unwrap().flows[&self.id].mask(self.shared.config)
     }
 }
-impl BackendDatagram for Datagram {
-    fn send_to(&self, data: &[u8], to: SocketAddr) -> Result<usize, Errno> {
+impl Datagram {
+    pub(crate) fn enqueue_to(
+        &self,
+        data: &[u8],
+        to: SocketAddr,
+        source: Option<wasixv2_vnet::endpoint::EndpointSourceId>,
+    ) -> Result<usize, Errno> {
         let mut inner = self.shared.inner.lock().unwrap();
         family_allowed(inner.capabilities, to)?;
-        let flow = inner.flows.get_mut(&self.id).unwrap();
+        let flow = inner.flows.get_mut(&self.id).ok_or(Errno::ECANCELED)?;
+        let _claim = if let Some(source) = source {
+            let state = flow
+                .selected
+                .as_ref()
+                .ok_or(Errno::ECANCELED)?
+                .state
+                .lock()
+                .unwrap();
+            if state.datagram_source != Some(source)
+                || state.close_requested
+                || state.closing
+                || state.close.is_some()
+            {
+                return Err(Errno::ECANCELED);
+            }
+            Some(state)
+        } else {
+            None
+        };
         if let Some(error) = flow
             .error
             .take()
@@ -678,6 +710,14 @@ impl BackendDatagram for Datagram {
         }
         if let Kind::Datagram(domain) = flow.kind
             && (domain == Domain::Inet) != to.is_ipv4()
+            && !(self.peer_only
+                && domain == Domain::Inet6
+                && to.is_ipv4()
+                && flow
+                    .selected
+                    .as_ref()
+                    .and_then(|resource| resource.request)
+                    .is_some_and(|request| !request.v6only))
         {
             return Err(Errno::EAFNOSUPPORT);
         }
@@ -687,14 +727,21 @@ impl BackendDatagram for Datagram {
         if flow.outgoing_bytes + data.len().max(1) > self.shared.config.buffer_bytes {
             return Err(Errno::EAGAIN);
         }
-        flow.outgoing.push_back(Packet {
-            data: data.to_vec(),
-            addr: to,
-        });
+        flow.outgoing
+            .push_back(crate::datagram::Output::Packet(Packet {
+                data: data.to_vec(),
+                addr: to,
+            }));
         flow.outgoing_bytes += data.len().max(1);
+        drop(_claim);
         drop(inner);
         self.shared.wake.wake();
         Ok(data.len())
+    }
+}
+impl BackendDatagram for Datagram {
+    fn send_to(&self, data: &[u8], to: SocketAddr) -> Result<usize, Errno> {
+        self.enqueue_to(data, to, None)
     }
     fn connect(&self, peer: Option<SocketAddr>) -> Result<(), Errno> {
         let mut inner = self.shared.inner.lock().unwrap();
@@ -761,7 +808,30 @@ impl BackendDatagram for Datagram {
             .front()
             .map_or(0, |p| p.data.len())
     }
+    fn start_readback(
+        &self,
+        query: wasixv2_vnet::DatagramReadback,
+        done: crate::datagram::Done,
+    ) -> Option<Result<(), Errno>> {
+        if !self.peer_only {
+            return None;
+        }
+        Some(crate::datagram::enqueue(
+            &self.shared,
+            self.id,
+            crate::datagram::Output::Readback { query, done },
+        ))
+    }
     fn set_option(&self, level: i32, name: i32, value: &[u8]) -> Result<(), Errno> {
+        if self.peer_only
+            && let Some(control) = crate::datagram::control(level, name, value)?
+        {
+            return crate::datagram::enqueue(
+                &self.shared,
+                self.id,
+                crate::datagram::Output::Control(control),
+            );
+        }
         self.shared
             .inner
             .lock()
@@ -911,6 +981,7 @@ impl WebBackend {
         let endpoint = Arc::new(Datagram {
             shared: self.shared.clone(),
             id,
+            peer_only: false,
         });
         Ok((endpoint.clone(), DatagramPublication { endpoint, host }))
     }
