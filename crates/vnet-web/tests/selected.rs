@@ -418,7 +418,10 @@ fn selected_close_is_shared_and_requires_actual_ack_not_send_acceptance() {
         socket,
         result: Ok(()),
     });
-    assert_eq!(second.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
+    assert_eq!(
+        second.as_mut().poll(&mut cx),
+        Poll::Ready(Ok(wasixv2_vnet_web::SelectedCloseReport::default()))
+    );
     assert_eq!(bound.local_addr(), Err(Errno::ENETDOWN));
 }
 
