@@ -7652,6 +7652,7 @@ dependencies = [
  "rkyv",
  "serde",
  "serde-wasm-bindgen",
+ "sha2",
  "shared-buffer",
  "symbolic-demangle",
  "tar",

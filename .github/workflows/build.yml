@@ -202,6 +202,7 @@ jobs:
         run: |
           make build-wasmer
         env:
+          GH_TOKEN: ${{ matrix.enable_v8 && github.token || '' }}
           ENABLE_LLVM: ${{ matrix.enable_llvm }}
           ENABLE_V8: ${{ matrix.enable_v8 }}
           ENABLE_NAPI_V8: ${{ matrix.enable_napi_v8 }}

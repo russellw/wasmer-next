@@ -277,8 +277,12 @@ jobs:
             cache-v${{ env.S3_CACHE_VERSION }}-${{ github.repository }}-${{ runner.os }}-wasmer-test-${{ matrix.build-what.key }}-api-${{ matrix.metadata.build }}-
       - name: Lint ${{ matrix.build-what.key }}
         run: ${{ matrix.build-what.lint-cmd }}
+        env:
+          GH_TOKEN: ${{ matrix.metadata.build == 'linux-x64' && github.token || '' }}
       - name: Test V8 API
         run: ${{ matrix.build-what.build-cmd }}
+        env:
+          GH_TOKEN: ${{ matrix.metadata.build == 'linux-x64' && github.token || '' }}
   test_store_context_miri:
     name: Store context under Miri
     runs-on: ubuntu-22.04
@@ -436,10 +440,7 @@ jobs:
             target: x86_64-unknown-linux-gnu
             exe: ""
             llvm_url: "https://github.com/wasmerio/llvm-custom-builds/releases/download/22.x/llvm-linux-amd64.tar.zst"
-            # Unfortunately, building a shared lib of the c_api with the V8
-            # backend does not work, due to unsupported relocations to hidden
-            # symbols in wee8.
-            supports_v8: false
+            supports_v8: true
           - build: linux-arm64
             os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
@@ -618,6 +619,8 @@ jobs:
         shell: bash
         run: ${{ matrix.build-what.build-cmd }}
         if: ${{ matrix.build-what.key == 'capi-v8' && matrix.metadata.supports_v8 == true  }}
+        env:
+          GH_TOKEN: ${{ matrix.metadata.build == 'linux-x64' && github.token || '' }}
       - name: Build Wasmer
         shell: bash
         if: ${{ matrix.build-what.key == 'wasmer' && matrix.metadata.build != 'windows-gnu'}}
