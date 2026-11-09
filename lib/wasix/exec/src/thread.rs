@@ -639,13 +639,13 @@ where
             }
             return Err(ExecError::Load(crate::LoadError::other(error)));
         }
-        let result = match crate::asyncify::prepare_buffer(entry.cx()).await {
+        let (result, origin) = match crate::asyncify::prepare_buffer(entry.cx()).await {
             Ok(()) => {
                 buffer.addr = entry
                     .cx()
                     .with(|env, _| env.asyncify.as_ref().and_then(|a| a.buffer_address()))
                     .await;
-                crate::cooperative::drive(
+                let result = crate::cooperative::drive(
                     &entry,
                     &*abi,
                     crate::contexts::drive(&entry, &mut attachments, {
@@ -658,16 +658,18 @@ where
                         }
                     }),
                 )
-                .await
+                .await;
+                let origin = crate::ErrorOrigin::guest_result(&result);
+                (result, origin)
             }
-            Err(err) => Err(err),
+            Err(err) => (Err(err), crate::ErrorOrigin::Other),
         };
         let on_return = abi.on_thread_return();
         let result = match &mut attachments {
             Some(attachments) => attachments.finish(result).await,
             None => result,
         };
-        let ended = crate::ended(entry.cx(), result, on_return, Role::Thread).await;
+        let ended = crate::ended(entry.cx(), result, on_return, Role::Thread, origin).await;
         if let Some(attachments) = &mut attachments {
             attachments.deactivate().await;
         }

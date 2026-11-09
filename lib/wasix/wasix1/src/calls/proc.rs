@@ -33,7 +33,10 @@ use wasixv2_exec::{
     AbiInstance,
     asyncify::import::{self, Resumed},
 };
-use wasixv2_syscalls::{Control, Errno as LinuxErrno, SysErr, Syscalls, TaskId, UserMemory};
+use wasixv2_syscalls::{
+    Control, Errno as LinuxErrno, ExecutionFault, SysErr, Syscalls, TaskId, UserMemory,
+    WaitCompletion, WaitCompletionSlot,
+};
 use wasmer::RuntimeError;
 
 use crate::{
@@ -1287,6 +1290,25 @@ fn join_status(info: &Siginfo) -> (u32, JoinStatus) {
     (pid, join)
 }
 
+fn join_status_with_cause(info: &Siginfo, completion: Option<WaitCompletion>) -> (u32, JoinStatus) {
+    let (pid, mut status) = join_status(info);
+    if let Some(completion) = completion
+        && pid != 0
+        && completion.pid == pid
+        && completion.code.0 == info.si_code
+        && completion.status == i32::from_le_bytes(info.sifields[8..12].try_into().unwrap())
+        && matches!(completion.code, SiCode::CLD_KILLED | SiCode::CLD_DUMPED)
+        && completion.fault == Some(ExecutionFault::WasmTrap)
+    {
+        // Legacy raw runtime traps finished with Noexec; proc_join reported ExitNormal.
+        // A signal number alone cannot authorize this v1-only projection.
+        status.tag = JoinStatusType::EXIT_NORMAL;
+        status.code = Errno::NOEXEC;
+        status.signal = Signal::NONE;
+    }
+    (pid, status)
+}
+
 /// `proc_join(pid, flags, status)`: `waitid` for the child `pid` names (any child for
 /// `NONE`), which it then holds; with `NON_BLOCKING` and no change, pid 0 and `NOTHING`.
 pub(crate) async fn proc_join<S: Syscalls + Control + 'static>(
@@ -1311,11 +1333,19 @@ pub(crate) async fn proc_join<S: Syscalls + Control + 'static>(
             options = WaitOptions(options.0 | WaitOptions::WSTOPPED.0);
         }
         let info = frame.mem.alloc_mut::<Siginfo>()?;
+        let completion = WaitCompletionSlot::default();
         frame
             .syscalls
-            .waitid(&frame.caller(), which, id, info, options, RusagePtr::NULL)
+            .waitid(
+                &frame.caller().with_wait_completion(&completion),
+                which,
+                id,
+                info,
+                options,
+                RusagePtr::NULL,
+            )
             .await?;
-        let (pid, status) = join_status(&frame.mem.take(info));
+        let (pid, status) = join_status_with_cause(&frame.mem.take(info), completion.get());
         let pid = OptionPid {
             tag: OptionTag::SOME,
             pid,
