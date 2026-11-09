@@ -853,12 +853,7 @@ impl Driver {
                         .is_some_and(|listener| listener.released);
                 let receipt = self.selected_receipt_pending(id);
                 if wrapper_released && state.close.is_some() && !receipt {
-                    crate::options::cancel(
-                        &mut self.option_results,
-                        inner,
-                        id,
-                        Errno::ECANCELED,
-                    );
+                    crate::options::cancel(&mut self.option_results, inner, id, Errno::ECANCELED);
                     inner.flows.remove(&id);
                     if let Some(listener) = inner.listeners.remove(&id) {
                         self.retired.push(listener);
