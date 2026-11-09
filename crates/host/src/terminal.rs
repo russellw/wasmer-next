@@ -1031,4 +1031,94 @@ mod tests {
             assert!(same(&get(pty.slave).unwrap(), &cooked));
         }
     }
+
+    /// Raw libc reference: XNU defers canonical reinput until a read-availability query.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_native_empty_pty_reinput_query_preserves_termios_snapshot() {
+        let pty = Pty::open();
+        let snapshot = || {
+            let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
+            // SAFETY: tcgetattr writes this live PTY's termios on success.
+            assert_eq!(
+                unsafe { libc::tcgetattr(pty.slave, termios.as_mut_ptr()) },
+                0,
+                "{}",
+                io::Error::last_os_error()
+            );
+            // SAFETY: the successful native call initialized the structure.
+            unsafe { termios.assume_init() }
+        };
+        let fields = |t: &libc::termios| {
+            (
+                t.c_iflag, t.c_oflag, t.c_cflag, t.c_lflag, t.c_cc, t.c_ispeed, t.c_ospeed,
+            )
+        };
+        let cooked = snapshot();
+        eprintln!("native termios fields (iflag, oflag, cflag, lflag, cc, ispeed, ospeed)");
+        eprintln!("native empty PTY initial={:x?}", fields(&cooked));
+        assert_ne!(
+            cooked.c_lflag,
+            cooked.c_lflag | libc::PENDIN,
+            "a fresh empty PTY has no pending reinput"
+        );
+        let mut raw = cooked;
+        // SAFETY: cfmakeraw changes the initialized local termios.
+        unsafe { libc::cfmakeraw(&mut raw) };
+        // SAFETY: the descriptor stays live and raw is a valid termios.
+        assert_eq!(
+            unsafe { libc::tcsetattr(pty.slave, libc::TCSANOW, &raw) },
+            0,
+            "{}",
+            io::Error::last_os_error()
+        );
+        let actual_raw = snapshot();
+        eprintln!("native empty PTY raw={:x?}", fields(&actual_raw));
+        assert!(is_raw(&actual_raw));
+        // SAFETY: restore through libc alone; no registry or lease is involved.
+        assert_eq!(
+            unsafe { libc::tcsetattr(pty.slave, libc::TCSADRAIN, &cooked) },
+            0,
+            "{}",
+            io::Error::last_os_error()
+        );
+        let restored = snapshot();
+        eprintln!("native empty PTY restored={:x?}", fields(&restored));
+        eprintln!(
+            "native restored flag XORs={:x?}; cc actual/expected={:x?}/{:x?}; speeds actual/expected={:?}/{:?}",
+            (
+                restored.c_iflag ^ cooked.c_iflag,
+                restored.c_oflag ^ cooked.c_oflag,
+                restored.c_cflag ^ cooked.c_cflag,
+                restored.c_lflag ^ cooked.c_lflag,
+            ),
+            restored.c_cc,
+            cooked.c_cc,
+            (restored.c_ispeed, restored.c_ospeed),
+            (cooked.c_ispeed, cooked.c_ospeed),
+        );
+        let mut pending = cooked;
+        pending.c_lflag |= libc::PENDIN;
+        assert_eq!(
+            fields(&restored),
+            fields(&pending),
+            "native raw-to-canonical restoration differs only by PENDIN"
+        );
+        let mut available: libc::c_int = -1;
+        // SAFETY: FIONREAD writes one int; this test has queued no PTY input.
+        assert_eq!(
+            unsafe { libc::ioctl(pty.slave, libc::FIONREAD, &mut available) },
+            0,
+            "{}",
+            io::Error::last_os_error()
+        );
+        assert_eq!(available, 0, "the private PTY is empty");
+        let settled = snapshot();
+        eprintln!("native empty PTY after FIONREAD={:x?}", fields(&settled));
+        assert_eq!(
+            fields(&settled),
+            fields(&cooked),
+            "FIONREAD completes empty canonical reinput without a read or flush"
+        );
+    }
 }
