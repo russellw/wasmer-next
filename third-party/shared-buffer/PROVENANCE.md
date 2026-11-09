@@ -50,5 +50,26 @@ A consumer type check must pass a `shared_buffer::OwnedBuffer` to
 `&shared_buffer::OwnedBuffer`; the existing WLK package-driver interfaces also
 cross these types. Runtime tests should retain the existing package/WebC fixtures.
 
+## Standalone upstream and mapped-buffer tests
+
+Cargo cannot run a dependency's dev tests with workspace-root `-p shared-buffer`
+because this package is deliberately excluded. Its existing exclusion already
+gives `--manifest-path` a standalone workspace boundary; no manifest/API change
+is necessary. The accompanying standalone `Cargo.lock` pins all 16 selected
+packages to the exact versions and checksums in the WLK production lock, notably
+memmap2 0.9.11. Its only extra dependency edge is upstream's existing dev
+`tempfile`; the unused bytes-to-serde feature edge is absent. No registry
+versions were upgraded to enable the tests. The production root lock is unchanged.
+
+Run the original upstream tests and the added mapped lifetime/offset controls:
+
+```sh
+cargo test --locked --manifest-path third-party/shared-buffer/Cargo.toml
+```
+
+The standalone lock serves only these tests. It does not replace the consuming
+root patch or alter the canonical `shared-buffer` dependency identity described
+above. All upstream Rust/license bytes remain exactly as recorded in UPSTREAM.json.
+
 Changes and tests were prepared by OpenAI Codex (AI agent). Independent review
 and manager-controlled validation are required before acceptance.
