@@ -311,7 +311,7 @@ impl WebBackend {
             let mut pending = false;
             let mut failure = None;
             let mut report = SelectedCloseReport::default();
-            for resource in &resources {
+            for resource in resources.iter() {
                 let state = resource.state.lock().unwrap();
                 report.remote_cleanup_unconfirmed |= state.remote_cleanup_unconfirmed;
                 if let Some(error) = state.close_error {
