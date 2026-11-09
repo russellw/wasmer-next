@@ -25,6 +25,70 @@ fn pack(value: impl Serialize) -> Result<Vec<u8>, Errno> {
 /// configured resolver provider (e.g. DoH); the classic Resolve record only names a host.
 pub fn encode(command: &Command) -> Result<Vec<u8>, Errno> {
     let out = match command {
+        Command::BindStream {
+            request,
+            socket,
+            bind,
+        } => {
+            let operation = match bind.purpose {
+                wasixv2_vnet::endpoint::EndpointBindPurpose::Bind => 16u32,
+                wasixv2_vnet::endpoint::EndpointBindPurpose::Listen { .. } => 15u32,
+            };
+            pack((
+                0u32,
+                operation,
+                socket,
+                bind.requested,
+                bind.v6only,
+                bind.reuse_port,
+                bind.reuse_addr,
+                Some(request),
+            ))?
+        }
+        Command::ConnectFrom {
+            request,
+            socket,
+            peer,
+            local: _,
+            requested_bind,
+            bound_addr,
+        } => {
+            if requested_bind.is_some() {
+                // Only a genuinely admitted bound resource may use ConnectBound.
+                bound_addr.ok_or(Errno::EINVAL)?;
+                pack((1u32, socket, 23u32, peer, Some(request)))?
+            } else {
+                let local = SocketAddr::new(
+                    if peer.is_ipv4() {
+                        IpAddr::from([0, 0, 0, 0])
+                    } else {
+                        IpAddr::from([0u16; 8])
+                    },
+                    0,
+                );
+                pack((0u32, 19u32, socket, local, peer, Some(request)))?
+            }
+        }
+        Command::ListenFrom {
+            request, socket, ..
+        } => pack((1u32, socket, 22u32, Some(request)))?,
+        Command::ListenReserved {
+            request,
+            socket,
+            member,
+            v6only,
+            ..
+        } => pack((
+            0u32,
+            15u32,
+            socket,
+            member.local,
+            v6only,
+            false,
+            false,
+            Some(request),
+        ))?,
+        Command::CloseSelected { request, socket } => pack((1u32, socket, 21u32, Some(request)))?,
         Command::Provider { request, operation } => match operation {
             Request::Bridge {
                 network,

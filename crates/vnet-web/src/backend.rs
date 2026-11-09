@@ -48,6 +48,7 @@ pub(crate) struct Inner {
     pub listeners: BTreeMap<u64, Listener>,
     pub lookups: BTreeMap<u64, Query>,
     pub controls: VecDeque<crate::provider::Transaction>,
+    pub selected_close: Option<Arc<[Arc<crate::endpoints::Resource>]>>,
 }
 impl Inner {
     pub fn id(&mut self) -> Result<u64, Errno> {
@@ -55,7 +56,7 @@ impl Inner {
         self.next_id = id.checked_add(1).ok_or(Errno::ENOBUFS)?;
         Ok(id)
     }
-    fn room(&self, config: Config) -> Result<(), Errno> {
+    pub(crate) fn room(&self, config: Config) -> Result<(), Errno> {
         if !self.online {
             return Err(Errno::ENETDOWN);
         }
@@ -78,6 +79,9 @@ pub(crate) struct Listener {
     pub released: bool,
     pub child: Option<u64>,
     pub binding: Option<Arc<Binding>>,
+    pub selected: Option<Arc<crate::endpoints::Resource>>,
+    pub endpoint: Option<Arc<crate::endpoints::MemberSink>>,
+    pub backlog: u32,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Kind {
@@ -91,6 +95,7 @@ pub(crate) struct Packet {
 pub(crate) struct Flow {
     pub kind: Kind,
     pub binding: Option<Arc<Binding>>,
+    pub selected: Option<Arc<crate::endpoints::Resource>>,
     pub peer: SocketAddr,
     pub connected_peer: Option<SocketAddr>,
     pub wq: WaitQueue,
@@ -122,10 +127,21 @@ pub(crate) struct Flow {
     pub sent_write_shut: bool,
 }
 impl Flow {
+    /// Selected phases, rather than Connecting, exclusively admit provider work.
+    pub fn selected_stream(
+        peer: SocketAddr,
+        wq: WaitQueue,
+        resource: Arc<crate::endpoints::Resource>,
+    ) -> Self {
+        let mut flow = Self::new(Kind::Stream, peer, wq);
+        flow.selected = Some(resource);
+        flow
+    }
     pub fn new(kind: Kind, peer: SocketAddr, wq: WaitQueue) -> Self {
         Self {
             kind,
             binding: None,
+            selected: None,
             peer,
             connected_peer: None,
             wq,
@@ -233,6 +249,7 @@ impl WebBackend {
                 listeners: BTreeMap::new(),
                 lookups: BTreeMap::new(),
                 controls: VecDeque::new(),
+                selected_close: None,
             }),
             wake: AtomicWaker::new(),
             failures: Mutex::new(VecDeque::new()),
@@ -262,11 +279,12 @@ impl WebBackend {
         inner.generation = inner.generation.checked_add(1).ok_or(Errno::ENOBUFS)?;
         inner.capabilities = capabilities;
         inner.online = true;
+        inner.selected_close = None;
         Ok(Driver::new(self.shared.clone(), inner.generation))
     }
 }
 
-fn family_allowed(capabilities: Capabilities, addr: SocketAddr) -> Result<(), Errno> {
+pub(crate) fn family_allowed(capabilities: Capabilities, addr: SocketAddr) -> Result<(), Errno> {
     if addr.is_ipv6() && !capabilities.ipv6 {
         Err(Errno::EAFNOSUPPORT)
     } else {
@@ -387,6 +405,12 @@ impl Stream {
     fn enqueue(&self, data: &[u8], urgent: bool) -> Result<usize, Errno> {
         let mut inner = self.shared.inner.lock().unwrap();
         let flow = inner.flows.get_mut(&self.id).unwrap();
+        if flow.selected.as_ref().is_some_and(|resource| {
+            let state = resource.state.lock().unwrap();
+            state.close_requested || state.closing
+        }) {
+            return Err(Errno::EPIPE);
+        }
         // Linux net/ipv4/tcp.c:tcp_sendmsg_locked consumes sk_err before EPIPE.
         if let Some(error) = flow
             .error
@@ -421,6 +445,14 @@ impl Stream {
     }
 }
 impl BackendStream for Stream {
+    fn provider_local_addr(&self) -> Option<Result<SocketAddr, Errno>> {
+        let inner = self.shared.inner.lock().unwrap();
+        inner
+            .flows
+            .get(&self.id)
+            .and_then(|flow| flow.selected.as_ref())
+            .map(|selected| selected.address())
+    }
     fn state(&self) -> StreamState {
         self.shared.inner.lock().unwrap().flows[&self.id].state
     }
@@ -698,7 +730,7 @@ impl Drop for Datagram {
     }
 }
 
-fn release(shared: &Arc<Shared>, id: u64) {
+pub(crate) fn release(shared: &Arc<Shared>, id: u64) {
     let mut inner = shared.inner.lock().unwrap();
     let Some(flow) = inner.flows.get_mut(&id) else {
         return;
@@ -757,7 +789,7 @@ impl WebBackend {
     pub(crate) fn start_publish(
         &self,
         host: SocketAddr,
-        _backlog: u32,
+        backlog: u32,
         binding: Option<Arc<Binding>>,
         sink: Arc<dyn InboundSink>,
     ) -> Result<Published, std::io::Error> {
@@ -779,6 +811,9 @@ impl WebBackend {
                 released: false,
                 child: None,
                 binding,
+                selected: None,
+                endpoint: None,
+                backlog,
             },
         );
         drop(inner);

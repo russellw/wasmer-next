@@ -54,6 +54,96 @@ Queue and lifecycle rules:
 
 ## Protocol limits and follow-ups
 
+### Opt-in namespace stream endpoints
+
+`backend.clone().with_namespace_endpoints()` exposes the canonical endpoint
+provider on the same backend and Driver. Only transports explicitly advertising
+`selected_endpoints` support its transactions. `selected_bind` additionally
+means real prebound resources: BindStream carries the original literal request
+and purpose, then ConnectFrom/ListenFrom transfer the same socket ID. A direct
+unbound listen uses its original Listen purpose; an unbound connection emits no
+bind. Profiles without physical prebind keep canonical namespace reservation and
+create ListenReserved at publication, retaining the original literal request
+separately from its actual canonical nonzero port.
+
+ConnectFrom additionally retains the canonical `local` reservation allocated by
+the existing Net port table. It is distinct from the original requested bind
+and physical `bound_addr`: virtual transports use the existing reserved source
+port rather than inventing another allocator, while an unbound physical factory
+keeps its actual any:0 source selection/readback. The Classic wire remains its
+original unbound connect(any:0, peer) or same-bound ConnectBound operation.
+
+Selected readiness uses canonical accepted-and-ready publication status before
+accept credit. AcceptedTo retains the actual peer and destination; a Classic
+selected accept instead queries the accepted child's GetAddrLocal. One accepted
+child per listener may wait for the actual canonical backlog queue, without
+invented source/destination addresses. Callback/ingress calls and wakes occur
+outside backend locks. This is independent of default Backend publication.
+
+Keep driving the same Driver while awaiting `close_endpoints()`. It revokes new
+selected admission and joins cached, request-qualified local close results.
+Sending CloseSelected does not finish close. Actual ProviderCloseAck confirms
+physical retirement; LocalCloseUnconfirmed attests only the joined local
+session described below. An adapter may map the existing Classic
+request-qualified Close response to physical confirmation only with a matching
+server ownership guarantee: the stock server has no
+provisional-create cancellation record, so InvalidFd cannot acknowledge an
+unfinished create or prove that a late remote resource has retired. Dropping a wait
+subscription withdraws its registration and leaves cleanup owned by the driver.
+Its `SelectedCloseReport::remote_cleanup_unconfirmed` records the original
+Classic boundary independently of a successful local close. The first actual
+cleanup errno is preserved. A pending old create/accept receipt stays in its
+existing bounded Flow/Listener while the connection can still deliver it; a
+late successful result owns cleanup of that same ID, never a replay of guest
+creation. A stock `Complete`/InvalidFd response supplies no false promise that
+an accepted notification cannot arrive.
+
+`ProviderCloseAck.accept_pending` describes only notification custody. False
+requires withdrawing/joining the unfulfilled credit so no notification can
+appear; true retains the exact listener/resource/generation/child receipt and
+the same closed Flow until its matching late notification is consumed without
+ingress. Those metadata slots count against `max_sockets`, and no-incoming
+credits do not accumulate tombstones. Physical confirmation is orthogonal.
+
+After an embedder actually cuts off/joins the entire captured local Driver
+transport callback session (possibly transferring pure remote receipts into
+its surviving broker), `LocalCloseUnconfirmed` can finish local ownership. A
+single socket close or bare WebSocket-close request is insufficient. The event
+validates the exact admitted close request/resource and uses the existing
+disconnect path to retire local callbacks/queued notifications; it reports
+unconfirmed remote cleanup rather than waiting forever for a foreign server.
+The embedder must ensure there can be no further producer into this old local
+session. It cannot close a sibling run's session or fabricate a physical ACK.
+Driver failure likewise retires local ownership without asserting remote join.
+Resources retain their immutable existing driver generation, so old retained
+wrappers/reports cannot close a replacement generation. A failed old wire close
+keeps its original errno even if later cleanup of the newly known resource
+succeeds or the eventual local session cutoff reports a different error.
+Default unqualified Classic Close and default publication::Binding are unchanged.
+
+Selected callback transports reserve one of their existing 64 RPC slots for
+cutoff/close dispatch (ordinary calls admit at most 63). Dispatch releases that
+RPC slot after the surviving owner has retained the close job; its eventual
+physical result arrives separately as ProviderCloseAck. `revoke_open` cancels
+only a captured socket's unfinished factory subscriptions, retaining late
+cleanup. The Driver moves an unaccepted cached command into its existing
+cleanup queue while selected close commands use that reserved capacity; an
+already accepted command is never moved or replayed. Pending actual-address
+queries preserve their identity and are withdrawn at their own close fence.
+
+`poll_recv_close` optionally extracts only ProviderCloseAck/LocalCloseUnconfirmed from the same bounded
+event queue while a different guest's RX is full. It must also drive completed
+close-dispatch calls, and must leave payload/EOF order intact. Callback adapters
+reserve one of the existing event slots for these acknowledgments and retain
+proper wake registrations for every waiting producer. The default Classic
+adapter does not implement this optional extraction. These requirements are
+integration contracts, not proof that a stock remote relay supports them.
+
+These source contracts and native in-memory tests do not establish browser,
+Node or WISP acceptance. Selected UDP ingress and asynchronously acknowledged
+host TCP option changes remain separate integration work; they must not be
+advertised merely because a transport supports selected streams.
+
 The stock v1 relay declares `Closed` but currently does not send it for TCP EOF
 (`server.rs:RemoteAdapterSocket::drain_reads_and_accepts`, `Ok(0)` branch). Its
 wire format cannot distinguish FIN from a peer reset. Consequently its default
