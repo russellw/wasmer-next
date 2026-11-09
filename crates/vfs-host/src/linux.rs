@@ -467,7 +467,7 @@ impl Filesystem for HostFs {
             .shared
             .blocking(move || {
                 // fs/fhandle.c do_handle_open: the host must also permit native decoding.
-                let decode = |mount_fd| {
+                let decode = |mount_fd: RawFd| {
                     // SAFETY: native has the validated UAPI layout; mount_fd stays open.
                     cvt(unsafe {
                         libc::syscall(
