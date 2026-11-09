@@ -3124,10 +3124,10 @@ impl Driver {
         self.input = None;
         let pending = std::mem::take(&mut self.pending);
         for (_, pending) in pending {
-            if let Pending::DatagramReadback(read) = pending {
-                if let Some(completion) = read.finish(Err(error)) {
-                    self.option_results.push(completion);
-                }
+            if let Pending::DatagramReadback(read) = pending
+                && let Some(completion) = read.finish(Err(error))
+            {
+                self.option_results.push(completion);
             }
         }
         self.cleanup.clear();
