@@ -1,0 +1,66 @@
+{
+  "package": "shared-buffer",
+  "version": "0.1.4",
+  "archive_url": "https://static.crates.io/crates/shared-buffer/shared-buffer-0.1.4.crate",
+  "archive_sha256": "f6c99835bad52957e7aa241d3975ed17c1e5f8c92026377d117a606f36b84b16",
+  "upstream_git": "https://github.com/wasmerio/shared-buffer",
+  "upstream_commit": "65e72d29726a748b71f754846fef3dad7df64f61",
+  "license": "MIT OR Apache-2.0",
+  "allowed_upstream_changes": [
+    "Cargo.toml: memmap2 0.6.1 -> 0.9.11"
+  ],
+  "files": {
+    ".cargo_vcs_info.json": {
+      "upstream_sha256": "ecd0cfb5653d8b3f3e487276468148c3ec00ccb13ef028b14dbac4ad87bce421",
+      "local_sha256": "ecd0cfb5653d8b3f3e487276468148c3ec00ccb13ef028b14dbac4ad87bce421"
+    },
+    ".github/workflows/ci.yml": {
+      "upstream_sha256": "796b0d1073dced9f5063d47604cba89c2718d9e066f37a8edd27c51dfa92f315",
+      "local_sha256": "796b0d1073dced9f5063d47604cba89c2718d9e066f37a8edd27c51dfa92f315"
+    },
+    ".gitignore": {
+      "upstream_sha256": "b53ee26e6ff1da219b0563333a76d2c9ec19eec713d6ee54e11a1edacb0e9f3d",
+      "local_sha256": "b53ee26e6ff1da219b0563333a76d2c9ec19eec713d6ee54e11a1edacb0e9f3d"
+    },
+    "CHANGELOG.md": {
+      "upstream_sha256": "f93a1ab42894a92dce912f7d0f0b2c4641e3b45dc8307542e51a21ca3d4ae788",
+      "local_sha256": "f93a1ab42894a92dce912f7d0f0b2c4641e3b45dc8307542e51a21ca3d4ae788"
+    },
+    "Cargo.toml": {
+      "upstream_sha256": "aa7c01b846cfc75309c0d59a7cf5aa9f936684b5da9c8c2e23890474d2b0fe67",
+      "local_sha256": "f0bd49214e65470705d249096c9a7b794f7fe8b50440d16c9f7a1f003415eaeb"
+    },
+    "Cargo.toml.orig": {
+      "upstream_sha256": "0b88e0feff65c1b84d15b58edc72552c709473a3ee536f9f95df9fa39f6d7566",
+      "local_sha256": "0b88e0feff65c1b84d15b58edc72552c709473a3ee536f9f95df9fa39f6d7566"
+    },
+    "LICENSE_APACHE.md": {
+      "upstream_sha256": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a",
+      "local_sha256": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a"
+    },
+    "LICENSE_MIT.md": {
+      "upstream_sha256": "e25487d4fa108f45f082cb416574dd1d8888a036d733e0d6c891c78574acacb8",
+      "local_sha256": "e25487d4fa108f45f082cb416574dd1d8888a036d733e0d6c891c78574acacb8"
+    },
+    "README.md": {
+      "upstream_sha256": "10f792396759d1328bed996da99813755b1a570b62172a81fed91f2bb40cda90",
+      "local_sha256": "10f792396759d1328bed996da99813755b1a570b62172a81fed91f2bb40cda90"
+    },
+    "release.toml": {
+      "upstream_sha256": "20c003e6f16642d7d4a12bf106971c3aa95fbeb317fc1fe8414e0c9b4e14d59a",
+      "local_sha256": "20c003e6f16642d7d4a12bf106971c3aa95fbeb317fc1fe8414e0c9b4e14d59a"
+    },
+    "src/lib.rs": {
+      "upstream_sha256": "f31fde103fb45155934c2cf8afeca38e879c0a25b6fd6b08030e033f96cd0c2e",
+      "local_sha256": "f31fde103fb45155934c2cf8afeca38e879c0a25b6fd6b08030e033f96cd0c2e"
+    },
+    "src/mmap.rs": {
+      "upstream_sha256": "edbb831ad2df01a6af4cd0f2ba2d57aad8a40ac1549589668db284789e12d83a",
+      "local_sha256": "edbb831ad2df01a6af4cd0f2ba2d57aad8a40ac1549589668db284789e12d83a"
+    },
+    "src/owned.rs": {
+      "upstream_sha256": "c03e8bcf139d03bb1cbcb05c3ec92958052bf558be350bbbdc416b4c2537371f",
+      "local_sha256": "c03e8bcf139d03bb1cbcb05c3ec92958052bf558be350bbbdc416b4c2537371f"
+    }
+  }
+}
