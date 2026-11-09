@@ -363,6 +363,24 @@ test("copy worker is coordinator-created pure JS and terminated with normal/fata
     assert.equal(vm.runInContext("memoryCopies", failed.context), null);
 });
 
+test("retired child detaches handlers and captured late callbacks cannot poison its owner", async () => {
+    const h = await setup();
+    const child = h.instances[1];
+    const stale = { message: child.onmessage, error: child.onerror, decode: child.onmessageerror };
+    await h.context.onmessage({ data: { type: "shutdown" } });
+    await flush();
+    assert(child.terminated);
+    assert.equal(child.onmessage, null);
+    assert.equal(child.onerror, null);
+    assert.equal(child.onmessageerror, null);
+    const count = h.output.length;
+    stale.message({ data: { type: "fatal", error: "late retired child" } });
+    stale.error({ preventDefault() {}, message: "late retired child" });
+    stale.decode();
+    assert.equal(h.output.length, count);
+    assert.equal(h.output.at(-1).type, "stopped");
+});
+
 
 test("timer rearm is routed to independent event worker while a task is busy", async () => {
     const h = await setup();

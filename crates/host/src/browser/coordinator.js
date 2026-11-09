@@ -181,12 +181,16 @@ function create(role) {
     workers.set(state.id, state);
     worker.onerror = (event) => {
         event.preventDefault();
+        if (workers.get(state.id) !== state) return;
         // Bootstrap may already be inside Rust TLS/allocator initialization. An
         // uncaught error cannot prove the shared heap safe for another admission.
         fail(`${state.role} worker ${state.id} (${state.status}): ${event.error?.stack ?? event.message}`);
     };
-    worker.onmessageerror = () => fail("worker message could not be decoded");
+    worker.onmessageerror = () => {
+        if (workers.get(state.id) === state) fail("worker message could not be decoded");
+    };
     worker.onmessage = ({ data }) => {
+        if (workers.get(state.id) !== state) return;
         try { receive(state, data); }
         catch (error) { fail(error.stack ?? String(error)); }
     };
@@ -395,6 +399,7 @@ function receive(state, data) {
         case "retired":
             for (const ticket of [...state.waits.keys()]) unwatch(state, ticket);
             workers.delete(state.id);
+            state.worker.onmessage = state.worker.onerror = state.worker.onmessageerror = null;
             state.worker.terminate();
             state.retirement?.resolve();
             state.retirement = null;
