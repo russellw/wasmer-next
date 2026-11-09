@@ -528,9 +528,21 @@ impl EndpointProvider for Provider {
             if bound.peer.is_none() {
                 return Ok(EndpointChoice::Namespace);
             }
+            let inner = self.shared.inner.lock().unwrap();
             let state = bound.resource.state.lock().unwrap();
-            if bound.resource.generation != generation
-                || state.datagram_source != Some(query.source_id)
+            // Selection carries the candidate source. Only associate_bound's
+            // later connect_datagram call installs it on this same resource.
+            if !inner.online
+                || inner.selected_close.is_some()
+                || inner.generation != generation
+                || bound.resource.generation != generation
+                || !inner.flows.get(&bound.id).is_some_and(|flow| {
+                    !flow.released
+                        && flow
+                            .selected
+                            .as_ref()
+                            .is_some_and(|resource| Arc::ptr_eq(resource, &bound.resource))
+                })
                 || state.closing
                 || state.close_requested
                 || state.close.is_some()
