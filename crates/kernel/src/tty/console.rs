@@ -17,7 +17,7 @@ use std::{
     time::Duration,
 };
 
-use wasixv2_abi::{OpenFlags, Signal, Winsize};
+use wasixv2_abi::{OpenFlags, Signal, TermiosOflag, Winsize};
 use wasixv2_host::{ByteSink, ByteSource, WindowSize};
 use wasixv2_syscalls::{Caller, Errno, Fd, SysErr, TaskId};
 use wasixv2_vfs::{Device, LookupFlags, OpenHow};
@@ -205,9 +205,20 @@ impl Kernel {
     /// Configures this source's EOF meaning before console admission. Explicit
     /// hangup and PTY peer closure retain their normal semantics under either policy.
     pub fn with_console_eof(
+        self,
+        console: wasixv2_host::Console,
+        eof_policy: ConsoleInputEof,
+    ) -> Self {
+        self.with_console_options(console, eof_policy, true)
+    }
+
+    /// Selects initial output processing for this console only. Canonical
+    /// TCSETS remains authoritative after admission; PTYs keep their defaults.
+    pub fn with_console_options(
         mut self,
         console: wasixv2_host::Console,
         eof_policy: ConsoleInputEof,
+        output_processing: bool,
     ) -> Self {
         let size = winsize(console.size);
         let driver = Driver::Console(Console::new(console, eof_policy));
@@ -215,9 +226,13 @@ impl Kernel {
             major: HVC_MAJOR,
             minor: 0,
         };
+        let mut termios = super::ldisc::std_termios();
+        if !output_processing {
+            termios.c_oflag.0 &= !TermiosOflag::OPOST.0;
+        }
         let tty = Tty::new(
             device,
-            super::ldisc::std_termios(),
+            termios,
             size,
             driver,
             self.jobs.clone(),
