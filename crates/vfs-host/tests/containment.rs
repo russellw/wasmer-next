@@ -456,6 +456,30 @@ fn host_file_handles_use_native_exports_without_pinning_exported_files() {
         );
         return;
     }
+    // A real file descriptor is also a valid mount anchor; Linux fdget rejects
+    // O_PATH anchors even though name_to_handle_at accepts them for encoding.
+    let anchor = fs::File::open(&real).unwrap();
+    // SAFETY: native contains the successful export above and anchor stays open.
+    let native_fd = unsafe {
+        libc::syscall(
+            libc::SYS_open_by_handle_at,
+            anchor.as_raw_fd(),
+            native.as_ptr(),
+            libc::O_PATH | libc::O_CLOEXEC,
+        )
+    };
+    let native_allowed = if native_fd >= 0 {
+        // SAFETY: open_by_handle_at returned an owned descriptor.
+        drop(unsafe { OwnedFd::from_raw_fd(native_fd as _) });
+        true
+    } else {
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EPERM),
+            "native decode requires a valid anchor and CAP_DAC_READ_SEARCH"
+        );
+        false
+    };
     let root = s.vfs.root();
     let cred = Cred::root();
     let cx = Ctx {
@@ -474,8 +498,11 @@ fn host_file_handles_use_native_exports_without_pinning_exported_files() {
     assert!(handle.data.len() <= wasixv2_vfs::MAX_HANDLE_SZ);
     let fs = &path.dentry.sb().fs;
     match block_on(fs.fh_to_node(&handle)) {
-        Ok(decoded) => assert_eq!(decoded.ino(), path.dentry.node().ino()),
-        Err(Errno::EPERM) => {} // Native decoding requires the host's CAP_DAC_READ_SEARCH.
+        Ok(decoded) => {
+            assert!(native_allowed);
+            assert_eq!(decoded.ino(), path.dentry.node().ino());
+        }
+        Err(Errno::EPERM) if !native_allowed => {} // Host lacks CAP_DAC_READ_SEARCH.
         Err(err) => panic!("native decode failed: {err:?}"),
     }
     // Only mount roots are retained by the export machinery, not this ordinary inode.
