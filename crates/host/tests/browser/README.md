@@ -65,6 +65,18 @@ const coordinator = await startCoordinator({
 }, onCoordinatorMessage);
 ```
 
+A non-browser embedder can supply a third caller-realm argument
+`{ baseURL, createWorker(url, options) }`. `baseURL` must be absolute and the
+factory returns the same synchronous Worker-shaped owner used by the protocol.
+It creates only the coordinator; that coordinator still creates all B2 descendants.
+This host object is never cloned. Browser callers omit it and retain the secure,
+cross-origin-isolation checks. Compiled-module, shared-memory and bounded-capacity
+validation applies to both hosts. No browser security globals need to be forged.
+When termination returns a native exit Promise, failed bootstrap joins it before
+rejecting with its original error. Post-ready terminal notifications still describe
+termination requests; a native embedding must separately join its worker exit.
+DOM `terminate()` provides no native completion acknowledgement.
+
 An optional caller-realm `signal` cancels bootstrap and remains attached until
 runtime disposal. An already aborted signal creates no worker. Later cancellation
 requests the existing whole-heap abort path, including admitted task/service and
