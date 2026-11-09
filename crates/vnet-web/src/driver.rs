@@ -28,6 +28,7 @@ enum Pending {
     Address(u64, bool),
     Listen(u64),
     Send(u64, usize),
+    OptionSet(u64),
     Shutdown(u64),
 }
 struct SelectedAccepted {
@@ -62,6 +63,7 @@ pub struct Driver {
     input: Option<(u64, Vec<u8>, usize, bool)>,
     selected_wakes: Vec<Arc<Resource>>,
     accepted: BTreeMap<u64, SelectedAccepted>,
+    option_results: Vec<crate::options::Completion>,
 }
 impl Driver {
     pub(crate) fn new(shared: Arc<Shared>, generation: u64) -> Self {
@@ -78,6 +80,7 @@ impl Driver {
             input: None,
             selected_wakes: Vec::new(),
             accepted: BTreeMap::new(),
+            option_results: Vec::new(),
         }
     }
 
@@ -108,7 +111,7 @@ impl Driver {
             return self.stop(transport, Errno::EINVAL);
         }
         for _ in 0..64 {
-            let mut progress = false;
+            let mut progress = self.cancel_options();
             let cutoffs = self.selected_cutoffs();
             if !cutoffs.is_empty() {
                 // A held ordinary command was not accepted by poll_send. Move
@@ -133,16 +136,12 @@ impl Driver {
             }
             if self.input.is_some() {
                 match transport.poll_recv_close(cx) {
-                    Poll::Ready(Ok(
-                        event @ (Event::ProviderCloseAck { .. }
-                        | Event::LocalCloseUnconfirmed { .. }),
-                    )) => {
-                        if let Err(error) = self.event(event) {
+                    Poll::Ready(Ok(event)) => {
+                        if let Err(error) = self.control_event(event) {
                             return self.stop(transport, error);
                         }
                         progress = true;
                     }
-                    Poll::Ready(Ok(_)) => return self.stop(transport, Errno::EPROTO),
                     Poll::Ready(Err(error)) => return self.stop(transport, error),
                     Poll::Pending => {}
                 }
@@ -192,6 +191,7 @@ impl Driver {
                     .queue
                     .wake(PollMask::READABLE | PollMask::WRITABLE | PollMask::ERR | PollMask::HUP);
             }
+            progress |= self.flush_options();
             // Trait-object destructors may reenter the backend, just like sink callbacks.
             self.retired.clear();
             if !self.command_valid() {
@@ -215,6 +215,89 @@ impl Driver {
         }
         cx.waker().wake_by_ref();
         Poll::Pending
+    }
+
+    /// Only exact transport receipts can progress past a held payload. No
+    /// payload/EOF is drained here, and validation never removes a different
+    /// pending operation. Absent receipts are harmless, without claiming that
+    /// every allocated identifier was ever issued to a provider.
+    fn control_event(&mut self, event: Event) -> Result<(), Errno> {
+        if self.shared.inner.lock().unwrap().generation != self.generation {
+            return Err(Errno::ENETDOWN);
+        }
+        match &event {
+            Event::ProviderCloseAck { .. } | Event::LocalCloseUnconfirmed { .. } => {}
+            Event::Sent { request, .. } | Event::SendError { request, .. } => {
+                match self.pending.get(request) {
+                    None => return Ok(()),
+                    Some(Pending::Send(..)) => {}
+                    Some(_) => return Err(Errno::EPROTO),
+                }
+            }
+            Event::Complete { request, .. } => match self.pending.get(request) {
+                Some(Pending::Selected(_, Operation::Close) | Pending::OptionSet(_)) => {}
+                None => return Ok(()),
+                _ => return Err(Errno::EPROTO),
+            },
+            Event::Writable { socket } => {
+                let inner = self.shared.inner.lock().unwrap();
+                if inner.generation != self.generation {
+                    return Err(Errno::ENETDOWN);
+                }
+                let Some(flow) = inner.flows.get(socket) else {
+                    return Ok(());
+                };
+                if flow.kind != Kind::Stream {
+                    return Err(Errno::EPROTO);
+                }
+                if flow.state == StreamState::Closed || !flow.remote {
+                    return Ok(());
+                }
+                if flow
+                    .selected
+                    .as_ref()
+                    .is_some_and(|resource| resource.generation != self.generation)
+                {
+                    return Err(Errno::ECANCELED);
+                }
+            }
+            _ => return Err(Errno::EPROTO),
+        }
+        self.event(event)
+    }
+
+    fn flush_options(&mut self) -> bool {
+        let completed = std::mem::take(&mut self.option_results);
+        let progress = !completed.is_empty();
+        for completion in completed {
+            completion.run();
+        }
+        progress
+    }
+    fn cancel_options(&mut self) -> bool {
+        let shared = self.shared.clone();
+        let mut inner = shared.inner.lock().unwrap();
+        let canceled: Vec<_> = inner
+            .flows
+            .iter()
+            .filter_map(|(&id, flow)| {
+                let selected = flow.selected.as_ref().is_some_and(|resource| {
+                    let state = resource.state.lock().unwrap();
+                    state.closing || state.close_requested || state.close.is_some()
+                });
+                (flow.options.is_some()
+                    && (flow.released
+                        || flow.reset
+                        || flow.state == StreamState::Closed
+                        || selected))
+                    .then_some((id, flow.error.unwrap_or(Errno::ECANCELED)))
+            })
+            .collect();
+        for (id, error) in canceled {
+            crate::options::cancel(&mut self.option_results, &mut inner, id, error);
+        }
+        drop(inner);
+        self.flush_options()
     }
 
     fn stop(&mut self, transport: &mut dyn Transport, error: Errno) -> Poll<Result<(), Errno>> {
@@ -381,6 +464,12 @@ impl Driver {
                 } else if flow.reset || (flow.tx.is_empty() && flow.outgoing.is_empty()) {
                     if !flow.remote {
                         if flow.released {
+                            crate::options::cancel(
+                                &mut self.option_results,
+                                &mut inner,
+                                id,
+                                Errno::ECANCELED,
+                            );
                             inner.flows.remove(&id);
                         }
                         continue;
@@ -390,6 +479,12 @@ impl Driver {
                     flow.remote = false;
                     let released = flow.released;
                     if released {
+                        crate::options::cancel(
+                            &mut self.option_results,
+                            &mut inner,
+                            id,
+                            Errno::ECANCELED,
+                        );
                         inner.flows.remove(&id);
                     }
                     Some(Command::Close { socket: id })
@@ -447,6 +542,31 @@ impl Driver {
                     }));
                 }
                 continue;
+            }
+            if flow.inflight.is_some() || flow.send_blocked {
+                continue;
+            }
+            if let Some(batch) = flow.options.as_mut() {
+                while let Some(crate::options::Step::Inline(value)) =
+                    batch.steps.get(batch.position)
+                {
+                    flow.oob_inline = *value;
+                    batch.position += 1;
+                }
+                if let Some(crate::options::Step::Wire(control)) = batch.steps.get(batch.position) {
+                    let control = control.clone();
+                    batch.pending = Some(request);
+                    flow.inflight = Some((request, 0));
+                    self.pending.insert(request, Pending::OptionSet(id));
+                    self.cursor = id;
+                    return Ok(Some(Command::SetOption {
+                        request: Some(request),
+                        socket: id,
+                        control,
+                    }));
+                }
+                let batch = flow.options.take().unwrap();
+                self.option_results.push(batch.complete(Ok(())));
             }
             if flow.inflight.is_some() || flow.send_blocked {
                 continue;
@@ -733,6 +853,12 @@ impl Driver {
                         .is_some_and(|listener| listener.released);
                 let receipt = self.selected_receipt_pending(id);
                 if wrapper_released && state.close.is_some() && !receipt {
+                    crate::options::cancel(
+                        &mut self.option_results,
+                        inner,
+                        id,
+                        Errno::ECANCELED,
+                    );
                     inner.flows.remove(&id);
                     if let Some(listener) = inner.listeners.remove(&id) {
                         self.retired.push(listener);
@@ -754,6 +880,12 @@ impl Driver {
                     self.selected_wakes.push(resource.clone());
                     let remove = inner.flows.get(&id).is_some_and(|flow| flow.released);
                     if remove {
+                        crate::options::cancel(
+                            &mut self.option_results,
+                            inner,
+                            id,
+                            Errno::ECANCELED,
+                        );
                         inner.flows.remove(&id);
                     } else if let Some(flow) = inner.flows.get_mut(&id) {
                         // An unaccepted connect already returned a live Stream.
@@ -888,6 +1020,24 @@ impl Driver {
     fn command_valid(&self) -> bool {
         let inner = self.shared.inner.lock().unwrap();
         match &self.command {
+            Some(Command::SetOption {
+                request: Some(request),
+                socket,
+                ..
+            }) => inner.flows.get(socket).is_some_and(|flow| {
+                !flow.released
+                    && !flow.reset
+                    && flow.state != StreamState::Closed
+                    && flow
+                        .options
+                        .as_ref()
+                        .is_some_and(|batch| batch.pending == Some(*request))
+                    && flow.inflight == Some((*request, 0))
+                    && flow.selected.as_ref().is_none_or(|resource| {
+                        let state = resource.state.lock().unwrap();
+                        !state.closing && !state.close_requested && state.close.is_none()
+                    })
+            }),
             Some(Command::LocalAddr { request, .. }) => self.pending.contains_key(request),
             Some(Command::Accept { socket, child }) => {
                 if let Some(listener) = inner.listeners.get(socket)
@@ -972,12 +1122,36 @@ impl Driver {
         let command = self.command.take();
         let mut inner = self.shared.inner.lock().unwrap();
         match command {
+            Some(Command::SetOption {
+                request: Some(request),
+                socket,
+                ..
+            }) => {
+                self.pending.remove(&request);
+                if let Some(flow) = inner.flows.get_mut(&socket)
+                    && flow.inflight == Some((request, 0))
+                {
+                    flow.inflight = None;
+                }
+                crate::options::cancel(
+                    &mut self.option_results,
+                    &mut inner,
+                    socket,
+                    Errno::ECANCELED,
+                );
+            }
             Some(Command::Accept { socket, child })
                 if inner
                     .flows
                     .get(&child)
                     .is_some_and(|flow| flow.selected.is_some() && !flow.remote) =>
             {
+                crate::options::cancel(
+                    &mut self.option_results,
+                    &mut inner,
+                    child,
+                    Errno::ECANCELED,
+                );
                 if let Some(flow) = inner.flows.remove(&child)
                     && let Some(resource) = flow.selected
                 {
@@ -1039,6 +1213,12 @@ impl Driver {
                     flow.opening = false;
                     flow.remote = false;
                     if flow.released {
+                        crate::options::cancel(
+                            &mut self.option_results,
+                            &mut inner,
+                            socket,
+                            Errno::ECANCELED,
+                        );
                         inner.flows.remove(&socket);
                     }
                 }
@@ -1095,6 +1275,26 @@ impl Driver {
                     },
                 );
                 debug_assert!(previous.is_none());
+            }
+        }
+        if let Command::Send {
+            request, socket, ..
+        }
+        | Command::SendUrgent {
+            request, socket, ..
+        } = &command
+        {
+            let mut inner = self.shared.inner.lock().unwrap();
+            if inner.capabilities.selected_endpoints
+                && let Some(flow) = inner.flows.get_mut(socket)
+                && flow
+                    .inflight
+                    .is_some_and(|(current, _)| current == *request)
+            {
+                // Arm at ACTUAL transport acceptance, before its callback can
+                // run. A later Writable clears this same latch even if the
+                // terminal EAGAIN is still stored/unpolled in Rpc.
+                flow.send_blocked = true;
             }
         }
         if let Command::BindStream { socket, .. }
@@ -1500,6 +1700,12 @@ impl Driver {
                 && !retain_receipt
                 && !retain_open;
             if remove {
+                crate::options::cancel(
+                    &mut self.option_results,
+                    &mut inner,
+                    socket,
+                    Errno::ECANCELED,
+                );
                 inner.flows.remove(&socket);
             } else if let Some(flow) = inner.flows.get_mut(&socket) {
                 // A reset stream may still have a guest wrapper. Its state and
@@ -1701,6 +1907,12 @@ impl Driver {
                 flow.remote = true;
                 flow.peer = peer;
             } else if state.close.is_some() && inner.flows[&child].released {
+                crate::options::cancel(
+                    &mut self.option_results,
+                    &mut inner,
+                    child,
+                    Errno::ECANCELED,
+                );
                 inner.flows.remove(&child);
             }
             drop(state);
@@ -1758,8 +1970,10 @@ impl Driver {
                 state.phase = Phase::Connected;
             }
             let queue = flow.wq.clone();
+            let async_options = inner.capabilities.async_options;
             drop(inner);
             let stream = Arc::new(Stream {
+                async_options,
                 shared: self.shared.clone(),
                 id: child,
                 peer,
@@ -1802,6 +2016,7 @@ impl Driver {
         let mut complete = None;
         let mut incoming = None;
         let mut inner = self.shared.inner.lock().unwrap();
+        let async_options = inner.capabilities.async_options;
         match event {
             Event::StreamBound { .. }
             | Event::StreamConnected { .. }
@@ -1818,7 +2033,19 @@ impl Driver {
                             result.err().unwrap_or(Errno::EPROTO),
                         )),
                     ));
-                } else if let Some(pending) = self.pending.remove(&request) {
+                } else if self.pending.contains_key(&request) {
+                    if matches!(self.pending.get(&request), Some(Pending::Send(..))) {
+                        return Err(Errno::EPROTO);
+                    }
+                    if let Some(Pending::OptionSet(id)) = self.pending.get(&request)
+                        && let Some(flow) = inner.flows.get(id)
+                        && let Some(batch) = &flow.options
+                        && batch.pending == Some(request)
+                        && flow.inflight != Some((request, 0))
+                    {
+                        return Err(Errno::EPROTO);
+                    }
+                    let pending = self.pending.remove(&request).unwrap();
                     match pending {
                         Pending::Selected(..)
                         | Pending::SelectedAddress(..)
@@ -1879,6 +2106,31 @@ impl Driver {
                             let error = result.err().ok_or(Errno::EPROTO)?;
                             self.bound(&mut inner, id, udp, Err(error), &mut binding_wakes)?;
                         }
+                        Pending::OptionSet(id) => {
+                            if let Some(flow) = inner.flows.get_mut(&id)
+                                && let Some(batch) = flow.options.as_mut()
+                            {
+                                if batch.pending != Some(request) {
+                                    // This exact old OptionSet was canceled. A
+                                    // new batch on the same live flow owns its
+                                    // own inflight request and remains intact.
+                                    return Ok(());
+                                }
+                                flow.inflight = None;
+                                batch.pending = None;
+                                if result.is_err() {
+                                    self.option_results
+                                        .push(flow.options.take().unwrap().complete(result));
+                                } else {
+                                    batch.position += 1;
+                                    if batch.position == batch.steps.len() {
+                                        self.option_results
+                                            .push(flow.options.take().unwrap().complete(Ok(())));
+                                    }
+                                }
+                                wakes.push((flow.wq.clone(), flow.mask(self.shared.config)));
+                            }
+                        }
                         Pending::Send(_, _) => return Err(Errno::EPROTO),
                     }
                 }
@@ -1920,15 +2172,25 @@ impl Driver {
                 socket,
                 amount,
             } => {
-                if let Some(Pending::Send(id, size)) = self.pending.remove(&request) {
-                    if id != socket || amount == 0 || amount > size {
+                if let Some(pending) = self.pending.get(&request) {
+                    let Pending::Send(id, size) = pending else {
+                        return Err(Errno::EPROTO);
+                    };
+                    let (id, size) = (*id, *size);
+                    if id != socket
+                        || amount == 0
+                        || amount > size
+                        || inner
+                            .flows
+                            .get(&id)
+                            .is_some_and(|flow| flow.inflight != Some((request, size)))
+                    {
                         return Err(Errno::EPROTO);
                     }
+                    self.pending.remove(&request);
                     if let Some(flow) = inner.flows.get_mut(&id) {
-                        if flow.inflight != Some((request, size)) {
-                            return Err(Errno::EPROTO);
-                        }
                         flow.inflight = None;
+                        flow.send_blocked = false;
                         flow.tx.drain(..amount);
                         flow.tx_head += amount as u64;
                         while flow
@@ -1947,14 +2209,31 @@ impl Driver {
                 socket,
                 error,
             } => {
-                if let Some(Pending::Send(id, _)) = self.pending.remove(&request) {
-                    if id != socket {
+                if let Some(pending) = self.pending.get(&request) {
+                    let Pending::Send(id, size) = pending else {
+                        return Err(Errno::EPROTO);
+                    };
+                    let (id, size) = (*id, *size);
+                    if id != socket
+                        || inner
+                            .flows
+                            .get(&id)
+                            .is_some_and(|flow| flow.inflight != Some((request, size)))
+                    {
                         return Err(Errno::EPROTO);
                     }
+                    self.pending.remove(&request);
+                    let armed_at_dispatch = inner.capabilities.selected_endpoints;
                     if let Some(flow) = inner.flows.get_mut(&id) {
                         flow.inflight = None;
                         if error == Errno::EAGAIN {
-                            flow.send_blocked = true;
+                            // For the opt-in callback profile the actual send
+                            // armed this latch. Preserve any Writable observed
+                            // since then; an older terminal result cannot erase
+                            // that edge. Default transports retain old behavior.
+                            if !armed_at_dispatch {
+                                flow.send_blocked = true;
+                            }
                         } else {
                             flow.fail(error);
                             flow.reset = true;
@@ -2117,6 +2396,7 @@ impl Driver {
         }
         if let Some((sink, id, peer, wq)) = incoming {
             let stream = Arc::new(Stream {
+                async_options,
                 shared: self.shared.clone(),
                 id,
                 peer,
@@ -2230,6 +2510,10 @@ impl Driver {
         let mut binding_wakes = Vec::new();
         let mut selected = Vec::new();
         for flow in inner.flows.values_mut() {
+            if let Some(batch) = flow.options.take() {
+                self.option_results
+                    .push(batch.complete(Err(cleanup_error.unwrap_or(error))));
+            }
             if let Some(resource) = &flow.selected
                 && resource.generation == self.generation
             {
@@ -2271,6 +2555,7 @@ impl Driver {
         let controls = std::mem::take(&mut inner.controls);
         drop(inner);
         self.accepted.clear();
+        self.flush_options();
         for listener in listeners.values() {
             if let Some(endpoint) = &listener.endpoint {
                 endpoint.report(Err(error));
@@ -2307,5 +2592,164 @@ impl Driver {
 impl Drop for Driver {
     fn drop(&mut self) {
         self.disconnect(Errno::ECONNABORTED);
+    }
+}
+
+#[cfg(test)]
+mod control_tests {
+    use super::*;
+    use crate::{Capabilities, Config, WebBackend};
+    use std::{net::SocketAddr, sync::Mutex};
+    use wasixv2_abi::{SocketLevel, TcpOption};
+    use wasixv2_vnet::Backend;
+
+    #[test]
+    fn wrong_control_receipts_preserve_other_pending_work_and_exact_retired_receipts_are_noops() {
+        let (backend, mut driver) = WebBackend::new(
+            Config::default(),
+            Capabilities {
+                async_options: true,
+                ..Capabilities::classic(true)
+            },
+        )
+        .unwrap();
+        let peer: SocketAddr = "192.0.2.1:80".parse().unwrap();
+        let stream = backend.connect(peer, WaitQueue::new()).unwrap();
+        let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+        let opening = driver.next(&mut cx).unwrap().unwrap();
+        let (open, socket) = match &opening {
+            Command::Connect {
+                request, socket, ..
+            } => (*request, *socket),
+            _ => panic!(),
+        };
+        driver.sent(opening);
+        driver
+            .event(Event::Complete {
+                request: open,
+                result: Ok(()),
+            })
+            .unwrap();
+        let completed = Arc::new(Mutex::new(Vec::new()));
+        let output = completed.clone();
+        stream
+            .start_options(
+                vec![(
+                    SocketLevel::SOL_TCP.0,
+                    TcpOption::TCP_NODELAY.0,
+                    1i32.to_le_bytes().to_vec(),
+                )],
+                Box::new(move |result| output.lock().unwrap().push(result)),
+            )
+            .unwrap();
+        let option = driver.next(&mut cx).unwrap().unwrap();
+        let option_id = match &option {
+            Command::SetOption {
+                request: Some(request),
+                ..
+            } => *request,
+            _ => panic!(),
+        };
+        driver.sent(option);
+        assert_eq!(
+            driver.control_event(Event::Sent {
+                request: option_id,
+                socket,
+                amount: 1
+            }),
+            Err(Errno::EPROTO)
+        );
+        assert!(
+            matches!(driver.pending.get(&option_id), Some(Pending::OptionSet(id)) if *id == socket)
+        );
+        assert!(completed.lock().unwrap().is_empty());
+        driver
+            .control_event(Event::Complete {
+                request: option_id,
+                result: Ok(()),
+            })
+            .unwrap();
+        driver.flush_options();
+        assert_eq!(*completed.lock().unwrap(), vec![Ok(())]);
+        stream.write(b"abcdef").unwrap();
+        let send = driver.next(&mut cx).unwrap().unwrap();
+        let first = match &send {
+            Command::Send { request, .. } => *request,
+            _ => panic!(),
+        };
+        driver.sent(send);
+        assert_eq!(
+            driver.control_event(Event::Sent {
+                request: first,
+                socket: socket + 100,
+                amount: 2
+            }),
+            Err(Errno::EPROTO)
+        );
+        assert!(matches!(driver.pending.get(&first), Some(Pending::Send(id, 6)) if *id == socket));
+        assert_eq!(stream.output_len(), 6);
+        driver
+            .control_event(Event::Sent {
+                request: first,
+                socket,
+                amount: 2,
+            })
+            .unwrap();
+        assert_eq!(stream.output_len(), 4);
+        let send = driver.next(&mut cx).unwrap().unwrap();
+        let second = match &send {
+            Command::Send { request, data, .. } => {
+                assert_eq!(data, b"cdef");
+                *request
+            }
+            _ => panic!(),
+        };
+        driver.sent(send);
+        assert_eq!(
+            driver.control_event(Event::Complete {
+                request: second,
+                result: Ok(())
+            }),
+            Err(Errno::EPROTO)
+        );
+        assert!(matches!(driver.pending.get(&second), Some(Pending::Send(id, 4)) if *id == socket));
+        assert_eq!(
+            driver.event(Event::Complete {
+                request: second,
+                result: Ok(())
+            }),
+            Err(Errno::EPROTO)
+        );
+        assert!(matches!(driver.pending.get(&second), Some(Pending::Send(id, 4)) if *id == socket));
+        driver
+            .control_event(Event::Complete {
+                request: option_id,
+                result: Ok(()),
+            })
+            .unwrap();
+        assert!(
+            driver.pending.contains_key(&second),
+            "duplicate completed option cannot steal another current operation"
+        );
+
+        // No numeric ID-range history is needed: absent pending receipts do
+        // nothing, including an exact duplicate of the prior acknowledged send.
+        driver
+            .control_event(Event::Sent {
+                request: first,
+                socket,
+                amount: 2,
+            })
+            .unwrap();
+        assert!(driver.pending.contains_key(&second));
+        assert_eq!(stream.output_len(), 4);
+        driver
+            .control_event(Event::Sent {
+                request: second,
+                socket,
+                amount: 4,
+            })
+            .unwrap();
+        assert_eq!(stream.output_len(), 0);
     }
 }

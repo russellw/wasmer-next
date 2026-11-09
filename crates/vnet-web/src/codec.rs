@@ -2,7 +2,7 @@
 //!
 //! Tags and field order are from `lib/virtual-net/src/meta.rs`, not a guest ABI. Keeping this
 //! adapter private to the driver avoids a runtime dependency on the v1 networking stack.
-use crate::transport::{Command, Event};
+use crate::transport::{Command, Event, SocketControl};
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
     net::{IpAddr, SocketAddr},
@@ -25,6 +25,32 @@ fn pack(value: impl Serialize) -> Result<Vec<u8>, Errno> {
 /// configured resolver provider (e.g. DoH); the classic Resolve record only names a host.
 pub fn encode(command: &Command) -> Result<Vec<u8>, Errno> {
     let out = match command {
+        Command::SetOption {
+            request,
+            socket,
+            control,
+        } => match control {
+            SocketControl::Ttl(value) => pack((1u32, socket, 27u32, value, request))?,
+            SocketControl::Linger(value) => pack((1u32, socket, 30u32, value, request))?,
+            SocketControl::NoDelay(value) => pack((1u32, socket, 38u32, value, request))?,
+            SocketControl::KeepAlive(value) => pack((1u32, socket, 40u32, value, request))?,
+            SocketControl::Broadcast(value) => pack((1u32, socket, 46u32, value, request))?,
+            SocketControl::MulticastLoopV4(value) => pack((1u32, socket, 48u32, value, request))?,
+            SocketControl::MulticastLoopV6(value) => pack((1u32, socket, 50u32, value, request))?,
+            SocketControl::MulticastTtlV4(value) => pack((1u32, socket, 52u32, value, request))?,
+            SocketControl::JoinMulticastV4 { multiaddr, iface } => {
+                pack((1u32, socket, 54u32, multiaddr, iface, request))?
+            }
+            SocketControl::LeaveMulticastV4 { multiaddr, iface } => {
+                pack((1u32, socket, 55u32, multiaddr, iface, request))?
+            }
+            SocketControl::JoinMulticastV6 { multiaddr, iface } => {
+                pack((1u32, socket, 56u32, multiaddr, iface, request))?
+            }
+            SocketControl::LeaveMulticastV6 { multiaddr, iface } => {
+                pack((1u32, socket, 57u32, multiaddr, iface, request))?
+            }
+        },
         Command::BindStream {
             request,
             socket,

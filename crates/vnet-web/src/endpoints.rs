@@ -466,6 +466,7 @@ impl EndpointProvider for Provider {
             return Err(Errno::ENETDOWN);
         }
         super::backend::family_allowed(inner.capabilities, peer)?;
+        let async_options = inner.capabilities.async_options;
         let id = if let Some(binding) = &target.binding {
             let bound = self.bound(binding)?;
             if bound.resource.generation != inner.generation {
@@ -497,6 +498,7 @@ impl EndpointProvider for Provider {
         drop(inner);
         self.shared.wake.wake();
         Ok(Arc::new(Stream {
+            async_options,
             shared: self.shared.clone(),
             id,
             peer,
