@@ -578,20 +578,23 @@ impl Kernel {
         let Some(process) = state.tasks.get(&task).map(|task| task.process.clone()) else {
             return false;
         };
-        let status = {
+        let (status, won) = {
             let mut group = process.group.state.lock_or_recover();
             match group.exit {
                 Some(_) if fatal.is_some() => return false,
-                Some(status) => status,
+                Some(status) => (status, false),
                 None => {
-                    if let Some((signal, fault)) = fatal {
-                        self.procs.claim_fatal_exit(process.pid.0, signal, fault);
-                    }
                     group.exit = Some(status);
-                    status
+                    (status, true)
                 }
             }
         };
+        // The kernel state lock serializes every group-exit writer and completion
+        // publisher. Release the group lock before entering the process tree:
+        // wait's tree -> ident and coredump's ident -> group must not form a cycle.
+        if won && let Some((signal, fault)) = fatal {
+            self.procs.claim_fatal_exit(process.pid.0, signal, fault);
+        }
         let mut others = false;
         let mut unstarted = Vec::new();
         for (&id, t) in state.tasks.iter_mut() {
