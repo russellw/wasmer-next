@@ -467,14 +467,32 @@ impl Filesystem for HostFs {
             .shared
             .blocking(move || {
                 // fs/fhandle.c do_handle_open: the host must also permit native decoding.
-                let fd = cvt(unsafe {
-                    libc::syscall(
-                        libc::SYS_open_by_handle_at,
-                        anchor.as_raw_fd(),
-                        &native,
-                        libc::O_PATH | libc::O_CLOEXEC,
-                    )
-                } as libc::c_int)?;
+                let decode = |mount_fd| {
+                    // SAFETY: native has the validated UAPI layout; mount_fd stays open.
+                    cvt(unsafe {
+                        libc::syscall(
+                            libc::SYS_open_by_handle_at,
+                            mount_fd,
+                            &native,
+                            libc::O_PATH | libc::O_CLOEXEC,
+                        )
+                    } as libc::c_int)
+                };
+                let fd = match decode(anchor.as_raw_fd()) {
+                    Err(Errno::EBADF) => {
+                        // Some kernels' fdget rejects O_PATH mount anchors. Reopen this
+                        // retained capability, never its original name; a bind mount's
+                        // first object may be a file rather than a directory.
+                        let readable = open_at(
+                            libc::AT_FDCWD,
+                            &proc_path(anchor.as_raw_fd()),
+                            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOCTTY,
+                            0,
+                        )?;
+                        decode(readable.as_raw_fd())?
+                    }
+                    result => result?,
+                };
                 // SAFETY: this syscall just returned a new owned descriptor.
                 let decoded = unsafe { OwnedFd::from_raw_fd(fd) };
                 let st = stat_fd(decoded.as_raw_fd())?;
