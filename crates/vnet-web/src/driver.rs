@@ -3624,6 +3624,9 @@ mod control_tests {
             fn poll_recv(&mut self, _: &mut Context<'_>) -> Poll<Result<Event, Errno>> {
                 Poll::Pending
             }
+            fn poll_closed(&mut self, _: &mut Context<'_>) -> Poll<Errno> {
+                Poll::Pending
+            }
             fn close(&mut self) {}
         }
         let caps = Capabilities {
