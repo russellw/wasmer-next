@@ -330,6 +330,413 @@ fn explicit_bind_connect_transfers_same_id_and_updates_actual_address() {
 }
 
 #[test]
+fn canonical_bound_tcp_connect_renews_source_and_transfers_same_resource() {
+    for (domain, requested, bound, peer, actual) in [
+        (
+            Domain::Inet,
+            "0.0.0.0:0",
+            "0.0.0.0:42101",
+            "127.0.0.1:8080",
+            "127.0.0.1:42101",
+        ),
+        (
+            Domain::Inet6,
+            "[::]:0",
+            "[::]:42102",
+            "[::1]:8080",
+            "[::1]:42102",
+        ),
+    ] {
+        let mut h = Harness::profile(true, true);
+        let net = h.net();
+        let socket = net.socket(domain, SocketKind::Stream, 0, 1).unwrap();
+        let admission = socket
+            .bind_admission(addr(requested), false)
+            .unwrap()
+            .unwrap();
+        h.pump();
+        let (bind_request, id) = match h.io.sent[0] {
+            Command::BindStream {
+                request,
+                socket,
+                bind,
+            } => {
+                assert_eq!(bind.requested, addr(requested));
+                (request, socket)
+            }
+            ref command => panic!("not selected bind: {command:?}"),
+        };
+        h.event(Event::StreamBound {
+            request: bind_request,
+            socket: id,
+            result: Ok(addr(bound)),
+        });
+        admission.complete().unwrap();
+        assert_eq!(socket.local_addr(), Ok(addr(bound)));
+        // This invokes NetTcp's actual source renewal, unlike provider-direct tests.
+        assert_eq!(socket.connect(addr(peer)), Err(Errno::EINPROGRESS));
+        h.pump();
+        let connect_request = match h.io.sent.last().unwrap() {
+            Command::ConnectFrom {
+                request,
+                socket,
+                peer: destination,
+                local,
+                requested_bind,
+                bound_addr,
+            } => {
+                assert_eq!(*socket, id);
+                assert_eq!(*destination, addr(peer));
+                assert_eq!(local.port(), addr(bound).port());
+                assert_eq!(*requested_bind, Some(addr(requested)));
+                assert_eq!(*bound_addr, Some(addr(bound)));
+                *request
+            }
+            command => panic!("bound connect did not keep its resource: {command:?}"),
+        };
+        assert_eq!(
+            h.io.sent
+                .iter()
+                .filter(|command| matches!(command, Command::ConnectFrom { .. }))
+                .count(),
+            1
+        );
+        h.event(Event::StreamConnected {
+            request: connect_request,
+            socket: id,
+            result: Ok(addr(actual)),
+        });
+        assert_eq!(socket.local_addr(), Ok(addr(actual)));
+        assert_eq!(socket.peer_addr(), Ok(addr(peer)));
+        assert_eq!(
+            socket.send(wasixv2_vnet::SendMsg {
+                data: b"ping",
+                to: None,
+                flags: wasixv2_abi::MsgFlags::empty(),
+                control: &[],
+                net_raw: false,
+                now: std::time::Duration::ZERO,
+            }),
+            Ok(4)
+        );
+        h.pump();
+        let request = match h.io.sent.last().unwrap() {
+            Command::Send {
+                request,
+                socket,
+                data,
+            } => {
+                assert_eq!(*socket, id);
+                assert_eq!(data, b"ping");
+                *request
+            }
+            command => panic!("missing same-resource payload: {command:?}"),
+        };
+        h.event(Event::Sent {
+            request,
+            socket: id,
+            amount: 4,
+        });
+        h.event(Event::Data {
+            socket: id,
+            data: b"pong".to_vec(),
+        });
+        let mut bytes = [0; 4];
+        assert_eq!(
+            socket
+                .recv(&mut bytes, wasixv2_abi::MsgFlags::empty())
+                .unwrap()
+                .len,
+            4
+        );
+        assert_eq!(&bytes, b"pong");
+    }
+}
+
+fn bound_candidate(h: &mut Harness) -> (Arc<dyn EndpointProvider>, EndpointQuery, u64) {
+    let provider = h.provider();
+    let original = request(EndpointBindPurpose::Bind);
+    let binding = provider.bind(original, WaitQueue::new()).unwrap().unwrap();
+    h.pump();
+    let (request, id) = match h.io.sent.last().unwrap() {
+        Command::BindStream {
+            request, socket, ..
+        } => (*request, *socket),
+        command => panic!("missing admitted bind: {command:?}"),
+    };
+    let local = addr("0.0.0.0:42103");
+    h.event(Event::StreamBound {
+        request,
+        socket: id,
+        result: Ok(local),
+    });
+    (
+        provider,
+        EndpointQuery {
+            kind: EndpointKind::Stream,
+            source_id: EndpointSourceId(original.source_id.0 + 1),
+            bound: Some(local),
+            requested_bind: Some(original.requested),
+            binding: Some(binding),
+            effective_source: None,
+            destination: addr("127.0.0.1:8080"),
+            local_binding: true,
+        },
+        id,
+    )
+}
+
+#[test]
+fn bound_tcp_candidate_keeps_provider_source_and_single_transfer_authority() {
+    let mut h = Harness::new(true);
+    let (provider, query, id) = bound_candidate(&mut h);
+    let EndpointChoice::Provider(target) = provider.select(&query).unwrap() else {
+        panic!()
+    };
+    assert!(matches!(h.provider().select(&query), Err(Errno::ENETDOWN)));
+    assert!(matches!(
+        h.provider().connect(
+            target.clone(),
+            query.source_id,
+            query.bound.unwrap(),
+            query.destination,
+            WaitQueue::new()
+        ),
+        Err(Errno::ECANCELED)
+    ));
+    assert!(matches!(
+        provider.connect(
+            target.clone(),
+            EndpointSourceId(query.source_id.0 + 1),
+            query.bound.unwrap(),
+            query.destination,
+            WaitQueue::new()
+        ),
+        Err(Errno::ECANCELED)
+    ));
+    assert!(
+        !h.io
+            .sent
+            .iter()
+            .any(|command| matches!(command, Command::ConnectFrom { .. }))
+    );
+    let stream = provider
+        .connect(
+            target.clone(),
+            query.source_id,
+            query.bound.unwrap(),
+            query.destination,
+            WaitQueue::new(),
+        )
+        .unwrap();
+    assert!(matches!(
+        provider.connect(
+            target,
+            query.source_id,
+            query.bound.unwrap(),
+            query.destination,
+            WaitQueue::new()
+        ),
+        Err(Errno::EINVAL)
+    ));
+    assert!(matches!(provider.select(&query), Err(Errno::EINVAL)));
+    h.pump();
+    assert_eq!(
+        h.io.sent
+            .iter()
+            .filter(
+                |command| matches!(command, Command::ConnectFrom { socket, .. } if *socket == id)
+            )
+            .count(),
+        1
+    );
+    let _retained = stream;
+}
+
+struct ResetWake(std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>);
+impl WaitEntry for ResetWake {
+    fn wake(&self, _: PollMask) -> bool {
+        // Drop the callback guard before reentering the same provider.
+        let callback = self.0.lock().unwrap().take();
+        if let Some(callback) = callback {
+            callback();
+        }
+        true
+    }
+}
+
+#[test]
+fn bound_tcp_reset_wake_cannot_select_or_transfer_before_resource_cutoff() {
+    for connect in [false, true] {
+        let mut h = Harness::new(true);
+        let (healthy, healthy_id) = selected_stream(&mut h);
+        let provider = h.provider();
+        let original = request(EndpointBindPurpose::Bind);
+        let queue = WaitQueue::new();
+        let binding = provider.bind(original, queue.clone()).unwrap().unwrap();
+        h.pump();
+        let (request, id) = match h.io.sent.last().unwrap() {
+            Command::BindStream {
+                request, socket, ..
+            } => (*request, *socket),
+            command => panic!("missing bound resource: {command:?}"),
+        };
+        let local = addr("0.0.0.0:42104");
+        h.event(Event::StreamBound {
+            request,
+            socket: id,
+            result: Ok(local),
+        });
+        let query = EndpointQuery {
+            kind: EndpointKind::Stream,
+            source_id: EndpointSourceId(original.source_id.0 + 1),
+            bound: Some(local),
+            requested_bind: Some(original.requested),
+            binding: Some(binding),
+            effective_source: None,
+            destination: addr("127.0.0.1:8080"),
+            local_binding: true,
+        };
+        let EndpointChoice::Provider(target) = provider.select(&query).unwrap() else {
+            panic!()
+        };
+        let observed = Arc::new(std::sync::Mutex::new(None));
+        let output = observed.clone();
+        let waiter = Arc::new(ResetWake(std::sync::Mutex::new(Some(Box::new(
+            move || {
+                assert_eq!(query.binding.as_ref().unwrap().local_addr(), Ok(local));
+                let result = if connect {
+                    provider
+                        .connect(
+                            target,
+                            query.source_id,
+                            local,
+                            query.destination,
+                            WaitQueue::new(),
+                        )
+                        .map(drop)
+                } else {
+                    provider.select(&query).map(drop)
+                };
+                *output.lock().unwrap() = Some(result);
+            },
+        )))));
+        let _registration = queue.add(waiter);
+        // Event::Reset sets Flow.reset and wakes this exact flow queue AFTER
+        // releasing Shared.inner, BEFORE the next selected_cutoffs pass can
+        // promote Resource.close_requested. Reentry must reject in that gap.
+        h.event(Event::Reset {
+            socket: id,
+            error: Errno::ECONNRESET,
+        });
+        assert_eq!(*observed.lock().unwrap(), Some(Err(Errno::ECANCELED)));
+        assert!(!h.io.sent.iter().any(
+            |command| matches!(command, Command::ConnectFrom { socket, .. } if *socket == id)
+        ));
+        h.event(Event::Data {
+            socket: healthy_id,
+            data: b"live".to_vec(),
+        });
+        let mut bytes = [0; 4];
+        assert_eq!(healthy.read(&mut bytes, false), Ok(4));
+        assert_eq!(&bytes, b"live");
+    }
+}
+
+#[test]
+fn bound_tcp_candidate_cannot_transfer_a_resource_closed_after_selection() {
+    let mut h = Harness::new(true);
+    let (healthy, healthy_id) = selected_stream(&mut h);
+    let (provider, query, id) = bound_candidate(&mut h);
+    let EndpointChoice::Provider(target) = provider.select(&query).unwrap() else {
+        panic!()
+    };
+    h.event(Event::Reset {
+        socket: id,
+        error: Errno::ECONNRESET,
+    });
+    assert!(matches!(
+        provider.connect(
+            target,
+            query.source_id,
+            query.bound.unwrap(),
+            query.destination,
+            WaitQueue::new()
+        ),
+        Err(Errno::ECANCELED)
+    ));
+    assert!(matches!(provider.select(&query), Err(Errno::ECANCELED)));
+    assert!(
+        !h.io
+            .sent
+            .iter()
+            .any(|command| matches!(command, Command::ConnectFrom { socket, .. } if *socket == id))
+    );
+    h.event(Event::Data {
+        socket: healthy_id,
+        data: b"live".to_vec(),
+    });
+    let mut bytes = [0; 4];
+    assert_eq!(healthy.read(&mut bytes, false), Ok(4));
+    assert_eq!(&bytes, b"live");
+}
+
+#[test]
+fn bound_tcp_candidate_cannot_cross_owner_close_or_generation_replacement() {
+    for replace_generation in [false, true] {
+        let mut h = Harness::new(true);
+        let (provider, query, _) = bound_candidate(&mut h);
+        let EndpointChoice::Provider(target) = provider.select(&query).unwrap() else {
+            panic!()
+        };
+        let backend = h.backend.clone();
+        let mut closing = Box::pin(backend.close_endpoints());
+        let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+        assert!(closing.as_mut().poll(&mut cx).is_pending());
+        assert!(matches!(
+            provider.connect(
+                target.clone(),
+                query.source_id,
+                query.bound.unwrap(),
+                query.destination,
+                WaitQueue::new()
+            ),
+            Err(Errno::ENETDOWN)
+        ));
+        if replace_generation {
+            // Drop the actual old Driver before reconnect; retain the old binding/target.
+            let (_, placeholder) = WebBackend::new(Config::default(), h.io.caps).unwrap();
+            drop(std::mem::replace(&mut h.driver, placeholder));
+            h.driver = h.backend.reconnect(h.io.caps).unwrap();
+            let (_replacement_provider, replacement_query, replacement_id) =
+                bound_candidate(&mut h);
+            assert!(matches!(provider.select(&query), Err(Errno::ECANCELED)));
+            assert!(matches!(
+                provider.connect(
+                    target,
+                    query.source_id,
+                    query.bound.unwrap(),
+                    query.destination,
+                    WaitQueue::new()
+                ),
+                Err(Errno::ENETDOWN)
+            ));
+            assert_eq!(
+                replacement_query.binding.unwrap().local_addr(),
+                Ok(addr("0.0.0.0:42103"))
+            );
+            assert!(!h.io.sent.iter().any(|command| matches!(command, Command::ConnectFrom { socket, .. } if *socket == replacement_id)));
+        }
+        assert!(
+            !h.io
+                .sent
+                .iter()
+                .any(|command| matches!(command, Command::ConnectFrom { .. }))
+        );
+    }
+}
+
+#[test]
 fn selected_close_seal_prevents_a_cached_bound_connect_across_driver_yields() {
     for (count, close_error) in [(70, None), (1, None), (70, Some(Errno::EIO))] {
         let mut h = Harness::limited(true, false, 128);

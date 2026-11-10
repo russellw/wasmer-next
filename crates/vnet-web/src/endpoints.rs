@@ -560,15 +560,36 @@ impl EndpointProvider for Provider {
         }
         if let Some(binding) = &query.binding {
             let bound = self.bound(binding)?;
-            if bound.resource.generation != generation {
+            let inner = self.shared.inner.lock().unwrap();
+            let state = bound.resource.state.lock().unwrap();
+            // TCP connect renews the association source before selection. The
+            // bind request identifies the retained resource, not that candidate.
+            if !inner.online
+                || inner.selected_close.is_some()
+                || inner.generation != generation
+                || bound.resource.generation != generation
+                || !inner.flows.get(&bound.id).is_some_and(|flow| {
+                    !flow.released
+                        && !flow.reset
+                        && flow
+                            .selected
+                            .as_ref()
+                            .is_some_and(|resource| Arc::ptr_eq(resource, &bound.resource))
+                })
+                || state.close_requested
+                || state.closing
+                || state.close.is_some()
+            {
                 return Err(Errno::ECANCELED);
             }
             if bound
                 .resource
                 .request
-                .is_none_or(|request| request.source_id != query.source_id)
+                .is_none_or(|request| request.kind != EndpointKind::Stream)
+                || state.phase != Phase::Bound
+                || state.transferred
             {
-                return Err(Errno::ECANCELED);
+                return Err(Errno::EINVAL);
             }
         } else if query.requested_bind.is_some() {
             // The namespace-reserved JS Node profile never supported bound
@@ -618,7 +639,25 @@ impl EndpointProvider for Provider {
             }
             let flow = inner.flows.get_mut(&bound.id).ok_or(Errno::ECANCELED)?;
             let mut state = bound.resource.state.lock().unwrap();
-            if state.phase != Phase::Bound || state.transferred || flow.released {
+            if flow.released
+                || flow.reset
+                || !flow
+                    .selected
+                    .as_ref()
+                    .is_some_and(|resource| Arc::ptr_eq(resource, &bound.resource))
+                || state.close_requested
+                || state.closing
+                || state.close.is_some()
+            {
+                return Err(Errno::ECANCELED);
+            }
+            if bound
+                .resource
+                .request
+                .is_none_or(|request| request.kind != EndpointKind::Stream)
+                || state.phase != Phase::Bound
+                || state.transferred
+            {
                 return Err(Errno::EINVAL);
             }
             state.transferred = true;
