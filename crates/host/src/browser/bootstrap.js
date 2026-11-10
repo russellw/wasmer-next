@@ -47,12 +47,13 @@ export async function startCoordinator(options, onMessage = () => {}, host) {
     const coordinator = host === undefined
         ? new Worker(coordinatorURL, { type: "module" })
         : host.createWorker(coordinatorURL, { type: "module" });
+    const nativeExit = coordinator.exited;
     async function retire() {
         let failure;
         try { await coordinator.terminate(); } catch (error) { failure = { error }; }
         // A rejected terminate request does not release an independently
         // captured native owner. DOM workers expose no such completion.
-        try { await coordinator.exited; } catch (error) { failure ??= { error }; }
+        try { await nativeExit; } catch (error) { failure ??= { error }; }
         if (failure) throw failure.error;
     }
     // Routing only: no Store, Instance, callback or guest graph is registered here.
@@ -72,6 +73,8 @@ export async function startCoordinator(options, onMessage = () => {}, host) {
     let disposal;
     function dispose() {
         if (disposed) return disposal;
+        let resolve, reject;
+        disposal = new Promise((done, fail) => { resolve = done; reject = fail; });
         disposed = true;
         // A tombstone permits a racing stale Waker to observe closed ownership
         // without retaining the coordinator or allowing a poisoned heap to reboot.
@@ -81,7 +84,7 @@ export async function startCoordinator(options, onMessage = () => {}, host) {
         coordinator.onmessage = coordinator.onerror = coordinator.onmessageerror = null;
         // DOM termination remains request-only. A native host can return its
         // real exit promise; bootstrap failure must retain that completion.
-        disposal = retire();
+        retire().then(resolve, reject);
         // Terminal event delivery is synchronous. Its owner can join the same
         // native completion later without an unhandled cleanup rejection here.
         disposal.catch(() => {});
@@ -89,35 +92,49 @@ export async function startCoordinator(options, onMessage = () => {}, host) {
     }
     try {
         await new Promise((resolve, reject) => {
-            const notifyFailure = (data) => {
-                if (host === undefined) { onMessage(data); return; }
+            const notifyFailure = (data, origin, originalError) => {
+                // Only this caller-local argument can contain an owned Promise
+                // or Error. Keep the ordinary message cloneable and unchanged.
+                let message = data;
+                if (Object.hasOwn(data, "nativeWorkerFailure")) {
+                    const { nativeWorkerFailure: _nativeWorkerFailure, ...rest } = data;
+                    message = rest;
+                }
+                const terminal = { retirement: disposal, ...(origin ? { origin } : {}),
+                    ...(originalError ? { originalError } : {}) };
+                if (host === undefined) { onMessage(message, terminal); return; }
                 // The failure was already selected before this notification.
                 // A secondary native-host callback must not escape its event
                 // emitter or replace the primary error while retirement joins.
-                try { onMessage(data); } catch {}
+                try { onMessage(message, terminal); } catch {}
             };
             timer = setTimeout(() => reject(new Error("coordinator bootstrap timed out")), config.admissionTimeout);
             coordinator.onerror = (event) => {
                 if (disposed) return;
+                const originalError = event.error instanceof Error ? event.error : new Error(event.message);
                 dispose();
-                reject(host !== undefined && event.error instanceof Error ? event.error : new Error(event.message));
-                notifyFailure({ type: "fatal", error: event.message });
+                reject(originalError);
+                notifyFailure({ type: "fatal", error: event.message }, "native-worker", originalError);
             };
             coordinator.onmessage = ({ data }) => {
                 if (disposed || (abortRequested && data.type === "ready")) return;
                 if (host !== undefined && data.type === "ready") {
                     // Native host callbacks can synchronously fail or reenter
                     // cancellation. Do not publish a healthy owner first.
-                    try { onMessage(data); }
+                    try { onMessage(data, { retire: dispose }); }
                     catch (error) { dispose(); reject(error); return; }
-                    if (!disposed && !abortRequested) { ready = true; clearTimeout(timer); resolve(); }
+                    if (disposed) reject(new Error("coordinator disposed during bootstrap"));
+                    else if (!abortRequested) { ready = true; clearTimeout(timer); resolve(); }
                     return;
                 }
                 if (data.type === "fatal" || data.type === "stopped") dispose();
                 if (data.type === "ready") { ready = true; clearTimeout(timer); resolve(); }
                 if (data.type === "fatal") { clearTimeout(timer); reject(abortRequested && data.ownerAbort === true ? signal.reason : new Error(data.error)); }
                 if (data.type === "stopped") reject(new Error("coordinator stopped during bootstrap"));
-                if (data.type === "fatal" || (data.type === "stopped" && !ready)) notifyFailure(data);
+                if (data.type === "fatal" || (data.type === "stopped" && !ready)) {
+                    notifyFailure(data, data.type === "fatal" && data.nativeWorkerFailure === true ? "native-worker" : undefined);
+                }
+                else if (data.type === "ready") onMessage(data, { retire: dispose });
                 else onMessage(data);
             };
             coordinator.onmessageerror = () => {
@@ -126,17 +143,18 @@ export async function startCoordinator(options, onMessage = () => {}, host) {
                 reject(new Error("coordinator message could not be decoded"));
                 notifyFailure({ type: "fatal", error: "coordinator message could not be decoded" });
             };
-            if (coordinator.exited) {
+            if (nativeExit) {
                 // Native self-close is not a B2 terminal acknowledgement. This
                 // observer remains live after readiness until protocol disposal.
-                const failed = (error) => {
+                const failed = (error, nativeWorkerFailure = false) => {
                     if (disposed) return;
                     dispose();
                     reject(error);
-                    notifyFailure({ type: "fatal", error: error.message });
+                    notifyFailure({ type: "fatal", error: error.message },
+                        nativeWorkerFailure ? "native-worker" : undefined, nativeWorkerFailure ? error : undefined);
                 };
-                Promise.resolve(coordinator.exited).then(
-                    code => failed(new Error(`coordinator exited before protocol shutdown with status ${code}`)),
+                Promise.resolve(nativeExit).then(
+                    code => failed(new Error(`coordinator exited before protocol shutdown with status ${code}`), true),
                     cause => failed(cause instanceof Error ? cause : new Error(String(cause))),
                 // Native exit was already the first failure. A secondary
                 // notification callback cannot replace its original cause.

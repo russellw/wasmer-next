@@ -95,7 +95,10 @@ function rotateMemoryCopies() {
 function createMemoryCopies() {
     const worker = new Worker(options.memoryCopyUrl, { type: "module" });
     let retired = false;
-    worker.onerror = (event) => { event.preventDefault(); fail(event.message); };
+    worker.onerror = (event) => {
+        event.preventDefault();
+        fail(event.message, false, !retired && (worker === memoryCopies || worker === copyRotation?.next));
+    };
     worker.onmessageerror = () => fail("memory-copy message could not be decoded");
     worker.onmessage = ({ data }) => {
         try {
@@ -152,7 +155,7 @@ function createMemoryCopies() {
     return worker;
 }
 
-function fail(error, ownerAbort = false) {
+function fail(error, ownerAbort = false, nativeWorkerFailure = false) {
     if (poisoned) return;
     poisoned = true;
     for (const request of admissions.values()) reply(request, 2);
@@ -170,7 +173,8 @@ function fail(error, ownerAbort = false) {
     stopMemoryCopies();
     root = timerWorker = ioWorker = null;
     options = null;
-    postMessage({ type: "fatal", error: String(error), ...(ownerAbort ? { ownerAbort: true } : {}) });
+    postMessage({ type: "fatal", error: String(error), ...(ownerAbort ? { ownerAbort: true } : {}),
+        ...(nativeWorkerFailure ? { nativeWorkerFailure: true } : {}) });
     close();
 }
 
@@ -184,7 +188,8 @@ function create(role) {
         if (workers.get(state.id) !== state) return;
         // Bootstrap may already be inside Rust TLS/allocator initialization. An
         // uncaught error cannot prove the shared heap safe for another admission.
-        fail(`${state.role} worker ${state.id} (${state.status}): ${event.error?.stack ?? event.message}`);
+        fail(`${state.role} worker ${state.id} (${state.status}): ${event.error?.stack ?? event.message}`,
+            false, workers.get(state.id) === state && state.worker === worker);
     };
     worker.onmessageerror = () => {
         if (workers.get(state.id) === state) fail("worker message could not be decoded");

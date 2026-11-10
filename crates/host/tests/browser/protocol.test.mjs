@@ -1335,3 +1335,116 @@ for (const failure of ["error", "messageerror"]) {
             ? "original native event error" : "coordinator message could not be decoded"));
     });
 }
+
+
+// The optional terminal receipt is caller-local; ordinary callback data remains
+// cloneable and one-argument consumers never receive a worker-wire Promise.
+for (const terminalKind of ["native", "generic"]) {
+    test(`bootstrap ${terminalKind} notice retains one caller-local retirement receipt and cloneable first data`, async () => {
+        const { context, options } = await hostBootstrapFixture();
+        let worker, receive, resolveExit, resolveTerminate;
+        const exited = new Promise(done => { resolveExit = done; });
+        const terminating = new Promise(done => { resolveTerminate = done; });
+        const original = vm.runInContext('new Error("actual native error identity")', context);
+        const notices = [];
+        const host = { baseURL: "file:///sdk/", createWorker() {
+            return worker = { exited, terminations: 0, postMessage() {},
+                terminate() { this.terminations++; receive({ data: { type: "fatal", error: "stale reentry" } }); return terminating; } };
+        } };
+        const opening = context.startCoordinator(options, (data, terminal) => notices.push({ data, terminal }), host);
+        receive = worker.onmessage;
+        worker.onmessage({ data: { type: "ready" } }); await opening;
+        if (terminalKind === "native") worker.onerror({ message: original.message, error: original });
+        else worker.onmessage({ data: { type: "fatal", error: "generic protocol failure" } });
+        const notice = notices.at(-1);
+        assert.equal(notice.data.type, "fatal");
+        assert.equal(notice.data.nativeWorkerFailure, undefined);
+        assert.deepEqual(structuredClone(notice.data), { type: "fatal", error: terminalKind === "native" ? original.message : "generic protocol failure" });
+        assert.equal(notice.terminal.origin, terminalKind === "native" ? "native-worker" : undefined);
+        assert.equal(notice.terminal.originalError, terminalKind === "native" ? original : undefined);
+        assert.equal(typeof notice.terminal.retirement.then, "function");
+        const receipt = notice.terminal.retirement;
+        let settled = false; receipt.then(() => { settled = true; });
+        await flush(); assert.equal(worker.terminations, 1); assert.equal(settled, false);
+        resolveTerminate(); await flush(); assert.equal(settled, false);
+        resolveExit(0); await receipt;
+        receive({ data: { type: "fatal", error: "late terminal" } });
+        assert.equal(worker.terminations, 1); assert.equal(notices.length, 2);
+        assert.equal(notice.terminal.retirement, receipt);
+    });
+}
+
+for (const failure of ["terminate-throws", "terminate-rejects", "exit-rejects"]) {
+    test(`bootstrap terminal receipt joins both captured retirement parts when ${failure}`, async () => {
+        const { context, options } = await hostBootstrapFixture();
+        let worker, resolveExit, rejectExit, resolveTerminate, rejectTerminate, receipt;
+        const exited = new Promise((done, fail) => { resolveExit = done; rejectExit = fail; });
+        const terminating = new Promise((done, fail) => { resolveTerminate = done; rejectTerminate = fail; });
+        const original = new Error(failure);
+        let stale;
+        const opening = context.startCoordinator(options, (_data, terminal) => { if (terminal) receipt = terminal.retirement; },
+            { baseURL: "file:///sdk/", createWorker() {
+                return worker = { exited, terminations: 0, postMessage() {}, terminate() {
+                    this.terminations++; stale({ data: { type: "fatal", error: "reentrant terminal" } });
+                    if (failure === "terminate-throws") throw original;
+                    return terminating;
+                } };
+            } });
+        stale = worker.onmessage;
+        worker.onmessage({ data: { type: "ready" } }); await opening;
+        worker.onmessageerror();
+        let settled = false;
+        const rejected = assert.rejects(receipt, error => error === original).then(() => { settled = true; });
+        if (failure === "exit-rejects") { resolveTerminate(); await flush(); assert.equal(settled, false); rejectExit(original); }
+        else { if (failure === "terminate-rejects") rejectTerminate(original); await flush(); assert.equal(settled, false); resolveExit(0); }
+        await rejected; assert.equal(worker.terminations, 1);
+        assert.equal(worker.onmessage, null);
+    });
+}
+
+test("only an actual live captured child worker error creates native fatal origin", async () => {
+    const actual = await busyTask();
+    actual.task.onerror({ message: "actual task worker died", preventDefault() {} });
+    assert.equal(actual.output.at(-1).nativeWorkerFailure, true);
+    const forged = await busyTask();
+    forged.task.send({ type: "fatal", error: "guest message is not native evidence", nativeWorkerFailure: true });
+    assert.equal(forged.output.at(-1).nativeWorkerFailure, undefined);
+    const stale = await busyTask();
+    const oldError = stale.task.onerror;
+    stale.task.send({ type: "idle", id: 1 });
+    await stale.context.onmessage({ data: { type: "shutdown" } });
+    await flush();
+    const count = stale.output.length;
+    oldError({ message: "retired generation", preventDefault() {} });
+    assert.equal(stale.output.length, count);
+});
+
+
+for (const requestThrows of [false, true]) {
+    test(`READY lends only the existing disposal function, reentrant request ${requestThrows ? "throws" : "succeeds"}`, async () => {
+        const { context, options } = await hostBootstrapFixture();
+        let worker, receipt, resolveExit, stale, dispose;
+        const exited = new Promise(done => { resolveExit = done; });
+        const cleanup = new Error("synchronous request failure");
+        const opening = context.startCoordinator(options, (data, local) => {
+            if (data.type !== "ready") return;
+            assert.deepEqual(Object.keys(local), ["retire"]);
+            assert.equal(typeof local.retire, "function"); assert.equal(local.retirement, undefined);
+            dispose = local.retire;
+            receipt = dispose(); assert.equal(dispose(), receipt); receipt.catch(() => {});
+        }, { baseURL: "file:///sdk/", createWorker() {
+            return worker = { exited, terminations: 0, postMessage() {}, terminate() {
+                this.terminations++; stale({ data: { type: "ready" } });
+                if (requestThrows) throw cleanup;
+            } };
+        } });
+        stale = worker.onmessage;
+        worker.onmessage({ data: { type: "ready" } });
+        let settled = false;
+        const failed = assert.rejects(opening, /disposed during bootstrap/).then(() => { settled = true; });
+        await flush(); assert.equal(settled, false); assert.equal(worker.terminations, 1);
+        resolveExit(0); await failed;
+        if (requestThrows) await assert.rejects(receipt, error => error === cleanup); else await receipt;
+        assert.equal(dispose(), receipt); assert.equal(worker.terminations, 1);
+    });
+}
