@@ -4,9 +4,6 @@
 [submodule "wasmer-test-files"]
 	path = wasmer-test-files
 	url = https://github.com/wasmerio/wasmer-test-files.git
-[submodule "tests/wasixv2"]
-	path = tests/wasixv2
-	url = https://github.com/wasix-org/wasixv2-tests.git
 [submodule "lib/napi/quickjs/deps/quickjs"]
 	path = lib/napi/quickjs/deps/quickjs
 	url = https://github.com/wasmerio/quickjs.git
