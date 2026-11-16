@@ -44,17 +44,12 @@ SETTINGS = {
     # extra features to put when publishing, for example wasmer-cli needs a
     # compiler by default otherwise it won't work standalone
     "publish_features": {
-        "wasmer-compiler": "compiler",
         "wasmer-cli": "default,cranelift",
-        "wasmer-wasix": "sys,wasmer/sys-default",
-        "wasmer-wasix-types": "wasmer/sys-default",
-        "wasmer-wast": "wasmer/sys-default",
-        "wai-bindgen-wasmer": "sys",
         "wasmer-cache": "wasmer/sys-default",
     },
     # workspace members we want to publish but whose path doesn't start by
     # "./lib/"
-    "non-lib-workspace-members": set(["tests/lib/wast"]),
+    "non-lib-workspace-members": set(),
 }
 
 

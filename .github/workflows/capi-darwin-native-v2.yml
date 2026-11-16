@@ -52,6 +52,10 @@ jobs:
           path: candidate
           submodules: false
           persist-credentials: false
+      - name: Configure private runtime access
+        uses: ./candidate/.github/actions/setup-runtime
+        with:
+          ssh-key: ${{ secrets.RUNTIME_CI_READ_SSH_KEY }}
       - name: Verify candidate and create isolated build and evidence state
         env:
           REQUESTED_CANDIDATE: ${{ inputs.candidate_ref }}

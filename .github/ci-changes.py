@@ -17,13 +17,10 @@ BUILD_MATRIX = [
         "build-cmd": "make build-wasmer && make package-wasmer",
         "name": "Wasmer-cli binary",
     },
-    {"key": "check", "build-cmd": "make check", "name": "Wasmer API (sys)"},
-    {"key": "api-feats", "build-cmd": "make check-api-features", "name": "API (sys)"},
+    {"key": "check", "build-cmd": "make check", "name": "Product checks"},
 ]
 TEST_MATRIX = [
     {"description": "All tests", "make": "test-all"},
-    {"description": "Compilers (std only)", "make": "check-compilers-only-std"},
-    {"description": "VM (baremetal)", "make": "check-baremetal"},
     {"description": "Package (feature sets)", "make": "check-package-features"},
     {"description": "Wasmer-cli", "make": "test-wasmer-cli"},
     {"description": "Examples", "make": "test-examples"},
@@ -61,8 +58,8 @@ def changed_paths(event_name, event):
 
 
 def select(paths):
-    # Engine changes fan out through integration to product; kernel changes
-    # enter at integration. Unknown paths deliberately retain full coverage.
+    # Kernel and binding changes fan out to product. Unknown paths run all
+    # retained areas; engine implementation jobs live in wasmer-runtime.
     areas = set()
     for path in paths:
         if path.startswith("wlk/") or (
@@ -79,22 +76,6 @@ def select(paths):
             or path == "tests/wasixv2"
         ):
             areas.add("integration")
-        elif (
-            path.startswith(
-                (
-                    "lib/api/",
-                    "lib/vm/",
-                    "lib/compiler",
-                    "lib/types/",
-                    "lib/derive/",
-                    "lib/middlewares/",
-                    "tests/compilers/",
-                    "tests/wast/",
-                )
-            )
-            or path == "tests/wast/spec"
-        ):
-            areas.add("engine")
         elif path.startswith(
             (
                 "lib/cli/",
@@ -103,7 +84,6 @@ def select(paths):
                 "lib/backend-api/",
                 "lib/config/",
                 "lib/cache/",
-                "lib/sys-utils/",
                 "tests/integration/",
                 "examples/",
             )
@@ -118,62 +98,39 @@ def select(paths):
         else:
             # Includes root manifests, toolchains, .github/, scripts/, guest/,
             # build configuration and any new area whose dependencies are unknown.
-            return {"engine", "integration", "product"}
-    if "engine" in areas:
-        areas.add("integration")
+            return {"integration", "product"}
     if "integration" in areas:
         areas.add("product")
     return areas
 
 
 def outputs(areas):
-    engine = "engine" in areas
     integration = "integration" in areas
     product = "product" in areas
     return {
-        "engine": engine,
         "integration": integration,
         "product": product,
         "code": bool(areas),
         "build_targets": [
-            target
-            for target in BUILD_MATRIX
-            if engine
-            or target["key"]
-            in (["capi", "capi-v8", "wasmer"] if integration else ["wasmer"])
-        ],
-        "test_stages": (
-            TEST_MATRIX
-            if engine
-            else (
-                [
-                    {
-                        "description": "WASIX and product tests",
-                        "make": "wasix-integration",
-                        "command": 'cargo test --release --locked --target "$TARGET" '
-                        "-p wasixv2 -p wasixv2-exec -p wasixv2-dylink "
-                        "-p wasixv2-wasix1 -p wasixv2-codegen "
-                        "-p wasmer-sdk -p wasmer-c-api-imports "
-                        "-p wasmer-package -p wasmer-package-sdk "
-                        "-p wasmer-backend-api -p wasmer-config "
-                        "-p wasmer-cache -p wasmer-sys-utils",
-                    }
-                ]
-                if product
-                else []
+            target for target in BUILD_MATRIX
+            if target["key"] in (
+                ["capi", "capi-v8", "wasmer", "check"]
+                if integration else ["wasmer", "check"]
             )
-            + [
-                stage
-                for stage in TEST_MATRIX
-                if stage["make"]
-                in (
-                    "check-package-features",
-                    "test-wasmer-cli",
-                    "test-examples",
-                    "test-integration-cli-ci",
-                )
-            ]
-        ),
+        ] if product else [],
+        "test_stages": ([
+            {
+                "description": "WASIX and product tests",
+                "make": "wasix-integration",
+                "command": 'cargo test --release --locked --target "$TARGET" '
+                "-p wasixv2 -p wasixv2-exec -p wasixv2-dylink "
+                "-p wasixv2-wasix1 -p wasixv2-codegen "
+                "-p wasmer-sdk -p wasmer-c-api-imports "
+                "-p wasmer-package -p wasmer-package-sdk "
+                "-p wasmer-backend-api -p wasmer-config -p wasmer-cache",
+            }
+        ] + [stage for stage in TEST_MATRIX if stage["make"] != "test-all"])
+        if product else [],
     }
 
 
@@ -183,7 +140,7 @@ def main():
         areas = select(changed_paths(os.environ["GITHUB_EVENT_NAME"], event))
     except (KeyError, ValueError, OSError, subprocess.CalledProcessError) as error:
         print(f"Running all areas: {error}")
-        areas = {"engine", "integration", "product"}
+        areas = {"integration", "product"}
     selected = outputs(areas)
     print(json.dumps(selected, indent=2))
     with open(os.environ["GITHUB_OUTPUT"], "a") as output:

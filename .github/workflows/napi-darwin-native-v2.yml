@@ -31,6 +31,10 @@ jobs:
           path: candidate
           submodules: true
           persist-credentials: false
+      - name: Configure private runtime access
+        uses: ./candidate/.github/actions/setup-runtime
+        with:
+          ssh-key: ${{ secrets.RUNTIME_CI_READ_SSH_KEY }}
       - name: Create task-local build context and disk guard
         shell: bash
         timeout-minutes: 1
@@ -242,13 +246,7 @@ jobs:
             public_cli_runner_charges_a_refilled_arraybuffer_once \
             public_runner_preserves_root_layer_precedence_cow_and_writable_mounts
           manifest="$CANDIDATE_DIR/Cargo.toml"
-          sdk_test='backend::sys::async_runtime::tests::paused_native_used_ranges_survive_yield_and_forced_unwind'
-          run_logged sdk-test-list cargo test --manifest-path "$manifest" --offline --locked -p wasmer \
-            --features cranelift,experimental-async --lib -- --list
-          require_one_test "$sdk_test" "$NAPI_EVIDENCE/sdk-test-list.log"
-          run_logged sdk-forced-unwind cargo test --manifest-path "$manifest" --offline --locked -p wasmer \
-            --features cranelift,experimental-async --lib "$sdk_test" -- --exact --test-threads=1
-
+          # Engine-internal forced-unwind unit checks live in wasmer-runtime CI.
           run_logged napi-library cargo test --manifest-path "$manifest" --offline --locked -p wasmer-napi \
             --features cli,native-stack-diagnostics --lib -- --test-threads=1
           run_logged wasix-leases cargo test --manifest-path "$manifest" --offline --locked -p wasmer-napi \

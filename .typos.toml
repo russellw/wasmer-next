@@ -23,7 +23,6 @@ extend-exclude = [
   "*.inc",
   "*.txt",
   "*.md.out",
-  "tests/wast/spec/",
   "CHANGELOG.md",
   "**/CHANGELOG.md",
   # external submodule

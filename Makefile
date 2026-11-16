@@ -27,7 +27,6 @@ SHELL=/usr/bin/env bash
 #####
 
 
-
 IS_DARWIN := 0
 IS_LINUX := 0
 IS_FREEBSD := 0
@@ -142,16 +141,16 @@ else ifneq ($(filter 1 true,$(ENABLE_LLVM)),)
 	LLVM_VERSION := $(shell llvm-config --version)
 	compilers += llvm
 	# … or try to autodetect LLVM from `llvm-config-<version>`.
-else ifneq (, $(shell which llvm-config-22 2>/dev/null))
-	LLVM_VERSION := $(shell llvm-config-22 --version)
+else ifneq (, $(shell which llvm-config-23 2>/dev/null))
+	LLVM_VERSION := $(shell llvm-config-23 --version)
 	compilers += llvm
-	# need force LLVM_SYS_221_PREFIX, or llvm_sys will not build in the case
-	export LLVM_SYS_221_PREFIX = $(shell llvm-config-22 --prefix)
+	# need force LLVM_SYS_231_PREFIX, or llvm_sys will not build in the case
+	export LLVM_SYS_231_PREFIX = $(shell llvm-config-23 --prefix)
 else ifneq (, $(shell which llvm-config 2>/dev/null))
 	LLVM_VERSION := $(shell llvm-config --version)
-	ifneq (, $(findstring 22,$(LLVM_VERSION)))
+	ifneq (, $(findstring 23,$(LLVM_VERSION)))
 		compilers += llvm
-		export LLVM_SYS_221_PREFIX = $(shell llvm-config --prefix)
+		export LLVM_SYS_231_PREFIX = $(shell llvm-config --prefix)
 	endif
 endif
 
@@ -164,20 +163,8 @@ exclude_tests += --exclude wasmer-integration-tests-ios
 exclude_tests += --exclude wasmer-swift
 exclude_tests += --exclude wasmer-napi
 
-ifeq ($(IS_WINDOWS), 1)
-	# These workspace members either use unsupported compiler backends or are
-	# only useful through cargo-fuzz.
-	exclude_tests += --exclude wasmer-compiler-cranelift
-	exclude_tests += --exclude wasmer-compiler-llvm
-	exclude_tests += --exclude wasmer-compiler-singlepass
-	exclude_tests += --exclude wasmer-bin-fuzz
-endif
-
 ifneq (, $(findstring llvm,$(compilers)))
 	ENABLE_LLVM := 1
-else
-	# We exclude LLVM from our package testing
-	exclude_tests += --exclude wasmer-compiler-llvm
 endif
 
 ##
@@ -324,7 +311,7 @@ endif
 compiler_features := --features $(subst $(space),$(comma),$(compilers)),wasmer-artifact-create,static-artifact-create,wasmer-artifact-load,static-artifact-load
 test_compiler_features := --features $(subst $(space),$(comma),$(test_compilers)),wasmer-artifact-create,static-artifact-create,wasmer-artifact-load,static-artifact-load
 # Features used by the workspace test suite.
-test_all_features := experimental-async,experimental-host-interrupt
+test_all_features := experimental-async
 test_all_default_features :=
 test_wast_features :=
 ifeq ($(IS_WINDOWS), 1)
@@ -332,8 +319,6 @@ ifeq ($(IS_WINDOWS), 1)
 	test_all_default_features := --no-default-features
 endif
 
-# virtual-net integration tests in src/tests.rs are gated on the crate's `tokio` feature.
-virtual_net_test_features := --features tokio
 ifeq ($(IS_WINDOWS), 1)
 build_compiler_features = --no-default-features --features v8$(if $(build_wasmer_extra_features_csv),$(comma)$(build_wasmer_extra_features_csv))
 headless_compiler_feature :=
@@ -403,7 +388,6 @@ ifneq (, $(LIBC))
 endif
 $(info Enabled Compilers: $(bold)$(green)$(subst $(space),$(reset)$(comma)$(space)$(bold)$(green),$(compilers))$(reset).)
 $(info Testing the following compilers & engines:)
-$(info   * API: $(bold)$(green)${compilers_engines}$(reset),)
 $(info   * C-API: $(bold)$(green)${capi_compilers_engines}$(reset).)
 $(info Cargo features:)
 $(info   * Compilers: `$(bold)$(green)${compiler_features}$(reset)`.)
@@ -446,18 +430,16 @@ endif
 # install will go through.
 all: build-wasmer build-capi build-capi-headless
 
-check: check-wasmer check-api-no-async check-capi
+check: check-wasmer check-capi
 
 check-wasmer:
 	$(CARGO_BINARY) check $(CARGO_TARGET_FLAG) --manifest-path lib/cli/Cargo.toml $(compiler_features) --bin wasmer --locked
 
-check-api-no-async:
-	$(CARGO_BINARY) check $(CARGO_TARGET_FLAG) --manifest-path lib/api/Cargo.toml $(compiler_features) --locked
 
 # Keep browser feature sets in separate Cargo invocations: unification can hide a
 # native dependency or a missing js/web feature. These are compile-only checks;
 # host drivers compiling here does not imply browser filesystem/network support.
-wasixv2_wasm_checks := core webhost engine exec wasix1 facade
+wasixv2_wasm_checks := core webhost exec wasix1 facade
 wasixv2_wasm_check_flags := --lib --locked --target wasm32-unknown-unknown
 
 .PHONY: check-wasixv2-wasm $(addprefix check-wasixv2-wasm-,$(wasixv2_wasm_checks))
@@ -473,8 +455,6 @@ check-wasixv2-wasm-core:
 check-wasixv2-wasm-webhost:
 	CARGO_TARGET_DIR="$${CARGO_TARGET_DIR:-$(CURDIR)/target}" $(CARGO_BINARY) check --manifest-path "$$(python3 scripts/wlk-source.py host)/Cargo.toml" $(wasixv2_wasm_check_flags) -p wasixv2-host --no-default-features --features web
 
-check-wasixv2-wasm-engine:
-	$(CARGO_BINARY) check $(wasixv2_wasm_check_flags) -p wasmer --no-default-features --features js-default,experimental-async
 
 check-wasixv2-wasm-exec:
 	$(CARGO_BINARY) check $(wasixv2_wasm_check_flags) -p wasixv2-exec --no-default-features --features js
@@ -495,15 +475,11 @@ build-wasmer:
 build-wasmer-v8:
 	$(CARGO_BINARY) build $(CARGO_TARGET_FLAG) --release --manifest-path lib/cli/Cargo.toml --no-default-features --features="v8" --bin wasmer --locked
 
-build-wasmer-api-js:
-	$(CARGO_BINARY) rustc --target wasm32-unknown-unknown --release --manifest-path lib/api/Cargo.toml --no-default-features --features js,js-default,wasm-types-polyfill --crate-type=cdylib --locked
 
 build-wasmer-debug:
 	RUSTFLAGS="--cfg tokio_unstable" \
 		$(CARGO_BINARY) build $(CARGO_TARGET_FLAG) --features tokio-subscriber --manifest-path lib/cli/Cargo.toml $(compiler_features) --bin wasmer --locked
 
-bench:
-	$(CARGO_BINARY) bench $(CARGO_TARGET_FLAG) $(compiler_features)
 
 # For best results ensure the release profile looks like the following
 # in Cargo.toml:
@@ -633,24 +609,15 @@ build-capi-headless-ios:
 #####
 
 # intentionally not using nextest as it runs tests in separate processes
-test-wast:
-	$(CARGO_BINARY) test $(CARGO_TARGET_FLAG) --release $(compiler_features) $(test_wast_features) --locked
 test-all:
 	$(CARGO_BINARY) nextest run $(CARGO_TARGET_FLAG) --workspace --release $(test_all_default_features) $(exclude_tests) --exclude wasmer-c-api-test-runner --exclude wasmer-capi-examples-runner $(test_compiler_features) --features $(test_all_features) --locked && \
-	$(CARGO_BINARY) nextest run $(CARGO_TARGET_FLAG) --manifest-path lib/virtual-net/Cargo.toml --release $(virtual_net_test_features) --locked && \
 	$(CARGO_BINARY) test --doc $(CARGO_TARGET_FLAG) --workspace --release $(test_all_default_features) $(exclude_tests) --exclude wasmer-c-api-test-runner --exclude wasmer-capi-examples-runner $(test_compiler_features) --features $(test_all_features) --locked
-check-compilers-only-std:
-	$(CARGO_BINARY) check $(CARGO_TARGET_FLAG) --manifest-path lib/compiler-cranelift/Cargo.toml --no-default-features --features=std --locked && \
-	$(CARGO_BINARY) check $(CARGO_TARGET_FLAG) --manifest-path lib/compiler-singlepass/Cargo.toml --no-default-features --features=std --locked
-check-baremetal:
-	$(CARGO_BINARY) check $(CARGO_TARGET_FLAG) --manifest-path lib/vm/Cargo.toml --features baremetal --locked
 # wasmer-package splits into `execution` and `authoring`; each must build on its own.
 check-package-features:
 	$(CARGO_BINARY) check $(CARGO_TARGET_FLAG) --manifest-path lib/package/Cargo.toml --all-targets --no-default-features --features=execution --locked && \
 	$(CARGO_BINARY) check $(CARGO_TARGET_FLAG) --manifest-path lib/package/Cargo.toml --all-targets --no-default-features --features=authoring --locked && \
 	$(CARGO_BINARY) check $(CARGO_TARGET_FLAG) --manifest-path lib/package/Cargo.toml --all-targets --locked
 test-wasmer-cli:
-	$(CARGO_BINARY) test $(CARGO_TARGET_FLAG) --manifest-path lib/virtual-fs/Cargo.toml --release --locked && \
 	$(CARGO_BINARY) test $(CARGO_TARGET_FLAG) --manifest-path lib/cli/Cargo.toml $(test_compiler_features) --release --locked
 # test examples
 test-examples:
@@ -661,52 +628,8 @@ test-capi-integration-tests:
 
 test: test-all test-examples
 
-test-packages: test-all check-compilers-only-std check-baremetal check-package-features test-wasmer-cli
+test-packages: test-all check-package-features test-wasmer-cli
 
-
-test-v8: test-v8-api
-
-test-v8-api:
-	cargo nextest run --package=wasmer --release --features="v8-default" --no-default-features
-
-test-js: test-js-api test-js-wasi
-
-# TODO: disabled because the no-std / core feature doesn't actually work at the moment.
-# See https://github.com/wasmerio/wasmer/issues/3429
-# test-js-core:
-# 	cd lib/api && wasm-pack test --node -- --no-default-features --features js,core,wasm-types-polyfill,wat
-
-test-js-api:
-	cd lib/api && wasm-pack test --node -- --no-default-features --features js-default,wat
-
-lint-js:
-	cargo clippy --target wasm32-unknown-unknown --manifest-path lib/api/Cargo.toml --no-default-features --features "js-default" --locked -- -D clippy::all
-
-test-js-wasi:
-	cd lib/wasix-legacy && wasm-pack test --node -- --no-default-features --features test-js,wasmer/js,wasmer/std
-
-#####
-#
-# Testing compilers.
-#
-#####
-
-test-compilers-compat: $(foreach compiler,$(compilers),test-$(compiler))
-
-test-singlepass:
-	$(CARGO_BINARY) test $(CARGO_TARGET_FLAG) --release --tests $(compiler_features) --locked -- singlepass
-
-test-cranelift:
-	$(CARGO_BINARY) test $(CARGO_TARGET_FLAG) --release --tests $(compiler_features) --locked -- cranelift
-
-test-llvm:
-	$(CARGO_BINARY) test $(CARGO_TARGET_FLAG) --release --tests $(compiler_features) --locked -- llvm
-
-test-singlepass: $(foreach singlepass_engine,$(filter singlepass-%,$(compilers_engines)),test-$(singlepass_engine))
-
-test-cranelift: $(foreach cranelift_engine,$(filter cranelift-%,$(compilers_engines)),test-$(cranelift_engine))
-
-test-llvm: $(foreach llvm_engine,$(filter llvm-%,$(compilers_engines)),test-$(llvm_engine))
 
 # same as test-capi, but without the build-capi step first
 test-capi-ci: $(foreach compiler_engine,$(capi_compilers_engines),test-capi-crate-$(compiler_engine) test-capi-integration-$(compiler_engine))
@@ -962,14 +885,11 @@ install-wasmer-headless-minimal:
 #####
 
 # Updates the spectests from the repo
-update-testsuite:
-	git subtree pull --prefix tests/wast/spec https://github.com/WebAssembly/testsuite.git master --squash
 
 lint-packages: RUSTFLAGS += -D dead-code -D nonstandard-style -D unused-imports -D unused-mut -D unused-variables -D unused-unsafe -D unreachable-patterns -D bad-style -D improper-ctypes -D unused-allocation -D unused-comparisons -D while-true -D unconditional-recursion -D bare-trait-objects -D function_item_references -D clippy::uninlined_format_args # TODO: add `-D missing-docs`
 lint-packages:
 	RUSTFLAGS="${RUSTFLAGS}" cargo clippy --all --examples --exclude wasmer-cli --exclude wasmer-swift --locked -- -D clippy::all
 	RUSTFLAGS="${RUSTFLAGS}" cargo clippy --manifest-path lib/cli/Cargo.toml --locked $(compiler_features) -- -D clippy::all
-	RUSTFLAGS="${RUSTFLAGS}" cargo clippy --manifest-path fuzz/Cargo.toml --locked $(compiler_features) -- -D clippy::all
 lint-clang-format:
 	find . \( -path './lib/napi' -o -path './lib/wild' -o -path './target' \) -prune -o -type f \( -name '*.c' -o -name '*.cpp' \) -exec clang-format --dry-run --color -Werror {} +
 lint-yamlfmt:
@@ -977,22 +897,16 @@ lint-yamlfmt:
 lint-taplo:
 	taplo format --check --diff
 
-lint-v8:
-	RUSTFLAGS="${RUSTFLAGS}" $(CARGO_BINARY) clippy $(CARGO_TARGET_FLAG) --package=wasmer --no-default-features --features="v8-default" --locked -- -D clippy::all
 
 lint-package-crate:
 	RUSTFLAGS="${RUSTFLAGS}" cargo clippy --manifest-path lib/package/Cargo.toml --locked -- -D clippy::all
 
 lint-formatting:
 	cargo fmt --all -- --check
-	cargo fmt --manifest-path fuzz/Cargo.toml -- --check
-	# The wasm_tests Rust fixtures are not part of any crate, so `cargo fmt`
-	# does not cover them.
-	cd lib/wasix-legacy/tests/wasm_tests && find . -path ./build -prune -o -type f -name '*.rs' -exec rustfmt --edition 2024 --check {} +
 
 lint: lint-yamlfmt lint-clang-format lint-formatting lint-packages lint-taplo
 
-lint-all: lint-formatting lint-packages lint-v8 lint-capi-ci lint-package-crate
+lint-all: lint-formatting lint-packages lint-capi-ci lint-package-crate
 
 install-local: package
 	tar -C ~/.wasmer -zxvf wasmer.tar.gz
@@ -1008,5 +922,3 @@ require-nextest:
 	cargo nextest --version > /dev/null || cargo binstall cargo-nextest --secure || cargo install cargo-nextest --locked
 
 # Check all the features compatible with the `sys` backend.
-check-api-features:
-	cargo check --package wasmer --features=$(subst $(space),$(comma),$(compilers)),default,artifact-size,core,enable-serde,wasmer-artifact-load,wasmer-artifact-create,static-artifact-load,static-artifact-create

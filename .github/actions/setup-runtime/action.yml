@@ -1,0 +1,29 @@
+name: Private runtime access
+description: Configure Cargo Git CLI access to the private engine
+inputs:
+  ssh-key:
+    description: Read-only deploy key for wasmerio/wasmer-runtime
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Configure runtime Git transport
+      shell: bash
+      env:
+        RUNTIME_SSH_KEY: ${{ inputs.ssh-key }}
+      run: |
+        set -euo pipefail
+        if [ -z "$RUNTIME_SSH_KEY" ]; then
+          echo 'RUNTIME_CI_READ_SSH_KEY must be a read-only deploy key for wasmerio/wasmer-runtime' >&2
+          exit 1
+        fi
+        runtime_ssh_dir="$RUNNER_TEMP/wasmer-runtime-ssh"
+        mkdir -p "$runtime_ssh_dir"
+        chmod 700 "$runtime_ssh_dir"
+        printf '%s\n' "$RUNTIME_SSH_KEY" > "$runtime_ssh_dir/key"
+        chmod 600 "$runtime_ssh_dir/key"
+        ssh-keyscan -t ed25519 github.com > "$runtime_ssh_dir/known_hosts"
+        chmod 600 "$runtime_ssh_dir/known_hosts"
+        git config --global url."ssh://git@github.com/wasmerio/wasmer-runtime".insteadOf https://github.com/wasmerio/wasmer-runtime
+        echo "GIT_SSH_COMMAND=ssh -i \"$runtime_ssh_dir/key\" -o IdentitiesOnly=yes -o UserKnownHostsFile=\"$runtime_ssh_dir/known_hosts\" -o StrictHostKeyChecking=yes" >> "$GITHUB_ENV"
+        echo 'CARGO_NET_GIT_FETCH_WITH_CLI=true' >> "$GITHUB_ENV"

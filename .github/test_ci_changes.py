@@ -26,10 +26,10 @@ class AreaTests(unittest.TestCase):
             ("lib/c-api/src/lib.rs", {"integration", "product"}),
             ("tests/wasixv2", {"integration", "product"}),
             ("lib/cli/src/lib.rs", {"product"}),
-            ("lib/api/src/lib.rs", {"engine", "integration", "product"}),
-            ("Cargo.lock", {"engine", "integration", "product"}),
-            (".github/workflows/test.yaml", {"engine", "integration", "product"}),
-            ("unknown/new-area", {"engine", "integration", "product"}),
+            ("lib/api/src/lib.rs", {"integration", "product"}),
+            ("Cargo.lock", {"integration", "product"}),
+            (".github/workflows/test.yaml", {"integration", "product"}),
+            ("unknown/new-area", {"integration", "product"}),
             ("docs/BUILD.md", set()),
         ]:
             with self.subTest(path=path):
@@ -37,18 +37,18 @@ class AreaTests(unittest.TestCase):
 
     def test_matrix_selection(self):
         kernel = changes.outputs(changes.select(["wlk/crates/abi/src/lib.rs"]))
-        self.assertFalse(kernel["engine"])
+        self.assertNotIn("engine", kernel)
         self.assertTrue(kernel["integration"])
         self.assertEqual(
             [item["key"] for item in kernel["build_targets"]],
-            ["capi", "capi-v8", "wasmer"],
+            ["capi", "capi-v8", "wasmer", "check"],
         )
         self.assertNotIn(
             "check-baremetal", [item["make"] for item in kernel["test_stages"]]
         )
         product = changes.outputs({"product"})
-        self.assertEqual([item["key"] for item in product["build_targets"]], ["wasmer"])
-        self.assertEqual(len(changes.outputs({"engine"})["test_stages"]), 7)
+        self.assertEqual([item["key"] for item in product["build_targets"]], ["wasmer", "check"])
+        self.assertEqual(changes.outputs(set())["test_stages"], [])
         self.assertNotIn("test-all", [item["make"] for item in kernel["test_stages"]])
         self.assertIn(
             "wasix-integration", [item["make"] for item in product["test_stages"]]
@@ -96,7 +96,7 @@ class EventTests(unittest.TestCase):
                 "push", {"before": self.git("rev-parse", "HEAD^")}
             )
         self.assertIn("lib/api/lib.rs", paths)
-        self.assertIn("engine", changes.select(paths))
+        self.assertEqual(changes.select(paths), {"integration", "product"})
 
     def test_pull_request_uses_merge_base(self):
         self.git("checkout", "-qb", "feature")
@@ -155,8 +155,8 @@ class EventTests(unittest.TestCase):
                     line.split("=", 1) for line in output_file.read_text().splitlines()
                 )
                 self.assertEqual(
-                    [output[key] for key in ("engine", "integration", "product")],
-                    ["true"] * 3,
+                    [output[key] for key in ("integration", "product")],
+                    ["true"] * 2,
                 )
 
 
