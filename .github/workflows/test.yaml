@@ -6,14 +6,15 @@ on:
       - edge
       - "with-ci-.*"
   pull_request:
+  merge_group:
   workflow_dispatch:
     inputs:
       release:
         description: "Make release"
-# Automatically cancel previous workflow runs when a new commit is pushed.
+# Only superseded PR runs may cancel an in-progress run.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 env:
   RUST_BACKTRACE: 1
   NEXTEST_PROFILE: "ci"
@@ -25,6 +26,25 @@ env:
   RUNS_ON_AWS_REGION: eu-west-3
   DEV_BACKEND_CIUSER_TOKEN: ${{ secrets.DEV_BACKEND_CIUSER_TOKEN }}
 jobs:
+  changes:
+    name: Detect changed areas
+    runs-on: ubuntu-24.04
+    outputs:
+      engine: ${{ steps.changes.outputs.engine }}
+      integration: ${{ steps.changes.outputs.integration }}
+      product: ${{ steps.changes.outputs.product }}
+      code: ${{ steps.changes.outputs.code }}
+      build_targets: ${{ steps.changes.outputs.build_targets }}
+      test_stages: ${{ steps.changes.outputs.test_stages }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Test area selection
+        run: python3 .github/test_ci_changes.py
+      - name: Select jobs and matrix entries
+        id: changes
+        run: python3 .github/ci-changes.py
   setup:
     name: Set up
     runs-on: ${{ github.event_name == 'pull_request' && 'aux-pub-16cpu-amd64' || 'aux-pub-trusted-16cpu-amd64' }}
@@ -43,6 +63,8 @@ jobs:
           echo $VERSION
           echo $DOING_RELEASE
   dependency_cooldown:
+    needs: changes
+    if: ${{ needs.changes.outputs.code == 'true' }}
     name: Dependency cooldown
     runs-on: ubuntu-24.04
     continue-on-error: true
@@ -55,6 +77,8 @@ jobs:
       - name: Check for eligible dependency updates
         run: cargo +nightly update
   lint:
+    needs: changes
+    if: ${{ needs.changes.outputs.code == 'true' }}
     name: Code lint
     runs-on: ${{ github.event_name == 'pull_request' && 'aux-pub-16cpu-amd64' || 'aux-pub-trusted-16cpu-amd64' }}
     steps:
@@ -136,6 +160,8 @@ jobs:
             exit 1
           fi
   check_wasixv2_wasm:
+    needs: changes
+    if: ${{ needs.changes.outputs.integration == 'true' }}
     name: WASIX v2 wasm check (${{ matrix.component }})
     runs-on: ${{ github.event_name == 'pull_request' && 'aux-pub-16cpu-amd64' || 'aux-pub-trusted-16cpu-amd64' }}
     strategy:
@@ -164,6 +190,8 @@ jobs:
       - name: Check browser libraries (compile only)
         run: make check-wasixv2-wasm-${{ matrix.component }}
   cargo_deny:
+    needs: changes
+    if: ${{ needs.changes.outputs.code == 'true' }}
     name: cargo-deny
     runs-on: ${{ github.event_name == 'pull_request' && 'aux-pub-16cpu-amd64' || 'aux-pub-trusted-16cpu-amd64' }}
     steps:
@@ -174,6 +202,8 @@ jobs:
         with:
           log-level: error
   test_nodejs:
+    needs: changes
+    if: ${{ needs.changes.outputs.engine == 'true' }}
     name: NodeJS
     runs-on: ${{ github.event_name == 'pull_request' && 'aux-pub-16cpu-amd64' || 'aux-pub-trusted-16cpu-amd64' }}
     steps:
@@ -208,6 +238,8 @@ jobs:
         #   run: |
         #     make test-js-core
   test_interpreter_api:
+    needs: changes
+    if: ${{ needs.changes.outputs.engine == 'true' }}
     name: ${{ matrix.build-what.name }} - ${{ matrix.metadata.build }}
     runs-on: ${{ matrix.metadata.build == 'linux-x64' && (github.event_name == 'pull_request' && 'aux-pub-16cpu-amd64' || 'aux-pub-trusted-16cpu-amd64') || matrix.metadata.os }}
     strategy:
@@ -284,6 +316,8 @@ jobs:
         env:
           GH_TOKEN: ${{ matrix.metadata.build == 'linux-x64' && github.token || '' }}
   test_store_context_miri:
+    needs: changes
+    if: ${{ needs.changes.outputs.engine == 'true' }}
     name: Store context under Miri
     runs-on: ubuntu-22.04
     steps:
@@ -308,6 +342,8 @@ jobs:
       - name: Borrow provenance of the store context
         run: cargo +nightly miri test -p wasmer --features sys --lib borrow_provenance
   test_build_docs_rs:
+    needs: changes
+    if: ${{ needs.changes.outputs.code == 'true' }}
     name: Build docs.rs
     runs-on: ${{ github.event_name == 'pull_request' && 'aux-pub-16cpu-amd64' || 'aux-pub-trusted-16cpu-amd64' }}
     steps:
@@ -344,6 +380,8 @@ jobs:
       - name: make test-build-docs-rs-ci
         run: make test-build-docs-rs-ci
   build_linux_riscv64:
+    needs: changes
+    if: ${{ needs.changes.outputs.engine == 'true' }}
     name: ${{ matrix.build-what.name }} - linux-riscv64
     runs-on: ${{ github.event_name == 'pull_request' && 'aux-pub-16cpu-amd64' || 'aux-pub-trusted-16cpu-amd64' }}
     strategy:
@@ -410,30 +448,16 @@ jobs:
           if-no-files-found: error
           retention-days: 2
   build:
+    needs: [setup, changes]
+    if: ${{ needs.changes.outputs.product == 'true' }}
     name: ${{ matrix.build-what.name }} - ${{ matrix.metadata.build }}
     runs-on: ${{ (matrix.metadata.build == 'linux-x64' || matrix.metadata.build == 'linux-musl' || matrix.metadata.build == 'windows-gnu') && (github.event_name == 'pull_request' && 'aux-pub-16cpu-amd64' || 'aux-pub-trusted-16cpu-amd64') || matrix.metadata.build == 'linux-arm64' && (github.event_name == 'pull_request' && 'aux-pub-16cpu-arm64' || 'aux-pub-trusted-16cpu-arm64') || matrix.metadata.os }}
-    needs: setup
     strategy:
       fail-fast: false
       matrix:
         skip_macos:
           - ${{ github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'macos') }}
-        build-what:
-          - key: capi
-            build-cmd: "make build-capi && make build-capi-headless && make package-capi"
-            name: "C-API"
-          - key: capi-v8
-            build-cmd: "make test-capi-v8"
-            name: "C-API with V8"
-          - key: wasmer
-            build-cmd: "make build-wasmer && make package-wasmer"
-            name: "Wasmer-cli binary"
-          - key: "check"
-            build-cmd: "make check"
-            name: "Wasmer API (sys)"
-          - key: "api-feats"
-            build-cmd: "make check-api-features"
-            name: "API (sys)"
+        build-what: ${{ fromJSON(needs.changes.outputs.build_targets) }}
         metadata:
           - build: linux-x64
             os: ubuntu-22.04
@@ -673,9 +697,10 @@ jobs:
           if-no-files-found: ignore
           retention-days: 2
   test:
+    needs: [setup, changes]
+    if: ${{ needs.changes.outputs.product == 'true' }}
     name: ${{ matrix.stage.description }} - ${{ matrix.metadata.build }}
     runs-on: ${{ (matrix.metadata.build == 'linux-x64' || matrix.metadata.build == 'linux-musl') && (github.event_name == 'pull_request' && 'aux-pub-16cpu-amd64' || 'aux-pub-trusted-16cpu-amd64') || matrix.metadata.build == 'linux-arm64' && (github.event_name == 'pull_request' && 'aux-pub-16cpu-arm64' || 'aux-pub-trusted-16cpu-arm64') || matrix.metadata.os }}
-    needs: setup
     strategy:
       fail-fast: false
       matrix:
@@ -683,21 +708,7 @@ jobs:
           - ${{ github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'macos') }}
         skip_musl:
           - ${{ github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'musl') }}
-        stage:
-          - description: "All tests"
-            make: "test-all"
-          - description: "Compilers (std only)"
-            make: "check-compilers-only-std"
-          - description: "VM (baremetal)"
-            make: "check-baremetal"
-          - description: "Package (feature sets)"
-            make: "check-package-features"
-          - description: "Wasmer-cli"
-            make: "test-wasmer-cli"
-          - description: "Examples"
-            make: "test-examples"
-          - description: "CLI integ. tests"
-            make: test-integration-cli-ci
+        stage: ${{ fromJSON(needs.changes.outputs.test_stages) }}
         metadata:
           # `wasix_rust_toolchain` marks the hosts wasix-org/rust publishes a
           # toolchain for, i.e. the ones that collect the Rust wasm_tests
@@ -878,7 +889,7 @@ jobs:
           aws-s3-force-path-style: true
       - name: ${{ matrix.stage.description }}
         shell: bash
-        run: make ${{ matrix.stage.make }}
+        run: ${{ matrix.stage.command || format('make {0}', matrix.stage.make) }}
         env:
           TARGET: ${{ matrix.metadata.target }}
           TARGET_DIR: target/${{ matrix.metadata.target }}/release
@@ -897,6 +908,7 @@ jobs:
     name: Tests CI
     runs-on: ${{ github.event_name == 'pull_request' && 'aux-pub-16cpu-amd64' || 'aux-pub-trusted-16cpu-amd64' }}
     needs:
+      - changes
       - setup
       - lint
       - check_wasixv2_wasm
@@ -911,7 +923,7 @@ jobs:
     if: ${{ always() }}
     steps:
       - name: Check required jobs
-        if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped') }}
+        if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
         run: exit 1
       - name: Required jobs passed
-        run: echo "All required jobs passed"
+        run: echo "All required jobs passed or were skipped"
