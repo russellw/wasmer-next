@@ -1,0 +1,33 @@
+# Tests that pass or fail from run to run. They are reported as ignored and never run, so they
+# neither fail the run nor land in expected-failures/. Fix the cause, then take the test off this
+# list; a name that matches no test fails discovery. Format as in excluded.txt.
+
+base-mmap-threads/default                                  # exits nonzero or passes
+posix/conformance/interfaces/aio_error/2-1                 # UNRESOLVED or PASS
+posix/conformance/interfaces/aio_suspend/1-1               # passes only under load: alone, AIOCB 6 completes before aio_suspend (UNRESOLVED), 8 of 8 runs on the feat and train 7 binaries alike
+posix/conformance/interfaces/aio_fsync/5-1                 # UNTESTED or PASS: passes only if the fsync is still in progress at the first aio_error
+posix/conformance/interfaces/lio_listio/4-1                # under load: "did not receive the right number of notifications"
+posix/conformance/interfaces/pthread_atfork/3-3            # timing
+posix/conformance/interfaces/pthread_attr_destroy/1-1      # timing
+posix/conformance/interfaces/pthread_barrier_destroy/2-1   # UNSUPPORTED or FAIL
+posix/conformance/interfaces/pthread_barrier_init/4-1      # under load the kernel panics: "syscall from an unknown task"
+posix/conformance/interfaces/pthread_cancel/3-1            # timing
+posix/conformance/interfaces/pthread_cond_signal/4-2       # times out under full-suite load, passes alone
+posix/conformance/interfaces/pthread_cond_timedwait/4-3    # times out under full-suite load, passes alone
+posix/conformance/interfaces/pthread_equal/2-1             # hangs about half the time
+posix/conformance/interfaces/pthread_mutex_init/1-2        # times out or passes
+posix/conformance/interfaces/pthread_mutex_trylock/4-3     # timing
+posix/conformance/interfaces/pthread_rwlock_unlock/3-1     # timing
+posix/conformance/interfaces/timer_getoverrun/2-2          # 0 overruns or the expected 75: fails about half the time alone, on the feat and train 7 binaries alike
+ltp/fs/fs_inod01                                           # shell stress test: 17-25 s alone, times out (60 s) under full-suite load now and then
+ltp/syscalls/getrusage04                                   # under load: utime grows more than 5 ms between getrusage calls (host CPU-time granularity)
+ltp/syscalls/fcntl14                                       # forks lockers (asyncify build): passes or dies with SIGKILL (exit 137) from run to run, alone too, on the feat binary as well
+ltp/syscalls/fcntl14_64                                    # as fcntl14
+ltp/syscalls/clock_gettime04                               # under load: successive CLOCK_REALTIME readings more than 5 ms apart
+ltp/syscalls/inotify09                                     # times out under full-suite load (inotify vs. concurrent writers stress); passes alone
+ltp/mm/mallocstress01                                      # stress test near the timeout: times out or passes from run to run
+ltp/mm/shm_test01                                          # stress test near the timeout: times out or passes from run to run
+ltp/cve/cve-2014-0196                                      # pty write race: timed out (60 s) in one of two full runs of merge train 12 (and in none before), passes alone
+ltp/cve/cve-2015-7550                                      # times out (60 s) under suite load since train 17; passes alone in 24 s. Investigate keyring read/revoke race cost in the validation phase
+posix/conformance/interfaces/pthread_kill/8-1              # signal stress: failed once under suite load in train 18, passes alone; capture and reproduce in the validation phase
+ltp/syscalls/epoll_pwait03                                 # timing: 100ms epoll_pwait2 mean exceeded the upper-latency ceiling by 35us once under full-suite load; passes alone
