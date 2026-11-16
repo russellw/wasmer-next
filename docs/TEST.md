@@ -1,68 +1,40 @@
 # Testing
 
-Thanks to the [WebAssembly spec tests](https://github.com/WebAssembly/testsuite)
-we can ensure 100% compatibility with the WebAssembly spec test suite.
+Product checks and tests are defined by the root Makefile. `make check` checks
+the CLI and C API; `make test` runs retained workspace tests and WASI examples.
+Build the CLI with an explicit backend or Makefile detection:
 
-Run the full local suite with `make test` (needs `cargo-nextest`;
-`make require-nextest` installs it). It automatically detects the
-compilers available on your system. Follow the
-[Building from Source](./BUILD.md) guide to prepare your system with the
-requirements for each backend.
-
-The [Makefile](../Makefile) lists the individual test targets and their
-purpose: the WAST spec tests per backend, the CLI, the examples, the
-C API, and more.
-
-It is also possible to test specific parts. One crate:
-
-```bash
-cargo test -p wasmer-wasix --features sys
+```sh
+cargo build --locked -p wasmer-cli --features cranelift
+cargo test --locked -p wasixv2 -p wasixv2-exec -p wasixv2-wasix1
+cargo test --locked -p wasixv2-exec --test generated
+make test-capi
+make test-integration-cli-ci
+make check-wasixv2-wasm
 ```
 
-One test by name filter:
+Engine unit, WAST, backend, Miri, benchmark and fuzz tests now belong in
+wasmerio/wasmer-runtime. Its tests/ignores.txt belongs to that engine suite;
+do not add engine ignores to this product repository. Private dependency setup
+is documented in [RUNTIME-EXTRACTION.md](RUNTIME-EXTRACTION.md).
 
-```bash
-cargo test --release --tests --features cranelift -- cranelift::spec::simd
-```
+## Kernel and guest tests
 
-## Skipping Tests
+WLK tests run from wlk/ with its own lockfile, including sealed checks, Clippy,
+nextest, audit and wasm profiles. Root fmt/lint does not cover that workspace.
+The product additionally checks generated files and the v1 network protocol
+reference tests in lib/wasix/api/tests/vnet_reference_{codec,relay}.rs.
+The independent classic-reference fixtures remain conformance oracles.
 
-If a test fails only on one backend or platform, add a line to
-`tests/ignores.txt` with a reason (`<compiler> <test> # reason`). Do not
-chase Singlepass failures for SIMD, relaxed SIMD, exception handling, or
-wide arithmetic. Singlepass does not support these proposals.
+The source-built guest suite is tests/wasixv2; upstream suites remain submodules.
+`make test-wasixv2` builds the CLI and invokes its runner. It needs wasixcc with
+wasm32-wasixv2 support, WASIXCC_LLVM_LOCATION and WASIXCC_SYSROOT_PREFIX selecting
+libc2's EH and asyncify sysroots. The guest LLVM fork is separate from the
+engine's LLVM 23. Expected failures live in expected-failures/<suite>.txt.
+See the suite README for setup. Full guest coverage is still a CI setup item.
 
-To debug a failing WAST test, see
-[AGENTS.md](../AGENTS.md#debugging-the-runtime).
-
-## WASIX Guest-Side Tests
-
-WASIX guest-side tests live in `lib/wasix-legacy/tests/wasm_tests/`. They need
-`wasixcc` and `cargo-wasix` on PATH. Fixture directives are documented in
-`lib/wasix-legacy/tests/wasm_tests/mod.rs`.
-
-## WASIX v2 Test Suite
-
-The wasixv2 suite and runner live in `tests/wasixv2/`. Its upstream suites
-remain submodules; initialize them with `git submodule update --init --recursive`. `make test-wasixv2` builds the
-`wasmer` CLI and runs it. It needs `wasixcc` with `wasm32-wasixv2` support on
-PATH; `WASIXCC_LLVM_LOCATION` and `WASIXCC_SYSROOT_PREFIX` point it at a local LLVM
-fork and libc2's EH and asyncify sysroots. Most tests are expected to fail until wasixv2 is
-complete: the suite's `expected-failures/<suite>.txt` lists them. CI does not run it
-yet.
-
-## CI Coverage Gaps
-
-macOS and musl CI jobs run on a PR only when the PR carries the `macos` or
-`musl` label (see [CONTRIBUTING.md](./CONTRIBUTING.md)). A PR can pass CI
-and still break `main` on those platforms.
-
-## WLK versus Wasmer tests
-
-Pure kernel, driver, VFS/VNet and syscall-layer tests now run in the private
-[WLK workspace](https://github.com/wasmerio/wlk) (`cargo nextest run --workspace`).
-Its CI also runs audit, check, Clippy, formatting and separate wasm feature checks.
-Wasmer keeps engine/guest behavior tests, including the v1 network-reference tests
-in `lib/wasix/api/tests/vnet_reference_{codec,relay}.rs` and canonical generator
-checks in `lib/wasix/exec/tests/generated.rs`. Run those with their owning packages;
-there is no local kernel workspace member after extraction.
+Legacy implementation fixtures were deleted with that runtime. Retained CLI,
+C API and adapter tests exercise v1 guests on v2. Do not copy old guest tests or
+prebuilt wasm into the v2 suite. macOS/musl label gating still applies; consult
+CONTRIBUTING.md. CI has integration/product areas and one ci_success aggregate;
+engine implementation jobs are owned by runtime.

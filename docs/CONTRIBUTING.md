@@ -32,8 +32,8 @@ runs. To apply clippy fixes in bulk:
 cargo clippy --all --exclude wasmer-swift --locked --fix --allow-dirty -- -D clippy::all
 ```
 
-`cargo fmt` does not cover `lib/wasix-legacy/tests/wasm_tests`. CI formats those
-files with `rustfmt --edition 2024` directly.
+Engine tests and lint live in wasmerio/wasmer-runtime. WLK has separate
+format/lint CI because it is an excluded workspace.
 
 ## Pull Requests
 
@@ -57,7 +57,7 @@ change once it is ready.
 
 ### LLVM Dependency
 
-`Didn't find usable system-wide LLVM` means LLVM 22 is missing. Either
+`Didn't find usable system-wide LLVM` means LLVM 23 is missing. Either
 install it or build with `ENABLE_LLVM=0`. See
 [Building Wasmer from Source](./BUILD.md#llvm-compiler) for installation
 instructions.

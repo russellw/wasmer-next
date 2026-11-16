@@ -79,9 +79,9 @@ WASIXCC_WASM_EXCEPTIONS=1 WASIXCC_PIC=1 wasixcc -g -O0 file.c -o file.wasm
 
 ### Debug a Failing WAST Test
 
-Find the `.wast` file under `tests/wast/`, then rerun with the
-backend-filtered command from [docs/TEST.md](./docs/TEST.md). The runner
-prints `Running wast <path>`.
+Engine WAST tests and tests/ignores.txt live in wasmerio/wasmer-runtime.
+Use that repository's TEST.md and backend-filtered runner. Product checks here
+use the Git engine pinned by Cargo.lock; see docs/RUNTIME-EXTRACTION.md.
 
 ## Testing WASIX v2
 
@@ -142,7 +142,8 @@ not run the suite yet.
 
 - New wasixv2 program tests go in `tests/wasixv2/suite/`, built from source
   with `wasixcc`. Never check in prebuilt wasm for them.
-- WASIX v1 tests stay in `lib/wasix-legacy/tests`; never copy them to `tests/wasixv2/`.
+- The legacy implementation and its fixtures are removed. Keep v1 adapter/product
+  compatibility tests here; never copy legacy fixtures into `tests/wasixv2/`.
 - An ABI change lands in wasixv2-abi first. Then bump the submodule in both
   wasmer and libc2 to the same commit, regenerating in the same commit as
   the bump.

@@ -20,17 +20,17 @@ curl https://sh.rustup.rs -sSf | sh
 
 Linux is fully supported by Wasmer. WASI(x) is also fully supported. Users
 building from source can enable the LLVM backend following the instruction in
-the dedicated section below and installing LLVM version 22. To install it,
+the dedicated section below and installing LLVM version 23. To install it,
 refer to [LLVM's download
-page](https://github.com/llvm/llvm-project/releases/tag/llvmorg-22.1.1) or
+page](https://github.com/llvm/llvm-project/releases/tag/llvmorg-23.1.3) or
 check your distro's package manager.
 
 ### macOS
 
 macOS is fully supported by Wasmer. WASI(x) is also fully supported. Users
 building from source can enable the LLVM backend following the instruction in
-the dedicated section below and installing LLVM version 22. To install it on
-macOS, you can use [homebrew](https://brew.sh/): `brew install llvm@22`.
+the dedicated section below and installing LLVM version 23. To install it on
+macOS, you can use [homebrew](https://brew.sh/): `brew install llvm@23`.
 
 ### Windows
 
@@ -39,9 +39,9 @@ Windows is fully supported by Wasmer. WASI(x) is also fully supported.
 1. Install [Visual Studio](https://visualstudio.microsoft.com/thank-you-downloading-visual-studio/?sku=Community&rel=15)
 2. Install [Rust for Windows](https://win.rustup.rs/)
 3. Install [Git for Windows](https://git-scm.com/download/win). Allow it to add `git.exe` to your PATH (default settings for the installer are fine).
-4. \(optional\) Install [LLVM 22.1](https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.1/LLVM-22.1.1-win64.exe)
+4. \(optional\) Install [LLVM 23.1](https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.3/LLVM-23.1.3-win64.exe)
 
-## Building the Wasmer Runtime
+## Building the Wasmer product
 
 Wasmer is built with [Cargo](https://crates.io/), the Rust package manager.
 
@@ -99,15 +99,15 @@ variable, and force its enabling with `ENABLE_CRANELIFT=1`.
 
 If you want support for the Wasmer LLVM compiler, then you will also need to:
 
-- Ensure that LLVM 22 (>=22.1.x) is installed on your system. The backend
-  needs LLVM 22 exactly; any other version silently disables it — read the
+- Ensure that LLVM 23 (>=23.1.x) is installed on your system. The backend
+  needs LLVM 23 exactly; any other version silently disables it — read the
   `Enabled Compilers:` banner. The error `Didn't find usable system-wide
-  LLVM` means LLVM 22 is missing.
-  - You can refer to [LLVM install instructions](https://github.com/wasmerio/wasmer/tree/master/lib/compiler-llvm#requirements)
+  LLVM` means LLVM 23 is missing.
+  - You can refer to [LLVM install instructions](https://github.com/wasmerio/wasmer-runtime/tree/next/lib/compiler-llvm#requirements)
   - You can also [download and use a prebuilt LLVM binary](https://releases.llvm.org/download.html)
-- In case `llvm-config-22` is not on PATH, set the correct environment variable
-  for LLVM to access: For example, the environment variable for LLVM 22.1.x
-  would be: `LLVM_SYS_221_PREFIX=/path/to/unpacked/llvm-22.1`
+- In case `llvm-config-23` is not on PATH, set the correct environment variable
+  for LLVM to access: For example, the environment variable for LLVM 23.1.x
+  would be: `LLVM_SYS_231_PREFIX=/path/to/unpacked/llvm-23.1`
 
 And create a Wasmer release
 
@@ -245,3 +245,11 @@ waiter requests cancellation; it does not authorize discarding that owning worke
 After an exec handoff transfers authority, the old worker can be discarded without
 faulting or releasing the replacement image. Cleanup does not make progress after
 the host discards every executor job and every owner-thread driver.
+
+## Extracted engine
+
+The engine is a private Git dependency, locked by Cargo.lock; Rust 1.99 and
+LLVM 23 are required. Engine implementation tests run in wasmer-runtime. See
+[RUNTIME-EXTRACTION.md](RUNTIME-EXTRACTION.md) for private fetch credentials,
+CI setup and coordinated engine patches. WLK is local at wlk/ and retains its
+own workspace, toolchain and lockfile; root lint does not cover it.

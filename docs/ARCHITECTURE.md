@@ -1,57 +1,36 @@
-# Repository Architecture
+# Repository architecture
 
-This document maps the workspace, one crate per concern. The workspace
-holds tens of crates; the full listing is the `members` section of the
-root [Cargo.toml](../Cargo.toml). The table below covers the paths you
-will touch most:
+This workspace owns the product: CLI, C API, NAPI, native SDK, Swift and WASIX v2
+engine integration. The root Cargo.toml lists its members.
 
-| Path                                                  | Content                                                              |
-| ----------------------------------------------------- | -------------------------------------------------------------------- |
-| `lib/api`                                             | Public `wasmer` crate. Flavors: `sys` (native, default), `v8`, `js`. |
-| `lib/cli`                                             | CLI crate `wasmer-cli`. Binaries: `wasmer`, `wasmer-headless`.       |
-| `lib/compiler`                                        | Compiler framework and traits.                                       |
-| `lib/compiler-{singlepass,cranelift,llvm}`            | The three compiler backends.                                         |
-| `lib/vm`                                              | Low-level VM runtime.                                                |
-| `lib/wasix/*`                                         | Wasmer-specific WASIX facade, execution, loader and v1 bindings.      |
-| `lib/wasix-legacy`                                    | Legacy `wasmer-wasix` embedding and package APIs; retained until consumer parity. |
-| `lib/journal`                                         | Temporary legacy compile dependency; journaling is intentionally unsupported. See [journal.md](./journal.md). |
-| `lib/virtual-fs`, `lib/virtual-net`, `lib/virtual-io` | Host abstraction layers.                                             |
-| `lib/c-api`                                           | C API (`cdylib` named `wasmer`).                                     |
-| `lib/backend-api`                                     | GraphQL client for the Wasmer registry.                              |
-| `lib/config`, `lib/package`                           | `wasmer.toml` parsing and webc packaging.                            |
-| `tests/compilers`                                     | Integration tests (`wast.rs`, `traps.rs`, `issues.rs`, more).        |
-| `tests/wast/{spec,wasmer}`                            | WAST test files. `spec` is a submodule.                              |
+| Path | Responsibility |
+| --- | --- |
+| lib/cli | wasmer and wasmer-headless binaries |
+| lib/c-api, lib/c-api-imports | Native C API and guest wasm_c_api_v0 imports |
+| lib/napi, lib/sdk/native, lib/swift | Product bindings and embedding APIs |
+| lib/wasix/{api,exec,dylink,wasix1,codegen} | V2 facade, engine glue, v1 guest adapter and canonical generator |
+| lib/package, lib/package-sdk, lib/config, lib/backend-api, lib/cache | Packaging, registry/configuration and module caching |
+| lib/wasi-types | Native dev-only ABI oracle for v2 adapter layout tests |
+| tests/integration, tests/wasixv2 | Product and guest integration suites |
 
-The root crate is a meta-crate. The WASIX crate identities are unchanged by
-the directory migration; see [the consumer parity gates](./WASIX-MIGRATION.md)
-for the legacy crates that still need replacements before removal.
+The engine (API, VM, compilers, types, derive, middlewares, WAST/compiler tests
+and fuzzing) lives in private wasmerio/wasmer-runtime, branch next. All engine
+packages use one Git source; Cargo.lock pins its revision. See
+[RUNTIME-EXTRACTION.md](RUNTIME-EXTRACTION.md) for credentials and development.
 
-## Submodules
+The obsolete wasmer-wasix runtime, journal, virtual-fs/net/mio, sys-utils and
+wai-bindgen-wasmer crates are removed. Supported WASI preview1 and WASIX32 guests
+run through the v2 kernel's wasix1 adapter, including in the CLI and C API.
+There is no legacy fallback. Limits are listed in lib/wasix/TODO.md.
 
-Submodules: `tests/wast/spec`, `lib/napi/quickjs/deps/quickjs`,
-`wasmer-test-files`, and the four upstream dependencies under
-`tests/wasixv2/upstream/{ltp,libc-test,libcap,libaio}`. The wasixv2 test suite
-and runner are tracked source in `tests/wasixv2`; run with `make test-wasixv2`.
+## Sealed kernel workspace
 
-`lib/wasix/codegen` owns the canonical annotated WIT and `wasixv2-codegen`
-generator as tracked source, with its upstream license and provenance. The
-standalone context/function C wrappers live beside it in `compat-libc`.
-`lib/wasix/exec/tests/generated.rs` checks the Wasmer and locked WLK outputs
-against this source.
+WLK is tracked at wlk/ and excluded from the root workspace. Its crates and lock
+remain independent; root integration consumes them by path. No WLK crate may
+depend on an engine crate. Its sparse-checkout CI enforces the boundary.
+Canonical generator checks remain in lib/wasix/exec/tests/generated.rs.
 
-For initialization and working with the different crates + submodules, see [BUILD.md](./BUILD.md)
-
-## Engine-independent kernel
-
-The kernel, syscall traits/layouts, scheduling primitives, host services, VFS/VNet
-and their drivers live in the **private** [wasmerio/wlk](https://github.com/wasmerio/wlk)
-workspace under `crates/`. Wasmer consumes its `main` branch via centralized git
-dependencies; `Cargo.lock` fixes the exact revision. Crate names are unchanged.
-Only the Wasmer-specific `api`, `exec`, `dylink`, `wasix1` and canonical `codegen`
-remain in `lib/wasix`. The generator checks for both repositories run from
-`cargo test -p wasixv2-exec --test generated`; `WLK_ROOT` selects a writable kernel
-checkout when intentionally blessing generated kernel outputs. Kernel behavior tests
-run in WLK; actual engine/guest and v1 reference-protocol tests remain here.
-
-The NAPI binding is maintained directly under `lib/napi`; its source provenance
-and retained QuickJS pin are recorded in [`SOURCE.md`](../lib/napi/SOURCE.md).
+Submodules are wasmer-test-files, NAPI's QuickJS, and the upstream suites at
+tests/wasixv2/upstream/{ltp,libc-test,libcap,libaio}. The v2 suite itself is tracked
+source. Initialize submodules before builds. NAPI remains local for now; its
+provenance is in lib/napi/SOURCE.md and comparison in NAPI-UPSTREAM-DIFF.md.
