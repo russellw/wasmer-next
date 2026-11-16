@@ -2839,6 +2839,15 @@ impl Kernel {
     /// `wasmer run` reports the death as the shell does: 128 + signal.
     /// False when the group was on its way out already, which the signal does not change.
     pub(crate) fn force_fatal_signal(&self, task: TaskId, sig: i32) -> bool {
+        self.force_fatal_signal_with_cause(task, sig, None)
+    }
+
+    pub(crate) fn force_fatal_signal_with_cause(
+        &self,
+        task: TaskId,
+        sig: i32,
+        cause: Option<wasixv2_syscalls::ExecutionFault>,
+    ) -> bool {
         // A reaped process's task traps only while it unwinds: part of its teardown.
         let process = {
             let state = self.state.read_or_recover();
@@ -2857,9 +2866,7 @@ impl Kernel {
         if crate::coredump::dumps_core(sig) {
             self.coredump_request(task, kernel_info(sig));
         }
-        self.note_killed(task, sig);
-        self.do_group_exit(task, 128 + sig);
-        true
+        self.do_fatal_group_exit(task, sig, cause)
     }
 
     /// `rt_sigreturn`: the innermost handler of `task` finished. A call it interrupted is not

@@ -600,8 +600,90 @@ pub trait BindAdmission: Pollable {
     }
 }
 
+/// An owned, optional socket-option operation. Dropping a waiter does not cancel
+/// a physical operation which its transport has already accepted.
+pub trait OptionAdmission: Pollable {
+    /// `None` while pending, including while another option owns the transport.
+    /// A completed `EAGAIN` is a result, rather than a request to replay work.
+    fn complete_result(&self) -> Option<Result<(), Errno>>;
+}
+
+/// The closed readback surface demonstrated by the original peer-only relay.
+/// These are host DTOs, not a new guest ABI or relay command numbering.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum DatagramReadback {
+    Ttl,
+    Broadcast,
+    MulticastLoopV4,
+    MulticastLoopV6,
+    MulticastTtlV4,
+    Local,
+    Peer,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum DatagramReadbackValue {
+    Ttl(u32),
+    Flag(bool),
+    Local(SocketAddr),
+    Peer(Option<SocketAddr>),
+}
+impl DatagramReadback {
+    /// The old scalar socket options only. Other gets retain their current path.
+    pub fn from_option(level: i32, name: i32) -> Option<Self> {
+        use wasixv2_abi::{IpOption, Ipv6Option, SocketLevel, SocketOption};
+        Some(match (level, name) {
+            (l, n) if l == SocketLevel::SOL_IP.0 && n == IpOption::IP_TTL.0 => Self::Ttl,
+            (l, n) if l == SocketLevel::SOL_SOCKET.0 && n == SocketOption::SO_BROADCAST.0 => {
+                Self::Broadcast
+            }
+            (l, n) if l == SocketLevel::SOL_IP.0 && n == IpOption::IP_MULTICAST_LOOP.0 => {
+                Self::MulticastLoopV4
+            }
+            (l, n) if l == SocketLevel::SOL_IPV6.0 && n == Ipv6Option::IPV6_MULTICAST_LOOP.0 => {
+                Self::MulticastLoopV6
+            }
+            (l, n) if l == SocketLevel::SOL_IP.0 && n == IpOption::IP_MULTICAST_TTL.0 => {
+                Self::MulticastTtlV4
+            }
+            _ => return None,
+        })
+    }
+    pub fn option_key(self) -> Option<(i32, i32)> {
+        use wasixv2_abi::{IpOption, Ipv6Option, SocketLevel, SocketOption};
+        Some(match self {
+            Self::Ttl => (SocketLevel::SOL_IP.0, IpOption::IP_TTL.0),
+            Self::Broadcast => (SocketLevel::SOL_SOCKET.0, SocketOption::SO_BROADCAST.0),
+            Self::MulticastLoopV4 => (SocketLevel::SOL_IP.0, IpOption::IP_MULTICAST_LOOP.0),
+            Self::MulticastLoopV6 => (SocketLevel::SOL_IPV6.0, Ipv6Option::IPV6_MULTICAST_LOOP.0),
+            Self::MulticastTtlV4 => (SocketLevel::SOL_IP.0, IpOption::IP_MULTICAST_TTL.0),
+            Self::Local | Self::Peer => return None,
+        })
+    }
+    pub fn accepts(self, value: DatagramReadbackValue) -> bool {
+        matches!(
+            (self, value),
+            (
+                Self::Ttl | Self::MulticastTtlV4,
+                DatagramReadbackValue::Ttl(_)
+            ) | (
+                Self::Broadcast | Self::MulticastLoopV4 | Self::MulticastLoopV6,
+                DatagramReadbackValue::Flag(_)
+            ) | (Self::Local, DatagramReadbackValue::Local(_))
+                | (Self::Peer, DatagramReadbackValue::Peer(_))
+        )
+    }
+}
+/// An owned read of one admitted peer-only datagram resource. A dropped wait
+/// subscription never cancels a callback already accepted by its driver.
+pub trait DatagramReadbackAdmission: Pollable {
+    /// None is pending, distinct from a completed provider EAGAIN.
+    fn complete_result(&self) -> Option<Result<DatagramReadbackValue, Errno>>;
+}
+
 pub trait Socket: Pollable {
     /// Kernel timer hook for TCP's 200 ms cork ceiling (TCP_RTO_MIN).
+    /// Like the existing synchronous setter, option commit may call this hook
+    /// under the socket lock; it must be bounded and must not reenter a socket.
     fn set_cork_timer(&self, arm: Box<dyn Fn(bool) + Send + Sync>) {
         let _ = arm;
     }
@@ -711,10 +793,35 @@ pub trait Socket: Pollable {
     /// `SO_SNDTIMEO*` and every `SOL_SOCKET` option that only describes the descriptor.
     fn set_option(&self, level: i32, name: i32, value: &[u8]) -> Result<(), Errno>;
 
+    /// Apply synchronously (`None`) or return owned completion before a backend
+    /// option becomes canonical. `None` means COMPLETED, not a request to call
+    /// set_option again. The default invokes the original setter exactly once.
+    fn set_option_admission(
+        &self,
+        level: i32,
+        name: i32,
+        value: &[u8],
+    ) -> Result<Option<Box<dyn OptionAdmission>>, Errno> {
+        self.set_option(level, name, value)?;
+        Ok(None)
+    }
+
     /// `getsockopt`: writes the value in guest layout to the start of `out` (whose length is
     /// the guest's `optlen`, at most what the kernel copies back) and returns its length;
     /// Linux truncates most values to `optlen` rather than failing.
     fn get_option(&self, level: i32, name: i32, out: &mut [u8]) -> Result<usize, Errno>;
+
+    /// Optional closed peer-only readback. Default None performs no getter,
+    /// callback or I/O; the caller then invokes its original getter ONCE.
+    /// An admitted object is lazy until polled, allowing interruption to be
+    /// checked before any provider callback is accepted.
+    fn datagram_readback_admission(
+        &self,
+        query: DatagramReadback,
+    ) -> Result<Option<Box<dyn DatagramReadbackAdmission>>, Errno> {
+        let _ = query;
+        Ok(None)
+    }
 
     /// `sock_graft`: the kernel made the socket a file whose inode is `ino`, which the port
     /// table reports ([`PortEntry::inode`]).
@@ -979,6 +1086,17 @@ pub enum StreamState {
     Closed,
 }
 
+/// Immutable option semantics of the same actual stream resource.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TcpOptionPolicy {
+    #[default]
+    Canonical,
+    /// Channel-backed streams ignore these setters and expose fixed values.
+    FixedTcpDefaults,
+    /// Linger is requested metadata, without a derived close action.
+    StoredLingerWithoutClose,
+}
+
 /// A stream through the backend, non-blocking like a guest socket. `poll` reports what
 /// `tcp_poll` would for the guest socket it carries; it registers nothing, since the stream
 /// wakes the guest socket's queue (see [`Backend`]), with `PRI` for a new urgent mark.
@@ -986,6 +1104,38 @@ pub enum StreamState {
 /// Urgent data follows `tcp_recvmsg` and `tcp_recv_urg` as [`crate::RecvQueue`] keeps them,
 /// with the guest's `SO_OOBINLINE`, which arrives through `set_option`.
 pub trait BackendStream: Pollable {
+    /// Pure, bounded metadata; never performs I/O or reenters a socket/backend.
+    /// None means the actual stream has not yet been classified. A provider
+    /// publishes its immutable policy before completing startup/readiness.
+    fn tcp_option_policy(&self) -> Option<TcpOptionPolicy> {
+        Some(TcpOptionPolicy::Canonical)
+    }
+
+    /// Whether physical options require owned completion. This getter is bounded
+    /// and nonreentrant; it may run under a socket lock. The physical stream's
+    /// capability is immutable; a reserved PendingStream returns false until it
+    /// can forward its actual Ready target. The socket's startup gate covers that
+    /// transition. Ordinary native and local transports stay synchronous.
+    fn async_options(&self) -> bool {
+        false
+    }
+
+    /// Apply an owned batch in order. `Ok` transfers the callback to this exact
+    /// transport until actual completion; `Err` accepts neither work nor callback.
+    /// Invoke the callback once, outside transport locks, with the first physical
+    /// error. A successful prefix is not rolled back or replayed on failure.
+    ///
+    /// Callers publish custody before entry: completion may be synchronous and
+    /// reentrant. Startup batches use `SockOpts::backend_options` ordering.
+    fn start_options(
+        &self,
+        options: Vec<(i32, i32, Vec<u8>)>,
+        done: Box<dyn FnOnce(Result<(), Errno>) + Send>,
+    ) -> Result<(), Errno> {
+        let _ = (options, done);
+        Err(Errno::EOPNOTSUPP)
+    }
+
     /// Actual local address of an opted-in endpoint stream. EAGAIN means it is not ready.
     /// None preserves the ordinary namespace source. Bounded and nonreentrant like read.
     fn provider_local_addr(&self) -> Option<Result<SocketAddr, Errno>> {
@@ -1056,6 +1206,19 @@ pub trait BackendDatagram: Pollable {
     fn take_error(&self) -> Option<Errno>;
     /// Receives one datagram into `buf`: (bytes copied, full datagram length, sender).
     fn recv_from(&self, buf: &mut [u8], peek: bool) -> Result<(usize, usize, SocketAddr), Errno>;
+    /// Optional actual readback on THIS admitted resource. None and Some(Err)
+    /// accept no work/callback. Some(Ok) owns exactly one terminal callback,
+    /// possibly inline; callers hold no socket/namespace/control guards. The
+    /// callback carries no guest memory. A selected unavailable query remains
+    /// unsupported, never replaced by a fabricated physical cached readback.
+    fn start_readback(
+        &self,
+        query: DatagramReadback,
+        done: Box<dyn FnOnce(Result<DatagramReadbackValue, Errno>) + Send>,
+    ) -> Option<Result<(), Errno>> {
+        let _ = (query, done);
+        None
+    }
     /// The next datagram's size, 0 if none.
     fn input_len(&self) -> usize;
     /// `IP_RECVERR` or `IPV6_RECVERR` changed on the guest socket; `value` is the new value as

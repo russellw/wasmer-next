@@ -14,8 +14,8 @@ use wasixv2_abi::{Errno, MsgFlags, SocketLevel, SocketOption, TcpOption};
 use wasixv2_wait::{PollMask, PollTable, Pollable, WaitQueue, poll_wait};
 
 use crate::{
-    Accepted, BackendStream, Domain, NetResult, PortEntry, Publication, RecvMsg, Room, SendMsg,
-    Shutdown, Socket, SocketKind, StreamState,
+    Accepted, BackendStream, Domain, NetResult, OptionAdmission, PortEntry, Publication, RecvMsg,
+    Room, SendMsg, Shutdown, Socket, SocketKind, StreamState,
     addr::{canonical, connect_target, present, unbound},
     endpoint::{
         AttemptGate, EndpointBindPurpose, EndpointBindRequest, EndpointBound, EndpointChoice,
@@ -209,6 +209,14 @@ struct Inner {
     opts: SockOpts,
     cork_timer: Option<Box<dyn Fn(bool) + Send + Sync>>,
     cork_armed: bool,
+    /// One accepted physical option operation; waiting syscalls own their own requests.
+    option_active: Option<Arc<OptionTxn>>,
+    option_startup: bool,
+    /// The selected factory owns the reserved PendingStream, not yet a real transport.
+    option_factory: bool,
+    option_generation: u64,
+    /// An accepted child's startup error is consumed once by its parent accept queue.
+    option_startup_error: Option<Errno>,
     /// Canonical bound address, once bound.
     local: Option<SocketAddr>,
     policy_bind: Option<SocketAddr>,
@@ -273,6 +281,67 @@ struct ListenerInner {
     syn: VecDeque<(Arc<TcpSocket>, Arc<Conn>, SocketAddr)>,
 }
 
+type OptionBatch = Vec<(i32, i32, Vec<u8>)>;
+type OptionStartup = (Arc<OptionTxn>, OptionBatch);
+
+/// One option waiter or startup batch. Admitted callbacks retain this owner, not
+/// the socket, transport or namespace. A dropped subscriber cannot drop accepted work.
+struct OptionTxn {
+    socket: Weak<TcpSocket>,
+    transport: Weak<dyn BackendStream>,
+    generation: u64,
+    source: EndpointSourceId,
+    request: Option<(i32, i32, Vec<u8>)>,
+    result: Mutex<Option<NetResult<()>>>,
+    queue: WaitQueue,
+    listener: Weak<Listener>,
+}
+
+struct OptionSubscription(Arc<OptionTxn>);
+
+impl OptionTxn {
+    fn result(&self) -> Option<NetResult<()>> {
+        *self.result.lock().unwrap()
+    }
+
+    fn wake(&self) {
+        self.queue.wake(PollMask::empty());
+        if let Some(listener) = self.listener.upgrade() {
+            listener.wq.wake(PollMask::IN | PollMask::RDNORM);
+        }
+    }
+
+    fn drive(self: &Arc<Self>) {
+        if self.result().is_some() {
+            return;
+        }
+        if let Some(socket) = self.socket.upgrade() {
+            socket.drive_option(self);
+        } else {
+            *self.result.lock().unwrap() = Some(Err(Errno::ECANCELED));
+        }
+    }
+}
+
+impl Pollable for OptionSubscription {
+    fn poll(&self, mut table: Option<&mut PollTable<'_>>) -> PollMask {
+        poll_wait(&mut table, &self.0.queue);
+        self.0.drive();
+        match self.0.result() {
+            Some(Ok(())) => PollMask::OUT,
+            Some(Err(_)) => PollMask::ERR,
+            None => PollMask::empty(),
+        }
+    }
+}
+
+impl OptionAdmission for OptionSubscription {
+    fn complete_result(&self) -> Option<NetResult<()>> {
+        self.0.drive();
+        self.0.result()
+    }
+}
+
 impl ListenerInner {
     /// `sk_acceptq_is_full`: one more than the backlog fits.
     fn full(&self) -> bool {
@@ -296,7 +365,57 @@ fn replay_options(stream: &dyn BackendStream, opts: &SockOpts) {
     }
 }
 
+fn backend_option(opts: &SockOpts, level: i32, name: i32) -> Option<(i32, i32, Vec<u8>)> {
+    // A disabled linger is absent from a fresh-stream replay, but clearing a
+    // previously enabled physical option still requires an acknowledged setter.
+    if (level, name) == (SocketLevel::SOL_SOCKET.0, SocketOption::SO_LINGER.0) {
+        let mut value = i32::from(opts.linger.is_some()).to_le_bytes().to_vec();
+        value.extend(opts.linger.unwrap_or(0).to_le_bytes());
+        return Some((level, name, value));
+    }
+    opts.backend_options()
+        .into_iter()
+        .find(|(l, n, _)| (*l, *n) == (level, name))
+}
+
 impl TcpSocket {
+    fn fixed_option(level: i32, name: i32) -> bool {
+        (level, name) == (SocketLevel::SOL_TCP.0, TcpOption::TCP_NODELAY.0)
+            || (level, name) == (SocketLevel::SOL_SOCKET.0, SocketOption::SO_KEEPALIVE.0)
+            || (level, name) == (SocketLevel::SOL_SOCKET.0, SocketOption::SO_LINGER.0)
+    }
+
+    fn option_policy(g: &Inner) -> Option<crate::TcpOptionPolicy> {
+        match &g.state {
+            State::Connecting(Transport::Remote(stream), _)
+            | State::Connected(Transport::Remote(stream), _) => stream.tcp_option_policy(),
+            _ => Some(crate::TcpOptionPolicy::Canonical),
+        }
+    }
+
+    fn normalize_options(
+        opts: &mut SockOpts,
+        policy: Option<crate::TcpOptionPolicy>,
+        bound: bool,
+    ) -> NetResult<()> {
+        if policy == Some(crate::TcpOptionPolicy::FixedTcpDefaults) {
+            opts.set(
+                SocketLevel::SOL_TCP.0,
+                TcpOption::TCP_NODELAY.0,
+                &1i32.to_le_bytes(),
+                bound,
+            )?;
+            opts.set(
+                SocketLevel::SOL_SOCKET.0,
+                SocketOption::SO_KEEPALIVE.0,
+                &0i32.to_le_bytes(),
+                bound,
+            )?;
+            opts.linger = None;
+        }
+        Ok(())
+    }
+
     pub(crate) fn new(net: Arc<Net>, domain: Domain, uid: u32) -> Arc<Self> {
         Self::with_state(
             net,
@@ -335,6 +454,11 @@ impl TcpSocket {
                 opts,
                 cork_timer: None,
                 cork_armed: false,
+                option_active: None,
+                option_startup: false,
+                option_factory: false,
+                option_generation: 0,
+                option_startup_error: None,
                 local,
                 policy_bind: None,
                 bind_pending: None,
@@ -352,6 +476,311 @@ impl TcpSocket {
                 wr_shut: false,
             }),
         })
+    }
+
+    fn remote(g: &Inner) -> Option<&Arc<dyn BackendStream>> {
+        match &g.state {
+            State::Connecting(Transport::Remote(stream), _)
+            | State::Connected(Transport::Remote(stream), _) => Some(stream),
+            _ => None,
+        }
+    }
+
+    fn option_current(&self, g: &Inner, txn: &OptionTxn) -> bool {
+        g.option_generation == txn.generation
+            && self.endpoint.source() == txn.source
+            && Self::remote(g).is_some_and(|stream| {
+                txn.transport
+                    .upgrade()
+                    .is_some_and(|old| Arc::ptr_eq(&old, stream))
+            })
+    }
+
+    fn option_txn(
+        &self,
+        g: &Inner,
+        request: Option<(i32, i32, Vec<u8>)>,
+        listener: Weak<Listener>,
+    ) -> Arc<OptionTxn> {
+        Arc::new(OptionTxn {
+            socket: self.me.clone(),
+            transport: Arc::downgrade(Self::remote(g).expect("remote option target")),
+            generation: g.option_generation,
+            source: self.endpoint.source(),
+            request,
+            result: Mutex::new(None),
+            queue: self.wq.clone(),
+            listener,
+        })
+    }
+
+    /// Publish the startup gate under the same lock as the latest option snapshot.
+    /// Later setters must join it even while the reserved PendingStream is Waiting.
+    fn prepare_options(
+        &self,
+        g: &mut Inner,
+        stream: &Arc<dyn BackendStream>,
+        listener: Weak<Listener>,
+    ) -> Option<OptionStartup> {
+        if !stream.async_options() {
+            return None;
+        }
+        let txn = self.option_txn(g, None, listener);
+        let batch = g.opts.backend_options();
+        g.option_startup = true;
+        g.option_active = Some(txn.clone());
+        Some((txn, batch))
+    }
+
+    fn dispatch_options(txn: Arc<OptionTxn>, stream: Arc<dyn BackendStream>, batch: OptionBatch) {
+        if txn.result().is_some() {
+            return;
+        }
+        let callback = txn.clone();
+        let result = stream.start_options(
+            batch,
+            Box::new(move |result| {
+                if let Some(socket) = callback.socket.upgrade() {
+                    socket.finish_option(&callback, result);
+                } else {
+                    *callback.result.lock().unwrap() = Some(Err(Errno::ECANCELED));
+                    callback.wake();
+                }
+            }),
+        );
+        if let Err(error) = result
+            && let Some(socket) = txn.socket.upgrade()
+        {
+            socket.finish_option(&txn, Err(error));
+        }
+    }
+
+    fn drive_option(&self, txn: &Arc<OptionTxn>) {
+        let mut g = self.inner.lock().unwrap();
+        if txn.result().is_some() {
+            return;
+        }
+        if !self.option_current(&g, txn) {
+            if g.option_active
+                .as_ref()
+                .is_some_and(|active| Arc::ptr_eq(active, txn))
+            {
+                g.option_active = None;
+                g.option_startup = false;
+            }
+            *txn.result.lock().unwrap() = Some(Err(Errno::ECANCELED));
+            drop(g);
+            txn.wake();
+            return;
+        }
+        if g.option_active.is_some() {
+            return;
+        }
+        let (level, name, value) = txn.request.as_ref().expect("startup dispatched by owner");
+        let mut candidate = g.opts.clone();
+        let result = candidate.set(*level, *name, value, g.local.is_some());
+        if let Err(error) = result {
+            *txn.result.lock().unwrap() = Some(Err(error));
+            drop(g);
+            txn.wake();
+            return;
+        }
+        let normalized = backend_option(&candidate, *level, *name)
+            .expect("backend option validated before admission");
+        let stream = Self::remote(&g).unwrap().clone();
+        g.option_active = Some(txn.clone());
+        drop(g);
+        Self::dispatch_options(txn.clone(), stream, vec![normalized]);
+    }
+
+    fn finish_option(&self, txn: &Arc<OptionTxn>, mut result: NetResult<()>) {
+        let mut g = self.inner.lock().unwrap();
+        if txn.result().is_some() {
+            return;
+        }
+        let active = g
+            .option_active
+            .as_ref()
+            .is_some_and(|active| Arc::ptr_eq(active, txn));
+        if !active || !self.option_current(&g, txn) {
+            if active {
+                g.option_active = None;
+                g.option_startup = false;
+            }
+            *txn.result.lock().unwrap() = Some(Err(Errno::ECANCELED));
+            drop(g);
+            txn.wake();
+            return;
+        }
+        let policy = result.is_ok().then(|| Self::option_policy(&g)).flatten();
+        let mut push = None;
+        if let Some((level, name, value)) = &txn.request
+            && result.is_ok()
+        {
+            let bound = g.local.is_some();
+            let mut candidate = g.opts.clone();
+            result = candidate.set(*level, *name, value, bound).map(|_| ());
+            if result.is_ok() {
+                result = Self::normalize_options(&mut candidate, policy, bound);
+            }
+            if result.is_ok() {
+                g.opts = candidate;
+            }
+            if result.is_ok()
+                && *level == SocketLevel::SOL_TCP.0
+                && *name == TcpOption::TCP_NODELAY.0
+                && g.opts.flag(*level, *name)
+            {
+                if let State::Connected(t, _) = &g.state {
+                    push = Some(t.clone());
+                }
+                if g.cork_armed {
+                    g.cork_armed = false;
+                    if let Some(arm) = &g.cork_timer {
+                        arm(false);
+                    }
+                }
+            }
+        }
+        let mut close = None;
+        if txn.request.is_none() {
+            if result.is_ok() {
+                let bound = g.local.is_some();
+                let mut candidate = g.opts.clone();
+                result = Self::normalize_options(&mut candidate, policy, bound);
+                if result.is_ok() {
+                    g.opts = candidate;
+                }
+            }
+            g.option_startup = false;
+            if let Err(error) = result {
+                g.option_startup_error = Some(error);
+                g.err = Some(error);
+                g.failed = true;
+                g.rd_shut = true;
+                g.wr_shut = true;
+                close = Some(std::mem::replace(&mut g.state, State::Closed));
+                self.put_port(&mut g);
+            }
+        }
+        *txn.result.lock().unwrap() = Some(result);
+        g.option_active = None;
+        drop(g);
+        if let Some(t) = push {
+            t.push();
+        }
+        if let Some(State::Connecting(t, _) | State::Connected(t, _)) = close {
+            t.close(true);
+        }
+        txn.wake();
+    }
+
+    /// Invalidation never waits for a foreign callback and cannot cancel a newer target.
+    fn cancel_options(g: &mut Inner) -> Option<Arc<OptionTxn>> {
+        g.option_generation = g.option_generation.wrapping_add(1);
+        g.option_startup = false;
+        g.option_factory = false;
+        let txn = g.option_active.take();
+        if let Some(txn) = &txn {
+            *txn.result.lock().unwrap() = Some(Err(Errno::ECANCELED));
+        }
+        txn
+    }
+
+    fn begin_option(
+        &self,
+        level: i32,
+        name: i32,
+        value: &[u8],
+        allow_owned: bool,
+    ) -> NetResult<Option<Box<dyn OptionAdmission>>> {
+        let mut g = self.lock();
+        if (level, name)
+            == (
+                SocketLevel::SOL_IPV6.0,
+                wasixv2_abi::Ipv6Option::IPV6_ADDRFORM.0,
+            )
+        {
+            let peer = Self::addrform_peer(&g);
+            g.opts.addrform(&self.net, value, peer, false)?;
+            if let Some(local) = g.local {
+                self.net
+                    .state()
+                    .tcp
+                    .set_family(self.id, local.port(), Domain::Inet);
+            }
+            self.domain.store(Domain::Inet as u8, Ordering::Release);
+            return Ok(None);
+        }
+        if crate::mcast::handles(level, name) {
+            return g
+                .opts
+                .set_mcast(&self.net, level, name, value)
+                .map(|()| None);
+        }
+        let owned_options =
+            g.option_startup || Self::remote(&g).is_some_and(|stream| stream.async_options());
+        if owned_options {
+            let mut candidate = g.opts.clone();
+            candidate.set(level, name, value, g.local.is_some())?;
+            if let Some(normalized) = backend_option(&candidate, level, name) {
+                if allow_owned {
+                    let txn = self.option_txn(&g, Some(normalized), Weak::new());
+                    return Ok(Some(Box::new(OptionSubscription(txn))));
+                }
+                return Err(Errno::EOPNOTSUPP);
+            }
+        }
+        let bound = g.local.is_some();
+        let changed = g.opts.set(level, name, value, bound)?;
+        match changed {
+            Changed::Reuse => {
+                if let Some(local) = g.local {
+                    self.net.state().tcp.set_reuse(
+                        self.id,
+                        local.port(),
+                        g.opts.reuseaddr,
+                        g.opts.reuseport,
+                    );
+                }
+            }
+            Changed::Buffers => {
+                if let State::Connected(Transport::Local(c, side), _) = &g.state {
+                    c.set_buffers(*side, bufs(&g.opts));
+                }
+            }
+            Changed::Nothing => {}
+        }
+        let mut push = None;
+        if level == SocketLevel::SOL_TCP.0
+            && ((name == TcpOption::TCP_NODELAY.0 && g.opts.flag(level, name))
+                || (name == TcpOption::TCP_CORK.0 && !g.opts.flag(level, name)))
+        {
+            if let State::Connected(t, _) = &g.state {
+                push = Some(t.clone());
+            }
+            if g.cork_armed {
+                if let Some(arm) = &g.cork_timer {
+                    arm(false);
+                }
+                g.cork_armed = false;
+            }
+        }
+        if !owned_options
+            && !g.option_factory
+            && let State::Connected(Transport::Remote(s), _)
+            | State::Connecting(Transport::Remote(s), _) = &g.state
+        {
+            let s = s.clone();
+            drop(g);
+            s.set_option(level, name, value)?;
+        } else {
+            drop(g);
+        }
+        if let Some(t) = push {
+            t.push();
+        }
+        Ok(None)
     }
 
     fn provider_bind(
@@ -582,6 +1011,9 @@ impl TcpSocket {
 
     /// Completes a connection attempt the far side has decided.
     fn refresh(&self, g: &mut Inner) {
+        if g.option_startup {
+            return;
+        }
         let State::Connecting(t, peer) = &g.state else {
             return;
         };
@@ -761,15 +1193,19 @@ impl TcpSocket {
     /// `tcp_disconnect` of a connection in progress or established: the peer is reset (from
     /// `SYN_SENT` there is none yet), and unless the connection had already ended
     /// (`tcp_need_reset`, or `SYN_SENT`) the socket's own `sk_err` becomes `ECONNRESET`.
-    fn abort_connection(&self, g: &mut Inner) {
+    fn abort_connection(&self, g: &mut Inner, defer_close: bool) -> Option<Transport> {
         if let State::Connecting(t, _) | State::Connected(t, _) =
             std::mem::replace(&mut g.state, State::Closed)
         {
             if !t.is_done() {
                 g.err = Some(Errno::ECONNRESET);
             }
+            if defer_close {
+                return Some(t);
+            }
             t.close(true);
         }
+        None
     }
 
     /// `inet_bhash2_reset_saddr`: back to the wildcard source address unless `bind` chose it.
@@ -787,11 +1223,14 @@ impl TcpSocket {
 
     fn release_inner(&self, abort: bool) {
         let mut g = self.inner.lock().unwrap();
+        let option = Self::cancel_options(&mut g);
         self.stop_listening(&mut g);
         if let Some(namespace) = self.net.endpoints() {
             self.endpoint.renew(&namespace);
         }
-        let abort = abort || g.opts.linger == Some(0);
+        let abort = abort
+            || (g.opts.linger == Some(0)
+                && Self::option_policy(&g) == Some(crate::TcpOptionPolicy::Canonical));
         let old = std::mem::replace(&mut g.state, State::Closed);
         if let Some(local) = g.local.take() {
             self.net.state().tcp.unbind(self.id, local.port());
@@ -799,6 +1238,10 @@ impl TcpSocket {
         // `inet_release`: `ip_mc_drop_socket`, `ipv6_sock_mc_close`.
         g.opts.mc.drop_all(&self.net);
         drop(g);
+        if let Some(option) = option {
+            option.wake();
+        }
+        self.wq.wake(PollMask::empty());
         if let State::Connecting(t, _) | State::Connected(t, _) = old {
             t.close(abort);
         }
@@ -918,9 +1361,15 @@ impl TcpSocket {
             }
         }
         let child = self.new_child(local, peer, wq, |_, opts| {
-            replay_options(&*stream, opts);
-            Transport::Remote(stream)
+            if !stream.async_options() {
+                replay_options(&*stream, opts);
+            }
+            Transport::Remote(stream.clone())
         });
+        let startup = {
+            let mut g = child.inner.lock().unwrap();
+            child.prepare_options(&mut g, &stream, Arc::downgrade(&l))
+        };
         let mut li = l.inner.lock().unwrap();
         if li.closed
             || li.full()
@@ -943,6 +1392,9 @@ impl TcpSocket {
         };
         drop(li);
         if queued {
+            if let Some((txn, batch)) = startup {
+                Self::dispatch_options(txn, stream, batch);
+            }
             l.wq.wake(PollMask::IN | PollMask::RDNORM);
             Offer::Queued
         } else {
@@ -1001,9 +1453,13 @@ impl TcpSocket {
 
 impl Listener {
     /// Takes the next established connection and moves SYN-queue entries up while room.
-    fn pop(&self) -> Option<(Arc<TcpSocket>, SocketAddr)> {
+    fn pop(&self) -> NetResult<(Arc<TcpSocket>, SocketAddr)> {
         let mut li = self.inner.lock().unwrap();
-        let next = li.ready.pop_front()?;
+        let (head, _) = li.ready.front().ok_or(Errno::EAGAIN)?;
+        if head.inner.lock().unwrap().option_startup {
+            return Err(Errno::EAGAIN);
+        }
+        let next = li.ready.pop_front().unwrap();
         let mut drop_list = Vec::new();
         while !li.full() {
             let Some((child, conn, peer)) = li.syn.pop_front() else {
@@ -1021,7 +1477,13 @@ impl Listener {
             child.release_inner(true);
         }
         self.room.wake(PollMask::empty());
-        Some(next)
+        let error = next.0.inner.lock().unwrap().option_startup_error.take();
+        if let Some(error) = error {
+            next.0.release_inner(true);
+            Err(error)
+        } else {
+            Ok(next)
+        }
     }
 }
 
@@ -1033,20 +1495,29 @@ impl Pollable for TcpSocket {
         let g = self.lock();
         match &g.state {
             State::Listening(l) => {
-                if l.inner.lock().unwrap().ready.is_empty() {
+                if l.inner
+                    .lock()
+                    .unwrap()
+                    .ready
+                    .front()
+                    .is_none_or(|(head, _)| head.inner.lock().unwrap().option_startup)
+                {
                     PollMask::empty()
                 } else {
                     PollMask::IN | PollMask::RDNORM
                 }
             }
             State::Connecting(t, _) | State::Connected(t, _) => {
+                let waiting_options = g.option_startup;
                 let waiting_local = g.endpoint_selected
                     && matches!(&g.state, State::Connecting(..))
                     && matches!(t, Transport::Remote(stream) if stream.provider_local_addr() == Some(Err(Errno::EAGAIN)));
                 let t = t.clone();
                 drop(g);
                 let events = t.poll();
-                if waiting_local {
+                if waiting_options {
+                    events & !(PollMask::IN | PollMask::RDNORM | PollMask::OUT | PollMask::WRNORM)
+                } else if waiting_local {
                     events & !(PollMask::OUT | PollMask::WRNORM)
                 } else {
                     events
@@ -1257,7 +1728,7 @@ impl Socket for TcpSocket {
 
     fn accept(&self) -> NetResult<Accepted> {
         let l = self.listener.lock().unwrap().clone().ok_or(Errno::EINVAL)?;
-        let (socket, peer) = l.pop().ok_or(Errno::EAGAIN)?;
+        let (socket, peer) = l.pop()?;
         // Historical host networking admits the accepted peer as an outbound address.
         if self.net.config.policy.as_ref().is_some_and(|p| {
             !p.allows_socket(
@@ -1301,6 +1772,7 @@ impl Socket for TcpSocket {
         if mapped && g.opts.v6only {
             return Err(Errno::ENETUNREACH);
         }
+        g.option_generation = g.option_generation.wrapping_add(1);
         // An opt-in external provider may own an address/route absent from this namespace.
         // Keep the ordinary route error intact until pure selection chooses its owner.
         let mut path = self.net.path(dst, g.local.map(|l| l.ip()).or(g.saddr));
@@ -1457,6 +1929,7 @@ impl Socket for TcpSocket {
                 let pending = PendingStream::new(dst, self.wq.clone());
                 let reserved: Arc<dyn BackendStream> = pending.clone();
                 g.state = State::Connecting(Transport::Remote(reserved.clone()), dst);
+                g.option_factory = true;
                 drop(g);
                 let result = namespace.provider.connect(
                     target,
@@ -1470,11 +1943,19 @@ impl Socket for TcpSocket {
                 let current = self.endpoint.source() == source
                     && matches!(&g.state,State::Connecting(Transport::Remote(stream),_) if Arc::ptr_eq(stream,&reserved));
                 if current {
+                    g.option_factory = false;
                     match result {
                         Ok(stream) => {
                             if canonical(stream.peer_addr()) != dst {
                                 pending.complete(Err(Errno::EPROTO));
                             } else {
+                                let startup = self.prepare_options(&mut g, &stream, Weak::new());
+                                if let Some((txn, batch)) = startup {
+                                    drop(g);
+                                    pending.complete(Ok(stream.clone()));
+                                    Self::dispatch_options(txn, stream, batch);
+                                    return Err(Errno::EINPROGRESS);
+                                }
                                 replay_options(&*stream, &g.opts);
                                 pending.complete(Ok(stream));
                             }
@@ -1511,6 +1992,14 @@ impl Socket for TcpSocket {
                 let backend = self.net.backend.clone().ok_or(Errno::ENETUNREACH)?;
                 match backend.connect(host_dst, self.wq.clone()) {
                     Ok(stream) => {
+                        if stream.async_options() {
+                            g.state = State::Connecting(Transport::Remote(stream.clone()), dst);
+                            let (txn, batch) =
+                                self.prepare_options(&mut g, &stream, Weak::new()).unwrap();
+                            drop(g);
+                            Self::dispatch_options(txn, stream, batch);
+                            return Err(Errno::EINPROGRESS);
+                        }
                         replay_options(&*stream, &g.opts);
                         g.state = State::Connecting(Transport::Remote(stream), dst);
                         Err(Errno::EINPROGRESS)
@@ -1528,17 +2017,26 @@ impl Socket for TcpSocket {
         // `tcp_disconnect`: abort whatever is going on and return to CLOSE, which gives back
         // an autobound port (`tcp_set_state` calls `inet_put_port`) and the source address.
         let mut g = self.lock();
+        let defer_close =
+            g.option_startup || Self::remote(&g).is_some_and(|stream| stream.async_options());
+        let option = Self::cancel_options(&mut g);
         self.stop_listening(&mut g);
         if let Some(namespace) = self.net.endpoints() {
             self.endpoint.renew(&namespace);
         }
-        self.abort_connection(&mut g);
+        let close = self.abort_connection(&mut g, defer_close);
         g.rd_shut = false;
         g.wr_shut = false;
         g.failed = false;
         self.reset_saddr(&mut g);
         self.put_port(&mut g);
         drop(g);
+        if let Some(transport) = close {
+            transport.close(true);
+        }
+        if let Some(option) = option {
+            option.wake();
+        }
         self.wq.wake(PollMask::empty());
         Ok(())
     }
@@ -1554,13 +2052,22 @@ impl Socket for TcpSocket {
             }
             // `inet_shutdown` in `SYN_SENT` disconnects (`tcp_disconnect`).
             State::Connecting(..) => {
+                let defer_close = g.option_startup
+                    || Self::remote(&g).is_some_and(|stream| stream.async_options());
+                let option = Self::cancel_options(&mut g);
                 if let Some(namespace) = self.net.endpoints() {
                     self.endpoint.renew(&namespace);
                 }
-                self.abort_connection(&mut g);
+                let close = self.abort_connection(&mut g, defer_close);
                 self.reset_saddr(&mut g);
                 self.put_port(&mut g);
                 drop(g);
+                if let Some(transport) = close {
+                    transport.close(true);
+                }
+                if let Some(option) = option {
+                    option.wake();
+                }
                 self.wq.wake(PollMask::empty());
                 Ok(())
             }
@@ -1634,6 +2141,9 @@ impl Socket for TcpSocket {
         }
         let peek = flags.0 & MsgFlags::MSG_PEEK.0 != 0;
         let mut g = self.lock();
+        if g.option_startup {
+            return Err(Errno::EAGAIN);
+        }
         let t = match &g.state {
             State::Connected(t, _) | State::Connecting(t, _) => t.clone(),
             State::Listening(_) => return Err(Errno::ENOTCONN),
@@ -1713,76 +2223,17 @@ impl Socket for TcpSocket {
         }
     }
 
+    fn set_option_admission(
+        &self,
+        level: i32,
+        name: i32,
+        value: &[u8],
+    ) -> NetResult<Option<Box<dyn OptionAdmission>>> {
+        self.begin_option(level, name, value, true)
+    }
+
     fn set_option(&self, level: i32, name: i32, value: &[u8]) -> NetResult<()> {
-        let mut g = self.lock();
-        if (level, name)
-            == (
-                SocketLevel::SOL_IPV6.0,
-                wasixv2_abi::Ipv6Option::IPV6_ADDRFORM.0,
-            )
-        {
-            let peer = Self::addrform_peer(&g);
-            g.opts.addrform(&self.net, value, peer, false)?;
-            if let Some(local) = g.local {
-                self.net
-                    .state()
-                    .tcp
-                    .set_family(self.id, local.port(), Domain::Inet);
-            }
-            self.domain.store(Domain::Inet as u8, Ordering::Release);
-            return Ok(());
-        }
-        if crate::mcast::handles(level, name) {
-            return g.opts.set_mcast(&self.net, level, name, value);
-        }
-        let bound = g.local.is_some();
-        let changed = g.opts.set(level, name, value, bound)?;
-        match changed {
-            Changed::Reuse => {
-                if let Some(local) = g.local {
-                    self.net.state().tcp.set_reuse(
-                        self.id,
-                        local.port(),
-                        g.opts.reuseaddr,
-                        g.opts.reuseport,
-                    );
-                }
-            }
-            Changed::Buffers => {
-                if let State::Connected(Transport::Local(c, side), _) = &g.state {
-                    c.set_buffers(*side, bufs(&g.opts));
-                }
-            }
-            Changed::Nothing => {}
-        }
-        let mut push = None;
-        if level == SocketLevel::SOL_TCP.0
-            && ((name == TcpOption::TCP_NODELAY.0 && g.opts.flag(level, name))
-                || (name == TcpOption::TCP_CORK.0 && !g.opts.flag(level, name)))
-        {
-            if let State::Connected(t, _) = &g.state {
-                push = Some(t.clone());
-            }
-            if g.cork_armed {
-                if let Some(arm) = &g.cork_timer {
-                    arm(false);
-                }
-                g.cork_armed = false;
-            }
-        }
-        if let State::Connected(Transport::Remote(s), _)
-        | State::Connecting(Transport::Remote(s), _) = &g.state
-        {
-            let s = s.clone();
-            drop(g);
-            s.set_option(level, name, value)?;
-        } else {
-            drop(g);
-        }
-        if let Some(t) = push {
-            t.push();
-        }
-        Ok(())
+        self.begin_option(level, name, value, false).map(|_| ())
     }
 
     fn graft(&self, ino: u64) {
@@ -1791,6 +2242,17 @@ impl Socket for TcpSocket {
 
     fn get_option(&self, level: i32, name: i32, out: &mut [u8]) -> NetResult<usize> {
         let mut g = self.lock();
+        if Self::fixed_option(level, name)
+            && Self::option_policy(&g) == Some(crate::TcpOptionPolicy::FixedTcpDefaults)
+        {
+            let mut fixed = g.opts.clone();
+            Self::normalize_options(
+                &mut fixed,
+                Some(crate::TcpOptionPolicy::FixedTcpDefaults),
+                g.local.is_some(),
+            )?;
+            return fixed.get(level, name, out);
+        }
         if crate::mcast::handles(level, name) {
             return g.opts.get_mcast(&self.net, level, name, out);
         }
@@ -1859,6 +2321,9 @@ impl TcpSocket {
     /// without copying and an empty buffer leaves with `MSG_TRUNC` set.
     fn recv_urgent(&self, buf: &mut [u8], flags: MsgFlags) -> NetResult<RecvMsg> {
         let g = self.lock();
+        if g.option_startup {
+            return Err(Errno::EAGAIN);
+        }
         let t = match &g.state {
             State::Listening(_) => return Err(Errno::ENOTCONN),
             State::Connected(t, _) | State::Connecting(t, _) => t.clone(),
@@ -1910,5 +2375,815 @@ impl Drop for TcpSocket {
     /// The kernel dropped its last reference: `close`.
     fn drop(&mut self) {
         self.release_inner(false);
+    }
+}
+
+#[cfg(test)]
+mod option_tests {
+    use super::*;
+    use crate::{Backend, BackendDatagram, InboundSink, NetConfig};
+
+    type Batch = Vec<(i32, i32, Vec<u8>)>;
+    type Done = Box<dyn FnOnce(NetResult<()>) + Send>;
+
+    struct DeferredStream {
+        pending: Mutex<VecDeque<(Batch, Done)>>,
+        synchronous: bool,
+        policy: Mutex<Option<crate::TcpOptionPolicy>>,
+        sync_calls: Mutex<usize>,
+        inline: bool,
+        on_start: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        on_close: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+
+    impl DeferredStream {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                pending: Mutex::default(),
+                synchronous: false,
+                policy: Mutex::new(Some(crate::TcpOptionPolicy::Canonical)),
+                sync_calls: Mutex::new(0),
+                inline: false,
+                on_start: Mutex::new(None),
+                on_close: Mutex::new(None),
+            })
+        }
+
+        fn complete(&self, result: NetResult<()>) -> Batch {
+            let (batch, done) = self.pending.lock().unwrap().pop_front().unwrap();
+            done(result);
+            batch
+        }
+    }
+
+    impl Pollable for DeferredStream {
+        fn poll(&self, _: Option<&mut PollTable<'_>>) -> PollMask {
+            PollMask::OUT | PollMask::WRNORM
+        }
+    }
+
+    impl BackendStream for DeferredStream {
+        fn tcp_option_policy(&self) -> Option<crate::TcpOptionPolicy> {
+            *self.policy.lock().unwrap()
+        }
+        fn async_options(&self) -> bool {
+            !self.synchronous
+        }
+        fn start_options(&self, options: Batch, done: Done) -> NetResult<()> {
+            let hook = self.on_start.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+            if self.inline {
+                done(Ok(()));
+                return Ok(());
+            }
+            self.pending.lock().unwrap().push_back((options, done));
+            Ok(())
+        }
+        fn state(&self) -> StreamState {
+            StreamState::Established
+        }
+        fn read(&self, _: &mut [u8], _: bool) -> NetResult<usize> {
+            Err(Errno::EAGAIN)
+        }
+        fn write(&self, data: &[u8]) -> NetResult<usize> {
+            Ok(data.len())
+        }
+        fn write_urgent(&self, _: &[u8]) -> NetResult<usize> {
+            Err(Errno::EOPNOTSUPP)
+        }
+        fn read_urgent(&self, _: bool) -> NetResult<u8> {
+            Err(Errno::EAGAIN)
+        }
+        fn at_mark(&self) -> bool {
+            false
+        }
+        fn shutdown(&self, _: Shutdown) -> NetResult<()> {
+            Ok(())
+        }
+        fn take_error(&self) -> Option<Errno> {
+            None
+        }
+        fn peer_addr(&self) -> SocketAddr {
+            addr("192.0.2.1:80")
+        }
+        fn input_len(&self) -> usize {
+            0
+        }
+        fn set_option(&self, level: i32, name: i32, _: &[u8]) -> NetResult<()> {
+            *self.sync_calls.lock().unwrap() += 1;
+            if (level, name) == (SocketLevel::SOL_SOCKET.0, SocketOption::SO_LINGER.0) {
+                let hook = self.on_close.lock().unwrap().take();
+                if let Some(hook) = hook {
+                    hook();
+                    // Completing on close is legal outside this transport's lock.
+                    let pending = self.pending.lock().unwrap().pop_front();
+                    if let Some((_, done)) = pending {
+                        done(Err(Errno::ECANCELED));
+                    }
+                }
+            }
+            Err(Errno::EPERM)
+        }
+    }
+
+    struct TestBackend(Arc<DeferredStream>);
+    impl Backend for TestBackend {
+        fn connect(&self, _: SocketAddr, _: WaitQueue) -> NetResult<Arc<dyn BackendStream>> {
+            Ok(self.0.clone())
+        }
+        fn datagram(&self, _: Domain, _: WaitQueue) -> NetResult<Arc<dyn BackendDatagram>> {
+            Err(Errno::EOPNOTSUPP)
+        }
+        fn publish(
+            &self,
+            _: SocketAddr,
+            _: u32,
+            _: Arc<dyn InboundSink>,
+        ) -> Result<Box<dyn Publication>, std::io::Error> {
+            Err(std::io::ErrorKind::Unsupported.into())
+        }
+    }
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    fn connected(stream: Arc<DeferredStream>) -> Arc<TcpSocket> {
+        TcpSocket::with_state(
+            Net::new(NetConfig::default(), None),
+            Domain::Inet,
+            1,
+            SockOpts::new(SocketKind::Stream, Domain::Inet),
+            None,
+            State::Connected(Transport::Remote(stream), addr("192.0.2.1:80")),
+            WaitQueue::new(),
+        )
+    }
+
+    fn admission(socket: &TcpSocket, value: i32) -> Box<dyn OptionAdmission> {
+        socket
+            .set_option_admission(
+                SocketLevel::SOL_TCP.0,
+                TcpOption::TCP_NODELAY.0,
+                &value.to_le_bytes(),
+            )
+            .unwrap()
+            .unwrap()
+    }
+
+    fn nodelay(socket: &dyn Socket) -> i32 {
+        let mut value = [0; 4];
+        assert_eq!(
+            socket.get_option(SocketLevel::SOL_TCP.0, TcpOption::TCP_NODELAY.0, &mut value),
+            Ok(4)
+        );
+        i32::from_le_bytes(value)
+    }
+
+    #[test]
+    fn async_option_ack_serializes_competing_updates_and_preserves_unrelated_fields() {
+        let stream = DeferredStream::new();
+        let socket = connected(stream.clone());
+        let first = admission(&socket, 1);
+        let second = admission(&socket, 0);
+        assert_eq!(first.complete_result(), None);
+        assert_eq!(second.complete_result(), None);
+        assert_eq!(stream.pending.lock().unwrap().len(), 1);
+        assert_eq!(nodelay(&*socket), 0);
+        socket
+            .set_option(
+                SocketLevel::SOL_SOCKET.0,
+                SocketOption::SO_REUSEADDR.0,
+                &1i32.to_le_bytes(),
+            )
+            .unwrap();
+        let first_batch = stream.complete(Ok(()));
+        assert_eq!(
+            first_batch,
+            vec![(
+                SocketLevel::SOL_TCP.0,
+                TcpOption::TCP_NODELAY.0,
+                1i32.to_le_bytes().to_vec()
+            )]
+        );
+        assert_eq!(first.complete_result(), Some(Ok(())));
+        assert_eq!(nodelay(&*socket), 1);
+        assert!(socket.inner.lock().unwrap().opts.reuseaddr);
+        assert_eq!(second.complete_result(), None);
+        stream.complete(Ok(()));
+        assert_eq!(second.complete_result(), Some(Ok(())));
+        assert_eq!(nodelay(&*socket), 0);
+        assert!(socket.inner.lock().unwrap().opts.reuseaddr);
+    }
+
+    #[test]
+    fn completed_eagain_is_terminal_and_failed_option_does_not_commit() {
+        let stream = DeferredStream::new();
+        let socket = connected(stream.clone());
+        let request = admission(&socket, 1);
+        assert_eq!(request.complete_result(), None);
+        stream.complete(Err(Errno::EAGAIN));
+        assert_eq!(request.complete_result(), Some(Err(Errno::EAGAIN)));
+        assert!(request.poll(None).contains(PollMask::ERR));
+        assert_eq!(request.complete_result(), Some(Err(Errno::EAGAIN)));
+        assert!(stream.pending.lock().unwrap().is_empty());
+        assert_eq!(nodelay(&*socket), 0);
+    }
+
+    #[test]
+    fn admitted_work_survives_waiter_drop_but_unadmitted_work_does_not_start() {
+        let stream = DeferredStream::new();
+        let socket = connected(stream.clone());
+        let first = admission(&socket, 1);
+        assert_eq!(first.complete_result(), None);
+        drop(first);
+        let abandoned = admission(&socket, 0);
+        assert_eq!(abandoned.complete_result(), None);
+        drop(abandoned);
+        assert_eq!(stream.pending.lock().unwrap().len(), 1);
+        stream.complete(Ok(()));
+        assert_eq!(nodelay(&*socket), 1);
+        assert!(socket.inner.lock().unwrap().option_active.is_none());
+        assert!(stream.pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn close_invalidates_all_waiters_and_late_ack_cannot_commit_or_hold_socket() {
+        let stream = DeferredStream::new();
+        let socket = connected(stream.clone());
+        let weak = Arc::downgrade(&socket);
+        let first = admission(&socket, 1);
+        let second = admission(&socket, 0);
+        assert_eq!(first.complete_result(), None);
+        assert_eq!(second.complete_result(), None);
+        socket.release_inner(true);
+        assert_eq!(first.complete_result(), Some(Err(Errno::ECANCELED)));
+        assert_eq!(second.complete_result(), Some(Err(Errno::ECANCELED)));
+        assert_eq!(nodelay(&*socket), 0);
+        drop(socket);
+        assert!(weak.upgrade().is_none());
+        stream.complete(Ok(()));
+        assert_eq!(first.complete_result(), Some(Err(Errno::ECANCELED)));
+    }
+
+    #[test]
+    fn connect_startup_ack_gates_established_and_replays_preconnect_options() {
+        let stream = DeferredStream::new();
+        let net = Net::new(
+            NetConfig::host_default(),
+            Some(Arc::new(TestBackend(stream.clone()))),
+        );
+        let socket = TcpSocket::new(net, Domain::Inet, 1);
+        socket
+            .set_option(
+                SocketLevel::SOL_TCP.0,
+                TcpOption::TCP_NODELAY.0,
+                &1i32.to_le_bytes(),
+            )
+            .unwrap();
+        assert_eq!(
+            socket.connect(addr("192.0.2.1:80")),
+            Err(Errno::EINPROGRESS)
+        );
+        assert!(!socket.poll(None).contains(PollMask::OUT));
+        let update = admission(&socket, 0);
+        assert_eq!(update.complete_result(), None);
+        assert_eq!(stream.pending.lock().unwrap().len(), 1);
+        let batch = stream.complete(Ok(()));
+        assert_eq!(
+            batch,
+            vec![(
+                SocketLevel::SOL_TCP.0,
+                TcpOption::TCP_NODELAY.0,
+                1i32.to_le_bytes().to_vec()
+            )]
+        );
+        assert!(socket.poll(None).contains(PollMask::OUT));
+        assert_eq!(update.complete_result(), None);
+        stream.complete(Ok(()));
+        assert_eq!(update.complete_result(), Some(Ok(())));
+        assert_eq!(nodelay(&*socket), 0);
+    }
+
+    #[test]
+    fn pending_stream_startup_marker_prevents_snapshot_bypass() {
+        let stream = DeferredStream::new();
+        let pending = PendingStream::new(addr("192.0.2.1:80"), WaitQueue::new());
+        let socket = TcpSocket::with_state(
+            Net::new(NetConfig::default(), None),
+            Domain::Inet,
+            1,
+            SockOpts::new(SocketKind::Stream, Domain::Inet),
+            None,
+            State::Connecting(Transport::Remote(pending.clone()), addr("192.0.2.1:80")),
+            WaitQueue::new(),
+        );
+        socket.inner.lock().unwrap().option_factory = true;
+        assert!(
+            socket
+                .set_option_admission(
+                    SocketLevel::SOL_TCP.0,
+                    TcpOption::TCP_NODELAY.0,
+                    &1i32.to_le_bytes(),
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(nodelay(&*socket), 1);
+        let actual: Arc<dyn BackendStream> = stream.clone();
+        let (txn, batch) = {
+            let mut g = socket.inner.lock().unwrap();
+            socket
+                .prepare_options(&mut g, &actual, Weak::new())
+                .unwrap()
+        };
+        assert!(!pending.async_options());
+        let update = admission(&socket, 0);
+        assert_eq!(update.complete_result(), None);
+        assert_eq!(
+            socket.set_option(
+                SocketLevel::SOL_TCP.0,
+                TcpOption::TCP_NODELAY.0,
+                &0i32.to_le_bytes()
+            ),
+            Err(Errno::EOPNOTSUPP)
+        );
+        assert_eq!(nodelay(&*socket), 1);
+        pending.complete(Ok(actual.clone()));
+        TcpSocket::dispatch_options(txn, actual, batch);
+        stream.complete(Ok(()));
+        assert_eq!(update.complete_result(), None);
+        stream.complete(Ok(()));
+        assert_eq!(update.complete_result(), Some(Ok(())));
+        assert_eq!(nodelay(&*socket), 0);
+    }
+
+    #[test]
+    fn accepted_startup_gates_same_queue_and_error_does_not_poison_listener() {
+        let listener = TcpSocket::new(Net::new(NetConfig::default(), None), Domain::Inet, 1);
+        let local = addr("127.0.0.1:8080");
+        let peer = addr("127.0.0.1:12000");
+        listener.bind(local, false).unwrap();
+        listener.listen(8).unwrap();
+        listener
+            .set_option(
+                SocketLevel::SOL_TCP.0,
+                TcpOption::TCP_NODELAY.0,
+                &1i32.to_le_bytes(),
+            )
+            .unwrap();
+        let first = DeferredStream::new();
+        assert!(matches!(
+            listener.incoming_remote(first.clone(), WaitQueue::new(), local, peer),
+            Offer::Queued
+        ));
+        assert!(!listener.poll(None).contains(PollMask::IN));
+        assert_eq!(listener.accept().unwrap_err(), Errno::EAGAIN);
+        first.complete(Err(Errno::EPERM));
+        assert!(listener.poll(None).contains(PollMask::IN));
+        assert_eq!(listener.accept().unwrap_err(), Errno::EPERM);
+        assert_eq!(listener.accept().unwrap_err(), Errno::EAGAIN);
+        let next = DeferredStream::new();
+        assert!(matches!(
+            listener.incoming_remote(next.clone(), WaitQueue::new(), local, peer),
+            Offer::Queued
+        ));
+        next.complete(Ok(()));
+        let accepted = listener.accept().unwrap();
+        assert_eq!(nodelay(&*accepted.socket), 1);
+        assert_eq!(listener.accept().unwrap_err(), Errno::EAGAIN);
+    }
+
+    #[test]
+    fn old_ack_does_not_commit_into_replacement_even_if_transport_arc_is_reused() {
+        let stream = DeferredStream::new();
+        let socket = connected(stream.clone());
+        let old = admission(&socket, 1);
+        assert_eq!(old.complete_result(), None);
+        socket.disconnect().unwrap();
+        socket.inner.lock().unwrap().state =
+            State::Connected(Transport::Remote(stream.clone()), addr("192.0.2.1:80"));
+        let new = admission(&socket, 0);
+        assert_eq!(new.complete_result(), None);
+        stream.complete(Ok(()));
+        assert_eq!(old.complete_result(), Some(Err(Errno::ECANCELED)));
+        assert_eq!(new.complete_result(), None);
+        assert_eq!(nodelay(&*socket), 0);
+        stream.complete(Ok(()));
+        assert_eq!(new.complete_result(), Some(Ok(())));
+    }
+
+    #[test]
+    fn synchronous_backend_keeps_original_setter_error_and_replay_path() {
+        let stream = Arc::new(DeferredStream {
+            pending: Mutex::default(),
+            synchronous: true,
+            policy: Mutex::new(Some(crate::TcpOptionPolicy::Canonical)),
+            sync_calls: Mutex::new(0),
+            inline: false,
+            on_start: Mutex::new(None),
+            on_close: Mutex::new(None),
+        });
+        let socket = connected(stream.clone());
+        assert!(matches!(
+            socket.set_option_admission(
+                SocketLevel::SOL_TCP.0,
+                TcpOption::TCP_NODELAY.0,
+                &1i32.to_le_bytes()
+            ),
+            Err(Errno::EPERM)
+        ));
+        assert_eq!(*stream.sync_calls.lock().unwrap(), 1);
+        assert_eq!(
+            socket.set_option(
+                SocketLevel::SOL_TCP.0,
+                TcpOption::TCP_NODELAY.0,
+                &1i32.to_le_bytes()
+            ),
+            Err(Errno::EPERM)
+        );
+        assert_eq!(nodelay(&*socket), 1);
+        assert!(stream.pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn inline_completion_and_reentrant_admission_run_outside_socket_locks() {
+        let stream = Arc::new(DeferredStream {
+            pending: Mutex::default(),
+            synchronous: false,
+            policy: Mutex::new(Some(crate::TcpOptionPolicy::Canonical)),
+            sync_calls: Mutex::new(0),
+            inline: true,
+            on_start: Mutex::new(None),
+            on_close: Mutex::new(None),
+        });
+        let socket = connected(stream.clone());
+        let reentrant = socket.clone();
+        *stream.on_start.lock().unwrap() = Some(Box::new(move || {
+            assert_eq!(nodelay(&*reentrant), 0);
+            let competing = admission(&reentrant, 0);
+            assert_eq!(competing.complete_result(), None);
+        }));
+        let first = admission(&socket, 1);
+        assert_eq!(first.complete_result(), Some(Ok(())));
+        assert_eq!(nodelay(&*socket), 1);
+        assert!(socket.inner.lock().unwrap().option_active.is_none());
+    }
+
+    #[test]
+    fn disabling_linger_is_an_owned_physical_update_not_a_replay_omission() {
+        let stream = DeferredStream::new();
+        let socket = connected(stream.clone());
+        let mut enabled = 1i32.to_le_bytes().to_vec();
+        enabled.extend(7i32.to_le_bytes());
+        let first = socket
+            .set_option_admission(
+                SocketLevel::SOL_SOCKET.0,
+                SocketOption::SO_LINGER.0,
+                &enabled,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.complete_result(), None);
+        stream.complete(Ok(()));
+        assert_eq!(socket.inner.lock().unwrap().opts.linger, Some(7));
+        let disabled = [0; 8];
+        let second = socket
+            .set_option_admission(
+                SocketLevel::SOL_SOCKET.0,
+                SocketOption::SO_LINGER.0,
+                &disabled,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.complete_result(), None);
+        assert_eq!(socket.inner.lock().unwrap().opts.linger, Some(7));
+        assert_eq!(
+            stream.complete(Ok(())),
+            vec![(
+                SocketLevel::SOL_SOCKET.0,
+                SocketOption::SO_LINGER.0,
+                disabled.to_vec()
+            )]
+        );
+        assert_eq!(second.complete_result(), Some(Ok(())));
+        assert_eq!(socket.inner.lock().unwrap().opts.linger, None);
+    }
+
+    #[test]
+    fn disconnect_closes_opted_transport_outside_lock_with_inline_option_completion() {
+        let stream = DeferredStream::new();
+        let socket = connected(stream.clone());
+        let request = admission(&socket, 1);
+        assert_eq!(request.complete_result(), None);
+        let reentrant = socket.clone();
+        *stream.on_close.lock().unwrap() = Some(Box::new(move || {
+            // Fail directly rather than deadlocking the test if close still owns Inner.
+            assert!(reentrant.inner.try_lock().is_ok());
+            assert_eq!(nodelay(&*reentrant), 0);
+        }));
+        socket.disconnect().unwrap();
+        assert!(stream.pending.lock().unwrap().is_empty());
+        assert_eq!(request.complete_result(), Some(Err(Errno::ECANCELED)));
+        assert!(matches!(socket.inner.lock().unwrap().state, State::Closed));
+    }
+
+    #[test]
+    fn connecting_shutdown_closes_outside_lock_with_inline_startup_completion() {
+        let stream = DeferredStream::new();
+        let net = Net::new(
+            NetConfig::host_default(),
+            Some(Arc::new(TestBackend(stream.clone()))),
+        );
+        let socket = TcpSocket::new(net, Domain::Inet, 1);
+        assert_eq!(
+            socket.connect(addr("192.0.2.1:80")),
+            Err(Errno::EINPROGRESS)
+        );
+        assert!(socket.inner.lock().unwrap().option_startup);
+        let update = admission(&socket, 1);
+        assert_eq!(update.complete_result(), None);
+        let reentrant = socket.clone();
+        *stream.on_close.lock().unwrap() = Some(Box::new(move || {
+            assert!(reentrant.inner.try_lock().is_ok());
+            assert_eq!(nodelay(&*reentrant), 0);
+        }));
+        socket.shutdown(Shutdown::Both).unwrap();
+        assert!(stream.pending.lock().unwrap().is_empty());
+        assert_eq!(update.complete_result(), Some(Err(Errno::ECANCELED)));
+        let g = socket.inner.lock().unwrap();
+        assert!(matches!(g.state, State::Closed));
+        assert!(g.option_active.is_none());
+        assert!(!g.option_startup);
+    }
+
+    fn profiled(policy: Option<crate::TcpOptionPolicy>) -> Arc<DeferredStream> {
+        let stream = DeferredStream::new();
+        *stream.policy.lock().unwrap() = policy;
+        stream
+    }
+
+    fn profile_startup(socket: &Arc<TcpSocket>, stream: &Arc<DeferredStream>) -> Arc<OptionTxn> {
+        let (txn, batch) = {
+            let mut g = socket.inner.lock().unwrap();
+            let target: Arc<dyn BackendStream> = stream.clone();
+            socket
+                .prepare_options(&mut g, &target, Weak::new())
+                .unwrap()
+        };
+        TcpSocket::dispatch_options(txn.clone(), stream.clone(), batch);
+        txn
+    }
+
+    fn profile_get(socket: &dyn Socket, level: i32, name: i32) -> Vec<u8> {
+        let mut value = [0xaa; 8];
+        let n = socket.get_option(level, name, &mut value).unwrap();
+        value[..n].to_vec()
+    }
+
+    #[test]
+    fn fixed_profile_initial_getters_and_empty_startup_preserve_layout_before_publication() {
+        let stream = profiled(Some(crate::TcpOptionPolicy::FixedTcpDefaults));
+        let socket = connected(stream.clone());
+        assert_eq!(nodelay(&*socket), 1);
+        assert_eq!(
+            profile_get(
+                &*socket,
+                SocketLevel::SOL_SOCKET.0,
+                SocketOption::SO_KEEPALIVE.0
+            ),
+            0i32.to_le_bytes()
+        );
+        assert_eq!(
+            profile_get(
+                &*socket,
+                SocketLevel::SOL_SOCKET.0,
+                SocketOption::SO_LINGER.0
+            ),
+            [0; 8]
+        );
+        let mut short = [0xaa; 2];
+        assert_eq!(
+            socket.get_option(SocketLevel::SOL_TCP.0, TcpOption::TCP_NODELAY.0, &mut short),
+            Ok(2)
+        );
+        assert_eq!(short, [1, 0]);
+        let txn = profile_startup(&socket, &stream);
+        assert_eq!(txn.result(), None);
+        assert!(socket.inner.lock().unwrap().option_startup);
+        assert_eq!(
+            socket
+                .inner
+                .lock()
+                .unwrap()
+                .opts
+                .int(SocketLevel::SOL_TCP.0, TcpOption::TCP_NODELAY.0),
+            0
+        );
+        assert!(stream.complete(Ok(())).is_empty());
+        assert_eq!(txn.result(), Some(Ok(())));
+        let g = socket.inner.lock().unwrap();
+        assert!(!g.option_startup);
+        assert_eq!(
+            g.opts.int(SocketLevel::SOL_TCP.0, TcpOption::TCP_NODELAY.0),
+            1
+        );
+        assert_eq!(
+            g.opts
+                .int(SocketLevel::SOL_SOCKET.0, SocketOption::SO_KEEPALIVE.0),
+            0
+        );
+        assert_eq!(g.opts.linger, None);
+    }
+
+    #[test]
+    fn fixed_profile_inherited_startup_and_requested_updates_keep_actual_channel_values() {
+        let parent = TcpSocket::new(Net::new(NetConfig::default(), None), Domain::Inet, 1);
+        parent
+            .set_option(
+                SocketLevel::SOL_TCP.0,
+                TcpOption::TCP_NODELAY.0,
+                &0i32.to_le_bytes(),
+            )
+            .unwrap();
+        parent
+            .set_option(
+                SocketLevel::SOL_SOCKET.0,
+                SocketOption::SO_KEEPALIVE.0,
+                &1i32.to_le_bytes(),
+            )
+            .unwrap();
+        parent
+            .set_option(
+                SocketLevel::SOL_SOCKET.0,
+                SocketOption::SO_LINGER.0,
+                &[1, 0, 0, 0, 0, 0, 0, 0],
+            )
+            .unwrap();
+        let stream = profiled(Some(crate::TcpOptionPolicy::FixedTcpDefaults));
+        let socket = parent.new_child(
+            addr("127.0.0.1:12345"),
+            addr("127.0.0.1:23456"),
+            WaitQueue::new(),
+            |_, _| Transport::Remote(stream.clone()),
+        );
+        let txn = profile_startup(&socket, &stream);
+        assert_eq!(stream.complete(Ok(())).len(), 3);
+        assert_eq!(txn.result(), Some(Ok(())));
+        assert_eq!(parent.inner.lock().unwrap().opts.linger, Some(0));
+        for (level, name, value) in [
+            (
+                SocketLevel::SOL_TCP.0,
+                TcpOption::TCP_NODELAY.0,
+                0i32.to_le_bytes().to_vec(),
+            ),
+            (
+                SocketLevel::SOL_SOCKET.0,
+                SocketOption::SO_KEEPALIVE.0,
+                1i32.to_le_bytes().to_vec(),
+            ),
+            (
+                SocketLevel::SOL_SOCKET.0,
+                SocketOption::SO_LINGER.0,
+                vec![1, 0, 0, 0, 0, 0, 0, 0],
+            ),
+        ] {
+            let update = socket
+                .set_option_admission(level, name, &value)
+                .unwrap()
+                .unwrap();
+            assert_eq!(update.complete_result(), None);
+            stream.complete(Ok(()));
+            assert_eq!(update.complete_result(), Some(Ok(())));
+        }
+        assert_eq!(nodelay(&*socket), 1);
+        assert_eq!(
+            profile_get(
+                &*socket,
+                SocketLevel::SOL_SOCKET.0,
+                SocketOption::SO_KEEPALIVE.0
+            ),
+            0i32.to_le_bytes()
+        );
+        assert_eq!(
+            profile_get(
+                &*socket,
+                SocketLevel::SOL_SOCKET.0,
+                SocketOption::SO_LINGER.0
+            ),
+            [0; 8]
+        );
+        socket.release_inner(false);
+        assert_eq!(*stream.sync_calls.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn stored_profile_keeps_requested_metadata_without_linger_derived_close() {
+        let stream = profiled(Some(crate::TcpOptionPolicy::StoredLingerWithoutClose));
+        let socket = connected(stream.clone());
+        for (level, name, value) in [
+            (
+                SocketLevel::SOL_TCP.0,
+                TcpOption::TCP_NODELAY.0,
+                1i32.to_le_bytes().to_vec(),
+            ),
+            (
+                SocketLevel::SOL_SOCKET.0,
+                SocketOption::SO_KEEPALIVE.0,
+                1i32.to_le_bytes().to_vec(),
+            ),
+            (
+                SocketLevel::SOL_SOCKET.0,
+                SocketOption::SO_LINGER.0,
+                vec![1, 0, 0, 0, 0, 0, 0, 0],
+            ),
+        ] {
+            let update = socket
+                .set_option_admission(level, name, &value)
+                .unwrap()
+                .unwrap();
+            assert_eq!(update.complete_result(), None);
+            stream.complete(Ok(()));
+            assert_eq!(update.complete_result(), Some(Ok(())));
+            assert_eq!(profile_get(&*socket, level, name), value);
+        }
+        socket.release_inner(false);
+        assert_eq!(*stream.sync_calls.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn profile_unknown_and_metadata_do_not_fabricate_normal_abort_but_explicit_abort_is_retained() {
+        for (policy, normal) in [
+            (None, 0),
+            (Some(crate::TcpOptionPolicy::FixedTcpDefaults), 0),
+            (Some(crate::TcpOptionPolicy::StoredLingerWithoutClose), 0),
+            (Some(crate::TcpOptionPolicy::Canonical), 1),
+        ] {
+            for abort in [false, true] {
+                let stream = profiled(policy);
+                let socket = connected(stream.clone());
+                socket.inner.lock().unwrap().opts.linger = Some(0);
+                socket.release_inner(abort);
+                assert_eq!(
+                    *stream.sync_calls.lock().unwrap(),
+                    if abort { 1 } else { normal }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fixed_profile_failed_completion_and_invalid_request_preserve_storage_and_original_error() {
+        let stream = profiled(Some(crate::TcpOptionPolicy::FixedTcpDefaults));
+        let socket = connected(stream.clone());
+        assert!(matches!(
+            socket.set_option_admission(
+                SocketLevel::SOL_SOCKET.0,
+                SocketOption::SO_LINGER.0,
+                &[1, 0, 0, 0]
+            ),
+            Err(Errno::EINVAL)
+        ));
+        assert!(stream.pending.lock().unwrap().is_empty());
+        let update = admission(&socket, 0);
+        assert_eq!(update.complete_result(), None);
+        stream.complete(Err(Errno::EACCES));
+        assert_eq!(update.complete_result(), Some(Err(Errno::EACCES)));
+        assert_eq!(
+            socket
+                .inner
+                .lock()
+                .unwrap()
+                .opts
+                .int(SocketLevel::SOL_TCP.0, TcpOption::TCP_NODELAY.0),
+            0
+        );
+        assert_eq!(nodelay(&*socket), 1);
+        assert!(socket.inner.lock().unwrap().option_active.is_none());
+    }
+
+    #[test]
+    fn fixed_profile_late_old_resource_completion_cannot_normalize_replacement() {
+        let old = profiled(Some(crate::TcpOptionPolicy::FixedTcpDefaults));
+        let socket = connected(old.clone());
+        let update = admission(&socket, 0);
+        assert_eq!(update.complete_result(), None);
+        let replacement = DeferredStream::new();
+        socket.inner.lock().unwrap().state =
+            State::Connected(Transport::Remote(replacement), addr("192.0.2.1:81"));
+        old.complete(Ok(()));
+        assert_eq!(update.complete_result(), Some(Err(Errno::ECANCELED)));
+        assert_eq!(nodelay(&*socket), 0);
+        assert_eq!(
+            socket
+                .inner
+                .lock()
+                .unwrap()
+                .opts
+                .int(SocketLevel::SOL_TCP.0, TcpOption::TCP_NODELAY.0),
+            0
+        );
     }
 }

@@ -3,7 +3,7 @@ use futures_util::task::AtomicWaker;
 use std::{
     collections::{BTreeMap, VecDeque},
     net::SocketAddr,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
 };
 use wasixv2_abi::Errno;
 use wasixv2_vnet::{
@@ -48,6 +48,7 @@ pub(crate) struct Inner {
     pub listeners: BTreeMap<u64, Listener>,
     pub lookups: BTreeMap<u64, Query>,
     pub controls: VecDeque<crate::provider::Transaction>,
+    pub selected_close: Option<Arc<[Arc<crate::endpoints::Resource>]>>,
 }
 impl Inner {
     pub fn id(&mut self) -> Result<u64, Errno> {
@@ -55,7 +56,7 @@ impl Inner {
         self.next_id = id.checked_add(1).ok_or(Errno::ENOBUFS)?;
         Ok(id)
     }
-    fn room(&self, config: Config) -> Result<(), Errno> {
+    pub(crate) fn room(&self, config: Config) -> Result<(), Errno> {
         if !self.online {
             return Err(Errno::ENETDOWN);
         }
@@ -78,6 +79,9 @@ pub(crate) struct Listener {
     pub released: bool,
     pub child: Option<u64>,
     pub binding: Option<Arc<Binding>>,
+    pub selected: Option<Arc<crate::endpoints::Resource>>,
+    pub endpoint: Option<Arc<crate::endpoints::MemberSink>>,
+    pub backlog: u32,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Kind {
@@ -89,8 +93,13 @@ pub(crate) struct Packet {
     pub addr: SocketAddr,
 }
 pub(crate) struct Flow {
+    /// SAME actual-resource metadata retained by every live Stream even after
+    /// map retirement. Never queries Page or reselects a provider.
+    pub tcp_policy: Arc<OnceLock<wasixv2_vnet::TcpOptionPolicy>>,
+    pub options: Option<crate::options::Batch>,
     pub kind: Kind,
     pub binding: Option<Arc<Binding>>,
+    pub selected: Option<Arc<crate::endpoints::Resource>>,
     pub peer: SocketAddr,
     pub connected_peer: Option<SocketAddr>,
     pub wq: WaitQueue,
@@ -110,7 +119,7 @@ pub(crate) struct Flow {
     pub attached: bool,
     pub tx: VecDeque<u8>,
     pub incoming: VecDeque<Packet>,
-    pub outgoing: VecDeque<Packet>,
+    pub outgoing: VecDeque<crate::datagram::Output>,
     pub incoming_bytes: usize,
     pub outgoing_bytes: usize,
     pub inflight: Option<(u64, usize)>,
@@ -122,10 +131,23 @@ pub(crate) struct Flow {
     pub sent_write_shut: bool,
 }
 impl Flow {
+    /// Selected phases, rather than Connecting, exclusively admit provider work.
+    pub fn selected_stream(
+        peer: SocketAddr,
+        wq: WaitQueue,
+        resource: Arc<crate::endpoints::Resource>,
+    ) -> Self {
+        let mut flow = Self::new(Kind::Stream, peer, wq);
+        flow.selected = Some(resource);
+        flow
+    }
     pub fn new(kind: Kind, peer: SocketAddr, wq: WaitQueue) -> Self {
         Self {
+            tcp_policy: Arc::new(OnceLock::new()),
+            options: None,
             kind,
             binding: None,
+            selected: None,
             peer,
             connected_peer: None,
             wq,
@@ -164,8 +186,14 @@ impl Flow {
         self.read_shut = true;
         self.write_shut = true;
         self.tx.clear();
-        self.outgoing.clear();
-        self.outgoing_bytes = 0;
+        // Accepted readback callbacks are retired by the driver, outside ALL locks.
+        self.outgoing
+            .retain(|entry| matches!(entry, crate::datagram::Output::Readback { .. }));
+        self.outgoing_bytes = self
+            .outgoing
+            .iter()
+            .map(crate::datagram::Output::charge)
+            .sum();
         self.inflight = None;
     }
     pub fn mask(&self, config: Config) -> PollMask {
@@ -192,7 +220,12 @@ impl Flow {
         if self.rx.readable(1, self.oob_inline) || self.read_shut {
             mask |= PollMask::READABLE;
         }
-        if (self.tx.len() < config.buffer_bytes && !self.send_blocked) || self.write_shut {
+        // The selected callback profile arms send_blocked at dispatch as a
+        // readiness latch. While that send is still inflight, guest writes may
+        // keep filling the SAME bounded queue just as before; only a terminal
+        // EAGAIN with no later Writable suppresses OUT.
+        let can_buffer = !self.send_blocked || self.inflight.is_some_and(|(_, size)| size > 0);
+        if (self.tx.len() < config.buffer_bytes && can_buffer) || self.write_shut {
             mask |= PollMask::WRITABLE;
         }
         if self.read_shut {
@@ -233,6 +266,7 @@ impl WebBackend {
                 listeners: BTreeMap::new(),
                 lookups: BTreeMap::new(),
                 controls: VecDeque::new(),
+                selected_close: None,
             }),
             wake: AtomicWaker::new(),
             failures: Mutex::new(VecDeque::new()),
@@ -262,11 +296,12 @@ impl WebBackend {
         inner.generation = inner.generation.checked_add(1).ok_or(Errno::ENOBUFS)?;
         inner.capabilities = capabilities;
         inner.online = true;
+        inner.selected_close = None;
         Ok(Driver::new(self.shared.clone(), inner.generation))
     }
 }
 
-fn family_allowed(capabilities: Capabilities, addr: SocketAddr) -> Result<(), Errno> {
+pub(crate) fn family_allowed(capabilities: Capabilities, addr: SocketAddr) -> Result<(), Errno> {
     if addr.is_ipv6() && !capabilities.ipv6 {
         Err(Errno::EAFNOSUPPORT)
     } else {
@@ -288,10 +323,15 @@ impl Backend for WebBackend {
         }
         family_allowed(inner.capabilities, peer)?;
         let id = inner.id()?;
-        inner.flows.insert(id, Flow::new(Kind::Stream, peer, wq));
+        let async_options = inner.capabilities.async_options;
+        let flow = Flow::new(Kind::Stream, peer, wq);
+        let tcp_policy = flow.tcp_policy.clone();
+        inner.flows.insert(id, flow);
         drop(inner);
         self.shared.wake.wake();
         Ok(Arc::new(Stream {
+            tcp_policy,
+            async_options,
             shared: self.shared.clone(),
             id,
             peer,
@@ -314,6 +354,7 @@ impl Backend for WebBackend {
         Ok(Arc::new(Datagram {
             shared: self.shared.clone(),
             id,
+            peer_only: false,
         }))
     }
     fn publish(
@@ -370,6 +411,8 @@ pub(crate) fn unbound(domain: Domain) -> SocketAddr {
 }
 
 pub(crate) struct Stream {
+    pub tcp_policy: Arc<OnceLock<wasixv2_vnet::TcpOptionPolicy>>,
+    pub async_options: bool,
     pub shared: Arc<Shared>,
     pub id: u64,
     pub peer: SocketAddr,
@@ -387,6 +430,12 @@ impl Stream {
     fn enqueue(&self, data: &[u8], urgent: bool) -> Result<usize, Errno> {
         let mut inner = self.shared.inner.lock().unwrap();
         let flow = inner.flows.get_mut(&self.id).unwrap();
+        if flow.selected.as_ref().is_some_and(|resource| {
+            let state = resource.state.lock().unwrap();
+            state.close_requested || state.closing
+        }) {
+            return Err(Errno::EPIPE);
+        }
         // Linux net/ipv4/tcp.c:tcp_sendmsg_locked consumes sk_err before EPIPE.
         if let Some(error) = flow
             .error
@@ -421,6 +470,56 @@ impl Stream {
     }
 }
 impl BackendStream for Stream {
+    fn tcp_option_policy(&self) -> Option<wasixv2_vnet::TcpOptionPolicy> {
+        if self.async_options {
+            self.tcp_policy.get().copied()
+        } else {
+            Some(wasixv2_vnet::TcpOptionPolicy::Canonical)
+        }
+    }
+    fn async_options(&self) -> bool {
+        self.async_options
+    }
+    fn start_options(
+        &self,
+        options: Vec<(i32, i32, Vec<u8>)>,
+        done: crate::options::Done,
+    ) -> Result<(), Errno> {
+        if !self.async_options {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        let batch = crate::options::Batch::prepare(options, done)?;
+        let mut inner = self.shared.inner.lock().unwrap();
+        if !inner.online {
+            return Err(Errno::ENETDOWN);
+        }
+        let flow = inner.flows.get_mut(&self.id).ok_or(Errno::ECANCELED)?;
+        if flow.released
+            || flow.reset
+            || flow.state == StreamState::Closed
+            || flow.selected.as_ref().is_some_and(|resource| {
+                let state = resource.state.lock().unwrap();
+                state.close_requested || state.closing || state.close.is_some()
+            })
+        {
+            return Err(Errno::ECANCELED);
+        }
+        if flow.options.is_some() {
+            return Err(Errno::EAGAIN);
+        }
+        flow.options = Some(batch);
+        drop(inner);
+        self.shared.wake.wake();
+        Ok(())
+    }
+    fn provider_local_addr(&self) -> Option<Result<SocketAddr, Errno>> {
+        let inner = self.shared.inner.lock().unwrap();
+        inner
+            .flows
+            .get(&self.id)
+            .and_then(|flow| flow.selected.as_ref())
+            .map(|selected| selected.address())
+    }
     fn state(&self) -> StreamState {
         self.shared.inner.lock().unwrap().flows[&self.id].state
     }
@@ -553,9 +652,10 @@ impl Drop for Stream {
     }
 }
 
-struct Datagram {
-    shared: Arc<Shared>,
-    id: u64,
+pub(crate) struct Datagram {
+    pub(crate) shared: Arc<Shared>,
+    pub(crate) id: u64,
+    pub(crate) peer_only: bool,
 }
 impl Pollable for Datagram {
     fn poll(&self, table: Option<&mut PollTable<'_>>) -> PollMask {
@@ -566,11 +666,35 @@ impl Pollable for Datagram {
         self.shared.inner.lock().unwrap().flows[&self.id].mask(self.shared.config)
     }
 }
-impl BackendDatagram for Datagram {
-    fn send_to(&self, data: &[u8], to: SocketAddr) -> Result<usize, Errno> {
+impl Datagram {
+    pub(crate) fn enqueue_to(
+        &self,
+        data: &[u8],
+        to: SocketAddr,
+        source: Option<wasixv2_vnet::endpoint::EndpointSourceId>,
+    ) -> Result<usize, Errno> {
         let mut inner = self.shared.inner.lock().unwrap();
         family_allowed(inner.capabilities, to)?;
-        let flow = inner.flows.get_mut(&self.id).unwrap();
+        let flow = inner.flows.get_mut(&self.id).ok_or(Errno::ECANCELED)?;
+        let _claim = if let Some(source) = source {
+            let state = flow
+                .selected
+                .as_ref()
+                .ok_or(Errno::ECANCELED)?
+                .state
+                .lock()
+                .unwrap();
+            if state.datagram_source != Some(source)
+                || state.close_requested
+                || state.closing
+                || state.close.is_some()
+            {
+                return Err(Errno::ECANCELED);
+            }
+            Some(state)
+        } else {
+            None
+        };
         if let Some(error) = flow
             .error
             .take()
@@ -586,6 +710,14 @@ impl BackendDatagram for Datagram {
         }
         if let Kind::Datagram(domain) = flow.kind
             && (domain == Domain::Inet) != to.is_ipv4()
+            && !(self.peer_only
+                && domain == Domain::Inet6
+                && to.is_ipv4()
+                && flow
+                    .selected
+                    .as_ref()
+                    .and_then(|resource| resource.request)
+                    .is_some_and(|request| !request.v6only))
         {
             return Err(Errno::EAFNOSUPPORT);
         }
@@ -595,14 +727,21 @@ impl BackendDatagram for Datagram {
         if flow.outgoing_bytes + data.len().max(1) > self.shared.config.buffer_bytes {
             return Err(Errno::EAGAIN);
         }
-        flow.outgoing.push_back(Packet {
-            data: data.to_vec(),
-            addr: to,
-        });
+        flow.outgoing
+            .push_back(crate::datagram::Output::Packet(Packet {
+                data: data.to_vec(),
+                addr: to,
+            }));
         flow.outgoing_bytes += data.len().max(1);
+        drop(_claim);
         drop(inner);
         self.shared.wake.wake();
         Ok(data.len())
+    }
+}
+impl BackendDatagram for Datagram {
+    fn send_to(&self, data: &[u8], to: SocketAddr) -> Result<usize, Errno> {
+        self.enqueue_to(data, to, None)
     }
     fn connect(&self, peer: Option<SocketAddr>) -> Result<(), Errno> {
         let mut inner = self.shared.inner.lock().unwrap();
@@ -669,7 +808,30 @@ impl BackendDatagram for Datagram {
             .front()
             .map_or(0, |p| p.data.len())
     }
+    fn start_readback(
+        &self,
+        query: wasixv2_vnet::DatagramReadback,
+        done: crate::datagram::Done,
+    ) -> Option<Result<(), Errno>> {
+        if !self.peer_only {
+            return None;
+        }
+        Some(crate::datagram::enqueue(
+            &self.shared,
+            self.id,
+            crate::datagram::Output::Readback { query, done },
+        ))
+    }
     fn set_option(&self, level: i32, name: i32, value: &[u8]) -> Result<(), Errno> {
+        if self.peer_only
+            && let Some(control) = crate::datagram::control(level, name, value)?
+        {
+            return crate::datagram::enqueue(
+                &self.shared,
+                self.id,
+                crate::datagram::Output::Control(control),
+            );
+        }
         self.shared
             .inner
             .lock()
@@ -698,7 +860,7 @@ impl Drop for Datagram {
     }
 }
 
-fn release(shared: &Arc<Shared>, id: u64) {
+pub(crate) fn release(shared: &Arc<Shared>, id: u64) {
     let mut inner = shared.inner.lock().unwrap();
     let Some(flow) = inner.flows.get_mut(&id) else {
         return;
@@ -710,7 +872,7 @@ fn release(shared: &Arc<Shared>, id: u64) {
     flow.incoming.clear();
     flow.incoming_bytes = 0;
     flow.write_shut = true;
-    if !flow.remote && flow.state == StreamState::Closed {
+    if !flow.remote && flow.state == StreamState::Closed && flow.options.is_none() {
         inner.flows.remove(&id);
     }
     drop(inner);
@@ -757,7 +919,7 @@ impl WebBackend {
     pub(crate) fn start_publish(
         &self,
         host: SocketAddr,
-        _backlog: u32,
+        backlog: u32,
         binding: Option<Arc<Binding>>,
         sink: Arc<dyn InboundSink>,
     ) -> Result<Published, std::io::Error> {
@@ -779,6 +941,9 @@ impl WebBackend {
                 released: false,
                 child: None,
                 binding,
+                selected: None,
+                endpoint: None,
+                backlog,
             },
         );
         drop(inner);
@@ -816,6 +981,7 @@ impl WebBackend {
         let endpoint = Arc::new(Datagram {
             shared: self.shared.clone(),
             id,
+            peer_only: false,
         });
         Ok((endpoint.clone(), DatagramPublication { endpoint, host }))
     }

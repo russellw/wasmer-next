@@ -4,7 +4,7 @@ This private repository contains the engine-independent WASIX kernel, syscall in
 
 ## Workspace
 
-The workspace contains 21 crates under `crates/`:
+The workspace contains 22 crates under `crates/`:
 
 | Crate | Description |
 | --- | --- |
@@ -29,8 +29,11 @@ The workspace contains 21 crates under `crates/`:
 | [wasixv2-record](crates/record) | Placeholder for syscall recording, guest-memory write capture, and replay. |
 | [wasixv2-policy](crates/policy) | Placeholder for syscall filtering and embedder policy enforcement. |
 | [wasixv2-checkpoint](crates/checkpoint) | Placeholder for serializing kernel state and guest memory for checkpoint/restore. |
+| [wlk-native](crates/native) | Linux x86_64 ELF runner with seccomp/ptrace, WLK filesystem, process, volume, and socket bridges. |
 
 The kernel uses engine-free capability traits. Host implementations provide clocks, timers, randomness, standard I/O, task execution, and platform-specific drivers. Engine-specific imports, Store and Instance ownership, guest memory access, and runtime control stay in Wasmer.
+
+The Linux-only `wlk-native` binary runs selected static and dynamically linked x86_64 Linux programs through WLK. It uses unprivileged seccomp and ptrace, creates no namespaces or cgroups, supports repeatable host volume mappings, and resolves dynamic interpreters and libraries through WLK. See [crates/native/README.md](crates/native/README.md) for tested behavior and syscall limits, and [crates/native/TODO.md](crates/native/TODO.md) for follow-up work.
 
 The host crate's optional `terminal` feature provides owned native-terminal handles and
 shared raw-mode leases without an engine or async runtime. The Wasmer facade owns the
@@ -55,6 +58,8 @@ Install Rust 1.96 through rustup. Common checks are:
 
 ```sh
 cargo check --workspace --locked
+cargo test -p wlk-native --test smoke --locked
+cargo run -p wlk-native -- --help
 cargo clippy --workspace --all-targets --locked -- -D clippy::all
 cargo nextest run --workspace --locked
 cargo check -p wasixv2-host --features tokio --locked

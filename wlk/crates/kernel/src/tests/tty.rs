@@ -10,7 +10,7 @@ use std::{
 use futures::FutureExt as _;
 use wasixv2_abi::{
     Idtype, IoctlRequest, OpenFlags, Pid, RusagePtr, SiginfoPtr, Signal, Termios, TermiosCcIndex,
-    TermiosLflag, WaitOptions, Winsize,
+    TermiosLflag, TermiosOflag, WaitOptions, Winsize,
 };
 use wasixv2_host::WindowSize;
 use wasixv2_syscalls::{read_value, write_value};
@@ -157,6 +157,15 @@ fn console_with_outputs(
     outputs: [Option<Arc<dyn ByteSink>>; 3],
     host: Arc<dyn Host>,
 ) -> Console {
+    console_with_options(input_eof, outputs, host, true)
+}
+
+fn console_with_options(
+    input_eof: Option<ConsoleInputEof>,
+    outputs: [Option<Arc<dyn ByteSink>>; 3],
+    host: Arc<dyn Host>,
+    output_processing: bool,
+) -> Console {
     let keyboard = Arc::new(Keyboard::default());
     let screen = Arc::new(Capture::default());
     let clock = Arc::new(HostClock(host.clone()));
@@ -175,9 +184,12 @@ fn console_with_outputs(
     let builder = Kernel::new(host, Arc::new(root))
         .with_shm(Arc::new(shm))
         .with_init();
-    let kernel = match input_eof {
-        Some(input_eof) => builder.with_console_eof(console, input_eof),
-        None => builder.with_console(console),
+    let kernel = match (input_eof, output_processing) {
+        (None, true) => builder.with_console(console),
+        (Some(input_eof), true) => builder.with_console_eof(console, input_eof),
+        (input_eof, false) => {
+            builder.with_console_options(console, input_eof.unwrap_or_default(), false)
+        }
     };
     let vfs = kernel.vfs().clone();
     block_on(vfs.mount(b"/proc", kernel.procfs(), MountFlags::default(), true)).unwrap();
@@ -337,6 +349,28 @@ fn writes_reach_the_host_post_processed() {
     let caller = Caller::new(c.leader, &memory);
     assert_eq!(c.write(&caller, 1, b"one\ntwo"), Ok(7));
     assert_eq!(c.shown(), b"one\r\ntwo");
+}
+
+#[test]
+fn initial_console_output_processing_preserves_literal_lf_and_guest_termios_control() {
+    let c = console_with_options(None, [None, None, None], Arc::new(ThreadHost), false);
+    let memory = memory();
+    let caller = Caller::new(c.leader, &memory);
+    let mut expected = crate::tty::ldisc::std_termios();
+    expected.c_oflag.0 &= !TermiosOflag::OPOST.0;
+    assert_eq!(c.tcgetattr(&caller), expected);
+    assert!(expected.c_oflag.contains(TermiosOflag::ONLCR));
+    assert_eq!(c.write(&caller, 1, b"body\n"), Ok(5));
+    assert_eq!(c.shown(), b"body\n");
+    c.keyboard.type_in(b"echo\r");
+    assert_eq!(c.read(&caller, 64), Ok(b"echo\n".to_vec()));
+    eventually("literal LF echo", || c.shown().ends_with(b"echo\n"));
+    assert_eq!(c.shown(), b"body\necho\n");
+    expected.c_oflag.0 |= TermiosOflag::OPOST.0;
+    assert_eq!(c.tcsetattr(&caller, &expected), Ok(0));
+    assert_eq!(c.write(&caller, 1, b"processed\n"), Ok(10));
+    assert!(c.shown().ends_with(b"processed\r\n"));
+    c.keyboard.unplug();
 }
 
 /// What the host types is edited and echoed by the console, and a read gets the line.
@@ -678,7 +712,10 @@ fn finite_console_empty_eof_does_not_hang_up_the_terminal() {
     assert!(ready.contains(wasixv2_wait::PollMask::READABLE));
     assert!(!ready.contains(wasixv2_wait::PollMask::HUP));
     assert!(!ready.contains(wasixv2_wait::PollMask::ERR));
-    assert_eq!(read.as_mut().now_or_never(), Some(Ok(0)));
+    // Readiness is published before the pump wakes registered readers. Await
+    // this same pending read, including the real wakeup, instead of assuming
+    // both publications finished by the first poll observation.
+    assert_eq!(block_on(read), Ok(0));
     assert!(!c.pending(c.leader, Signal::SIGHUP));
 
     assert_eq!(c.write(&caller, 1, b"still open\n"), Ok(11));

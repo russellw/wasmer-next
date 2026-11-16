@@ -557,6 +557,7 @@ impl Kernel {
             code: why,
             status,
             uid: cred.user.real,
+            execution_fault: None,
         };
         let pid = self.pids.nr(&them.pid_ns, task.0);
         let sig = wasixv2_abi::Signal::SIGCHLD.0;
@@ -1313,6 +1314,7 @@ impl Kernel {
                         code: wasixv2_abi::SiCode::CLD_TRAPPED,
                         status: code,
                         uid: cred.user.real,
+                        execution_fault: None,
                     }),
             };
             if let Some(report) = report {
@@ -1388,16 +1390,18 @@ impl Kernel {
         {
             return;
         }
-        let exit = match self.killed_by(process.pid.0) {
-            Some(sig) => crate::process::Exit {
+        let exit = match self.fatal_completion(process.pid.0) {
+            Some((sig, execution_fault)) => crate::process::Exit {
                 code: wasixv2_abi::SiCode::CLD_KILLED,
                 status: sig,
                 uid: self.task_cred(task).user.real,
+                execution_fault,
             },
             None => crate::process::Exit {
                 code: wasixv2_abi::SiCode::CLD_EXITED,
                 status: code & 0xff,
                 uid: self.task_cred(task).user.real,
+                execution_fault: None,
             },
         };
         if let Some(t) = self.tracees.lock().get_mut(&task) {

@@ -684,6 +684,51 @@ impl Kernel {
         }
     }
 
+    /// Wait on one optional, lazy peer-only readback using the same retained
+    /// fd and canonical blocking machinery as an owned option admission.
+    async fn datagram_readback_value(
+        &self,
+        caller: &Caller<'_>,
+        any: &AnySock,
+        query: wasixv2_vnet::DatagramReadback,
+    ) -> SysResult<Option<wasixv2_vnet::DatagramReadbackValue>> {
+        use wasixv2_wait::Interrupt;
+        let AnySock::Inet((file, sock)) = any else {
+            return Ok(None);
+        };
+        let Some(admission) = sock.socket.datagram_readback_admission(query)? else {
+            return Ok(None);
+        };
+        // Capturing the pure capability/fd accepts no provider work. Deliver
+        // preexisting STOP/KILL/task work before the first poll can admit it.
+        let interrupt = self.interrupt(caller);
+        if interrupt.pending() {
+            return Err(SysErr::Restart);
+        }
+        let mut io = Self::io(caller, &*interrupt, file);
+        io.flags &= !OpenFlags::O_NONBLOCK;
+        let mut wait = socket::Blocking::new(&*self.host, io, MsgFlags::empty(), None);
+        let result = wait
+            .wait(
+                WaitOn::Object(&*admission),
+                PollMask::WRITABLE | PollMask::ERR,
+                || admission.complete_result().ok_or(Errno::EAGAIN),
+            )
+            .await
+            .map_err(|error| match error {
+                // Blocking::wait ALWAYS drives the lazy completion first.
+                // A wait-phase Restart therefore follows accepted pending
+                // work; unlike the pre-poll check above it must not replay the
+                // provider query under SA_RESTART.
+                SysErr::Restart => SysErr::Errno(Errno::EINTR),
+                other => other,
+            })??;
+        if !query.accepts(result) {
+            return Err(Errno::EPROTO.into());
+        }
+        Ok(Some(result))
+    }
+
     /// `__sys_getsockname`.
     pub(crate) async fn sys_getsockname(
         &self,
@@ -704,7 +749,24 @@ impl Kernel {
         addr: SockaddrPtr,
         addrlen: SocklenPtr,
     ) -> SysResult<i32> {
-        let raw = match any_socket_file(file)? {
+        let any = any_socket_file(file)?;
+        let query = if peer {
+            wasixv2_vnet::DatagramReadback::Peer
+        } else {
+            wasixv2_vnet::DatagramReadback::Local
+        };
+        if let Some(value) = self.datagram_readback_value(caller, &any, query).await? {
+            let address = match value {
+                wasixv2_vnet::DatagramReadbackValue::Local(address) => address,
+                wasixv2_vnet::DatagramReadbackValue::Peer(address) => {
+                    address.ok_or(Errno::ENOTCONN)?
+                }
+                _ => return Err(Errno::EPROTO.into()),
+            };
+            move_addr_to_user(caller, &socket::encode(address), addr, addrlen).await?;
+            return Ok(0);
+        }
+        let raw = match any {
             AnySock::Inet((_, sock)) => socket::encode(if peer {
                 sock.socket.peer_addr()?
             } else {
@@ -751,7 +813,24 @@ impl Kernel {
         addr: SockaddrPtr,
         addrlen: SocklenPtr,
     ) -> SysResult<i32> {
-        let raw = match self.any_socket(caller, fd)? {
+        let any = self.any_socket(caller, fd)?;
+        if let Some(value) = self
+            .datagram_readback_value(caller, &any, wasixv2_vnet::DatagramReadback::Peer)
+            .await?
+        {
+            let wasixv2_vnet::DatagramReadbackValue::Peer(address) = value else {
+                return Err(Errno::EPROTO.into());
+            };
+            move_addr_to_user(
+                caller,
+                &socket::encode(address.ok_or(Errno::ENOTCONN)?),
+                addr,
+                addrlen,
+            )
+            .await?;
+            return Ok(0);
+        }
+        let raw = match any {
             AnySock::Inet((_, sock)) => socket::encode(sock.socket.peer_addr()?),
             AnySock::Unix(_, sock) => sock.peer_addr()?,
             AnySock::Netlink(_, nl) => nl.peer_addr(),
@@ -1634,14 +1713,27 @@ impl Kernel {
             {
                 return Err(Errno::EPERM.into());
             }
-            AnySock::Inet((_, sock)) => {
+            AnySock::Inet((file, sock)) => {
                 if level == SocketLevel::SOL_SOCKET
                     && unix::forcing_buffer(name)
                     && !self.cred(caller).capable(Cap::NetAdmin)
                 {
                     return Err(Errno::EPERM.into());
                 }
-                sock.socket.set_option(level.0, name, &value)?
+                if let Some(admission) = sock.socket.set_option_admission(level.0, name, &value)? {
+                    let interrupt = self.interrupt(caller);
+                    // Like bind, setsockopt acquires neither O_NONBLOCK nor
+                    // socket send-timeout semantics from its descriptor.
+                    let mut io = Self::io(caller, &*interrupt, &file);
+                    io.flags &= !OpenFlags::O_NONBLOCK;
+                    let mut wait = socket::Blocking::new(&*self.host, io, MsgFlags::empty(), None);
+                    wait.wait(
+                        WaitOn::Object(&*admission),
+                        PollMask::WRITABLE | PollMask::ERR,
+                        || admission.complete_result().ok_or(Errno::EAGAIN),
+                    )
+                    .await??;
+                }
             }
             // Unix sockets have no options of their own beyond `SOL_SOCKET`.
             AnySock::Unix(..) if level != SocketLevel::SOL_SOCKET => {
@@ -1782,7 +1874,33 @@ impl Kernel {
             write_value(caller.memory(), optlen, &(n as u32)).await?;
             return Ok(0);
         }
-        let out = self.option_value(caller, &any, level, name, len)?;
+        let readback = if let (Some(query), AnySock::Inet((_, sock))) = (
+            wasixv2_vnet::DatagramReadback::from_option(level.0, name),
+            &any,
+        ) {
+            // The closed scalar set contains no consuming SO_ERROR/fixed/BPF
+            // getter. Preserve existing socket-layer level/family precedence
+            // before the optional provider can accept any work.
+            self.socket_option(sock, level, name)?;
+            self.datagram_readback_value(caller, &any, query).await?
+        } else {
+            None
+        };
+        let out = if let Some(value) = readback {
+            let mut out = match value {
+                wasixv2_vnet::DatagramReadbackValue::Ttl(value) => value.to_le_bytes().to_vec(),
+                wasixv2_vnet::DatagramReadbackValue::Flag(value) => {
+                    i32::from(value).to_le_bytes().to_vec()
+                }
+                _ => return Err(Errno::EPROTO.into()),
+            };
+            out.truncate(len.min(out.len()));
+            out
+        } else {
+            // Default None has performed no protocol getter or user callback;
+            // the original getter is invoked exactly once here.
+            self.option_value(caller, &any, level, name, len)?
+        };
         caller.memory().write(optval.addr(), &out).await?;
         write_value(caller.memory(), optlen, &(out.len() as u32)).await?;
         Ok(0)

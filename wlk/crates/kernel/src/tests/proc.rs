@@ -190,6 +190,265 @@ fn a_forked_child_is_reaped_by_its_parent() {
     assert_eq!(word(&memory.0, 32 + 20), 7, "si_status");
 }
 
+/// The optional host completion describes the winning exit, without changing Linux status.
+#[test]
+fn execution_fault_cause_belongs_only_to_the_first_group_exit() {
+    use wasixv2_syscalls::ExecutionFault;
+
+    for status in [0, 1, 45, 132] {
+        let (kernel, task, _) = setup(b"");
+        let memory = forkable();
+        let caller = Caller::new(task, &memory);
+        let child = TaskId(clone(&kernel, &caller, SIGCHLD, 0).unwrap() as u32);
+        kernel.take_pending(task);
+        let child_memory = forkable();
+        let child_caller = Caller::new(child, &child_memory);
+        block_on(kernel.exit_group(&child_caller, status)).unwrap();
+        assert!(!kernel.fault_with_cause(child, Signal::SIGILL.0, ExecutionFault::WasmTrap));
+        assert_eq!(kernel.fatal_completion(child.0), None);
+        let slot = wasixv2_syscalls::WaitCompletionSlot::default();
+        let waiting = Caller::new(task, &memory).with_wait_completion(&slot);
+        block_on(kernel.waitid(
+            &waiting,
+            Idtype::P_PID,
+            child.0 as Pid,
+            SiginfoPtr::new(32),
+            WaitOptions::WEXITED,
+            RusagePtr::NULL,
+        ))
+        .unwrap();
+        let completion = slot.get().unwrap();
+        assert_eq!(completion.code, wasixv2_abi::SiCode::CLD_EXITED);
+        assert_eq!(completion.status, status);
+        assert_eq!(completion.fault, None);
+    }
+
+    for signal in [Signal::SIGILL, Signal::SIGKILL] {
+        let (kernel, task, _) = setup(b"");
+        let memory = forkable();
+        let caller = Caller::new(task, &memory);
+        let child = TaskId(clone(&kernel, &caller, SIGCHLD, 0).unwrap() as u32);
+        kernel.take_pending(task);
+        assert!(kernel.fault(child, signal.0));
+        assert!(!kernel.fault_with_cause(child, Signal::SIGILL.0, ExecutionFault::WasmTrap));
+        assert_eq!(kernel.fatal_completion(child.0), Some((signal.0, None)));
+    }
+
+    let (kernel, task, _) = setup(b"");
+    let memory = forkable();
+    let caller = Caller::new(task, &memory);
+    let child = TaskId(clone(&kernel, &caller, SIGCHLD, 0).unwrap() as u32);
+    kernel.take_pending(task);
+    assert!(kernel.fault_with_cause(child, Signal::SIGILL.0, ExecutionFault::WasmTrap));
+    assert!(!kernel.fault(child, Signal::SIGKILL.0));
+    assert_eq!(
+        kernel.fatal_completion(child.0),
+        Some((Signal::SIGILL.0, Some(ExecutionFault::WasmTrap)))
+    );
+    kernel.note_rebooted(child.0, Signal::SIGHUP.0);
+    assert_eq!(
+        kernel.fatal_completion(child.0),
+        Some((Signal::SIGHUP.0, None))
+    );
+}
+
+#[test]
+fn concurrent_normal_and_fault_exit_claims_keep_status_and_cause_together() {
+    use std::sync::Barrier;
+    use wasixv2_syscalls::ExecutionFault;
+
+    let (kernel, task, _) = setup(b"");
+    let memory = forkable();
+    let caller = Caller::new(task, &memory);
+    let child = TaskId(clone(&kernel, &caller, SIGCHLD, 0).unwrap() as u32);
+    kernel.take_pending(task);
+    let ready = Barrier::new(2);
+    std::thread::scope(|scope| {
+        let fault = scope.spawn(|| {
+            ready.wait();
+            kernel.fault_with_cause(child, Signal::SIGILL.0, ExecutionFault::WasmTrap)
+        });
+        ready.wait();
+        kernel.do_group_exit(child, 0);
+        let won = fault.join().unwrap();
+        let status = kernel.process(child).group.status();
+        let completion = kernel.fatal_completion(child.0);
+        if won {
+            assert_eq!(status, Some(128 + Signal::SIGILL.0));
+            assert_eq!(
+                completion,
+                Some((Signal::SIGILL.0, Some(ExecutionFault::WasmTrap)))
+            );
+        } else {
+            assert_eq!(status, Some(0));
+            assert_eq!(completion, None);
+        }
+    });
+}
+
+#[test]
+fn fatal_exit_releases_the_group_lock_before_waiting_for_the_process_tree() {
+    use std::sync::mpsc;
+    use wasixv2_syscalls::ExecutionFault;
+
+    let (kernel, task, _) = setup(b"");
+    let memory = forkable();
+    let caller = Caller::new(task, &memory);
+    let child = TaskId(clone(&kernel, &caller, SIGCHLD, 0).unwrap() as u32);
+    kernel.take_pending(task);
+    let process = kernel.process(child);
+    let tree = kernel.procs.tree.lock_or_recover();
+    let (claimed, observed) = mpsc::channel();
+    std::thread::scope(|scope| {
+        let exit = scope.spawn(|| {
+            kernel.do_fatal_group_exit(child, Signal::SIGILL.0, Some(ExecutionFault::WasmTrap))
+        });
+        let observe = scope.spawn(|| {
+            loop {
+                if let Some(status) = process.group.status() {
+                    claimed.send(status).unwrap();
+                    break;
+                }
+                std::thread::yield_now();
+            }
+        });
+        let before_tree_release = observed.recv_timeout(Duration::from_secs(10));
+        // Release before asserting, so a regressed lock order cannot hang the workers.
+        drop(tree);
+        assert!(exit.join().unwrap());
+        observe.join().unwrap();
+        assert_eq!(before_tree_release.unwrap(), 128 + Signal::SIGILL.0);
+    });
+}
+
+#[test]
+fn execution_fault_wait_snapshot_survives_wnowait_and_reap_without_changing_siginfo() {
+    use wasixv2_syscalls::{ExecutionFault, Layered, WaitCompletionSlot};
+
+    let (kernel, task, _) = setup(b"");
+    let memory = forkable();
+    let caller = Caller::new(task, &memory);
+    let child = TaskId(clone(&kernel, &caller, SIGCHLD, 0).unwrap() as u32);
+    kernel.take_pending(task);
+    // Control forwarding is required by the engine's actual Layered syscall provider.
+    let layered = Layered::new((), kernel);
+    assert!(layered.fault_with_cause(child, Signal::SIGILL.0, ExecutionFault::WasmTrap));
+    let kernel = &layered.inner;
+    let child_memory = forkable();
+    let child_caller = Caller::new(child, &child_memory);
+    block_on(kernel.exit_mm(&child_caller));
+    kernel.release(child);
+
+    let nowait = WaitOptions(WaitOptions::WEXITED.0 | WaitOptions::WNOWAIT.0);
+    block_on(kernel.waitid(
+        &caller,
+        Idtype::P_PID,
+        child.0 as Pid,
+        SiginfoPtr::new(32),
+        nowait,
+        RusagePtr::NULL,
+    ))
+    .unwrap();
+    let canonical = memory.0.0.borrow()[32..160].to_vec();
+    let mut snapshots = Vec::new();
+    for options in [nowait, WaitOptions::WEXITED] {
+        let slot = WaitCompletionSlot::default();
+        let waiting = Caller::new(task, &memory).with_wait_completion(&slot);
+        block_on(kernel.waitid(
+            &waiting,
+            Idtype::P_PID,
+            child.0 as Pid,
+            SiginfoPtr::new(32),
+            options,
+            RusagePtr::NULL,
+        ))
+        .unwrap();
+        assert_eq!(&memory.0.0.borrow()[32..160], canonical.as_slice());
+        let completion = slot.get().unwrap();
+        assert_eq!(completion.pid, child.0);
+        assert_eq!(completion.status, Signal::SIGILL.0);
+        assert_eq!(completion.code.0 as u32, word(&memory.0, 32 + 8));
+        assert_eq!(completion.fault, Some(ExecutionFault::WasmTrap));
+        snapshots.push(completion);
+    }
+    assert_eq!(snapshots[0], snapshots[1]);
+    let after_reap = WaitCompletionSlot::default();
+    let waiting = Caller::new(task, &memory).with_wait_completion(&after_reap);
+    assert_eq!(
+        block_on(kernel.waitid(
+            &waiting,
+            Idtype::P_PID,
+            child.0 as Pid,
+            SiginfoPtr::new(32),
+            WaitOptions::WEXITED,
+            RusagePtr::NULL,
+        )),
+        Err(SysErr::Errno(Errno::ECHILD))
+    );
+    assert_eq!(after_reap.get(), None);
+}
+
+#[test]
+fn cancelled_and_nohang_waits_do_not_publish_execution_fault_custody() {
+    use wasixv2_syscalls::{ExecutionFault, WaitCompletionSlot};
+
+    let (kernel, task, _) = setup(b"");
+    let memory = forkable();
+    let caller = Caller::new(task, &memory);
+    let child = TaskId(clone(&kernel, &caller, SIGCHLD, 0).unwrap() as u32);
+    kernel.take_pending(task);
+    let cancelled = WaitCompletionSlot::default();
+    let waiting = Caller::new(task, &memory).with_wait_completion(&cancelled);
+    assert!(
+        kernel
+            .waitid(
+                &waiting,
+                Idtype::P_PID,
+                child.0 as Pid,
+                SiginfoPtr::new(32),
+                WaitOptions::WEXITED,
+                RusagePtr::NULL,
+            )
+            .now_or_never()
+            .is_none()
+    );
+    assert_eq!(cancelled.get(), None);
+    let nohang = WaitCompletionSlot::default();
+    let waiting = Caller::new(task, &memory).with_wait_completion(&nohang);
+    block_on(kernel.waitid(
+        &waiting,
+        Idtype::P_PID,
+        child.0 as Pid,
+        SiginfoPtr::new(32),
+        WaitOptions(WaitOptions::WEXITED.0 | WaitOptions::WNOHANG.0),
+        RusagePtr::NULL,
+    ))
+    .unwrap();
+    assert_eq!(nohang.get(), None);
+    assert_eq!(word(&memory.0, 32 + 12), 0);
+    assert!(kernel.fault_with_cause(child, Signal::SIGILL.0, ExecutionFault::WasmTrap));
+    let child_memory = forkable();
+    let child_caller = Caller::new(child, &child_memory);
+    block_on(kernel.exit_mm(&child_caller));
+    kernel.release(child);
+    assert_eq!(cancelled.get(), None, "the cancelled wait retained no slot");
+    let selected = WaitCompletionSlot::default();
+    let waiting = Caller::new(task, &memory).with_wait_completion(&selected);
+    block_on(kernel.waitid(
+        &waiting,
+        Idtype::P_PID,
+        child.0 as Pid,
+        SiginfoPtr::new(32),
+        WaitOptions::WEXITED,
+        RusagePtr::NULL,
+    ))
+    .unwrap();
+    assert_eq!(
+        selected.get().unwrap().fault,
+        Some(ExecutionFault::WasmTrap)
+    );
+}
+
 #[test]
 fn fork_rejects_a_new_stack() {
     let (kernel, task, _) = setup(b"");

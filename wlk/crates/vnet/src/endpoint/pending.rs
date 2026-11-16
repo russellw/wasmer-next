@@ -54,6 +54,21 @@ impl Pollable for PendingStream {
     }
 }
 impl BackendStream for PendingStream {
+    fn tcp_option_policy(&self) -> Option<crate::TcpOptionPolicy> {
+        self.stream()
+            .ok()
+            .and_then(|stream| stream.tcp_option_policy())
+    }
+    fn async_options(&self) -> bool {
+        self.stream().is_ok_and(|stream| stream.async_options())
+    }
+    fn start_options(
+        &self,
+        options: Vec<(i32, i32, Vec<u8>)>,
+        done: Box<dyn FnOnce(Result<(), Errno>) + Send>,
+    ) -> Result<(), Errno> {
+        self.stream()?.start_options(options, done)
+    }
     fn provider_local_addr(&self) -> Option<Result<SocketAddr, Errno>> {
         self.stream()
             .ok()

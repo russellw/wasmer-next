@@ -19574,6 +19574,15 @@ impl<L, S: crate::Control> crate::Control for Layered<L, S> {
         self.inner.fault(task, signal)
     }
 
+    fn fault_with_cause(
+        &self,
+        task: crate::TaskId,
+        signal: i32,
+        cause: crate::ExecutionFault,
+    ) -> bool {
+        self.inner.fault_with_cause(task, signal, cause)
+    }
+
     fn release(&self, task: crate::TaskId) {
         self.inner.release(task)
     }

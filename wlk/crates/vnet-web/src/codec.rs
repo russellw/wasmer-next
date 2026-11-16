@@ -2,7 +2,7 @@
 //!
 //! Tags and field order are from `lib/virtual-net/src/meta.rs`, not a guest ABI. Keeping this
 //! adapter private to the driver avoids a runtime dependency on the v1 networking stack.
-use crate::transport::{Command, Event};
+use crate::transport::{Command, Event, SocketControl};
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
     net::{IpAddr, SocketAddr},
@@ -25,6 +25,148 @@ fn pack(value: impl Serialize) -> Result<Vec<u8>, Errno> {
 /// configured resolver provider (e.g. DoH); the classic Resolve record only names a host.
 pub fn encode(command: &Command) -> Result<Vec<u8>, Errno> {
     let out = match command {
+        Command::SendDatagramQueued {
+            dispatch,
+            socket,
+            data,
+            addr,
+        } => {
+            // Stock server executes UDP ONLY with Some and normally emits no
+            // Sent. This local receipt identity is not an awaited wire result.
+            if data.len() > 65535 {
+                return Err(Errno::EMSGSIZE);
+            }
+            pack((3u32, socket, data, addr, Some(dispatch)))?
+        }
+        Command::SetDatagramQueued {
+            socket, control, ..
+        } => {
+            return encode(&Command::SetOption {
+                request: None,
+                socket: *socket,
+                control: control.clone(),
+            });
+        }
+        Command::BindDatagram {
+            request,
+            socket,
+            bind,
+        } => pack((
+            0u32,
+            17u32,
+            socket,
+            bind.requested,
+            bind.reuse_port,
+            bind.reuse_addr,
+            Some(request),
+        ))?,
+        Command::DatagramReadback {
+            request,
+            socket,
+            query,
+        } => {
+            use wasixv2_vnet::DatagramReadback as Q;
+            let tag = match query {
+                Q::Ttl => 28u32,
+                Q::Broadcast => 47,
+                Q::MulticastLoopV4 => 49,
+                Q::MulticastLoopV6 => 51,
+                Q::MulticastTtlV4 => 53,
+                Q::Local => 25,
+                Q::Peer => 26,
+            };
+            pack((1u32, socket, tag, Some(request)))?
+        }
+        Command::SetOption {
+            request,
+            socket,
+            control,
+        } => match control {
+            SocketControl::Ttl(value) => pack((1u32, socket, 27u32, value, request))?,
+            SocketControl::Linger(value) => pack((1u32, socket, 30u32, value, request))?,
+            SocketControl::NoDelay(value) => pack((1u32, socket, 38u32, value, request))?,
+            SocketControl::KeepAlive(value) => pack((1u32, socket, 40u32, value, request))?,
+            SocketControl::Broadcast(value) => pack((1u32, socket, 46u32, value, request))?,
+            SocketControl::MulticastLoopV4(value) => pack((1u32, socket, 48u32, value, request))?,
+            SocketControl::MulticastLoopV6(value) => pack((1u32, socket, 50u32, value, request))?,
+            SocketControl::MulticastTtlV4(value) => pack((1u32, socket, 52u32, value, request))?,
+            SocketControl::JoinMulticastV4 { multiaddr, iface } => {
+                pack((1u32, socket, 54u32, multiaddr, iface, request))?
+            }
+            SocketControl::LeaveMulticastV4 { multiaddr, iface } => {
+                pack((1u32, socket, 55u32, multiaddr, iface, request))?
+            }
+            SocketControl::JoinMulticastV6 { multiaddr, iface } => {
+                pack((1u32, socket, 56u32, multiaddr, iface, request))?
+            }
+            SocketControl::LeaveMulticastV6 { multiaddr, iface } => {
+                pack((1u32, socket, 57u32, multiaddr, iface, request))?
+            }
+        },
+        Command::BindStream {
+            request,
+            socket,
+            bind,
+        } => {
+            let operation = match bind.purpose {
+                wasixv2_vnet::endpoint::EndpointBindPurpose::Bind => 16u32,
+                wasixv2_vnet::endpoint::EndpointBindPurpose::Listen { .. } => 15u32,
+            };
+            pack((
+                0u32,
+                operation,
+                socket,
+                bind.requested,
+                bind.v6only,
+                bind.reuse_port,
+                bind.reuse_addr,
+                Some(request),
+            ))?
+        }
+        Command::ConnectFrom {
+            request,
+            socket,
+            peer,
+            local: _,
+            requested_bind,
+            bound_addr,
+        } => {
+            if requested_bind.is_some() {
+                // Only a genuinely admitted bound resource may use ConnectBound.
+                bound_addr.ok_or(Errno::EINVAL)?;
+                pack((1u32, socket, 23u32, peer, Some(request)))?
+            } else {
+                let local = SocketAddr::new(
+                    if peer.is_ipv4() {
+                        IpAddr::from([0, 0, 0, 0])
+                    } else {
+                        IpAddr::from([0u16; 8])
+                    },
+                    0,
+                );
+                pack((0u32, 19u32, socket, local, peer, Some(request)))?
+            }
+        }
+        Command::ListenFrom {
+            request, socket, ..
+        } => pack((1u32, socket, 22u32, Some(request)))?,
+        Command::ListenReserved {
+            request,
+            socket,
+            member,
+            v6only,
+            ..
+        } => pack((
+            0u32,
+            15u32,
+            socket,
+            member.local,
+            v6only,
+            false,
+            false,
+            Some(request),
+        ))?,
+        Command::CloseSelected { request, socket } => pack((1u32, socket, 21u32, Some(request)))?,
         Command::Provider { request, operation } => match operation {
             Request::Bridge {
                 network,
@@ -173,6 +315,14 @@ pub fn decode(frame: &[u8]) -> Result<Event, Errno> {
                 1 => Event::Complete {
                     request,
                     result: Err(network_error(r.get()?)?),
+                },
+                4 => Event::DatagramValue {
+                    request,
+                    value: crate::DatagramValue::Flag(r.get()?),
+                },
+                13 => Event::DatagramValue {
+                    request,
+                    value: crate::DatagramValue::Ttl(r.get()?),
                 },
                 9 => Event::Provider {
                     request,
@@ -352,5 +502,33 @@ fn relay_errno(value: i32) -> Result<Errno, Errno> {
         Ok(Errno(value))
     } else {
         Err(Errno::EPROTO)
+    }
+}
+
+#[cfg(test)]
+mod queued_datagram_wire_tests {
+    use super::*;
+    #[test]
+    fn queued_packet_keeps_original_some_wire_identity_but_setter_keeps_none() {
+        let destination: SocketAddr = "192.0.2.1:9000".parse().unwrap();
+        let command = Command::SendDatagramQueued {
+            dispatch: 73,
+            socket: 11,
+            data: vec![1, 2, 3],
+            addr: destination,
+        };
+        assert_eq!(
+            encode(&command).unwrap(),
+            pack((3u32, 11u64, vec![1u8, 2, 3], destination, Some(73u64))).unwrap()
+        );
+        let setter = Command::SetDatagramQueued {
+            dispatch: 74,
+            socket: 11,
+            control: SocketControl::Broadcast(true),
+        };
+        assert_eq!(
+            encode(&setter).unwrap(),
+            pack((1u32, 11u64, 46u32, true, None::<u64>)).unwrap()
+        );
     }
 }

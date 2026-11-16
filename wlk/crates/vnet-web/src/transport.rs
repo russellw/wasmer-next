@@ -1,7 +1,8 @@
 //! Worker-local transport boundary. Implementations must bound their own JS/WebSocket queues.
 use std::{
-    net::SocketAddr,
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     task::{Context, Poll},
+    time::Duration,
 };
 use wasixv2_abi::Errno;
 use wasixv2_vnet::{Found, Lookup, LookupError, Shutdown};
@@ -26,6 +27,18 @@ pub struct Capabilities {
     pub udp_publish: bool,
     /// Destination-qualified ICMP port-unreachable notifications (fidelity op4).
     pub udp_icmp: bool,
+    /// Opt-in same-resource stream binding/connection and acknowledged cleanup.
+    /// Existing profiles leave this disabled unless their actual transport supports it.
+    pub selected_endpoints: bool,
+    /// This profile admits prebound stream or datagram resources. False retains
+    /// namespace reservation and creates stream listeners at publication.
+    pub selected_bind: bool,
+    /// Unbound uplink connections report a real provider local address. Browser
+    /// WISP leaves this false; Node host and capable Classic profiles opt in.
+    pub selected_external: bool,
+    /// Actual option transactions require owned completion on this profile.
+    /// Default/native/local behavior is unchanged unless explicitly selected.
+    pub async_options: bool,
 }
 
 impl Capabilities {
@@ -66,9 +79,109 @@ impl Capabilities {
     }
 }
 
+/// Supported stock relay socket controls. These are host transport records,
+/// never a guest syscall ABI or new relay tag. Datagrams/groups remain codec
+/// primitives until the caller has its own admitted canonical setter path.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SocketControl {
+    Ttl(u32),
+    Linger(Option<Duration>),
+    NoDelay(bool),
+    KeepAlive(bool),
+    Broadcast(bool),
+    MulticastLoopV4(bool),
+    MulticastLoopV6(bool),
+    MulticastTtlV4(u32),
+    JoinMulticastV4 {
+        multiaddr: Ipv4Addr,
+        iface: Ipv4Addr,
+    },
+    LeaveMulticastV4 {
+        multiaddr: Ipv4Addr,
+        iface: Ipv4Addr,
+    },
+    JoinMulticastV6 {
+        multiaddr: Ipv6Addr,
+        iface: u32,
+    },
+    LeaveMulticastV6 {
+        multiaddr: Ipv6Addr,
+        iface: u32,
+    },
+}
+
 /// One ordered request. IDs are never reused within a backend, including across reconnects.
 #[derive(Clone, Debug)]
 pub enum Command {
+    /// Local transport dispatch receipt only; stock SendTo still carries Some.
+    /// No remote Sent result is required or fabricated by this operation.
+    /// Stock UDP silently drops send errors. Non-stock transient Closed-interest
+    /// notifications need a separate delivery contract; no HUP/RST is inferred.
+    SendDatagramQueued {
+        dispatch: u64,
+        socket: u64,
+        data: Vec<u8>,
+        addr: SocketAddr,
+    },
+    /// Original queued setter uses wire request None; this identity is local only.
+    SetDatagramQueued {
+        dispatch: u64,
+        socket: u64,
+        control: SocketControl,
+    },
+    SetOption {
+        request: Option<u64>,
+        socket: u64,
+        control: SocketControl,
+    },
+    /// Same admitted source-only UDP resource; literal flags precede actual local readback.
+    BindDatagram {
+        request: u64,
+        socket: u64,
+        bind: wasixv2_vnet::endpoint::EndpointBindRequest,
+    },
+    DatagramReadback {
+        request: u64,
+        socket: u64,
+        query: wasixv2_vnet::DatagramReadback,
+    },
+    /// A bind-only stream, or a direct unbound listen according to `bind.purpose`.
+    BindStream {
+        request: u64,
+        socket: u64,
+        bind: wasixv2_vnet::endpoint::EndpointBindRequest,
+    },
+    /// Continue this same selected socket; None is different from an explicit any:0 bind.
+    ConnectFrom {
+        request: u64,
+        socket: u64,
+        peer: SocketAddr,
+        /// Canonical source reservation; not a requested physical prebind.
+        /// Virtual transports use this existing source/port, while physical
+        /// unbound factories still choose/report their actual local address.
+        local: SocketAddr,
+        requested_bind: Option<SocketAddr>,
+        bound_addr: Option<SocketAddr>,
+    },
+    ListenFrom {
+        request: u64,
+        socket: u64,
+        backlog: u32,
+    },
+    /// A namespace-reserved listener, not an invented physical bound token.
+    ListenReserved {
+        request: u64,
+        socket: u64,
+        member: wasixv2_vnet::endpoint::EndpointMember,
+        domain: wasixv2_vnet::Domain,
+        v6only: bool,
+        backlog: u32,
+    },
+    /// Success means actual provider cleanup, not command-queue acceptance.
+    CloseSelected {
+        request: u64,
+        socket: u64,
+    },
     Provider {
         request: u64,
         operation: wasixv2_vnet::provider::Request,
@@ -134,6 +247,69 @@ pub enum Command {
 /// An asynchronous completion produced by the owning I/O worker.
 #[derive(Clone, Debug)]
 pub enum Event {
+    /// SDK-only lifecycle result. Policy belongs to this actual resource;
+    /// default/stock Complete retains its original canonical semantics.
+    StreamOpenedWithPolicy {
+        request: u64,
+        socket: u64,
+        result: Result<wasixv2_vnet::TcpOptionPolicy, Errno>,
+    },
+    StreamConnectedWithPolicy {
+        request: u64,
+        socket: u64,
+        result: Result<(SocketAddr, wasixv2_vnet::TcpOptionPolicy), Errno>,
+    },
+    AcceptedToWithPolicy {
+        socket: u64,
+        child: u64,
+        peer: SocketAddr,
+        local: SocketAddr,
+        policy: wasixv2_vnet::TcpOptionPolicy,
+    },
+    /// SAME captured local WebSocket send returned, never a remote/physical ACK.
+    DatagramDispatched {
+        request: u64,
+        socket: u64,
+        result: Result<(), Errno>,
+    },
+    DatagramValue {
+        request: u64,
+        value: crate::DatagramValue,
+    },
+    StreamBound {
+        request: u64,
+        socket: u64,
+        result: Result<SocketAddr, Errno>,
+    },
+    StreamConnected {
+        request: u64,
+        socket: u64,
+        result: Result<SocketAddr, Errno>,
+    },
+    StreamListening {
+        request: u64,
+        socket: u64,
+        result: Result<SocketAddr, Errno>,
+    },
+    ProviderCloseAck {
+        request: u64,
+        socket: u64,
+        /// This exact resource has emitted an accepted notification that may
+        /// still be pending ordinary delivery. False guarantees withdrawal and
+        /// completion of the unfulfilled accept credit instead. This flag is
+        /// independent of the remote provider's cleanup-confirmation boundary.
+        accept_pending: bool,
+        result: Result<(), Errno>,
+    },
+    /// The captured LOCAL DRIVER TRANSPORT SESSION has cut off and joined its
+    /// producers (possibly transferring pure remote receipts to its surviving
+    /// broker). A socket close alone is insufficient. Remote relay operations
+    /// may remain unconfirmed; this is not a relay/physical CloseACK.
+    LocalCloseUnconfirmed {
+        request: u64,
+        socket: u64,
+        error: Option<Errno>,
+    },
     Provider {
         request: u64,
         reply: wasixv2_vnet::provider::Reply,
@@ -200,6 +376,13 @@ pub enum Event {
         child: u64,
         peer: SocketAddr,
     },
+    /// Selected ingress requires the actual accepted socket's destination.
+    AcceptedTo {
+        socket: u64,
+        child: u64,
+        peer: SocketAddr,
+        local: SocketAddr,
+    },
     Lookup {
         request: u64,
         result: Result<Found, LookupError>,
@@ -218,6 +401,23 @@ pub trait Transport {
     fn capabilities(&self) -> Capabilities;
     fn poll_send(&mut self, cx: &mut Context<'_>, command: &Command) -> Poll<Result<(), Errno>>;
     fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Result<Event, Errno>>;
+    /// Selected close completion may progress past a full receive frame using
+    /// the transport's existing bounded queue. Exact accepted Send/SendError,
+    /// Writable, and option Complete receipts may also progress so normal close
+    /// can drain accepted TX despite unrelated full RX. Driver validates the
+    /// same pending operation/flow before mutation. Payload/EOF order stays
+    /// unchanged. LocalCloseUnconfirmed requires a joined local session, never
+    /// an invented remote response.
+    /// Implementations also drive completed close-dispatch calls here so their
+    /// reserved admission slot is released independently of physical cleanup.
+    fn poll_recv_close(&mut self, _cx: &mut Context<'_>) -> Poll<Result<Event, Errno>> {
+        Poll::Pending
+    }
+    /// Revoke only this selected socket's admitted, unfinished factory calls.
+    /// Implementations retain late-result/physical-cleanup ownership; this is
+    /// not a CloseACK. Repeated calls and unknown/already-finished IDs are no-op.
+    /// Called outside backend locks before sending the same socket's close.
+    fn revoke_open(&mut self, _socket: u64) {}
     /// Observe disconnect even when a full guest receive queue stops frame consumption.
     /// Pending registers the waker; Ready is terminal for this transport session.
     fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Errno>;
@@ -258,6 +458,21 @@ impl<T: FrameTransport> Transport for Classic<T> {
         self.capabilities
     }
     fn poll_send(&mut self, cx: &mut Context<'_>, command: &Command) -> Poll<Result<(), Errno>> {
+        if matches!(command, Command::SetOption { .. }) && !self.capabilities.async_options {
+            return Poll::Ready(Err(Errno::EOPNOTSUPP));
+        }
+        if matches!(
+            command,
+            Command::BindDatagram { .. }
+                | Command::BindStream { .. }
+                | Command::ConnectFrom { .. }
+                | Command::ListenFrom { .. }
+                | Command::ListenReserved { .. }
+                | Command::CloseSelected { .. }
+        ) && !self.capabilities.selected_endpoints
+        {
+            return Poll::Ready(Err(Errno::EOPNOTSUPP));
+        }
         if matches!(command, Command::Provider { .. }) && self.capabilities.provider.is_none() {
             return Poll::Ready(Err(Errno::EOPNOTSUPP));
         }
