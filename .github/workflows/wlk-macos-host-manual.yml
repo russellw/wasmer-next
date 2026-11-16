@@ -64,7 +64,7 @@ jobs:
           max_log = 8 * 1024**2
 
           def fingerprint():
-              names = subprocess.check_output(["git", "ls-files", "-z"], cwd=candidate).split(b"\0")
+              names = subprocess.check_output(["git", "ls-files", "-z", "--", "wlk"], cwd=candidate).split(b"\0")
               digest = hashlib.sha256()
               for name in sorted(n for n in names if n):
                   digest.update(name + b"\0")
