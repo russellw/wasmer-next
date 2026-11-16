@@ -1522,6 +1522,187 @@ fn tty_on_the_console() {
     assert_eq!(status, 0);
 }
 
+/// Guest and host sizing share terminal state; v1 leaves SIGWINCH default-ignored.
+/// Kernel TTY tests cover actual notification and same-size signal suppression.
+#[test]
+fn tty_resize_and_host_resize_share_the_console_state() {
+    let wat = r#"
+    (module
+      (import "wasix_32v1" "tty_get" (func $get (param i32) (result i32)))
+      (import "wasix_32v1" "tty_set" (func $set (param i32) (result i32)))
+      (import "wasix_32v1" "callback_signal" (func $callback (param i32 i32)))
+      (import "wasi_snapshot_preview1" "fd_write" (func $write (param i32 i32 i32 i32) (result i32)))
+      (import "wasix_32v1" "proc_exit2" (func $exit (param i32)))
+      (memory (export "memory") 1)
+      (data (i32.const 16) "__wasm_signal")
+      (data (i32.const 64) "x")
+      (global $resizes (mut i32) (i32.const 0))
+      (func (export "__wasm_signal") (param $sig i32)
+        (if (i32.eq (local.get $sig) (i32.const 28))
+          (then (global.set $resizes (i32.add (global.get $resizes) (i32.const 1))))))
+      (func $check (param $condition i32) (param $status i32)
+        (if (i32.eqz (local.get $condition)) (then (call $exit (local.get $status)) unreachable)))
+      (func (export "_start")
+        (call $callback (i32.const 16) (i32.const 13))
+        (call $check (i32.eqz (call $get (i32.const 100))) (i32.const 1))
+        ;; Real zero dimensions stay zero, including rows/columns and unknown pixels.
+        (call $check (i32.eqz (i32.load (i32.const 100))) (i32.const 2))
+        (call $check (i32.eqz (i32.load (i32.const 104))) (i32.const 3))
+        (call $check (i32.eqz (i32.load (i32.const 108))) (i32.const 4))
+        (call $check (i32.eqz (i32.load (i32.const 112))) (i32.const 5))
+        ;; Guest tty_set updates the console; v1 keeps SIGWINCH default-ignored.
+        (i32.store (i32.const 100) (i32.const 120))
+        (i32.store (i32.const 104) (i32.const 40))
+        (i32.store (i32.const 108) (i32.const 960))
+        (i32.store (i32.const 112) (i32.const 640))
+        (call $check (i32.eqz (call $set (i32.const 100))) (i32.const 6))
+        (call $check (i32.eq (global.get $resizes) (i32.const 0)) (i32.const 7))
+        (call $check (i32.eqz (call $get (i32.const 100))) (i32.const 8))
+        (call $check (i32.eq (i32.load (i32.const 100)) (i32.const 120)) (i32.const 9))
+        (call $check (i32.eq (i32.load (i32.const 104)) (i32.const 40)) (i32.const 10))
+        (call $check (i32.eq (i32.load (i32.const 108)) (i32.const 960)) (i32.const 11))
+        (call $check (i32.eq (i32.load (i32.const 112)) (i32.const 640)) (i32.const 12))
+        ;; A real output call asks the host to resize the same console to 90x30.
+        (i32.store (i32.const 200) (i32.const 64))
+        (i32.store (i32.const 204) (i32.const 1))
+        (call $check (i32.eqz (call $write (i32.const 1) (i32.const 200) (i32.const 1) (i32.const 208))) (i32.const 13))
+        (call $check (i32.eq (global.get $resizes) (i32.const 0)) (i32.const 14))
+        (call $check (i32.eqz (call $get (i32.const 100))) (i32.const 15))
+        (call $check (i32.eq (i32.load (i32.const 100)) (i32.const 90)) (i32.const 16))
+        (call $check (i32.eq (i32.load (i32.const 104)) (i32.const 30)) (i32.const 17))
+        (call $check (i32.eq (i32.load (i32.const 108)) (i32.const 720)) (i32.const 18))
+        (call $check (i32.eq (i32.load (i32.const 112)) (i32.const 480)) (i32.const 19))
+        ;; Same-size host and guest updates also leave v1's callback quiet.
+        (call $check (i32.eqz (call $write (i32.const 1) (i32.const 200) (i32.const 1) (i32.const 208))) (i32.const 20))
+        (call $check (i32.eqz (call $set (i32.const 100))) (i32.const 21))
+        (call $check (i32.eq (global.get $resizes) (i32.const 0)) (i32.const 22))
+        (call $exit (i32.const 0))))
+    "#;
+    struct ResizeOnWrite(Mutex<std::sync::Weak<wasixv2::Signaller>>);
+    impl ByteSink for ResizeOnWrite {
+        fn write<'a>(&'a self, data: &'a [u8]) -> LocalFuture<'a, io::Result<usize>> {
+            let signaller = self.0.lock().unwrap().upgrade().unwrap();
+            signaller.console_resize(WindowSize {
+                cols: 90,
+                rows: 30,
+                xpixel: 720,
+                ypixel: 480,
+            });
+            Box::pin(async move { Ok(data.len()) })
+        }
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let status = tokio::task::LocalSet::new().block_on(&runtime, async {
+        let output = Arc::new(ResizeOnWrite(Mutex::default()));
+        let console = Console {
+            input: Arc::new(Silence),
+            output: output.clone(),
+            size: WindowSize::default(),
+        };
+        let machine = Machine::builder().console(console, [true; 3]).build();
+        let signaller = Arc::new(machine.signaller());
+        *output.0.lock().unwrap() = Arc::downgrade(&signaller);
+        let stdio = Stdio {
+            stdin: Arc::new(EmptySource),
+            stdout: Arc::new(Capture::default()),
+            stderr: Arc::new(Capture::default()),
+        };
+        machine
+            .run(&wat::parse_str(wat).unwrap(), stdio)
+            .await
+            .unwrap()
+    });
+    assert_eq!(status, 0);
+}
+
+/// Public u32 sizes are admitted; the actual terminal exposes the documented low 16 bits.
+#[test]
+fn tty_dimensions_use_the_shared_linux_projection() {
+    let wat = r#"
+    (module
+      (import "wasix_32v1" "tty_get" (func $get (param i32) (result i32)))
+      (import "wasix_32v1" "tty_set" (func $set (param i32) (result i32)))
+      (import "wasix_32v1" "proc_exit2" (func $exit (param i32)))
+      (memory (export "memory") 1)
+      (func $round_trip (param $value i32) (param $expected i32) (param $status i32)
+        (i32.store (i32.const 100) (local.get $value))
+        (i32.store (i32.const 104) (local.get $value))
+        (i32.store (i32.const 108) (local.get $value))
+        (i32.store (i32.const 112) (local.get $value))
+        (if (call $set (i32.const 100)) (then (call $exit (local.get $status))))
+        (if (call $get (i32.const 100)) (then (call $exit (i32.add (local.get $status) (i32.const 1)))))
+        (if (i32.ne (i32.load (i32.const 100)) (local.get $expected))
+          (then (call $exit (i32.add (local.get $status) (i32.const 2)))))
+        (if (i32.ne (i32.load (i32.const 104)) (local.get $expected))
+          (then (call $exit (i32.add (local.get $status) (i32.const 3)))))
+        (if (i32.ne (i32.load (i32.const 108)) (local.get $expected))
+          (then (call $exit (i32.add (local.get $status) (i32.const 4)))))
+        (if (i32.ne (i32.load (i32.const 112)) (local.get $expected))
+          (then (call $exit (i32.add (local.get $status) (i32.const 5))))))
+      (func (export "_start")
+        (if (call $get (i32.const 100)) (then (call $exit (i32.const 1))))
+        (call $round_trip (i32.const 65535) (i32.const 65535) (i32.const 10))
+        (call $round_trip (i32.const 65536) (i32.const 0) (i32.const 20))
+        (call $round_trip (i32.const -1) (i32.const 65535) (i32.const 30))
+        (call $round_trip (i32.const 0) (i32.const 0) (i32.const 40))
+        (call $exit (i32.const 0))))
+    "#;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let status = tokio::task::LocalSet::new().block_on(&runtime, async {
+        let console = Console {
+            input: Arc::new(Silence),
+            output: Arc::new(Capture::default()),
+            size: WindowSize::default(),
+        };
+        let machine = Machine::builder().console(console, [true; 3]).build();
+        let stdio = Stdio {
+            stdin: Arc::new(EmptySource),
+            stdout: Arc::new(Capture::default()),
+            stderr: Arc::new(Capture::default()),
+        };
+        machine
+            .run(&wat::parse_str(wat).unwrap(), stdio)
+            .await
+            .unwrap()
+    });
+    assert_eq!(status, 0);
+}
+
+/// Without any terminal, dimensions remain the v1 defaults even after a wide request.
+#[test]
+fn tty_dimensions_without_a_terminal_remain_v1_defaults() {
+    let wat = r#"
+    (module
+      (import "wasix_32v1" "tty_get" (func $get (param i32) (result i32)))
+      (import "wasix_32v1" "tty_set" (func $set (param i32) (result i32)))
+      (import "wasix_32v1" "proc_exit2" (func $exit (param i32)))
+      (memory (export "memory") 1)
+      (func (export "_start")
+        (if (call $get (i32.const 100)) (then (call $exit (i32.const 1))))
+        (i32.store (i32.const 100) (i32.const 65535))
+        (i32.store (i32.const 104) (i32.const 65536))
+        (i32.store (i32.const 108) (i32.const -1))
+        (i32.store (i32.const 112) (i32.const 0))
+        (if (call $set (i32.const 100)) (then (call $exit (i32.const 2))))
+        (if (call $get (i32.const 100)) (then (call $exit (i32.const 3))))
+        (if (i32.ne (i32.load (i32.const 100)) (i32.const 80)) (then (call $exit (i32.const 4))))
+        (if (i32.ne (i32.load (i32.const 104)) (i32.const 25)) (then (call $exit (i32.const 5))))
+        (if (i32.ne (i32.load (i32.const 108)) (i32.const 800)) (then (call $exit (i32.const 6))))
+        (if (i32.ne (i32.load (i32.const 112)) (i32.const 600)) (then (call $exit (i32.const 7))))
+        (if (i32.load8_u (i32.const 116)) (then (call $exit (i32.const 8))))
+        (if (i32.load8_u (i32.const 117)) (then (call $exit (i32.const 9))))
+        (if (i32.load8_u (i32.const 118)) (then (call $exit (i32.const 10))))
+        (call $exit (i32.const 0))))
+    "#;
+    assert_eq!(status(wat), 0);
+}
+
 /// A terminal nobody types on.
 struct Silence;
 

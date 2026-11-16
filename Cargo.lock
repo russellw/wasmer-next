@@ -7407,6 +7407,7 @@ dependencies = [
  "wasixv2-abi",
  "wasixv2-dylink",
  "wasixv2-exec",
+ "wasixv2-host",
  "wasixv2-kernel",
  "wasixv2-syscalls",
  "wasixv2-vfs-mem",
