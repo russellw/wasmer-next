@@ -15,6 +15,7 @@ use wasixv2_syscalls::{
     Caller, Control, ExitMm, Fault, GuestAction, Layer, Syscall, UserMemory, UserSlice,
     UserSliceMut,
 };
+use wasixv2_vfs::MountFlags;
 
 mod elf;
 mod exec;
@@ -124,6 +125,22 @@ fn run_cli() -> io::Result<()> {
                 .with_binfmt(Arc::new(exec::NativeBinfmt))
                 .with_init(),
         );
+        // Resolve process magic links through WLK, not the supervisor's host procfs.
+        kernel
+            .vfs()
+            .mount(
+                b"/proc",
+                kernel.procfs(),
+                MountFlags {
+                    nosuid: true,
+                    nodev: true,
+                    noexec: true,
+                    ..MountFlags::default()
+                },
+                true,
+            )
+            .await
+            .map_err(|error| io::Error::other(format!("could not mount procfs: {error:?}")))?;
         volumes::mount(&kernel, host, &fs_volumes).await?;
         let stdio = host_stdio();
         let task = kernel
