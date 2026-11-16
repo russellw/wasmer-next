@@ -179,7 +179,7 @@ jobs:
         timeout-minutes: 2
         run: |
           set -euo pipefail
-          cargo metadata --manifest-path "$CANDIDATE_DIR/Cargo.toml" --locked --offline --format-version=1 > "$CAPI_EVIDENCE/metadata.json"
+          cargo metadata --manifest-path "$CANDIDATE_DIR/Cargo.toml" --locked --offline --filter-platform aarch64-apple-darwin --format-version=1 > "$CAPI_EVIDENCE/metadata.json"
           cargo tree --manifest-path "$CANDIDATE_DIR/Cargo.toml" --locked --offline -p wasmer-c-api --no-default-features --features cranelift,wasi --target aarch64-apple-darwin --edges normal --prefix none > "$CAPI_EVIDENCE/normal-dependencies.txt"
           python3 - <<'PY'
           import json, os, re
