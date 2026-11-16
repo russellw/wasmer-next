@@ -1,5 +1,10 @@
 # WASIX Redesign: Linux-Compatible Kernel
 
+Ownership update (2026-11-16): WLK is local at wlk/; the engine is a private
+wasmer-runtime Git dependency. The legacy implementation is deleted. Historical
+architecture notes below may describe earlier migration states; current
+compatibility limits are maintained in TODO.md.
+
 ## Goals and non-goals
 
 We are building a new kernel for wasm guests, designed from scratch, that aims for full compatibility with Linux userspace. The current `lib/wasix-legacy` is not a reference for any part of it.

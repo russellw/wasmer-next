@@ -194,13 +194,10 @@ Drafts: [runtime `wasixv2/parity-napi-facade-20261104`](https://github.com/wasme
 - [ ] Finish package/public-Core source beyond the opt-in raw transport foundation.
   The old SDK remains default. TS, wasm metadata and strict Rust library lint passed;
   real browser execution and full SDK feature acceptance have not run.
-- [ ] Port CLI package/cache/loading/HTTP helpers and C API WasiEnv/InstantiationHook/
-  State consumers, Swift/root examples, sys-utils and old optional NAPI consumers
-  before deleting their old runtime dependencies.
-- [ ] Map and verify every retained feature before deleting legacy runtime/support
-  crates (`wasmer-wasix`, wasi-types, virtual-fs/net/io/mio, journal and related users).
-  Do not delete a shared provider merely because new guest execution uses v2.
-  Keep legacy fixtures and old/new behavior evidence.
+- [x] Retire old runtime dependencies after inspecting retained CLI, C API,
+  Swift, SDK, NAPI and root example paths. The legacy runtime and its exclusive
+  support crates are deleted; shared product helpers and the wasi-types native
+  layout oracle remain. Runtime extraction limits are recorded below.
 
 SDK draft: [wasmer-sdk `codex/sdk-v2-browser-core`](https://github.com/wasmerio/wasmer-sdk/tree/codex/sdk-v2-browser-core)
 `32f497ec6d238c6e44e898a28442bc5b87643615`. Its exact runtime source pin remains
@@ -306,3 +303,27 @@ Deferred source is preserved in
 [generator `wip/wasix64-stop-20261105`](https://github.com/wasix-org/wasixv2-abi/tree/wip/wasix64-stop-20261105)
 `62378c78aa6a04daaae69ddba02ad2b9daff742e`. This draft is uncompiled/unregenerated,
 not a supported Memory64 implementation, and must not be merged just to clear TODOs.
+
+## Runtime extraction compatibility limits
+
+The CLI and C API already execute WASI preview1/WASIX32 guests through v2 and
+the `wasix1` adapter; there is no legacy-runtime fallback. The obsolete legacy
+runtime, virtual-fs/net/mio, journal, sys-utils and WAI wrapper are removed.
+`wasi-types` remains a native dev dependency for adapter layout conformance.
+
+- WASIX64 (`wasix_64v1`) remains unsupported: `V1Flavor::unsupported_reason`
+  rejects it, as do CLI dispatch and C API `canonical::import_object`. The
+  removed legacy implementation exported it, but no staying consumer used it.
+- `proc_snapshot` is the adapter import table's only Unsupported entry; no
+  Pending imports remain. Journaling/checkpoint and old-format compatibility
+  remain intentionally outside delivery. Shim presence alone does not establish
+  semantic parity; run the retained compatibility suites in CI.
+- CLI machine execution rejects explicitly supplied `--enable-async-threads`,
+  `--enable-cpu-backoff`, non-package `--entrypoint`, `--invoke` other than
+  `_start`, `--experimental-napi` and `--coredump-on-trap`. These are existing
+  v2 limitations, not newly removed execution paths.
+- C API `wasi_env_set_memory` remains explicitly unsupported (it panics).
+
+Historical DESIGN notes listing HTTP, dynamic linking and port calls as missing
+are stale where current `wasix1/src/imports.rs` entries are Shim. Validate actual
+provider/build-profile behavior rather than reinstating a legacy dependency.

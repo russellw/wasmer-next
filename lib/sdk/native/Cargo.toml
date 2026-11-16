@@ -27,12 +27,12 @@ sha2.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
 toml.workspace = true
-wasmer = { path = "../../api", default-features = false }
+wasmer = { workspace = true, default-features = false }
 wasmer-cache = { path = "../../cache", default-features = false, features = ["module-cache-filesystem", "module-cache-sys"] }
 wasmer-c-api-imports = { path = "../../c-api-imports", default-features = false, features = ["sys", "wasixv2"] }
 wasmer-config.workspace = true
 wasmer-package = { workspace = true, features = ["acquisition-thread", "http-client", "authoring"] }
-wasmer-types = { path = "../../types", features = ["detect-wasm-features"] }
+wasmer-types = { workspace = true, default-features = true, features = ["detect-wasm-features"] }
 wasixv2 = { path = "../../wasix/api", default-features = false, features = ["resolved-packages"] }
 wasixv2-dylink = { path = "../../wasix/dylink", default-features = false, features = ["sys"] }
 wasixv2-abi.workspace = true

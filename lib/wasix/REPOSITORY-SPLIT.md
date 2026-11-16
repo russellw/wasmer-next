@@ -1,3 +1,8 @@
+> Ownership update (2026-11-16): WLK extraction has been reversed into the
+> sealed local wlk/ workspace; the engine now lives in wasmerio/wasmer-runtime.
+> Legacy runtime/support crates are removed. The body records the historical
+> split design, not the current dependency layout.
+
 > Implementation update (2026-11-05): the approved 21-crate cut is now in the
 > private `wasmerio/wlk` workspace under `crates/`; Wasmer consumes its `main`
 > branch via git dependencies and Cargo.lock. Canonical codegen remains here.

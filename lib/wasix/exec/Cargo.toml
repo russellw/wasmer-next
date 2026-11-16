@@ -15,10 +15,10 @@ wasixv2-abi = { workspace = true }
 wasixv2-syscalls = { workspace = true }
 wasixv2-host = { workspace = true }
 wasixv2-pages = { workspace = true }
-wasmer = { path = "../../api", version = "=7.5.0", default-features = false, features = [
+wasmer = { workspace = true, default-features = false, features = [
   "experimental-async",
 ] }
-wasmer-types = { path = "../../types", version = "=7.5.0", default-features = false }
+wasmer-types = { workspace = true, default-features = false }
 thiserror.workspace = true
 tracing.workspace = true
 wasm-encoder = { workspace = true, features = ["wasmparser"] }
@@ -39,7 +39,7 @@ wasmprinter.workspace = true
 wat.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-wasmer = { path = "../../api", version = "=7.5.0", default-features = false, features = ["cranelift"] }
+wasmer = { workspace = true, default-features = false, features = ["cranelift"] }
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test.workspace = true

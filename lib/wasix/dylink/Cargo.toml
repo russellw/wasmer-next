@@ -12,9 +12,9 @@ rust-version.workspace = true
 
 [dependencies]
 wasixv2-exec = { path = "../exec", default-features = false, optional = true }
-wasmer = { path = "../../api", version = "=7.5.0", default-features = false, optional = true }
+wasmer = { workspace = true, default-features = false, optional = true }
 
-wasmer-types = { path = "../../types", version = "=7.5.0", default-features = false, optional = true }
+wasmer-types = { workspace = true, default-features = false, optional = true }
 wasixv2-abi = { workspace = true, optional = true }
 wasixv2-syscalls = { workspace = true, optional = true }
 wasixv2-host = { workspace = true, optional = true }

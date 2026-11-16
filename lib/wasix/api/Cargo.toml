@@ -35,7 +35,7 @@ wasixv2-checkpoint = { workspace = true }
 wasixv2-exec = { path = "../exec", default-features = false }
 wasixv2-dylink = { path = "../dylink", default-features = false }
 wasixv2-wasix1 = { path = "../wasix1", default-features = false, optional = true }
-wasmer = { path = "../../api", version = "=7.5.0", default-features = false }
+wasmer = { workspace = true, default-features = false }
 shared-buffer.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
@@ -62,7 +62,7 @@ wasix1-net-reference = { path = "tests/support/classic-reference" }
 wasixv2-vnet-web = { workspace = true }
 wasixv2-wait = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
-wasmer = { path = "../../api", version = "=7.5.0", default-features = false, features = [
+wasmer = { workspace = true, default-features = false, features = [
   "cranelift",
 ] }
 

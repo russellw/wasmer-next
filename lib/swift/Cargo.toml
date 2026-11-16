@@ -16,7 +16,7 @@ anyhow.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread"], default-features = false }
 uniffi.workspace = true
-wasmer = { version = "=7.5.0", path = "../api", default-features = false, features = [
+wasmer = { workspace = true, default-features = false, features = [
   "cranelift",
   "std",
 ] }

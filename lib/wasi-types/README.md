@@ -1,3 +1,4 @@
-# wasmer-wasix-types
+# WASI(X) ABI layout oracle
 
-This crate contains WASI(X) type definitions used by `wasmer-wasix`.
+Retained for native dev-only layout checks in wasixv2-wasix1. The obsolete
+wasmer-wasix runtime is removed; product execution uses the v2 adapter.

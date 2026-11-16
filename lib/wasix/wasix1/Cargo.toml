@@ -17,7 +17,7 @@ wasixv2-host = { workspace = true }
 wasixv2-vnet = { workspace = true }
 wasixv2-dylink = { path = "../dylink", default-features = false }
 wasixv2-exec = { path = "../exec", default-features = false }
-wasmer = { path = "../../api", version = "=7.5.0", default-features = false, features = [
+wasmer = { workspace = true, default-features = false, features = [
   "experimental-async",
 ] }
 tracing.workspace = true
@@ -41,7 +41,7 @@ wasixv2 = { path = "../api", default-features = false, features = ["js", "web", 
 wasmer-wasix-types = { path = "../../wasi-types" }
 wasixv2 = { path = "../api" }
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
-wasmer = { path = "../../api", version = "=7.5.0", default-features = false, features = [
+wasmer = { workspace = true, default-features = false, features = [
   "cranelift",
 ] }
 

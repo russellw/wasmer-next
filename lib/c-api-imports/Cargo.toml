@@ -13,7 +13,7 @@ version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-wasmer-api = { version = "=7.5.0", path = "../api", default-features = false, package = "wasmer" }
+wasmer-api = { workspace = true, default-features = false }
 wasixv2-exec = { path = "../wasix/exec", default-features = false, optional = true }
 
 [dev-dependencies]

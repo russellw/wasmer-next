@@ -17,7 +17,6 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 //#[cfg(all(target_os = "linux", feature = "tun-tap"))]
-//mod net;
 
 mod commands;
 mod common;
