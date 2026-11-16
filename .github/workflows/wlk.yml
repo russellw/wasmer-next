@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+    paths: ["wlk/**", ".github/workflows/wlk.yml"]
+  pull_request:
+    paths: ["wlk/**", ".github/workflows/wlk.yml"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wlk-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: wlk
+
+jobs:
+  native:
+    name: Native check, lint, and tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: wlk
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96 --profile minimal --component rustfmt --component clippy --target wasm32-unknown-unknown
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Check engine-free boundary
+        run: python3 scripts/check-engine-free.py
+      - name: Check workspace
+        run: cargo check --workspace --locked
+      - name: Check Tokio host profile
+        run: cargo check -p wasixv2-host --features tokio --locked
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D clippy::all
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Browser protocol tests
+        run: node --test crates/host/tests/browser/protocol.test.mjs
+      - uses: taiki-e/install-action@nextest
+      - name: Rust tests
+        run: cargo nextest run --workspace --locked
+
+  terminal:
+    name: Native terminal leases (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: wlk
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96 --profile minimal --component clippy
+      - name: Terminal lease regressions
+        run: cargo test --locked -p wasixv2-host --no-default-features --features terminal --lib terminal::tests
+      - name: Terminal profile Clippy
+        run: cargo clippy --locked -p wasixv2-host --no-default-features --features terminal --all-targets -- -D clippy::all
+
+  wasm:
+    name: wasm32 feature profiles
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: wlk
+      - name: Install pinned Rust toolchain and wasm target
+        run: rustup toolchain install 1.96 --profile minimal --target wasm32-unknown-unknown
+      - name: Check browser host
+        run: cargo check -p wasixv2-host --features browser --target wasm32-unknown-unknown --locked
+      - name: Check web drivers
+        run: cargo check -p wasixv2-stdio-web -p wasixv2-vfs-web -p wasixv2-vnet-web --target wasm32-unknown-unknown --locked
+
+  security:
+    name: Cargo audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: wlk
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96 --profile minimal
+      - uses: taiki-e/install-action@cargo-audit
+      - name: Audit lockfile
+        run: cargo audit --deny warnings

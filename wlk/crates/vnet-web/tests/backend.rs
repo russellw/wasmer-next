@@ -1,0 +1,2311 @@
+use std::{
+    collections::VecDeque,
+    net::SocketAddr,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    task::{Context, Poll},
+};
+use wasixv2_abi::Errno;
+use wasixv2_vnet::{
+    Answer, Backend, BackendStream, Domain, Found, InboundSink, Lookup, LookupError, Room,
+    Shutdown, StreamState,
+};
+use wasixv2_vnet_web::{Capabilities, Command, Config, Driver, Event, Transport, WebBackend};
+use wasixv2_wait::{PollMask, PollTable, WaitEntry, WaitQueue};
+
+fn peer() -> SocketAddr {
+    "192.0.2.1:1234".parse().unwrap()
+}
+struct Mock {
+    capabilities: Capabilities,
+    commands: Vec<Command>,
+    events: VecDeque<Event>,
+    blocked: bool,
+    error: Option<Errno>,
+    closed: Arc<AtomicBool>,
+}
+impl Transport for Mock {
+    fn capabilities(&self) -> Capabilities {
+        self.capabilities
+    }
+    fn poll_send(&mut self, _: &mut Context<'_>, command: &Command) -> Poll<Result<(), Errno>> {
+        if self.blocked {
+            return Poll::Pending;
+        }
+        self.commands.push(command.clone());
+        Poll::Ready(Ok(()))
+    }
+    fn poll_recv(&mut self, _: &mut Context<'_>) -> Poll<Result<Event, Errno>> {
+        if let Some(error) = self.error.take() {
+            return Poll::Ready(Err(error));
+        }
+        self.events
+            .pop_front()
+            .map_or(Poll::Pending, |event| Poll::Ready(Ok(event)))
+    }
+    fn poll_closed(&mut self, _: &mut Context<'_>) -> Poll<Errno> {
+        self.error.take().map_or(Poll::Pending, Poll::Ready)
+    }
+    fn close(&mut self) {
+        self.closed.store(true, Ordering::SeqCst);
+    }
+}
+struct Harness {
+    backend: Arc<WebBackend>,
+    driver: Driver,
+    transport: Mock,
+}
+impl Harness {
+    fn new() -> Self {
+        Self::with_capabilities(Capabilities::classic(true))
+    }
+    fn with_capabilities(capabilities: Capabilities) -> Self {
+        let (backend, driver) = WebBackend::new(
+            Config {
+                max_sockets: 8,
+                max_lookups: 2,
+                buffer_bytes: 8,
+                chunk_bytes: 4,
+            },
+            capabilities,
+        )
+        .unwrap();
+        Self {
+            backend,
+            driver,
+            transport: Mock {
+                capabilities,
+                commands: Vec::new(),
+                events: VecDeque::new(),
+                blocked: false,
+                error: None,
+                closed: Arc::new(AtomicBool::new(false)),
+            },
+        }
+    }
+    fn pump(&mut self) -> Poll<Result<(), Errno>> {
+        let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+        self.driver.poll(&mut cx, &mut self.transport)
+    }
+    fn event(&mut self, event: Event) {
+        self.transport.events.push_back(event);
+        assert!(self.pump().is_pending());
+    }
+    fn connect(&mut self) -> (Arc<dyn BackendStream>, u64) {
+        let stream = self.backend.connect(peer(), WaitQueue::new()).unwrap();
+        assert!(self.pump().is_pending());
+        let (request, socket) = self
+            .transport
+            .commands
+            .iter()
+            .rev()
+            .find_map(|c| match c {
+                Command::Connect {
+                    request, socket, ..
+                } => Some((*request, *socket)),
+                _ => None,
+            })
+            .unwrap();
+        self.event(Event::Complete {
+            request,
+            result: Ok(()),
+        });
+        (stream, socket)
+    }
+    fn send_request(&self) -> (u64, u64, Vec<u8>) {
+        self.transport
+            .commands
+            .iter()
+            .rev()
+            .find_map(|c| match c {
+                Command::Send {
+                    request,
+                    socket,
+                    data,
+                } => Some((*request, *socket, data.clone())),
+                _ => None,
+            })
+            .unwrap()
+    }
+    fn ack(&mut self, amount: usize) {
+        let (request, socket, _) = self.send_request();
+        self.event(Event::Sent {
+            request,
+            socket,
+            amount,
+        });
+    }
+}
+#[test]
+fn short_writes_and_acknowledgments_preserve_bytes_and_readiness() {
+    let mut h = Harness::new();
+    let (s, _) = h.connect();
+    assert_eq!(s.state(), StreamState::Established);
+    assert_eq!(s.write(b"abcdefghij"), Ok(8));
+    assert_eq!(s.write(b"x"), Err(Errno::EAGAIN));
+    assert!(!s.poll(None).contains(PollMask::OUT));
+    assert!(h.pump().is_pending());
+    assert_eq!(h.send_request().2, b"abcd");
+    assert_eq!(s.output_len(), 8);
+    h.ack(2);
+    assert_eq!(h.send_request().2, b"cdef");
+    assert_eq!(s.output_len(), 6);
+    assert!(s.poll(None).contains(PollMask::OUT));
+    assert_eq!(s.write(b"ij"), Ok(2));
+    h.ack(4);
+    assert_eq!(h.send_request().2, b"ghij");
+    h.ack(4);
+    assert_eq!(s.output_len(), 0);
+}
+#[test]
+fn eof_keeps_write_direction_and_shutdown_orders_fin_after_data() {
+    let mut h = Harness::new();
+    let (s, socket) = h.connect();
+    h.event(Event::Data {
+        socket,
+        data: b"abc".to_vec(),
+    });
+    h.event(Event::Eof { socket });
+    assert!(s.poll(None).contains(PollMask::RDHUP));
+    assert!(!s.poll(None).contains(PollMask::HUP));
+    assert!(!s.tcp_established());
+    let mut buf = [0; 8];
+    assert_eq!(s.read(&mut buf, true), Ok(3));
+    assert_eq!(s.input_len(), 3);
+    assert_eq!(s.read(&mut buf, false), Ok(3));
+    assert_eq!(s.read(&mut buf, false), Ok(0));
+    assert_eq!(s.write(b"reply"), Ok(5));
+    s.shutdown(Shutdown::Write).unwrap();
+    assert_eq!(s.write(b"x"), Err(Errno::EPIPE));
+    assert!(h.pump().is_pending());
+    assert!(
+        !h.transport
+            .commands
+            .iter()
+            .any(|c| matches!(c, Command::Shutdown { .. }))
+    );
+    h.ack(4);
+    h.ack(1);
+    let request = h
+        .transport
+        .commands
+        .iter()
+        .find_map(|c| match c {
+            Command::Shutdown {
+                request,
+                how: Shutdown::Write,
+                ..
+            } => Some(*request),
+            _ => None,
+        })
+        .unwrap();
+    h.event(Event::Complete {
+        request,
+        result: Ok(()),
+    });
+    assert!(s.poll(None).contains(PollMask::HUP | PollMask::RDHUP));
+}
+#[test]
+fn reset_drains_readable_bytes_then_reports_error_once() {
+    let mut h = Harness::new();
+    let (s, socket) = h.connect();
+    h.event(Event::Data {
+        socket,
+        data: b"data".to_vec(),
+    });
+    h.event(Event::Reset {
+        socket,
+        error: Errno::ECONNRESET,
+    });
+    assert_eq!(s.state(), StreamState::Closed);
+    assert!(s.poll(None).contains(PollMask::ERR | PollMask::HUP));
+    let mut buf = [0; 8];
+    assert_eq!(s.read(&mut buf, false), Ok(4));
+    assert_eq!(s.read(&mut buf, false), Err(Errno::ECONNRESET));
+    assert_eq!(s.read(&mut buf, false), Ok(0));
+    assert_eq!(s.write(b"x"), Err(Errno::EPIPE));
+    assert_eq!(s.take_error(), None);
+}
+struct WakeCounter(AtomicUsize);
+impl WaitEntry for WakeCounter {
+    fn wake(&self, _: PollMask) -> bool {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        true
+    }
+}
+#[test]
+fn refusal_wakes_the_original_wait_queue_and_so_error_clears() {
+    let mut h = Harness::new();
+    let wq = WaitQueue::new();
+    let counter = Arc::new(WakeCounter(AtomicUsize::new(0)));
+    let _registration = wq.add(counter.clone());
+    let s = h.backend.connect(peer(), wq).unwrap();
+    assert_eq!(s.state(), StreamState::Connecting);
+    assert_eq!(s.poll(None), PollMask::empty());
+    assert_eq!(s.read(&mut [0; 1], false), Err(Errno::EAGAIN));
+    assert!(h.pump().is_pending());
+    let request = match h.transport.commands[0] {
+        Command::Connect { request, .. } => request,
+        _ => unreachable!(),
+    };
+    h.event(Event::Complete {
+        request,
+        result: Err(Errno::ECONNREFUSED),
+    });
+    assert!(counter.0.load(Ordering::SeqCst) > 0);
+    assert_eq!(s.take_error(), Some(Errno::ECONNREFUSED));
+    assert_eq!(s.take_error(), None);
+    assert!(!s.poll(None).contains(PollMask::ERR));
+    assert_eq!(s.write(b"x"), Err(Errno::EPIPE));
+}
+#[test]
+fn disconnect_and_reconnect_never_replay_queued_bytes() {
+    let mut h = Harness::new();
+    let (old, _) = h.connect();
+    h.transport.blocked = true;
+    assert_eq!(old.write(b"old"), Ok(3));
+    assert!(h.pump().is_pending());
+    let done = Arc::new(Mutex::new(None));
+    let output = done.clone();
+    h.backend.lookup(
+        Lookup::Name("cancel.test".into()),
+        Box::new(move |r| *output.lock().unwrap() = Some(r)),
+    );
+    h.transport.error = Some(Errno::ENETDOWN);
+    assert_eq!(h.pump(), Poll::Ready(Err(Errno::ENETDOWN)));
+    assert!(h.transport.closed.load(Ordering::SeqCst));
+    assert_eq!(old.output_len(), 0);
+    assert_eq!(old.take_error(), Some(Errno::ECONNABORTED));
+    assert_eq!(*done.lock().unwrap(), Some(Err(LookupError::Failed)));
+    let capabilities = h.backend.capabilities();
+    h.driver = h.backend.reconnect(capabilities).unwrap();
+    assert!(h.backend.reconnect(capabilities).is_err());
+    h.transport.blocked = false;
+    h.transport.commands.clear();
+    let (new, _) = h.connect();
+    assert_eq!(old.write(b"bad"), Err(Errno::EPIPE));
+    assert_eq!(new.write(b"new"), Ok(3));
+    assert!(h.pump().is_pending());
+    assert_eq!(h.send_request().2, b"new");
+    assert!(
+        !h.transport
+            .commands
+            .iter()
+            .any(|c| matches!(c, Command::Send { data, .. } if data == b"old"))
+    );
+    drop(old);
+    assert_eq!(new.state(), StreamState::Established);
+}
+#[test]
+fn last_reference_drains_writes_but_unread_data_aborts() {
+    let mut h = Harness::new();
+    let (s, socket) = h.connect();
+    s.write(b"abc").unwrap();
+    let held = s.clone();
+    drop(s);
+    assert!(h.pump().is_pending());
+    assert!(
+        !h.transport
+            .commands
+            .iter()
+            .any(|c| matches!(c, Command::Close { .. }))
+    );
+    drop(held);
+    h.ack(3);
+    assert!(
+        h.transport
+            .commands
+            .iter()
+            .any(|c| matches!(c, Command::Close { socket: id } if *id == socket))
+    );
+    let (s, socket) = h.connect();
+    h.event(Event::Data {
+        socket,
+        data: vec![1],
+    });
+    drop(s);
+    assert!(h.pump().is_pending());
+    let reset = h
+        .transport
+        .commands
+        .iter()
+        .position(|c| matches!(c, Command::Reset { socket: id } if *id == socket))
+        .unwrap();
+    let close = h
+        .transport
+        .commands
+        .iter()
+        .position(|c| matches!(c, Command::Close { socket: id } if *id == socket))
+        .unwrap();
+    assert!(reset < close);
+}
+#[test]
+fn receive_saturation_retains_frame_suffix_and_disconnect_still_progresses() {
+    let mut h = Harness::new();
+    let (s, socket) = h.connect();
+    h.event(Event::Data {
+        socket,
+        data: b"abcdefghijkl".to_vec(),
+    });
+    assert_eq!(s.input_len(), 8);
+    let mut buf = [0; 8];
+    assert_eq!(s.read(&mut buf, false), Ok(8));
+    assert_eq!(&buf, b"abcdefgh");
+    assert!(h.pump().is_pending());
+    assert_eq!(s.read(&mut buf, false), Ok(4));
+    assert_eq!(&buf[..4], b"ijkl");
+    h.event(Event::Data {
+        socket,
+        data: vec![1; 12],
+    });
+    h.transport.error = Some(Errno::ENETDOWN);
+    assert_eq!(h.pump(), Poll::Ready(Err(Errno::ENETDOWN)));
+    assert_eq!(s.take_error(), Some(Errno::ECONNABORTED));
+}
+#[test]
+fn provider_eagain_waits_for_writable_notification_without_busy_retry() {
+    let mut h = Harness::new();
+    let (s, socket) = h.connect();
+    s.write(b"abc").unwrap();
+    assert!(h.pump().is_pending());
+    let (request, _, _) = h.send_request();
+    let count = h.transport.commands.len();
+    h.event(Event::SendError {
+        request,
+        socket,
+        error: Errno::EAGAIN,
+    });
+    assert_eq!(h.transport.commands.len(), count);
+    assert!(!s.poll(None).contains(PollMask::OUT));
+    h.event(Event::Writable { socket });
+    assert_eq!(h.send_request().2, b"abc");
+    h.ack(3);
+    assert_eq!(s.output_len(), 0);
+}
+#[test]
+fn udp_retains_boundaries_source_peek_truncation_and_empty_datagrams() {
+    let mut h = Harness::new();
+    let s = h.backend.datagram(Domain::Inet, WaitQueue::new()).unwrap();
+    assert_eq!(s.send_to(b"x", peer()), Err(Errno::EAGAIN));
+    assert!(h.pump().is_pending());
+    let (request, socket) = h
+        .transport
+        .commands
+        .iter()
+        .find_map(|c| match c {
+            Command::Bind {
+                request, socket, ..
+            } => Some((*request, *socket)),
+            _ => None,
+        })
+        .unwrap();
+    h.event(Event::Complete {
+        request,
+        result: Ok(()),
+    });
+    for data in [b"abc".to_vec(), vec![]] {
+        h.event(Event::Datagram {
+            socket,
+            data,
+            addr: peer(),
+        });
+    }
+    let mut buf = [0; 2];
+    assert_eq!(s.recv_from(&mut buf, true), Ok((2, 3, peer())));
+    assert_eq!(&buf, b"ab");
+    assert_eq!(s.input_len(), 3);
+    assert_eq!(s.recv_from(&mut buf, false), Ok((2, 3, peer())));
+    assert!(s.poll(None).contains(PollMask::IN));
+    assert_eq!(s.recv_from(&mut buf, false), Ok((0, 0, peer())));
+    assert!(!s.poll(None).contains(PollMask::IN));
+    s.connect(Some(peer())).unwrap();
+    h.event(Event::Datagram {
+        socket,
+        data: vec![1],
+        addr: "192.0.2.2:1".parse().unwrap(),
+    });
+    assert_eq!(s.recv_from(&mut buf, false), Err(Errno::EAGAIN));
+    for _ in 0..8 {
+        assert_eq!(s.send_to(&[], peer()), Ok(0));
+    }
+    assert_eq!(s.send_to(&[], peer()), Err(Errno::EAGAIN));
+    assert!(!s.poll(None).contains(PollMask::OUT));
+    assert!(h.pump().is_pending());
+    assert!(s.poll(None).contains(PollMask::OUT));
+    assert_eq!(s.send_to(&[0; 9], peer()), Err(Errno::EMSGSIZE));
+}
+#[test]
+fn provider_capabilities_and_dns_answers_are_explicit_and_bounded() {
+    let mut h = Harness::with_capabilities(Capabilities::wisp(false));
+    assert!(matches!(
+        h.backend.datagram(Domain::Inet, WaitQueue::new()),
+        Err(Errno::EOPNOTSUPP)
+    ));
+    assert!(matches!(
+        h.backend
+            .connect("[::1]:1".parse().unwrap(), WaitQueue::new()),
+        Err(Errno::EAFNOSUPPORT)
+    ));
+    let calls = Arc::new(AtomicUsize::new(0));
+    for lookup in [Lookup::Addr(peer().ip()), Lookup::Forward(vec![])] {
+        let calls = calls.clone();
+        h.backend.lookup(
+            lookup,
+            Box::new(move |r| {
+                assert_eq!(r, Err(LookupError::Failed));
+                calls.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    let answer = Arc::new(Mutex::new(None));
+    let output = answer.clone();
+    let backend = h.backend.clone();
+    h.backend.lookup(
+        Lookup::Name("a.test".into()),
+        Box::new(move |r| {
+            // Callback may reenter the backend: it must never run under its mutex.
+            assert!(backend.capabilities().dns_name);
+            *output.lock().unwrap() = Some(r);
+        }),
+    );
+    assert!(h.pump().is_pending());
+    let request = h
+        .transport
+        .commands
+        .iter()
+        .find_map(|c| match c {
+            Command::Lookup { request, .. } => Some(*request),
+            _ => None,
+        })
+        .unwrap();
+    h.event(Event::Lookup {
+        request,
+        result: Ok(Found {
+            answer: Answer::Addrs {
+                canonical: String::new(),
+                addrs: vec![peer().ip()],
+            },
+            ttl: 30,
+        }),
+    });
+    assert!(
+        matches!(&*answer.lock().unwrap(), Some(Ok(Found { answer: Answer::Addrs { canonical, .. }, .. })) if canonical == "a.test")
+    );
+    for _ in 0..3 {
+        let calls = calls.clone();
+        h.backend.lookup(
+            Lookup::Name("pending.test".into()),
+            Box::new(move |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    drop(h.driver);
+    assert_eq!(calls.load(Ordering::SeqCst), 5);
+}
+#[test]
+fn resolver_provider_supports_reverse_and_raw_forward_without_host_files() {
+    let mut caps = Capabilities::wisp(true);
+    caps.dns_reverse = true;
+    caps.dns_forward = true;
+    let mut h = Harness::with_capabilities(caps);
+    for (lookup, expected) in [
+        (Lookup::Addr(peer().ip()), Answer::Name("a.test".into())),
+        (Lookup::Forward(vec![1, 2]), Answer::Message(vec![1, 2, 3])),
+    ] {
+        let result = Arc::new(Mutex::new(None));
+        let output = result.clone();
+        h.backend
+            .lookup(lookup, Box::new(move |r| *output.lock().unwrap() = Some(r)));
+        assert!(h.pump().is_pending());
+        let request = h
+            .transport
+            .commands
+            .iter()
+            .rev()
+            .find_map(|c| match c {
+                Command::Lookup { request, .. } => Some(*request),
+                _ => None,
+            })
+            .unwrap();
+        let found = Found {
+            answer: expected,
+            ttl: 60,
+        };
+        h.event(Event::Lookup {
+            request,
+            result: Ok(found.clone()),
+        });
+        assert_eq!(*result.lock().unwrap(), Some(Ok(found)));
+    }
+}
+struct Sink {
+    room: AtomicBool,
+    queue: WaitQueue,
+    incoming: Mutex<Vec<Arc<dyn BackendStream>>>,
+}
+impl Sink {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            room: AtomicBool::new(false),
+            queue: WaitQueue::new(),
+            incoming: Mutex::new(Vec::new()),
+        })
+    }
+}
+impl InboundSink for Sink {
+    fn poll_room(&self, table: Option<&mut PollTable<'_>>) -> Room {
+        if let Some(table) = table {
+            table.wait_on(&self.queue);
+        }
+        if self.room.load(Ordering::SeqCst) {
+            Room::Ready
+        } else {
+            Room::Full
+        }
+    }
+    fn incoming(&self, stream: Arc<dyn BackendStream>, _: WaitQueue) -> bool {
+        assert_eq!(stream.read(&mut [0; 1], false), Err(Errno::EAGAIN));
+        self.room.store(false, Ordering::SeqCst);
+        self.incoming.lock().unwrap().push(stream);
+        true
+    }
+}
+#[test]
+fn publication_obeys_accept_room_and_drop_closes_late_accepted_children() {
+    let mut h = Harness::new();
+    let sink = Sink::new();
+    let publication = h.backend.publish(peer(), 1, sink.clone()).unwrap();
+    assert_eq!(publication.host_addr(), peer());
+    assert!(h.pump().is_pending());
+    let (request, socket) = h
+        .transport
+        .commands
+        .iter()
+        .find_map(|c| match c {
+            Command::Listen {
+                request, socket, ..
+            } => Some((*request, *socket)),
+            _ => None,
+        })
+        .unwrap();
+    h.event(Event::Complete {
+        request,
+        result: Ok(()),
+    });
+    assert!(
+        !h.transport
+            .commands
+            .iter()
+            .any(|c| matches!(c, Command::Accept { .. }))
+    );
+    sink.room.store(true, Ordering::SeqCst);
+    sink.queue.wake(PollMask::OUT);
+    assert!(h.pump().is_pending());
+    let child = h
+        .transport
+        .commands
+        .iter()
+        .find_map(|c| match c {
+            Command::Accept { child, .. } => Some(*child),
+            _ => None,
+        })
+        .unwrap();
+    h.event(Event::Accepted {
+        socket,
+        child,
+        peer: peer(),
+    });
+    assert_eq!(sink.incoming.lock().unwrap().len(), 1);
+    assert_eq!(sink.incoming.lock().unwrap()[0].peer_addr(), peer());
+    assert_eq!(
+        h.transport
+            .commands
+            .iter()
+            .filter(|c| matches!(c, Command::Accept { .. }))
+            .count(),
+        1
+    );
+    sink.room.store(true, Ordering::SeqCst);
+    assert!(h.pump().is_pending());
+    let child = h
+        .transport
+        .commands
+        .iter()
+        .rev()
+        .find_map(|c| match c {
+            Command::Accept { child, .. } => Some(*child),
+            _ => None,
+        })
+        .unwrap();
+    drop(publication);
+    assert!(h.pump().is_pending());
+    h.transport.commands.clear();
+    h.event(Event::Accepted {
+        socket,
+        child,
+        peer: peer(),
+    });
+    assert!(
+        h.transport
+            .commands
+            .iter()
+            .any(|c| matches!(c, Command::Close { socket } if *socket == child))
+    );
+}
+#[test]
+fn publication_failure_is_visible_only_to_embedder() {
+    let mut h = Harness::new();
+    let sink = Sink::new();
+    let publication = h.backend.publish(peer(), 1, sink).unwrap();
+    assert!(h.pump().is_pending());
+    let request = h
+        .transport
+        .commands
+        .iter()
+        .find_map(|c| match c {
+            Command::Listen { request, .. } => Some(*request),
+            _ => None,
+        })
+        .unwrap();
+    h.event(Event::Complete {
+        request,
+        result: Err(Errno::EADDRINUSE),
+    });
+    assert_eq!(
+        h.backend.take_publication_error(),
+        Some((peer(), Errno::EADDRINUSE))
+    );
+    assert_eq!(publication.host_addr(), peer());
+    drop(publication);
+}
+#[test]
+fn bad_ack_fails_session_and_pending_dns_exactly_once() {
+    let mut h = Harness::new();
+    let (s, socket) = h.connect();
+    s.write(b"abc").unwrap();
+    assert!(h.pump().is_pending());
+    let (request, _, _) = h.send_request();
+    let count = Arc::new(AtomicUsize::new(0));
+    let output = count.clone();
+    h.backend.lookup(
+        Lookup::Name("a.test".into()),
+        Box::new(move |r| {
+            assert!(r.is_err());
+            output.fetch_add(1, Ordering::SeqCst);
+        }),
+    );
+    h.transport.events.push_back(Event::Sent {
+        request,
+        socket,
+        amount: 4,
+    });
+    assert_eq!(h.pump(), Poll::Ready(Err(Errno::EPROTO)));
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    assert_eq!(s.take_error(), Some(Errno::ECONNABORTED));
+}
+#[test]
+fn canceling_run_closes_transport_and_wakes_connect_waiter() {
+    use std::{future::Future, pin::pin};
+    let h = Harness::new();
+    let s = h.backend.connect(peer(), WaitQueue::new()).unwrap();
+    let closed = h.transport.closed.clone();
+    {
+        let mut run = pin!(h.driver.run(h.transport));
+        assert!(
+            run.as_mut()
+                .poll(&mut Context::from_waker(
+                    futures_util::task::noop_waker_ref()
+                ))
+                .is_pending()
+        );
+    }
+    assert!(closed.load(Ordering::SeqCst));
+    assert_eq!(s.take_error(), Some(Errno::ECONNABORTED));
+}
+#[test]
+fn socket_and_config_limits_are_enforced() {
+    let h = Harness::new();
+    let sockets: Vec<_> = (0..8)
+        .map(|_| h.backend.connect(peer(), WaitQueue::new()).unwrap())
+        .collect();
+    assert!(matches!(
+        h.backend.connect(peer(), WaitQueue::new()),
+        Err(Errno::ENOBUFS)
+    ));
+    assert_eq!(sockets.len(), 8);
+    assert!(
+        WebBackend::new(
+            Config {
+                buffer_bytes: 0,
+                ..Config::default()
+            },
+            Capabilities::classic(true)
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn cancel_before_transport_acceptance_never_opens_remote_socket() {
+    let mut h = Harness::new();
+    h.transport.blocked = true;
+    let socket = h.backend.connect(peer(), WaitQueue::new()).unwrap();
+    assert!(h.pump().is_pending());
+    drop(socket);
+    assert!(h.pump().is_pending());
+    h.transport.blocked = false;
+    assert!(h.pump().is_pending());
+    assert!(h.transport.commands.is_empty());
+    let _sockets: Vec<_> = (0..8)
+        .map(|_| h.backend.connect(peer(), WaitQueue::new()).unwrap())
+        .collect();
+}
+#[test]
+fn unread_close_aborts_even_while_an_acknowledgment_is_pending() {
+    let mut h = Harness::new();
+    let (s, socket) = h.connect();
+    s.write(b"abc").unwrap();
+    assert!(h.pump().is_pending());
+    let (request, _, _) = h.send_request();
+    h.event(Event::Data {
+        socket,
+        data: b"in".to_vec(),
+    });
+    drop(s);
+    assert!(h.pump().is_pending());
+    assert!(
+        h.transport
+            .commands
+            .iter()
+            .any(|c| matches!(c, Command::Close { socket: id } if *id == socket))
+    );
+    h.event(Event::Sent {
+        request,
+        socket,
+        amount: 3,
+    });
+}
+
+#[test]
+fn udp_connect_preserves_already_queued_datagrams() {
+    let mut h = Harness::new();
+    let s = h.backend.datagram(Domain::Inet, WaitQueue::new()).unwrap();
+    assert!(h.pump().is_pending());
+    let (request, socket) = h
+        .transport
+        .commands
+        .iter()
+        .find_map(|c| match c {
+            Command::Bind {
+                request, socket, ..
+            } => Some((*request, *socket)),
+            _ => None,
+        })
+        .unwrap();
+    h.event(Event::Complete {
+        request,
+        result: Ok(()),
+    });
+    let other = "192.0.2.2:1".parse().unwrap();
+    h.event(Event::Datagram {
+        socket,
+        data: vec![1],
+        addr: other,
+    });
+    s.connect(Some(peer())).unwrap();
+    assert_eq!(s.recv_from(&mut [0; 8], false), Ok((1, 1, other)));
+    h.event(Event::Datagram {
+        socket,
+        data: vec![2],
+        addr: other,
+    });
+    assert_eq!(s.recv_from(&mut [0; 8], false), Err(Errno::EAGAIN));
+}
+#[test]
+fn vnet_socket_layer_drives_backend_connect_send_receive_and_shutdown() {
+    use wasixv2_abi::MsgFlags;
+    use wasixv2_vnet::{Net, NetConfig, Network, SendMsg, SocketKind};
+    let mut h = Harness::new();
+    let net = Net::new(NetConfig::host_default(), Some(h.backend.clone()));
+    let s = net.socket(Domain::Inet, SocketKind::Stream, 0, 1).unwrap();
+    assert_eq!(s.connect(peer()), Err(Errno::EINPROGRESS));
+    assert!(h.pump().is_pending());
+    let (request, socket) = h
+        .transport
+        .commands
+        .iter()
+        .find_map(|c| match c {
+            Command::Connect {
+                request, socket, ..
+            } => Some((*request, *socket)),
+            _ => None,
+        })
+        .unwrap();
+    h.event(Event::Complete {
+        request,
+        result: Ok(()),
+    });
+    assert!(s.poll(None).contains(PollMask::OUT));
+    assert_eq!(s.take_error(), None);
+    assert_eq!(
+        s.send(SendMsg {
+            data: b"abc",
+            to: None,
+            flags: MsgFlags(0),
+            control: &[],
+            net_raw: false,
+            now: std::time::Duration::ZERO
+        }),
+        Ok(3)
+    );
+    assert!(h.pump().is_pending());
+    h.ack(3);
+    h.event(Event::Data {
+        socket,
+        data: b"reply".to_vec(),
+    });
+    let mut buf = [0; 8];
+    assert_eq!(s.recv(&mut buf, MsgFlags(0)).unwrap().len, 5);
+    assert_eq!(&buf[..5], b"reply");
+    s.shutdown(Shutdown::Write).unwrap();
+    assert!(h.pump().is_pending());
+    assert!(h.transport.commands.iter().any(|c| matches!(
+        c,
+        Command::Shutdown {
+            how: Shutdown::Write,
+            ..
+        }
+    )));
+}
+
+struct ReenterOnDrop {
+    backend: Arc<WebBackend>,
+    dropped: Arc<AtomicBool>,
+}
+impl InboundSink for ReenterOnDrop {
+    fn poll_room(&self, _: Option<&mut PollTable<'_>>) -> Room {
+        Room::Gone
+    }
+    fn incoming(&self, _: Arc<dyn BackendStream>, _: WaitQueue) -> bool {
+        false
+    }
+}
+impl Drop for ReenterOnDrop {
+    fn drop(&mut self) {
+        assert!(self.backend.capabilities().tcp);
+        self.dropped.store(true, Ordering::SeqCst);
+    }
+}
+#[test]
+fn sink_destructors_can_reenter_after_publication_close_and_disconnect() {
+    // The timeout detects a lock-order regression without hanging the entire test runner.
+    let (done, result) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        for disconnect in [false, true] {
+            let mut h = Harness::new();
+            let dropped = Arc::new(AtomicBool::new(false));
+            let publication = h
+                .backend
+                .publish(
+                    peer(),
+                    1,
+                    Arc::new(ReenterOnDrop {
+                        backend: h.backend.clone(),
+                        dropped: dropped.clone(),
+                    }),
+                )
+                .unwrap();
+            if disconnect {
+                drop(h.driver);
+            } else {
+                drop(publication);
+                assert!(h.pump().is_pending());
+            }
+            assert!(dropped.load(Ordering::SeqCst));
+        }
+        done.send(()).unwrap();
+    });
+    result
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap();
+    thread.join().unwrap();
+}
+
+struct GoneSink;
+impl InboundSink for GoneSink {
+    fn poll_room(&self, _: Option<&mut PollTable<'_>>) -> Room {
+        Room::Gone
+    }
+    fn incoming(&self, _: Arc<dyn BackendStream>, _: WaitQueue) -> bool {
+        panic!("no guest listener exists")
+    }
+}
+#[test]
+fn publication_without_guest_listener_accepts_and_resets_instead_of_stalling() {
+    let mut h = Harness::new();
+    let _publication = h.backend.publish(peer(), 1, Arc::new(GoneSink)).unwrap();
+    assert!(h.pump().is_pending());
+    let (request, socket) = h
+        .transport
+        .commands
+        .iter()
+        .find_map(|c| match c {
+            Command::Listen {
+                request, socket, ..
+            } => Some((*request, *socket)),
+            _ => None,
+        })
+        .unwrap();
+    h.event(Event::Complete {
+        request,
+        result: Ok(()),
+    });
+    let child = h
+        .transport
+        .commands
+        .iter()
+        .find_map(|c| match c {
+            Command::Accept { child, .. } => Some(*child),
+            _ => None,
+        })
+        .unwrap();
+    h.event(Event::Accepted {
+        socket,
+        child,
+        peer: peer(),
+    });
+    assert!(
+        h.transport
+            .commands
+            .iter()
+            .any(|c| matches!(c, Command::Reset { socket } if *socket == child))
+    );
+    assert!(
+        h.transport
+            .commands
+            .iter()
+            .any(|c| matches!(c, Command::Close { socket } if *socket == child))
+    );
+}
+
+#[test]
+fn read_shutdown_preserves_queued_bytes_and_the_established_tcp_state() {
+    let mut h = Harness::new();
+    let (s, socket) = h.connect();
+    h.event(Event::Data {
+        socket,
+        data: b"abcdefghijkl".to_vec(),
+    });
+    s.shutdown(Shutdown::Read).unwrap();
+    assert!(s.tcp_established(), "SHUT_RD sends no FIN");
+    let mut buf = [0; 8];
+    assert_eq!(s.read(&mut buf, false), Ok(8));
+    assert_eq!(&buf, b"abcdefgh");
+    assert!(h.pump().is_pending());
+    assert_eq!(s.read(&mut buf, false), Ok(4));
+    assert_eq!(&buf[..4], b"ijkl");
+    assert_eq!(s.read(&mut buf, false), Ok(0));
+    assert_eq!(s.write(b"out"), Ok(3));
+}
+#[test]
+fn close_resets_when_unread_bytes_remain_in_the_driver_input_slot() {
+    let mut h = Harness::new();
+    let (s, socket) = h.connect();
+    h.event(Event::Data {
+        socket,
+        data: b"abcdefghijkl".to_vec(),
+    });
+    assert_eq!(s.read(&mut [0; 8], false), Ok(8));
+    drop(s);
+    assert!(h.pump().is_pending());
+    assert!(
+        h.transport
+            .commands
+            .iter()
+            .any(|c| matches!(c, Command::Reset { socket: id } if *id == socket))
+    );
+}
+
+#[test]
+fn fidelity_urgent_marks_preserve_order_peek_inline_and_bounded_writes() {
+    let mut h = Harness::with_capabilities(Capabilities::classic_fidelity(true));
+    let (stream, socket) = h.connect();
+    assert_eq!(stream.write(b"ab"), Ok(2));
+    assert_eq!(stream.write_urgent(b"c!"), Ok(2));
+    assert_eq!(stream.write(b"de"), Ok(2));
+    assert!(h.pump().is_pending());
+    assert_eq!(h.send_request().2, b"abc");
+    h.ack(3);
+    let (request, data) = h
+        .transport
+        .commands
+        .iter()
+        .find_map(|c| match c {
+            Command::SendUrgent { request, data, .. } => Some((*request, data.clone())),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(data, b"!");
+    h.event(Event::Sent {
+        request,
+        socket,
+        amount: 1,
+    });
+    assert_eq!(h.send_request().2, b"de");
+    h.ack(2);
+    h.event(Event::Urgent {
+        socket,
+        data: b"abc!".to_vec(),
+    });
+    h.event(Event::Data {
+        socket,
+        data: b"de".to_vec(),
+    });
+    assert!(stream.poll(None).contains(PollMask::PRI));
+    let mut buf = [0; 8];
+    assert_eq!(stream.read(&mut buf, false), Ok(3));
+    assert_eq!(&buf[..3], b"abc");
+    assert!(stream.at_mark());
+    assert_eq!(stream.read_urgent(true), Ok(b'!'));
+    assert_eq!(stream.read_urgent(false), Ok(b'!'));
+    assert!(!stream.poll(None).contains(PollMask::PRI));
+    assert_eq!(stream.read(&mut buf, false), Ok(2));
+    assert_eq!(&buf[..2], b"de");
+    stream
+        .set_option(
+            wasixv2_abi::SocketLevel::SOL_SOCKET.0,
+            wasixv2_abi::SocketOption::SO_OOBINLINE.0,
+            &1i32.to_le_bytes(),
+        )
+        .unwrap();
+    h.event(Event::Urgent {
+        socket,
+        data: vec![b'?'],
+    });
+    assert_eq!(stream.read_urgent(false), Err(Errno::EINVAL));
+    assert_eq!(stream.read(&mut buf, false), Ok(1));
+    assert_eq!(buf[0], b'?');
+    assert_eq!(stream.write_urgent(b"123456789"), Ok(8));
+    assert_eq!(stream.write_urgent(b"!"), Err(Errno::EAGAIN));
+}
+
+#[test]
+fn published_udp_drops_unattached_packets_resets_attachment_and_preserves_errors() {
+    let mut h = Harness::with_capabilities(Capabilities::classic_fidelity(true));
+    let (endpoint, publication) = h.backend.publish_datagram(peer()).unwrap();
+    assert_eq!(publication.host_addr(), peer());
+    assert!(h.pump().is_pending());
+    let (request, socket) = h
+        .transport
+        .commands
+        .iter()
+        .find_map(|c| match c {
+            Command::Bind {
+                request,
+                socket,
+                addr,
+            } => {
+                assert_eq!(*addr, peer());
+                Some((*request, *socket))
+            }
+            _ => None,
+        })
+        .unwrap();
+    h.event(Event::Complete {
+        request,
+        result: Ok(()),
+    });
+    h.event(Event::Datagram {
+        socket,
+        data: vec![],
+        addr: peer(),
+    });
+    assert!(!endpoint.poll(None).contains(PollMask::READABLE));
+    endpoint.attach(Some(WaitQueue::new())).unwrap();
+    h.event(Event::Datagram {
+        socket,
+        data: vec![],
+        addr: peer(),
+    });
+    assert_eq!(endpoint.recv_from(&mut [], true), Ok((0, 0, peer())));
+    assert_eq!(endpoint.recv_from(&mut [], false), Ok((0, 0, peer())));
+    assert_eq!(endpoint.recv_from(&mut [], false), Err(Errno::EAGAIN));
+    h.event(Event::DatagramError {
+        socket,
+        error: Errno::EMSGSIZE,
+    });
+    assert!(endpoint.poll(None).contains(PollMask::ERR));
+    assert_eq!(endpoint.take_error(), Some(Errno::EMSGSIZE));
+    assert_eq!(endpoint.send_to(b"ok", peer()), Ok(2));
+    h.event(Event::Datagram {
+        socket,
+        data: b"stale".to_vec(),
+        addr: peer(),
+    });
+    endpoint.attach(None).unwrap();
+    endpoint.attach(Some(WaitQueue::new())).unwrap();
+    assert_eq!(endpoint.recv_from(&mut [0; 8], false), Err(Errno::EAGAIN));
+    drop(endpoint);
+    assert!(h.pump().is_pending());
+    assert!(
+        !h.transport
+            .commands
+            .iter()
+            .any(|c| matches!(c,Command::Close{socket:id} if *id==socket))
+    );
+    drop(publication);
+    assert!(h.pump().is_pending());
+    assert!(
+        h.transport
+            .commands
+            .iter()
+            .any(|c| matches!(c,Command::Close{socket:id} if *id==socket))
+    );
+    assert!(
+        h.backend
+            .publish_datagram("127.0.0.1:0".parse().unwrap())
+            .is_err()
+    );
+    let stock = Harness::new();
+    assert!(stock.backend.publish_datagram(peer()).is_err());
+}
+
+#[test]
+fn dropping_udp_drains_accepted_datagrams_before_close() {
+    let mut h = Harness::new();
+    let endpoint = h.backend.datagram(Domain::Inet, WaitQueue::new()).unwrap();
+    assert!(h.pump().is_pending());
+    let (request, socket) = h
+        .transport
+        .commands
+        .iter()
+        .find_map(|c| match c {
+            Command::Bind {
+                request, socket, ..
+            } => Some((*request, *socket)),
+            _ => None,
+        })
+        .unwrap();
+    h.event(Event::Complete {
+        request,
+        result: Ok(()),
+    });
+    assert_eq!(endpoint.send_to(b"last", peer()), Ok(4));
+    drop(endpoint);
+    assert!(h.pump().is_pending());
+    let send = h
+        .transport
+        .commands
+        .iter()
+        .position(
+            |c| matches!(c,Command::SendTo {socket:id,data,..} if *id==socket && data==b"last"),
+        )
+        .unwrap();
+    let close = h
+        .transport
+        .commands
+        .iter()
+        .position(|c| matches!(c,Command::Close {socket:id} if *id==socket))
+        .unwrap();
+    assert!(send < close);
+}
+
+#[test]
+fn publication_rechecks_a_listener_created_after_accept_credit() {
+    struct LaterListener {
+        ready: AtomicBool,
+        accepted: AtomicUsize,
+    }
+    impl InboundSink for LaterListener {
+        fn poll_room(&self, _: Option<&mut PollTable<'_>>) -> Room {
+            if self.ready.load(Ordering::SeqCst) {
+                Room::Ready
+            } else {
+                Room::Gone
+            }
+        }
+        fn incoming(&self, _: Arc<dyn BackendStream>, _: WaitQueue) -> bool {
+            self.accepted.fetch_add(1, Ordering::SeqCst);
+            true
+        }
+    }
+    let mut h = Harness::new();
+    let sink = Arc::new(LaterListener {
+        ready: AtomicBool::new(false),
+        accepted: AtomicUsize::new(0),
+    });
+    let _publication = h.backend.publish(peer(), 1, sink.clone()).unwrap();
+    assert!(h.pump().is_pending());
+    let (request, socket) = h
+        .transport
+        .commands
+        .iter()
+        .find_map(|c| match c {
+            Command::Listen {
+                request, socket, ..
+            } => Some((*request, *socket)),
+            _ => None,
+        })
+        .unwrap();
+    h.event(Event::Complete {
+        request,
+        result: Ok(()),
+    });
+    let child = h
+        .transport
+        .commands
+        .iter()
+        .find_map(|c| match c {
+            Command::Accept { child, .. } => Some(*child),
+            _ => None,
+        })
+        .unwrap();
+    sink.ready.store(true, Ordering::SeqCst);
+    h.event(Event::Accepted {
+        socket,
+        child,
+        peer: peer(),
+    });
+    assert_eq!(sink.accepted.load(Ordering::SeqCst), 1);
+    assert!(
+        !h.transport
+            .commands
+            .iter()
+            .any(|c| matches!(c,Command::Reset {socket:id} if *id==child))
+    );
+}
+
+#[test]
+fn skipping_an_urgent_only_full_queue_wakes_the_input_driver() {
+    use futures_util::task::{ArcWake, waker_ref};
+    struct Wake(AtomicUsize);
+    impl ArcWake for Wake {
+        fn wake_by_ref(this: &Arc<Self>) {
+            this.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let caps = Capabilities::classic_fidelity(false);
+    let mut h = Harness::with_capabilities(caps);
+    let (backend, driver) = WebBackend::new(
+        Config {
+            max_sockets: 8,
+            max_lookups: 2,
+            buffer_bytes: 1,
+            chunk_bytes: 1,
+        },
+        caps,
+    )
+    .unwrap();
+    h.backend = backend;
+    h.driver = driver;
+    let (stream, socket) = h.connect();
+    h.event(Event::Urgent {
+        socket,
+        data: vec![b'!'],
+    });
+    h.transport.events.push_back(Event::Data {
+        socket,
+        data: vec![b'a'],
+    });
+    let wake = Arc::new(Wake(AtomicUsize::new(0)));
+    let waker = waker_ref(&wake);
+    let mut cx = Context::from_waker(&waker);
+    assert!(h.driver.poll(&mut cx, &mut h.transport).is_pending());
+    wake.0.store(0, Ordering::SeqCst);
+    assert_eq!(stream.read(&mut [0; 1], false), Err(Errno::EAGAIN));
+    assert!(
+        wake.0.load(Ordering::SeqCst) > 0,
+        "skipping the urgent byte released receive capacity"
+    );
+    assert!(h.pump().is_pending());
+    let mut data = [0; 1];
+    assert_eq!(stream.read(&mut data, false), Ok(1));
+    assert_eq!(data[0], b'a');
+}
+
+fn poll_future<F: std::future::Future>(future: std::pin::Pin<&mut F>) -> Poll<F::Output> {
+    future.poll(&mut Context::from_waker(
+        futures_util::task::noop_waker_ref(),
+    ))
+}
+fn address_request(h: &Harness) -> (u64, u64) {
+    h.transport
+        .commands
+        .iter()
+        .rev()
+        .find_map(|c| match c {
+            Command::LocalAddr { request, socket } => Some((*request, *socket)),
+            _ => None,
+        })
+        .unwrap()
+}
+#[test]
+fn port_zero_publication_waits_for_bound_address_and_cancels_cleanly() {
+    let mut h = Harness::new();
+    let backend = h.backend.clone();
+    let host: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let mut future = Box::pin(backend.publish_resolved(host, 1, Sink::new()));
+    assert!(poll_future(future.as_mut()).is_pending());
+    assert!(h.pump().is_pending());
+    let (request, socket) = h
+        .transport
+        .commands
+        .iter()
+        .find_map(|c| match c {
+            Command::Listen {
+                request,
+                socket,
+                addr,
+            } => {
+                assert_eq!(*addr, host);
+                Some((*request, *socket))
+            }
+            _ => None,
+        })
+        .unwrap();
+    h.event(Event::Complete {
+        request,
+        result: Ok(()),
+    });
+    assert!(
+        poll_future(future.as_mut()).is_pending(),
+        "listen acknowledgment has no address"
+    );
+    let (request, id) = address_request(&h);
+    assert_eq!(id, socket);
+    let resolved = "127.0.0.1:43210".parse().unwrap();
+    h.event(Event::LocalAddr {
+        request,
+        addr: resolved,
+    });
+    let publication = match poll_future(future.as_mut()) {
+        Poll::Ready(Ok(p)) => p,
+        _ => panic!("publication did not resolve"),
+    };
+    assert_eq!(publication.host_addr(), resolved);
+    drop(publication);
+    assert!(h.pump().is_pending());
+    assert!(
+        h.transport
+            .commands
+            .iter()
+            .any(|c| matches!(c, Command::Close { socket: id } if *id == socket))
+    );
+
+    let mut future = Box::pin(backend.publish_resolved(host, 1, Sink::new()));
+    assert!(poll_future(future.as_mut()).is_pending());
+    assert!(h.pump().is_pending());
+    let (request, socket) = h
+        .transport
+        .commands
+        .iter()
+        .rev()
+        .find_map(|c| match c {
+            Command::Listen {
+                request, socket, ..
+            } => Some((*request, *socket)),
+            _ => None,
+        })
+        .unwrap();
+    drop(future);
+    h.event(Event::Complete {
+        request,
+        result: Ok(()),
+    });
+    let (request, _) = address_request(&h);
+    h.event(Event::LocalAddr {
+        request,
+        addr: resolved,
+    });
+    assert!(
+        h.transport
+            .commands
+            .iter()
+            .any(|c| matches!(c, Command::Close { socket: id } if *id == socket))
+    );
+}
+#[test]
+fn udp_zero_publication_resolves_and_failure_or_disconnect_finishes_waiters() {
+    for failure in [None, Some(Errno::EADDRINUSE), Some(Errno::ECONNABORTED)] {
+        let mut h = Harness::with_capabilities(Capabilities::classic_fidelity(true));
+        let backend = h.backend.clone();
+        let mut future = Box::pin(backend.publish_datagram_resolved("[::1]:0".parse().unwrap()));
+        assert!(poll_future(future.as_mut()).is_pending());
+        assert!(h.pump().is_pending());
+        let (request, _) = h
+            .transport
+            .commands
+            .iter()
+            .find_map(|c| match c {
+                Command::Bind {
+                    request, socket, ..
+                } => Some((*request, *socket)),
+                _ => None,
+            })
+            .unwrap();
+        h.event(Event::Complete {
+            request,
+            result: Ok(()),
+        });
+        let (request, _) = address_request(&h);
+        match failure {
+            None => h.event(Event::LocalAddr {
+                request,
+                addr: "[::1]:12345".parse().unwrap(),
+            }),
+            Some(Errno::ECONNABORTED) => {
+                h.transport.error = failure;
+                assert!(h.pump().is_ready());
+            }
+            Some(error) => h.event(Event::Complete {
+                request,
+                result: Err(error),
+            }),
+        }
+        match poll_future(future.as_mut()) {
+            Poll::Ready(Ok((endpoint, publication))) if failure.is_none() => {
+                assert_eq!(publication.host_addr(), "[::1]:12345".parse().unwrap());
+                endpoint.attach(Some(WaitQueue::new())).unwrap();
+                assert_eq!(endpoint.send_to(b"", "[::1]:8000".parse().unwrap()), Ok(0));
+            }
+            Poll::Ready(Err(error)) => assert_eq!(error.raw_os_error(), failure.map(|e| e.0)),
+            _ => panic!("bound address waiter did not finish"),
+        }
+    }
+}
+#[test]
+fn unresolved_or_wrong_family_address_is_protocol_failure_and_wakes_waiter() {
+    for invalid in ["127.0.0.1:0", "[::1]:1234"] {
+        let mut h = Harness::new();
+        let backend = h.backend.clone();
+        let mut future =
+            Box::pin(backend.publish_resolved("127.0.0.1:0".parse().unwrap(), 1, Sink::new()));
+        assert!(poll_future(future.as_mut()).is_pending());
+        assert!(h.pump().is_pending());
+        let request = h
+            .transport
+            .commands
+            .iter()
+            .find_map(|c| match c {
+                Command::Listen { request, .. } => Some(*request),
+                _ => None,
+            })
+            .unwrap();
+        h.event(Event::Complete {
+            request,
+            result: Ok(()),
+        });
+        let (request, _) = address_request(&h);
+        h.transport.events.push_back(Event::LocalAddr {
+            request,
+            addr: invalid.parse().unwrap(),
+        });
+        assert_eq!(h.pump(), Poll::Ready(Err(Errno::EPROTO)));
+        assert!(matches!(poll_future(future.as_mut()), Poll::Ready(Err(_))));
+    }
+}
+#[test]
+fn icmp_refusal_matches_current_connected_peer_and_next_io_consumes_once() {
+    for receive in [false, true] {
+        let mut h = Harness::with_capabilities(Capabilities::classic_fidelity(true));
+        let endpoint = h.backend.datagram(Domain::Inet, WaitQueue::new()).unwrap();
+        assert!(h.pump().is_pending());
+        let (request, socket) = h
+            .transport
+            .commands
+            .iter()
+            .find_map(|c| match c {
+                Command::Bind {
+                    request, socket, ..
+                } => Some((*request, *socket)),
+                _ => None,
+            })
+            .unwrap();
+        h.event(Event::Complete {
+            request,
+            result: Ok(()),
+        });
+        endpoint.connect(Some(peer())).unwrap();
+        let event = |destination| Event::DatagramRefused {
+            socket,
+            destination,
+            offender: None,
+            payload: vec![],
+        };
+        h.event(event("192.0.2.2:1234".parse().unwrap()));
+        assert_eq!(endpoint.take_error(), None);
+        h.event(event(peer()));
+        assert!(endpoint.poll(None).contains(PollMask::ERR));
+        if receive {
+            assert_eq!(endpoint.recv_from(&mut [], false), Err(Errno::ECONNREFUSED));
+        } else {
+            assert_eq!(endpoint.send_to(b"x", peer()), Err(Errno::ECONNREFUSED));
+        }
+        assert_eq!(endpoint.take_error(), None);
+        assert!(!endpoint.poll(None).contains(PollMask::ERR));
+        assert_eq!(endpoint.send_to(b"x", peer()), Ok(1));
+        endpoint.connect(None).unwrap();
+        h.event(event(peer()));
+        assert_eq!(endpoint.take_error(), None);
+    }
+}
+#[test]
+fn recverr_retains_bounded_icmp_quotes_and_attach_drops_them() {
+    use wasixv2_abi::{IpOption, SocketLevel};
+    // Model queue bound is 8 bytes, below an error skb's charge: pending still reports
+    // the error but allocation cannot exceed the endpoint bound.
+    let mut h = Harness::with_capabilities(Capabilities::classic_fidelity(true));
+    let (endpoint, _publication) = h.backend.publish_datagram(peer()).unwrap();
+    endpoint.attach(Some(WaitQueue::new())).unwrap();
+    endpoint
+        .set_option(
+            SocketLevel::SOL_IP.0,
+            IpOption::IP_RECVERR.0,
+            &1i32.to_le_bytes(),
+        )
+        .unwrap();
+    assert!(h.pump().is_pending());
+    let (request, socket) = h
+        .transport
+        .commands
+        .iter()
+        .find_map(|c| match c {
+            Command::Bind {
+                request, socket, ..
+            } => Some((*request, *socket)),
+            _ => None,
+        })
+        .unwrap();
+    h.event(Event::Complete {
+        request,
+        result: Ok(()),
+    });
+    h.event(Event::DatagramRefused {
+        socket,
+        destination: peer(),
+        offender: None,
+        payload: vec![],
+    });
+    assert_eq!(endpoint.take_error(), Some(Errno::ECONNREFUSED));
+    assert_eq!(endpoint.take_queued_error(), None);
+    endpoint.attach(None).unwrap();
+    endpoint.attach(Some(WaitQueue::new())).unwrap();
+    h.event(Event::DatagramRefused {
+        socket,
+        destination: peer(),
+        offender: None,
+        payload: vec![],
+    });
+    assert_eq!(
+        endpoint.take_error(),
+        None,
+        "new socket inherits neither RECVERR nor connection"
+    );
+}
+
+fn provider_command(h: &Harness) -> (u64, wasixv2_vnet::provider::Request) {
+    match h.transport.commands.last().unwrap() {
+        Command::Provider { request, operation } => (*request, operation.clone()),
+        other => panic!("expected provider command, got {other:?}"),
+    }
+}
+fn provider_harness(
+    readback: wasixv2_vnet::provider::Readback,
+) -> (Harness, Arc<wasixv2_vnet::Net>) {
+    let mut capabilities = Capabilities::classic(true);
+    capabilities.provider = Some(readback);
+    let h = Harness::with_capabilities(capabilities);
+    let net = wasixv2_vnet::Net::new(
+        wasixv2_vnet::NetConfig::host_default(),
+        Some(h.backend.clone()),
+    );
+    (h, net)
+}
+#[test]
+fn provider_serializes_ack_readbacks_and_atomic_publication() {
+    use wasixv2_vnet::{
+        Network,
+        provider::{Cidr, Readback, Reply, Request},
+    };
+    let (mut h, net) = provider_harness(Readback {
+        addresses: true,
+        routes: true,
+        mac: false,
+    });
+    let provider = net.provider().unwrap();
+    let completed = Arc::new(AtomicUsize::new(0));
+    let count = completed.clone();
+    let view = net.clone();
+    provider.start(
+        Request::Dhcp,
+        Box::new(move |done| {
+            assert!(matches!(done.result, Ok(Reply::Acquired(_))));
+            assert!(
+                view.interfaces()
+                    .iter()
+                    .flat_map(|i| &i.addresses)
+                    .any(|a| a.addr == "192.0.2.4".parse::<std::net::IpAddr>().unwrap())
+            );
+            assert!(
+                view.routes()
+                    .iter()
+                    .all(|r| r.gateway != Some("10.0.2.2".parse().unwrap()))
+            );
+            count.fetch_add(1, Ordering::SeqCst);
+        }),
+    );
+    provider.start(Request::ClearRoutes, Box::new(|_| {}));
+    assert!(h.pump().is_pending());
+    let (id, request) = provider_command(&h);
+    assert_eq!(request, Request::Dhcp);
+    assert_eq!(h.transport.commands.len(), 1);
+    h.event(Event::Provider {
+        request: id,
+        reply: Reply::Acquired(vec!["192.0.2.4".parse().unwrap()]),
+    });
+    let (id, request) = provider_command(&h);
+    assert_eq!(request, Request::Addresses);
+    h.event(Event::Provider {
+        request: id,
+        reply: Reply::Addresses(vec![Cidr {
+            ip: "192.0.2.4".parse().unwrap(),
+            prefix: 24,
+        }]),
+    });
+    // No half-published address before the promised routes reply.
+    assert!(
+        !net.interfaces()
+            .iter()
+            .flat_map(|i| &i.addresses)
+            .any(|a| a.addr == "192.0.2.4".parse::<std::net::IpAddr>().unwrap())
+    );
+    let (id, request) = provider_command(&h);
+    assert_eq!(request, Request::Routes);
+    assert_eq!(completed.load(Ordering::SeqCst), 0);
+    h.event(Event::Provider {
+        request: id,
+        reply: Reply::Routes(vec![]),
+    });
+    assert_eq!(completed.load(Ordering::SeqCst), 1);
+    assert_eq!(provider_command(&h).1, Request::ClearRoutes);
+}
+#[test]
+fn provider_postcommit_readback_failure_disables_uplink_and_full_retry_recovers() {
+    use wasixv2_vnet::{
+        Network,
+        provider::{Cidr, Readback, Reply, Request, Security},
+    };
+    let (mut h, net) = provider_harness(Readback {
+        addresses: true,
+        ..Readback::default()
+    });
+    let provider = net.provider().unwrap();
+    let result = Arc::new(Mutex::new(None));
+    let output = result.clone();
+    provider.start(
+        Request::Bridge {
+            network: "tenant".into(),
+            token: "secret".into(),
+            security: Security::AnyEncryption,
+        },
+        Box::new(move |done| *output.lock().unwrap() = Some((done.result, done.reconciliation))),
+    );
+    assert!(h.pump().is_pending());
+    let (id, _) = provider_command(&h);
+    h.event(Event::Complete {
+        request: id,
+        result: Ok(()),
+    });
+    let (id, request) = provider_command(&h);
+    assert_eq!(request, Request::Addresses);
+    h.event(Event::Complete {
+        request: id,
+        result: Err(Errno::EIO),
+    });
+    assert_eq!(
+        *result.lock().unwrap(),
+        Some((Err(Errno::EIO), Some(Errno::EIO)))
+    );
+    assert!(
+        net.interfaces()
+            .iter()
+            .filter(|i| i.name == "eth0")
+            .all(|i| i.flags & 1 == 0)
+    );
+    let result = Arc::new(Mutex::new(None));
+    let output = result.clone();
+    provider.start(
+        Request::Addresses,
+        Box::new(move |done| *output.lock().unwrap() = Some(done.result)),
+    );
+    assert!(h.pump().is_pending());
+    let (id, _) = provider_command(&h);
+    h.event(Event::Provider {
+        request: id,
+        reply: Reply::Addresses(vec![Cidr {
+            ip: "192.0.2.7".parse().unwrap(),
+            prefix: 24,
+        }]),
+    });
+    assert!(result.lock().unwrap().as_ref().unwrap().is_ok());
+    assert!(
+        net.interfaces()
+            .iter()
+            .filter(|i| i.name == "eth0")
+            .all(|i| i.flags & 1 != 0)
+    );
+}
+#[test]
+fn provider_does_not_require_unadvertised_getters_or_fallback_on_refusal() {
+    use wasixv2_vnet::{
+        Network,
+        provider::{Readback, Request},
+    };
+    let (mut h, net) = provider_harness(Readback::default());
+    let provider = net.provider().unwrap();
+    let result = Arc::new(Mutex::new(None));
+    let output = result.clone();
+    provider.start(
+        Request::Unbridge,
+        Box::new(move |done| *output.lock().unwrap() = Some(done.result)),
+    );
+    assert!(h.pump().is_pending());
+    let (id, _) = provider_command(&h);
+    h.event(Event::Complete {
+        request: id,
+        result: Err(Errno::EOPNOTSUPP),
+    });
+    assert_eq!(*result.lock().unwrap(), Some(Err(Errno::EOPNOTSUPP)));
+    assert_eq!(h.transport.commands.len(), 1);
+    let result = Arc::new(Mutex::new(None));
+    let output = result.clone();
+    provider.start(
+        Request::Unbridge,
+        Box::new(move |done| *output.lock().unwrap() = Some(done.result)),
+    );
+    assert!(h.pump().is_pending());
+    let (id, _) = provider_command(&h);
+    h.event(Event::Complete {
+        request: id,
+        result: Ok(()),
+    });
+    assert!(result.lock().unwrap().as_ref().unwrap().is_ok());
+    assert_eq!(h.transport.commands.len(), 2);
+    assert!(
+        net.interfaces()
+            .iter()
+            .filter(|i| i.name == "eth0")
+            .all(|i| i.flags & 1 == 0)
+    );
+}
+#[test]
+fn provider_disconnect_after_commit_preserves_reconciliation_custody() {
+    use wasixv2_vnet::{
+        Network,
+        provider::{Readback, Request},
+    };
+    let (mut h, net) = provider_harness(Readback {
+        addresses: true,
+        ..Readback::default()
+    });
+    let result = Arc::new(Mutex::new(None));
+    let output = result.clone();
+    net.provider().unwrap().start(
+        Request::ClearAddresses,
+        Box::new(move |done| *output.lock().unwrap() = Some((done.result, done.reconciliation))),
+    );
+    assert!(h.pump().is_pending());
+    let (id, _) = provider_command(&h);
+    h.event(Event::Complete {
+        request: id,
+        result: Ok(()),
+    });
+    drop(h.driver);
+    assert_eq!(
+        *result.lock().unwrap(),
+        Some((Err(Errno::ECONNABORTED), Some(Errno::ECONNABORTED)))
+    );
+    assert!(
+        net.interfaces()
+            .iter()
+            .filter(|i| i.name == "eth0")
+            .all(|i| i.flags & 1 == 0)
+    );
+}
+
+fn bridge_request() -> wasixv2_vnet::provider::Request {
+    use wasixv2_vnet::provider::{Request, Security};
+    Request::Bridge {
+        network: "tenant".into(),
+        token: "credential".into(),
+        security: Security::DoubleEncryption,
+    }
+}
+fn uplink_up(net: &wasixv2_vnet::Net) -> bool {
+    use wasixv2_vnet::Network;
+    net.interfaces()
+        .iter()
+        .any(|i| i.name == "eth0" && i.flags & 1 != 0)
+}
+#[test]
+fn provider_malformed_mutation_reply_disables_until_explicit_activity_ack() {
+    use wasixv2_vnet::{
+        Network,
+        provider::{Readback, Reply, Request},
+    };
+    for operation in [bridge_request(), Request::Unbridge] {
+        let (mut h, net) = provider_harness(Readback::default());
+        let result = Arc::new(Mutex::new(None));
+        let output = result.clone();
+        net.provider().unwrap().start(
+            operation,
+            Box::new(move |done| {
+                *output.lock().unwrap() = Some((done.result, done.reconciliation))
+            }),
+        );
+        assert!(h.pump().is_pending());
+        let (id, _) = provider_command(&h);
+        // The remote side may already have changed activity; an address list is no ACK.
+        h.event(Event::Provider {
+            request: id,
+            reply: Reply::Addresses(vec![]),
+        });
+        assert_eq!(
+            *result.lock().unwrap(),
+            Some((Err(Errno::EPROTO), Some(Errno::EPROTO)))
+        );
+        assert!(!uplink_up(&net));
+        net.provider().unwrap().start(
+            Request::Addresses,
+            Box::new(|done| assert!(done.result.is_ok())),
+        );
+        assert!(h.pump().is_pending());
+        let (id, _) = provider_command(&h);
+        h.event(Event::Provider {
+            request: id,
+            reply: Reply::Addresses(vec![]),
+        });
+        assert!(!uplink_up(&net), "getters cannot prove bridge activity");
+        net.provider().unwrap().start(
+            bridge_request(),
+            Box::new(|done| assert!(done.result.is_ok())),
+        );
+        assert!(h.pump().is_pending());
+        let (id, _) = provider_command(&h);
+        h.event(Event::Complete {
+            request: id,
+            result: Ok(()),
+        });
+        assert!(uplink_up(&net));
+    }
+}
+#[test]
+fn provider_ambiguous_bridge_and_unbridge_cannot_recover_from_getters_after_reconnect() {
+    use wasixv2_vnet::{
+        Network,
+        provider::{Readback, Reply, Request},
+    };
+    for operation in [bridge_request(), Request::Unbridge] {
+        let (mut h, net) = provider_harness(Readback::default());
+        net.provider().unwrap().start(
+            operation,
+            Box::new(|done| {
+                assert_eq!(done.result, Err(Errno::ECONNABORTED));
+                assert_eq!(done.reconciliation, Some(Errno::ECONNABORTED));
+            }),
+        );
+        assert!(h.pump().is_pending());
+        h.transport.error = Some(Errno::ECONNABORTED);
+        assert!(h.pump().is_ready());
+        assert!(!uplink_up(&net));
+        h.driver = h.backend.reconnect(h.transport.capabilities).unwrap();
+        net.provider().unwrap().start(
+            Request::Routes,
+            Box::new(|done| assert!(done.result.is_ok())),
+        );
+        assert!(h.pump().is_pending());
+        let (id, _) = provider_command(&h);
+        h.event(Event::Provider {
+            request: id,
+            reply: Reply::Routes(vec![]),
+        });
+        assert!(
+            !uplink_up(&net),
+            "readback after reconnect cannot invent activity"
+        );
+        net.provider().unwrap().start(
+            Request::Unbridge,
+            Box::new(|done| assert!(done.result.is_ok())),
+        );
+        assert!(h.pump().is_pending());
+        let (id, _) = provider_command(&h);
+        h.event(Event::Complete {
+            request: id,
+            result: Ok(()),
+        });
+        assert!(!uplink_up(&net));
+        net.provider().unwrap().start(
+            bridge_request(),
+            Box::new(|done| assert!(done.result.is_ok())),
+        );
+        assert!(h.pump().is_pending());
+        let (id, _) = provider_command(&h);
+        h.event(Event::Complete {
+            request: id,
+            result: Ok(()),
+        });
+        assert!(uplink_up(&net));
+    }
+}
+
+#[test]
+fn option_batch_waits_for_each_actual_ack_and_callbacks_can_reenter() {
+    use wasixv2_abi::{SocketLevel, SocketOption, TcpOption};
+    use wasixv2_vnet_web::SocketControl;
+    let mut h = Harness::with_capabilities(Capabilities {
+        async_options: true,
+        ..Capabilities::classic(true)
+    });
+    let (stream, socket) = h.connect();
+    let completed = Arc::new(Mutex::new(Vec::new()));
+    let results = completed.clone();
+    let reentrant = stream.clone();
+    stream
+        .start_options(
+            vec![
+                (
+                    SocketLevel::SOL_TCP.0,
+                    TcpOption::TCP_NODELAY.0,
+                    1i32.to_le_bytes().to_vec(),
+                ),
+                (
+                    SocketLevel::SOL_SOCKET.0,
+                    SocketOption::SO_KEEPALIVE.0,
+                    1i32.to_le_bytes().to_vec(),
+                ),
+            ],
+            Box::new(move |result| {
+                assert_eq!(reentrant.state(), StreamState::Established);
+                results.lock().unwrap().push(result);
+            }),
+        )
+        .unwrap();
+    assert!(h.pump().is_pending());
+    let first = match h.transport.commands.last().unwrap() {
+        Command::SetOption {
+            request: Some(request),
+            socket: actual,
+            control: SocketControl::NoDelay(true),
+        } => {
+            assert_eq!(*actual, socket);
+            *request
+        }
+        other => panic!("expected actual NODELAY request, got {other:?}"),
+    };
+    assert!(completed.lock().unwrap().is_empty());
+    h.event(Event::Complete {
+        request: first,
+        result: Ok(()),
+    });
+    let second = match h.transport.commands.last().unwrap() {
+        Command::SetOption {
+            request: Some(request),
+            control: SocketControl::KeepAlive(true),
+            ..
+        } => *request,
+        other => panic!("expected actual KEEPALIVE request, got {other:?}"),
+    };
+    assert_ne!(first, second);
+    assert!(completed.lock().unwrap().is_empty());
+    h.event(Event::Complete {
+        request: second,
+        result: Ok(()),
+    });
+    assert_eq!(*completed.lock().unwrap(), vec![Ok(())]);
+    assert!(h.pump().is_pending());
+    assert_eq!(*completed.lock().unwrap(), vec![Ok(())]);
+}
+
+#[test]
+fn option_batch_preserves_first_physical_error_without_replaying_prefix() {
+    use wasixv2_abi::{SocketLevel, SocketOption, TcpOption};
+    let mut h = Harness::with_capabilities(Capabilities {
+        async_options: true,
+        ..Capabilities::classic(true)
+    });
+    let (stream, _) = h.connect();
+    let completed = Arc::new(Mutex::new(Vec::new()));
+    let results = completed.clone();
+    stream
+        .start_options(
+            vec![
+                (
+                    SocketLevel::SOL_TCP.0,
+                    TcpOption::TCP_NODELAY.0,
+                    1i32.to_le_bytes().to_vec(),
+                ),
+                (
+                    SocketLevel::SOL_SOCKET.0,
+                    SocketOption::SO_KEEPALIVE.0,
+                    1i32.to_le_bytes().to_vec(),
+                ),
+                (
+                    SocketLevel::SOL_TCP.0,
+                    TcpOption::TCP_NODELAY.0,
+                    0i32.to_le_bytes().to_vec(),
+                ),
+            ],
+            Box::new(move |result| results.lock().unwrap().push(result)),
+        )
+        .unwrap();
+    assert!(h.pump().is_pending());
+    let first = match h.transport.commands.last().unwrap() {
+        Command::SetOption {
+            request: Some(request),
+            ..
+        } => *request,
+        _ => unreachable!(),
+    };
+    h.event(Event::Complete {
+        request: first,
+        result: Ok(()),
+    });
+    let second = match h.transport.commands.last().unwrap() {
+        Command::SetOption {
+            request: Some(request),
+            ..
+        } => *request,
+        _ => unreachable!(),
+    };
+    h.event(Event::Complete {
+        request: second,
+        result: Err(Errno::EPERM),
+    });
+    assert_eq!(*completed.lock().unwrap(), vec![Err(Errno::EPERM)]);
+    assert_eq!(
+        h.transport
+            .commands
+            .iter()
+            .filter(|command| matches!(command, Command::SetOption { .. }))
+            .count(),
+        2
+    );
+    assert_eq!(stream.state(), StreamState::Established);
+}
+
+#[test]
+fn blocked_option_is_withdrawn_on_close_and_late_ack_cannot_complete_again() {
+    use wasixv2_abi::{SocketLevel, TcpOption};
+    let mut h = Harness::with_capabilities(Capabilities {
+        async_options: true,
+        ..Capabilities::classic(true)
+    });
+    let (stream, _) = h.connect();
+    let completed = Arc::new(Mutex::new(Vec::new()));
+    let results = completed.clone();
+    stream
+        .start_options(
+            vec![(
+                SocketLevel::SOL_TCP.0,
+                TcpOption::TCP_NODELAY.0,
+                1i32.to_le_bytes().to_vec(),
+            )],
+            Box::new(move |result| results.lock().unwrap().push(result)),
+        )
+        .unwrap();
+    h.transport.blocked = true;
+    assert!(h.pump().is_pending());
+    drop(stream);
+    h.transport.blocked = false;
+    assert!(h.pump().is_pending());
+    assert_eq!(*completed.lock().unwrap(), vec![Err(Errno::ECANCELED)]);
+    assert!(
+        !h.transport
+            .commands
+            .iter()
+            .any(|command| matches!(command, Command::SetOption { .. }))
+    );
+
+    let (stream, _) = h.connect();
+    let results = completed.clone();
+    stream
+        .start_options(
+            vec![(
+                SocketLevel::SOL_TCP.0,
+                TcpOption::TCP_NODELAY.0,
+                0i32.to_le_bytes().to_vec(),
+            )],
+            Box::new(move |result| results.lock().unwrap().push(result)),
+        )
+        .unwrap();
+    assert!(h.pump().is_pending());
+    let request = match h.transport.commands.last().unwrap() {
+        Command::SetOption {
+            request: Some(request),
+            ..
+        } => *request,
+        _ => unreachable!(),
+    };
+    drop(stream);
+    assert!(h.pump().is_pending());
+    assert_eq!(*completed.lock().unwrap(), vec![Err(Errno::ECANCELED); 2]);
+    h.event(Event::Complete {
+        request,
+        result: Ok(()),
+    });
+    assert_eq!(*completed.lock().unwrap(), vec![Err(Errno::ECANCELED); 2]);
+}
+
+#[test]
+fn default_stream_does_not_admit_async_options_and_disconnect_joins_accepted_batch() {
+    use wasixv2_abi::{SocketLevel, TcpOption};
+    let mut h = Harness::new();
+    let (stream, _) = h.connect();
+    assert!(!stream.async_options());
+    assert_eq!(
+        stream.start_options(Vec::new(), Box::new(|_| panic!("unaccepted callback"))),
+        Err(Errno::EOPNOTSUPP)
+    );
+    let mut h = Harness::with_capabilities(Capabilities {
+        async_options: true,
+        ..Capabilities::classic(true)
+    });
+    let (stream, _) = h.connect();
+    let completed = Arc::new(Mutex::new(Vec::new()));
+    let results = completed.clone();
+    stream
+        .start_options(
+            vec![(
+                SocketLevel::SOL_TCP.0,
+                TcpOption::TCP_NODELAY.0,
+                1i32.to_le_bytes().to_vec(),
+            )],
+            Box::new(move |result| results.lock().unwrap().push(result)),
+        )
+        .unwrap();
+    assert!(h.pump().is_pending());
+    h.transport.error = Some(Errno::ENETDOWN);
+    assert_eq!(h.pump(), Poll::Ready(Err(Errno::ENETDOWN)));
+    assert_eq!(*completed.lock().unwrap(), vec![Err(Errno::ENETDOWN)]);
+}
+
+#[test]
+fn stock_socket_control_tags_and_field_order_match_original_wire_bytes() {
+    use std::{
+        net::{Ipv4Addr, Ipv6Addr},
+        time::Duration,
+    };
+    use wasixv2_vnet_web::{SocketControl, codec};
+    // Original virtual-net meta::RequestType discriminants and fixed-width
+    // serde fields; no new relay variants are assigned by this adapter.
+    let multi6: Ipv6Addr = "ff02::1234".parse().unwrap();
+    let mut scoped6 = multi6.octets().to_vec();
+    scoped6.extend(7u32.to_le_bytes());
+    let mut linger = vec![1];
+    linger.extend(5u64.to_le_bytes());
+    linger.extend(7u32.to_le_bytes());
+    let controls = [
+        (27u32, SocketControl::Ttl(37), 37u32.to_le_bytes().to_vec()),
+        (30, SocketControl::Linger(Some(Duration::new(5, 7))), linger),
+        (30, SocketControl::Linger(None), vec![0]),
+        (38, SocketControl::NoDelay(true), vec![1]),
+        (40, SocketControl::KeepAlive(false), vec![0]),
+        (46, SocketControl::Broadcast(true), vec![1]),
+        (48, SocketControl::MulticastLoopV4(false), vec![0]),
+        (50, SocketControl::MulticastLoopV6(true), vec![1]),
+        (
+            52,
+            SocketControl::MulticastTtlV4(11),
+            11u32.to_le_bytes().to_vec(),
+        ),
+        (
+            54,
+            SocketControl::JoinMulticastV4 {
+                multiaddr: Ipv4Addr::new(239, 1, 2, 3),
+                iface: Ipv4Addr::new(192, 0, 2, 1),
+            },
+            vec![239, 1, 2, 3, 192, 0, 2, 1],
+        ),
+        (
+            55,
+            SocketControl::LeaveMulticastV4 {
+                multiaddr: Ipv4Addr::new(239, 1, 2, 3),
+                iface: Ipv4Addr::new(192, 0, 2, 1),
+            },
+            vec![239, 1, 2, 3, 192, 0, 2, 1],
+        ),
+        (
+            56,
+            SocketControl::JoinMulticastV6 {
+                multiaddr: multi6,
+                iface: 7,
+            },
+            scoped6.clone(),
+        ),
+        (
+            57,
+            SocketControl::LeaveMulticastV6 {
+                multiaddr: multi6,
+                iface: 7,
+            },
+            scoped6,
+        ),
+    ];
+    for (tag, control, value) in controls {
+        for request in [None, Some(19u64)] {
+            let mut expected = 1u32.to_le_bytes().to_vec();
+            expected.extend(9u64.to_le_bytes());
+            expected.extend(tag.to_le_bytes());
+            expected.extend(&value);
+            expected.push(u8::from(request.is_some()));
+            if let Some(request) = request {
+                expected.extend(request.to_le_bytes());
+            }
+            assert_eq!(
+                codec::encode(&Command::SetOption {
+                    request,
+                    socket: 9,
+                    control: control.clone()
+                })
+                .unwrap(),
+                expected,
+                "{control:?}/{request:?}"
+            );
+        }
+    }
+    // The original None/Error responses carry the actual option ACK/error.
+    let mut success = 0u32.to_le_bytes().to_vec();
+    success.extend(19u64.to_le_bytes());
+    success.extend(0u32.to_le_bytes());
+    assert!(matches!(
+        codec::decode(&success),
+        Ok(Event::Complete {
+            request: 19,
+            result: Ok(())
+        })
+    ));
+    let mut denied = 0u32.to_le_bytes().to_vec();
+    denied.extend(19u64.to_le_bytes());
+    denied.extend(1u32.to_le_bytes());
+    denied.extend(17u32.to_le_bytes());
+    assert!(matches!(
+        codec::decode(&denied),
+        Ok(Event::Complete {
+            request: 19,
+            result: Err(Errno::EACCES)
+        })
+    ));
+    for frame in [&success, &denied] {
+        for end in 0..frame.len() {
+            assert!(matches!(codec::decode(&frame[..end]), Err(Errno::EPROTO)));
+        }
+        let mut trailing = frame.to_vec();
+        trailing.push(0);
+        assert!(matches!(codec::decode(&trailing), Err(Errno::EPROTO)));
+    }
+}

@@ -640,6 +640,22 @@ pub(crate) enum Ended {
     Detached(Arc<process::Handoff>),
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum ErrorOrigin {
+    GuestInvocation,
+    Other,
+}
+
+fn guest_trap(origin: ErrorOrigin, error: &RuntimeError) -> bool {
+    matches!(origin, ErrorOrigin::GuestInvocation)
+        && !error.is_host_abort()
+        && (error.downcast_ref::<InstructionTrap>().is_some()
+            || error
+                .clone()
+                .to_trap()
+                .is_some_and(|code| code != TrapCode::HostInterrupt))
+}
+
 /// How an image's run ended, from how the call of its entry point in the instance behind `cx`
 /// did. `on_return` is what the ABI makes of the entry returning, the entry of a `role`.
 async fn ended<S: Syscalls + Control + Send + Sync + 'static>(
@@ -647,9 +663,11 @@ async fn ended<S: Syscalls + Control + Send + Sync + 'static>(
     result: Result<(), RuntimeError>,
     on_return: EntryReturn,
     role: Role,
+    origin: ErrorOrigin,
 ) -> Ended {
     // The task is charged with its time up to its end.
     cx.with(|env, _| env.sample_cpu()).await;
+    let original_error = result.is_err();
     let err = match (result, on_return) {
         (Ok(()), EntryReturn::Exit(status)) => return exit_on_return(cx, role, status).await,
         // Linux kills a process whose entry point returns with SIGSEGV, as it runs into
@@ -678,10 +696,15 @@ async fn ended<S: Syscalls + Control + Send + Sync + 'static>(
         .with(|env, _| (env.syscalls.clone(), env.task, env.proc.handoff.clone()))
         .await;
     let message = err.to_string();
+    let execution_fault = original_error && guest_trap(origin, &err);
     let signal = fault_signal(err);
     // The trap's signal ends the task (`force_sig_fault`), then `exit_mm` while the memory is
     // still there, which dumps core if the signal does, as for an `exit_group`.
-    let killed = syscalls.fault(task, signal);
+    let killed = if execution_fault {
+        syscalls.fault_with_cause(task, signal, wasixv2_syscalls::ExecutionFault::WasmTrap)
+    } else {
+        syscalls.fault(task, signal)
+    };
     let memory = memory::OutsideMemory { cx };
     syscalls.exit_mm(&Caller::new(task, &memory)).await;
     tracing::debug!(tid = task.0, signal, "guest trapped: {message}");
@@ -1291,9 +1314,9 @@ impl<S: Syscalls + Control + Send + Sync + 'static> Ready<S> {
             drop(self.admission.take());
             None
         };
-        let result = match prepared {
+        let (result, origin) = match prepared {
             Ok(()) => {
-                cooperative::drive(
+                let result = cooperative::drive(
                     &entry,
                     &*self.abi,
                     contexts::drive(&entry, &mut attachments, {
@@ -1303,16 +1326,17 @@ impl<S: Syscalls + Control + Send + Sync + 'static> Ready<S> {
                         async move { abi.start(&Entry::new(&env, &store)).await }
                     }),
                 )
-                .await
+                .await;
+                (result, ErrorOrigin::GuestInvocation)
             }
-            Err(e) => Err(e),
+            Err(e) => (Err(e), ErrorOrigin::Other),
         };
         let on_return = self.abi.on_entry_return();
         let result = match &mut attachments {
             Some(attachments) => attachments.finish(result).await,
             None => result,
         };
-        let ended = ended(entry.cx(), result, on_return, Role::Process).await;
+        let ended = ended(entry.cx(), result, on_return, Role::Process, origin).await;
         if let Some(attachments) = &mut attachments {
             attachments.deactivate().await;
         }
@@ -1354,10 +1378,10 @@ impl<S: Syscalls + Control + Send + Sync + 'static> Ready<S> {
             env: &self.env,
             store: &store,
         };
-        let result = match asyncify::start_rewind(&cx, buffer).await {
+        let (result, origin) = match asyncify::start_rewind(&cx, buffer).await {
             Ok(()) => {
                 let root = Entry::new(&self.env, &store);
-                cooperative::drive(
+                let result = cooperative::drive(
                     &root,
                     &*self.abi,
                     contexts::drive(&root, &mut attachments, {
@@ -1374,16 +1398,17 @@ impl<S: Syscalls + Control + Send + Sync + 'static> Ready<S> {
                         }
                     }),
                 )
-                .await
+                .await;
+                (result, ErrorOrigin::GuestInvocation)
             }
-            Err(err) => Err(err),
+            Err(err) => (Err(err), ErrorOrigin::Other),
         };
         let on_return = self.abi.on_entry_return();
         let result = match &mut attachments {
             Some(attachments) => attachments.finish(result).await,
             None => result,
         };
-        let ended = ended(&cx, result, on_return, Role::Process).await;
+        let ended = ended(&cx, result, on_return, Role::Process, origin).await;
         if let Some(attachments) = &mut attachments {
             attachments.deactivate().await;
         }
@@ -1900,6 +1925,26 @@ async fn return_to_guest<S: Syscalls + Control + 'static, R: From<i32>>(
 
 #[cfg(all(test, feature = "sys"))]
 mod loader_binding_tests {
+    #[test]
+    fn only_an_actual_guest_error_can_supply_execution_fault_provenance() {
+        let trap = super::unreachable_trap().unwrap_err();
+        assert!(super::guest_trap(
+            super::ErrorOrigin::GuestInvocation,
+            &trap
+        ));
+        assert!(!super::guest_trap(super::ErrorOrigin::Other, &trap));
+        assert!(!super::guest_trap(
+            super::ErrorOrigin::GuestInvocation,
+            &wasmer::RuntimeError::new("unreachable")
+        ));
+        let abort = wasmer::RuntimeError::host_abort(Box::new(super::InstructionTrap(
+            super::TrapCode::UnreachableCodeReached,
+        )));
+        assert!(!super::guest_trap(
+            super::ErrorOrigin::GuestInvocation,
+            &abort
+        ));
+    }
     #[test]
     fn registered_store_lives_exactly_as_long_as_its_execution_frame() {
         use wasixv2_syscalls::{LoaderGate, TaskId};

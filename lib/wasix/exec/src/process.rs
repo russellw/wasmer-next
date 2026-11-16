@@ -1666,6 +1666,7 @@ pub(super) mod tests {
         pending_calls: AtomicU32,
         group_wait_failure: Option<Arc<GroupWaitProbe>>,
         pub(crate) faulted: Mutex<Vec<(TaskId, i32)>>,
+        pub(crate) fault_causes: Mutex<Vec<(TaskId, wasixv2_syscalls::ExecutionFault)>>,
         pub(crate) released: Mutex<Vec<TaskId>>,
         /// The tasks that left their memory and the ones that faulted, in order.
         ended: Mutex<Vec<(&'static str, TaskId)>>,
@@ -1815,6 +1816,16 @@ pub(super) mod tests {
             self.faulted.lock().unwrap().push((task, signal));
             self.queue(task, GuestAction::Exit(128 + signal));
             true
+        }
+
+        fn fault_with_cause(
+            &self,
+            task: TaskId,
+            signal: i32,
+            cause: wasixv2_syscalls::ExecutionFault,
+        ) -> bool {
+            self.fault_causes.lock().unwrap().push((task, cause));
+            self.fault(task, signal)
         }
 
         fn release(&self, task: TaskId) {

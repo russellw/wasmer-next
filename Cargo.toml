@@ -74,6 +74,7 @@ members = [
   "tests/wasmer-argus",
 ]
 exclude = [
+  "wlk",
   "./lib/cli/tests/packages/axum",
   "lib/wild",
   "lib/wasix/api/tests/support/classic-reference",
@@ -91,28 +92,28 @@ rust-version = "1.96"
 version = "7.5.0"
 
 [workspace.dependencies]
-# Engine-independent kernel; Cargo.lock records the selected WLK main revision.
-wasixv2-abi = { git = "https://github.com/wasmerio/wlk", branch = "main" }
-wasixv2-checkpoint = { git = "https://github.com/wasmerio/wlk", branch = "main" }
-wasixv2-host = { git = "https://github.com/wasmerio/wlk", branch = "main" }
-wasixv2-kernel = { git = "https://github.com/wasmerio/wlk", branch = "main" }
-wasixv2-pages = { git = "https://github.com/wasmerio/wlk", branch = "main" }
-wasixv2-policy = { git = "https://github.com/wasmerio/wlk", branch = "main" }
-wasixv2-record = { git = "https://github.com/wasmerio/wlk", branch = "main" }
-wasixv2-stdio-web = { git = "https://github.com/wasmerio/wlk", branch = "main" }
-wasixv2-syscalls = { git = "https://github.com/wasmerio/wlk", branch = "main" }
-wasixv2-trace = { git = "https://github.com/wasmerio/wlk", branch = "main" }
-wasixv2-vfs = { git = "https://github.com/wasmerio/wlk", branch = "main" }
-wasixv2-vfs-host = { git = "https://github.com/wasmerio/wlk", branch = "main" }
-wasixv2-vfs-mem = { git = "https://github.com/wasmerio/wlk", branch = "main" }
-wasixv2-vfs-overlay = { git = "https://github.com/wasmerio/wlk", branch = "main" }
-wasixv2-vfs-package = { git = "https://github.com/wasmerio/wlk", branch = "main" }
-wasixv2-vfs-web = { git = "https://github.com/wasmerio/wlk", branch = "main" }
-wasixv2-vnet = { git = "https://github.com/wasmerio/wlk", branch = "main" }
-wasixv2-vnet-host = { git = "https://github.com/wasmerio/wlk", branch = "main" }
-wasixv2-vnet-switch = { git = "https://github.com/wasmerio/wlk", branch = "main" }
-wasixv2-vnet-web = { git = "https://github.com/wasmerio/wlk", branch = "main" }
-wasixv2-wait = { git = "https://github.com/wasmerio/wlk", branch = "main" }
+# Engine-independent kernel in its sealed WLK workspace.
+wasixv2-abi = { path = "wlk/crates/abi" }
+wasixv2-checkpoint = { path = "wlk/crates/checkpoint" }
+wasixv2-host = { path = "wlk/crates/host" }
+wasixv2-kernel = { path = "wlk/crates/kernel" }
+wasixv2-pages = { path = "wlk/crates/pages" }
+wasixv2-policy = { path = "wlk/crates/policy" }
+wasixv2-record = { path = "wlk/crates/record" }
+wasixv2-stdio-web = { path = "wlk/crates/stdio-web" }
+wasixv2-syscalls = { path = "wlk/crates/syscalls" }
+wasixv2-trace = { path = "wlk/crates/trace" }
+wasixv2-vfs = { path = "wlk/crates/vfs" }
+wasixv2-vfs-host = { path = "wlk/crates/vfs-host" }
+wasixv2-vfs-mem = { path = "wlk/crates/vfs-mem" }
+wasixv2-vfs-overlay = { path = "wlk/crates/vfs-overlay" }
+wasixv2-vfs-package = { path = "wlk/crates/vfs-package" }
+wasixv2-vfs-web = { path = "wlk/crates/vfs-web" }
+wasixv2-vnet = { path = "wlk/crates/vnet" }
+wasixv2-vnet-host = { path = "wlk/crates/vnet-host" }
+wasixv2-vnet-switch = { path = "wlk/crates/vnet-switch" }
+wasixv2-vnet-web = { path = "wlk/crates/vnet-web" }
+wasixv2-wait = { path = "wlk/crates/wait" }
 
 # Repo-local crates
 wasmer-package = { version = "0.705.0", path = "lib/package", default-features = false }
@@ -308,8 +309,8 @@ termios = "0.3"
 test-log = { version = "0.2", default-features = false }
 thiserror = "2.0.17"
 time = { version = "0.3.47", default-features = false }
-# MIO 1.0 starts at tokio version 1.39, hence the minimum requirement.
-tokio = { version = "1.39.0", default-features = false }
+# Match the patched Tokio minimum used by the sealed kernel.
+tokio = { version = "1.53.3", default-features = false }
 tokio-serde = "0.9"
 tokio-stream = "0.1"
 tokio-tungstenite = "0.28.0"
@@ -366,6 +367,10 @@ xxhash-rust = { version = "0.8.10", default-features = false }
 xz = "0.1.0"
 zip = { version = "8.1.0", default-features = false }
 libwild = { version = "0.10.0", default-features = false }
+
+[patch.crates-io]
+# Keep WebC and the kernel on the same reviewed buffer implementation.
+shared-buffer = { path = "wlk/third-party/shared-buffer" }
 
 [build-dependencies]
 test-generator = { path = "tests/lib/test-generator" }

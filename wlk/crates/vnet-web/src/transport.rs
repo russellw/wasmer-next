@@ -1,0 +1,513 @@
+//! Worker-local transport boundary. Implementations must bound their own JS/WebSocket queues.
+use std::{
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    task::{Context, Poll},
+    time::Duration,
+};
+use wasixv2_abi::Errno;
+use wasixv2_vnet::{Found, Lookup, LookupError, Shutdown};
+
+/// Capabilities of the actual provider, not of the browser or the guest socket layer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Capabilities {
+    /// Explicit configured-provider controls and promised readbacks on this transport.
+    pub provider: Option<wasixv2_vnet::provider::Readback>,
+    pub tcp: bool,
+    pub udp: bool,
+    pub ipv6: bool,
+    pub listen: bool,
+    pub dns_name: bool,
+    pub dns_reverse: bool,
+    pub dns_forward: bool,
+    /// The relay sends EOF notifications (the stock v1 server currently does not).
+    pub eof: bool,
+    /// Additive v1 relay extension, selected out of band with a matching provider.
+    pub fidelity: bool,
+    pub urgent: bool,
+    pub udp_publish: bool,
+    /// Destination-qualified ICMP port-unreachable notifications (fidelity op4).
+    pub udp_icmp: bool,
+    /// Opt-in same-resource stream binding/connection and acknowledged cleanup.
+    /// Existing profiles leave this disabled unless their actual transport supports it.
+    pub selected_endpoints: bool,
+    /// This profile admits prebound stream or datagram resources. False retains
+    /// namespace reservation and creates stream listeners at publication.
+    pub selected_bind: bool,
+    /// Unbound uplink connections report a real provider local address. Browser
+    /// WISP leaves this false; Node host and capable Classic profiles opt in.
+    pub selected_external: bool,
+    /// Actual option transactions require owned completion on this profile.
+    /// Default/native/local behavior is unchanged unless explicitly selected.
+    pub async_options: bool,
+}
+
+impl Capabilities {
+    /// The classic relay's wire surface. IPv6 availability is a relay deployment choice.
+    pub fn classic(ipv6: bool) -> Self {
+        Self {
+            tcp: true,
+            udp: true,
+            ipv6,
+            listen: true,
+            dns_name: true,
+            ..Self::default()
+        }
+    }
+
+    /// Our additive classic-fidelity profile; never use against a stock relay.
+    pub fn classic_fidelity(ipv6: bool) -> Self {
+        Self {
+            eof: true,
+            fidelity: true,
+            urgent: true,
+            udp_publish: true,
+            udp_icmp: true,
+            dns_reverse: true,
+            dns_forward: true,
+            ..Self::classic(ipv6)
+        }
+    }
+
+    /// The current SDK WISP provider carries TCP and DNS, not UDP or ingress.
+    pub fn wisp(ipv6: bool) -> Self {
+        Self {
+            tcp: true,
+            ipv6,
+            dns_name: true,
+            ..Self::default()
+        }
+    }
+}
+
+/// Supported stock relay socket controls. These are host transport records,
+/// never a guest syscall ABI or new relay tag. Datagrams/groups remain codec
+/// primitives until the caller has its own admitted canonical setter path.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SocketControl {
+    Ttl(u32),
+    Linger(Option<Duration>),
+    NoDelay(bool),
+    KeepAlive(bool),
+    Broadcast(bool),
+    MulticastLoopV4(bool),
+    MulticastLoopV6(bool),
+    MulticastTtlV4(u32),
+    JoinMulticastV4 {
+        multiaddr: Ipv4Addr,
+        iface: Ipv4Addr,
+    },
+    LeaveMulticastV4 {
+        multiaddr: Ipv4Addr,
+        iface: Ipv4Addr,
+    },
+    JoinMulticastV6 {
+        multiaddr: Ipv6Addr,
+        iface: u32,
+    },
+    LeaveMulticastV6 {
+        multiaddr: Ipv6Addr,
+        iface: u32,
+    },
+}
+
+/// One ordered request. IDs are never reused within a backend, including across reconnects.
+#[derive(Clone, Debug)]
+pub enum Command {
+    /// Local transport dispatch receipt only; stock SendTo still carries Some.
+    /// No remote Sent result is required or fabricated by this operation.
+    /// Stock UDP silently drops send errors. Non-stock transient Closed-interest
+    /// notifications need a separate delivery contract; no HUP/RST is inferred.
+    SendDatagramQueued {
+        dispatch: u64,
+        socket: u64,
+        data: Vec<u8>,
+        addr: SocketAddr,
+    },
+    /// Original queued setter uses wire request None; this identity is local only.
+    SetDatagramQueued {
+        dispatch: u64,
+        socket: u64,
+        control: SocketControl,
+    },
+    SetOption {
+        request: Option<u64>,
+        socket: u64,
+        control: SocketControl,
+    },
+    /// Same admitted source-only UDP resource; literal flags precede actual local readback.
+    BindDatagram {
+        request: u64,
+        socket: u64,
+        bind: wasixv2_vnet::endpoint::EndpointBindRequest,
+    },
+    DatagramReadback {
+        request: u64,
+        socket: u64,
+        query: wasixv2_vnet::DatagramReadback,
+    },
+    /// A bind-only stream, or a direct unbound listen according to `bind.purpose`.
+    BindStream {
+        request: u64,
+        socket: u64,
+        bind: wasixv2_vnet::endpoint::EndpointBindRequest,
+    },
+    /// Continue this same selected socket; None is different from an explicit any:0 bind.
+    ConnectFrom {
+        request: u64,
+        socket: u64,
+        peer: SocketAddr,
+        /// Canonical source reservation; not a requested physical prebind.
+        /// Virtual transports use this existing source/port, while physical
+        /// unbound factories still choose/report their actual local address.
+        local: SocketAddr,
+        requested_bind: Option<SocketAddr>,
+        bound_addr: Option<SocketAddr>,
+    },
+    ListenFrom {
+        request: u64,
+        socket: u64,
+        backlog: u32,
+    },
+    /// A namespace-reserved listener, not an invented physical bound token.
+    ListenReserved {
+        request: u64,
+        socket: u64,
+        member: wasixv2_vnet::endpoint::EndpointMember,
+        domain: wasixv2_vnet::Domain,
+        v6only: bool,
+        backlog: u32,
+    },
+    /// Success means actual provider cleanup, not command-queue acceptance.
+    CloseSelected {
+        request: u64,
+        socket: u64,
+    },
+    Provider {
+        request: u64,
+        operation: wasixv2_vnet::provider::Request,
+    },
+    Connect {
+        request: u64,
+        socket: u64,
+        peer: SocketAddr,
+    },
+    Bind {
+        request: u64,
+        socket: u64,
+        addr: SocketAddr,
+    },
+    Send {
+        request: u64,
+        socket: u64,
+        data: Vec<u8>,
+    },
+    SendUrgent {
+        request: u64,
+        socket: u64,
+        data: Vec<u8>,
+    },
+    /// UDP has no success acknowledgment in the classic protocol.
+    SendTo {
+        socket: u64,
+        data: Vec<u8>,
+        addr: SocketAddr,
+    },
+    Shutdown {
+        request: u64,
+        socket: u64,
+        how: Shutdown,
+    },
+    Close {
+        socket: u64,
+    },
+    /// Sent before Close when unread bytes or receive overflow require an abort.
+    Reset {
+        socket: u64,
+    },
+    Listen {
+        request: u64,
+        socket: u64,
+        addr: SocketAddr,
+    },
+    /// Existing classic GetAddrLocal request, after a successful bind/listen.
+    LocalAddr {
+        request: u64,
+        socket: u64,
+    },
+    Accept {
+        socket: u64,
+        child: u64,
+    },
+    Lookup {
+        request: u64,
+        lookup: Lookup,
+    },
+}
+
+/// An asynchronous completion produced by the owning I/O worker.
+#[derive(Clone, Debug)]
+pub enum Event {
+    /// SDK-only lifecycle result. Policy belongs to this actual resource;
+    /// default/stock Complete retains its original canonical semantics.
+    StreamOpenedWithPolicy {
+        request: u64,
+        socket: u64,
+        result: Result<wasixv2_vnet::TcpOptionPolicy, Errno>,
+    },
+    StreamConnectedWithPolicy {
+        request: u64,
+        socket: u64,
+        result: Result<(SocketAddr, wasixv2_vnet::TcpOptionPolicy), Errno>,
+    },
+    AcceptedToWithPolicy {
+        socket: u64,
+        child: u64,
+        peer: SocketAddr,
+        local: SocketAddr,
+        policy: wasixv2_vnet::TcpOptionPolicy,
+    },
+    /// SAME captured local WebSocket send returned, never a remote/physical ACK.
+    DatagramDispatched {
+        request: u64,
+        socket: u64,
+        result: Result<(), Errno>,
+    },
+    DatagramValue {
+        request: u64,
+        value: crate::DatagramValue,
+    },
+    StreamBound {
+        request: u64,
+        socket: u64,
+        result: Result<SocketAddr, Errno>,
+    },
+    StreamConnected {
+        request: u64,
+        socket: u64,
+        result: Result<SocketAddr, Errno>,
+    },
+    StreamListening {
+        request: u64,
+        socket: u64,
+        result: Result<SocketAddr, Errno>,
+    },
+    ProviderCloseAck {
+        request: u64,
+        socket: u64,
+        /// This exact resource has emitted an accepted notification that may
+        /// still be pending ordinary delivery. False guarantees withdrawal and
+        /// completion of the unfulfilled accept credit instead. This flag is
+        /// independent of the remote provider's cleanup-confirmation boundary.
+        accept_pending: bool,
+        result: Result<(), Errno>,
+    },
+    /// The captured LOCAL DRIVER TRANSPORT SESSION has cut off and joined its
+    /// producers (possibly transferring pure remote receipts to its surviving
+    /// broker). A socket close alone is insufficient. Remote relay operations
+    /// may remain unconfirmed; this is not a relay/physical CloseACK.
+    LocalCloseUnconfirmed {
+        request: u64,
+        socket: u64,
+        error: Option<Errno>,
+    },
+    Provider {
+        request: u64,
+        reply: wasixv2_vnet::provider::Reply,
+    },
+    LocalAddr {
+        request: u64,
+        addr: SocketAddr,
+    },
+    Complete {
+        request: u64,
+        result: Result<(), Errno>,
+    },
+    Data {
+        socket: u64,
+        data: Vec<u8>,
+    },
+    Datagram {
+        socket: u64,
+        data: Vec<u8>,
+        addr: SocketAddr,
+    },
+    Sent {
+        request: u64,
+        socket: u64,
+        amount: usize,
+    },
+    SendError {
+        request: u64,
+        socket: u64,
+        error: Errno,
+    },
+    /// Last byte is urgent, at this position in the ordered stream.
+    Urgent {
+        socket: u64,
+        data: Vec<u8>,
+    },
+    /// A host UDP send failed; the endpoint remains usable.
+    DatagramError {
+        socket: u64,
+        error: Errno,
+    },
+    /// ICMP port unreachable with the quoted destination/payload. Unlike DatagramError
+    /// (a local host send failure), this is filtered by connection and RECVERR state.
+    DatagramRefused {
+        socket: u64,
+        destination: SocketAddr,
+        offender: Option<SocketAddr>,
+        payload: Vec<u8>,
+    },
+    /// Peer FIN, preserving the other direction. Reset is a distinct event.
+    Eof {
+        socket: u64,
+    },
+    Reset {
+        socket: u64,
+        error: Errno,
+    },
+    /// A provider send previously returned EAGAIN; it may now be retried.
+    Writable {
+        socket: u64,
+    },
+    Accepted {
+        socket: u64,
+        child: u64,
+        peer: SocketAddr,
+    },
+    /// Selected ingress requires the actual accepted socket's destination.
+    AcceptedTo {
+        socket: u64,
+        child: u64,
+        peer: SocketAddr,
+        local: SocketAddr,
+    },
+    Lookup {
+        request: u64,
+        result: Result<Found, LookupError>,
+    },
+}
+
+/// No Send/Sync bound: JS references stay on the I/O worker. Poll methods must not reenter
+/// the backend synchronously; completion is delivered by `poll_recv`. Pending registers the
+/// supplied waker, including for transport capacity (`WebSocket.bufferedAmount`).
+///
+/// `poll_send` accepts an entire command exactly once on Ready(Ok); Pending accepts nothing.
+/// A failed send is ambiguous and ends the session: the driver never retries it on a new
+/// connection. For WISP, the SDK adapter implements this trait using its provider callbacks
+/// and reports only its actual capabilities. No WISP bytes are interpreted as classic frames.
+pub trait Transport {
+    fn capabilities(&self) -> Capabilities;
+    fn poll_send(&mut self, cx: &mut Context<'_>, command: &Command) -> Poll<Result<(), Errno>>;
+    fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Result<Event, Errno>>;
+    /// Selected close completion may progress past a full receive frame using
+    /// the transport's existing bounded queue. Exact accepted Send/SendError,
+    /// Writable, and option Complete receipts may also progress so normal close
+    /// can drain accepted TX despite unrelated full RX. Driver validates the
+    /// same pending operation/flow before mutation. Payload/EOF order stays
+    /// unchanged. LocalCloseUnconfirmed requires a joined local session, never
+    /// an invented remote response.
+    /// Implementations also drive completed close-dispatch calls here so their
+    /// reserved admission slot is released independently of physical cleanup.
+    fn poll_recv_close(&mut self, _cx: &mut Context<'_>) -> Poll<Result<Event, Errno>> {
+        Poll::Pending
+    }
+    /// Revoke only this selected socket's admitted, unfinished factory calls.
+    /// Implementations retain late-result/physical-cleanup ownership; this is
+    /// not a CloseACK. Repeated calls and unknown/already-finished IDs are no-op.
+    /// Called outside backend locks before sending the same socket's close.
+    fn revoke_open(&mut self, _socket: u64) {}
+    /// Observe disconnect even when a full guest receive queue stops frame consumption.
+    /// Pending registers the waker; Ready is terminal for this transport session.
+    fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Errno>;
+    /// Idempotent, releasing JS event handlers, pending callbacks and connection resources.
+    fn close(&mut self);
+}
+
+/// Whole binary websocket frames. An implementation owns the websocket exclusively and
+/// limits buffered bytes before returning Ready from `poll_send`. Receive frames must be
+/// bounded by [`crate::codec::MAX_FRAME`] before allocation/copy from JS.
+pub trait FrameTransport {
+    fn poll_send(&mut self, cx: &mut Context<'_>, frame: &[u8]) -> Poll<Result<(), Errno>>;
+    fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Result<Vec<u8>, Errno>>;
+    /// Observe disconnect even when a full guest receive queue stops frame consumption.
+    /// Pending registers the waker; Ready is terminal for this transport session.
+    fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Errno>;
+    /// Idempotent, releasing JS event handlers, pending callbacks and connection resources.
+    fn close(&mut self);
+}
+
+/// Classic relay protocol adapter over a worker-local websocket implementation.
+pub struct Classic<T> {
+    transport: T,
+    capabilities: Capabilities,
+}
+
+impl<T> Classic<T> {
+    pub fn new(transport: T, capabilities: Capabilities) -> Self {
+        Self {
+            transport,
+            capabilities,
+        }
+    }
+}
+
+impl<T: FrameTransport> Transport for Classic<T> {
+    fn capabilities(&self) -> Capabilities {
+        self.capabilities
+    }
+    fn poll_send(&mut self, cx: &mut Context<'_>, command: &Command) -> Poll<Result<(), Errno>> {
+        if matches!(command, Command::SetOption { .. }) && !self.capabilities.async_options {
+            return Poll::Ready(Err(Errno::EOPNOTSUPP));
+        }
+        if matches!(
+            command,
+            Command::BindDatagram { .. }
+                | Command::BindStream { .. }
+                | Command::ConnectFrom { .. }
+                | Command::ListenFrom { .. }
+                | Command::ListenReserved { .. }
+                | Command::CloseSelected { .. }
+        ) && !self.capabilities.selected_endpoints
+        {
+            return Poll::Ready(Err(Errno::EOPNOTSUPP));
+        }
+        if matches!(command, Command::Provider { .. }) && self.capabilities.provider.is_none() {
+            return Poll::Ready(Err(Errno::EOPNOTSUPP));
+        }
+        if !self.capabilities.fidelity
+            && matches!(
+                command,
+                Command::SendUrgent { .. }
+                    | Command::Lookup {
+                        lookup: Lookup::Addr(_) | Lookup::Forward(_),
+                        ..
+                    }
+            )
+        {
+            return Poll::Ready(Err(Errno::EOPNOTSUPP));
+        }
+        let frame = match crate::codec::encode(command) {
+            Ok(frame) => frame,
+            Err(error) => return Poll::Ready(Err(error)),
+        };
+        self.transport.poll_send(cx, &frame)
+    }
+    fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Result<Event, Errno>> {
+        self.transport.poll_recv(cx).map(|frame| {
+            frame.and_then(|frame| {
+                if !self.capabilities.fidelity && frame.starts_with(&7u32.to_le_bytes()) {
+                    return Err(Errno::EPROTO);
+                }
+                crate::codec::decode(&frame)
+            })
+        })
+    }
+    fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Errno> {
+        self.transport.poll_closed(cx)
+    }
+    fn close(&mut self) {
+        self.transport.close();
+    }
+}

@@ -33,7 +33,10 @@ use wasixv2_exec::{
     AbiInstance,
     asyncify::import::{self, Resumed},
 };
-use wasixv2_syscalls::{Control, Errno as LinuxErrno, SysErr, Syscalls, TaskId, UserMemory};
+use wasixv2_syscalls::{
+    Control, Errno as LinuxErrno, ExecutionFault, SysErr, Syscalls, TaskId, UserMemory,
+    WaitCompletion, WaitCompletionSlot,
+};
 use wasmer::RuntimeError;
 
 use crate::{
@@ -1287,6 +1290,25 @@ fn join_status(info: &Siginfo) -> (u32, JoinStatus) {
     (pid, join)
 }
 
+fn join_status_with_cause(info: &Siginfo, completion: Option<WaitCompletion>) -> (u32, JoinStatus) {
+    let (pid, mut status) = join_status(info);
+    if let Some(completion) = completion
+        && pid != 0
+        && completion.pid == pid
+        && completion.code.0 == info.si_code
+        && completion.status == i32::from_le_bytes(info.sifields[8..12].try_into().unwrap())
+        && matches!(completion.code, SiCode::CLD_KILLED | SiCode::CLD_DUMPED)
+        && completion.fault == Some(ExecutionFault::WasmTrap)
+    {
+        // Legacy raw runtime traps finished with Noexec; proc_join reported ExitNormal.
+        // A signal number alone cannot authorize this v1-only projection.
+        status.tag = JoinStatusType::EXIT_NORMAL;
+        status.code = Errno::NOEXEC;
+        status.signal = Signal::NONE;
+    }
+    (pid, status)
+}
+
 /// `proc_join(pid, flags, status)`: `waitid` for the child `pid` names (any child for
 /// `NONE`), which it then holds; with `NON_BLOCKING` and no change, pid 0 and `NOTHING`.
 pub(crate) async fn proc_join<S: Syscalls + Control + 'static>(
@@ -1311,11 +1333,19 @@ pub(crate) async fn proc_join<S: Syscalls + Control + 'static>(
             options = WaitOptions(options.0 | WaitOptions::WSTOPPED.0);
         }
         let info = frame.mem.alloc_mut::<Siginfo>()?;
+        let completion = WaitCompletionSlot::default();
         frame
             .syscalls
-            .waitid(&frame.caller(), which, id, info, options, RusagePtr::NULL)
+            .waitid(
+                &frame.caller().with_wait_completion(&completion),
+                which,
+                id,
+                info,
+                options,
+                RusagePtr::NULL,
+            )
             .await?;
-        let (pid, status) = join_status(&frame.mem.take(info));
+        let (pid, status) = join_status_with_cause(&frame.mem.take(info), completion.get());
         let pid = OptionPid {
             tag: OptionTag::SOME,
             pid,
@@ -1536,6 +1566,89 @@ mod tests {
             (JoinStatusType::STOPPED, Errno(19))
         );
         let (pid, status) = join_status(&Siginfo::ZERO);
+        assert_eq!((pid, status.tag), (0, JoinStatusType::NOTHING));
+    }
+
+    #[test]
+    fn join_projects_only_the_exact_unambiguous_engine_fault_completion() {
+        let fault = WaitCompletion {
+            pid: 7,
+            code: SiCode::CLD_KILLED,
+            status: 4,
+            fault: Some(ExecutionFault::WasmTrap),
+        };
+        let info = sigchld(fault.code, fault.pid, fault.status);
+        let (_, projected) = join_status_with_cause(&info, Some(fault));
+        assert_eq!(
+            (projected.tag, projected.code, projected.signal),
+            (JoinStatusType::EXIT_NORMAL, Errno::NOEXEC, Signal::NONE)
+        );
+        for metadata in [
+            None,
+            Some(WaitCompletion {
+                fault: None,
+                ..fault
+            }),
+            Some(WaitCompletion { pid: 8, ..fault }),
+            Some(WaitCompletion {
+                code: SiCode::CLD_DUMPED,
+                ..fault
+            }),
+            Some(WaitCompletion { status: 9, ..fault }),
+        ] {
+            let (_, status) = join_status_with_cause(&info, metadata);
+            assert_eq!(
+                (status.tag, status.signal),
+                (JoinStatusType::EXIT_SIGNAL, Signal(4))
+            );
+        }
+        let dumped = WaitCompletion {
+            code: SiCode::CLD_DUMPED,
+            ..fault
+        };
+        let (_, status) = join_status_with_cause(
+            &sigchld(dumped.code, dumped.pid, dumped.status),
+            Some(dumped),
+        );
+        assert_eq!(
+            (status.tag, status.code, status.signal),
+            (JoinStatusType::EXIT_NORMAL, Errno::NOEXEC, Signal::NONE)
+        );
+        let duplicate = WaitCompletionSlot::default();
+        duplicate.publish(fault);
+        duplicate.publish(fault);
+        let (_, status) = join_status_with_cause(&info, duplicate.get());
+        assert_eq!(status.tag, JoinStatusType::EXIT_SIGNAL);
+        for code in [0, 1, 45, 132] {
+            let info = sigchld(SiCode::CLD_EXITED, 7, code);
+            let (_, status) = join_status_with_cause(
+                &info,
+                Some(WaitCompletion {
+                    code: SiCode::CLD_EXITED,
+                    status: code,
+                    ..fault
+                }),
+            );
+            assert_eq!(
+                (status.tag, status.code),
+                (JoinStatusType::EXIT_NORMAL, Errno(code as u16))
+            );
+        }
+        for code in [
+            SiCode::CLD_STOPPED,
+            SiCode::CLD_TRAPPED,
+            SiCode::CLD_CONTINUED,
+        ] {
+            let info = sigchld(code, 7, 4);
+            let (pid, status) =
+                join_status_with_cause(&info, Some(WaitCompletion { code, ..fault }));
+            let (expected_pid, expected) = join_status(&info);
+            assert_eq!(
+                (pid, status.tag, status.code, status.signal),
+                (expected_pid, expected.tag, expected.code, expected.signal)
+            );
+        }
+        let (pid, status) = join_status_with_cause(&Siginfo::ZERO, Some(fault));
         assert_eq!((pid, status.tag), (0, JoinStatusType::NOTHING));
     }
 

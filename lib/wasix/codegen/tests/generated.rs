@@ -343,22 +343,25 @@ fn only_loader_imports_attach_borrowed_engine_authority() {
 fn function_imports_keep_original_error_custody_before_completion() {
     let source =
         wasixv2_codegen::generate_exec(&repo_root().join(WIT), WIT, Target::WASM32).unwrap();
-    assert_eq!(source.matches("with_functions(&functions)").count(), 5);
+    assert_eq!(source.matches("with_functions(&functions)").count(), 8);
     for name in [
         "call_dynamic",
         "reflect_signature",
         "closure_allocate",
         "closure_prepare",
         "closure_free",
+        "context_create",
+        "context_switch",
+        "context_destroy",
     ] {
         let function = source
-            .split(&format!("async fn {name}<"))
+            .split(&format!("fn {name}<"))
             .nth(1)
             .unwrap()
-            .split("\nasync fn ")
+            .split("\n}")
             .next()
             .unwrap();
-        assert!(function.contains("crate::GuestUnwind::default()"));
+        assert!(function.contains("crate::GuestUnwind::new(&env).await"));
         assert!(function.contains("crate::GuestFunctionOperations::new(&env, &unwind)"));
         let dispatch = function.find(&format!("Syscalls::{name}(")).unwrap();
         let custody = function.find("unwind.finish(&env, ret).await?").unwrap();

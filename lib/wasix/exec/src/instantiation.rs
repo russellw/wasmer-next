@@ -1496,6 +1496,74 @@ mod tests {
     }
 
     #[test]
+    fn late_original_wasm_trap_keeps_guest_origin_through_physical_settlement() {
+        if !native_scope_subprocess(
+            "instantiation::tests::late_original_wasm_trap_keeps_guest_origin_through_physical_settlement",
+        ) {
+            return;
+        }
+        use std::{
+            future::Future,
+            task::{Context, Waker},
+        };
+        assert!(JOBS.with(|jobs| jobs.borrow().is_empty()));
+        let mut store = Store::default();
+        // Retain a genuine engine-produced trap, rather than a message resembling one.
+        let trapping = Module::new(
+            &store,
+            wat::parse_str(r#"(module (func (export "trap") unreachable))"#).unwrap(),
+        )
+        .unwrap();
+        let instance = Instance::new(&mut store, &trapping, &Imports::new()).unwrap();
+        let error = instance
+            .exports
+            .get_typed_function::<(), ()>(&store, "trap")
+            .unwrap()
+            .call(&mut store)
+            .unwrap_err();
+        drop(instance);
+        drop(trapping);
+        let module = module(&store);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let control = Arc::new(Recorder::default());
+        let mut ready = futures::executor::block_on(crate::instantiate(
+            store,
+            &module,
+            control.clone(),
+            TaskId(1),
+            Arc::new(QueueHost),
+            registry(events, Failure::None),
+            wasixv2_host::LoaderCleanup::new(Arc::new(QueueHost)),
+            None,
+        ))
+        .unwrap();
+        ready.abi = Arc::new(RetainedInvocation(
+            ready.abi.clone(),
+            RetainedPhase::StartOutcome,
+        ));
+        NATIVE_STACK_ERROR.with(|slot| *slot.borrow_mut() = Some(error));
+        // Logical success is replaced by the original trap only during physical settlement.
+        NATIVE_OUTCOME.with(|slot| *slot.borrow_mut() = Some(Ok(())));
+        let mut run = Box::pin(ready.start());
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(run.as_mut().poll(&mut cx).is_pending());
+        drop(NATIVE_CALL.with(|slot| slot.borrow_mut().take().unwrap()));
+        assert!(run.as_mut().poll(&mut cx).is_pending());
+        assert!(control.fault_causes.lock().unwrap().is_empty());
+        drop(NATIVE_FRAME.with(|slot| slot.borrow_mut().take().unwrap()));
+        let crate::Ended::Fault { signal, .. } = futures::executor::block_on(run) else {
+            panic!("late original trap must replace successful logical return");
+        };
+        assert_eq!(signal, wasixv2_abi::Signal::SIGILL.0);
+        assert_eq!(
+            *control.fault_causes.lock().unwrap(),
+            [(TaskId(1), wasixv2_syscalls::ExecutionFault::WasmTrap)]
+        );
+        NATIVE_WEAK.with(|slot| drop(slot.borrow_mut().take()));
+        NATIVE_OBSERVED_STORE.with(|slot| drop(slot.borrow_mut().take()));
+    }
+
+    #[test]
     fn rejected_cleanup_jobs_keep_native_frame_error_attachments_and_thread_lease() {
         if !native_scope_subprocess(
             "instantiation::tests::rejected_cleanup_jobs_keep_native_frame_error_attachments_and_thread_lease",

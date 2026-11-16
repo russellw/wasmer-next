@@ -102,7 +102,7 @@ jobs:
           python3 "$RUNNER_TEMP/napi-disk-guard.py" after rustup 1073741824
           "$toolchain_bin/rustc" -Vv | tee "$NAPI_EVIDENCE/rust-toolchain.txt"
           "$cargo_bin" -V | tee -a "$NAPI_EVIDENCE/rust-toolchain.txt"
-      - name: Record candidate, pinned WLK lock, runner, and preinstalled LLVM 18
+      - name: Record candidate, local WLK lock, runner, and preinstalled LLVM 18
         shell: bash
         working-directory: ${{ runner.temp }}/napi-cargo-context
         timeout-minutes: 2
@@ -115,19 +115,26 @@ jobs:
             uname -m
             xcrun --sdk macosx --show-sdk-version
           } | tee "$NAPI_EVIDENCE/runner-and-candidate.txt"
-          python3 - "$CANDIDATE_DIR/Cargo.lock" "$NAPI_EVIDENCE/wlk-lock.txt" <<'PY'
-          import sys, tomllib
-          expected = "git+https://github.com/wasmerio/wlk?branch=main#5d9102ccd0e70c82c0c8724d67c1618be8fa8b05"
-          with open(sys.argv[1], "rb") as source:
-              packages = tomllib.load(source)["package"]
-          wlk = [p for p in packages if p.get("source", "").startswith("git+https://github.com/wasmerio/wlk?")]
-          if len(wlk) != 21 or any(p.get("source") != expected for p in wlk):
-              raise SystemExit(f"expected 21 WLK packages at the reviewed revision; found {len(wlk)}")
-          lines = [f"{p['name']} {p['version']} {p['source']}" for p in sorted(wlk, key=lambda p: p["name"])]
-          open(sys.argv[2], "w").write("\n".join(lines) + "\n")
-          print("verified_wlk_packages=21 revision=5d9102ccd0e70c82c0c8724d67c1618be8fa8b05")
+          cargo metadata --manifest-path "$CANDIDATE_DIR/Cargo.toml" --locked --all-features --filter-platform aarch64-apple-darwin --format-version=1 > "$NAPI_EVIDENCE/metadata.json"
+          python3 - "$CANDIDATE_DIR" "$NAPI_EVIDENCE" <<'PYCODE'
+          import json, sys, tomllib
+          from pathlib import Path
+          candidate, evidence = map(Path, sys.argv[1:])
+          declared = tomllib.loads((candidate / "Cargo.toml").read_text())["workspace"]["dependencies"]
+          names = {name for name, value in declared.items()
+                   if isinstance(value, dict) and value.get("path", "").startswith("wlk/crates/")}
+          locked = [p for p in tomllib.loads((candidate / "Cargo.lock").read_text())["package"] if p["name"] in names]
+          packages = [p for p in json.loads((evidence / "metadata.json").read_text())["packages"] if p["name"] in names]
+          root = (candidate / "wlk/crates").resolve()
+          if len(names) != 21 or len(locked) != 21 or any("source" in p for p in locked):
+              raise SystemExit("expected exactly 21 source-free WLK lock packages")
+          if len(packages) != 21 or any(p.get("source") is not None or not Path(p["manifest_path"]).resolve().is_relative_to(root) for p in packages):
+              raise SystemExit("expected exactly 21 local WLK manifests under wlk/crates")
+          lines = [f"{p['name']} {p['version']} {Path(p['manifest_path']).resolve().relative_to(candidate.resolve())}" for p in sorted(packages, key=lambda p: p["name"])]
+          (evidence / "wlk-lock.txt").write_text("\n".join(lines) + "\n")
+          print("verified_wlk_packages=21 source=local")
           print("\n".join(lines))
-          PY
+          PYCODE
           llvm_bin="$(brew --prefix llvm@18)/bin"
           for tool in llvm-objcopy llvm-nm llvm-ar; do
             test -x "$llvm_bin/$tool"
@@ -141,44 +148,14 @@ jobs:
             printf 'AR=%s/llvm-ar\n' "$llvm_bin"
           } >> "$GITHUB_ENV"
           printf '%s\n' "$llvm_bin" >> "$GITHUB_PATH"
-      - name: Fetch locked private WLK dependency graph
-        env:
-          WLK_CI_READ_SSH_KEY: ${{ secrets.WLK_CI_READ_SSH_KEY }}
+      - name: Fetch locked dependency graph
         shell: bash
         working-directory: ${{ runner.temp }}/napi-cargo-context
         timeout-minutes: 7
         run: |
           set -euo pipefail
           # Cargo config discovery follows this task-local cwd, not the candidate manifest path.
-          umask 077
-          test -n "${WLK_CI_READ_SSH_KEY:-}"
           python3 "$RUNNER_TEMP/napi-disk-guard.py" before cargo-fetch 4294967296
-          key_file="$RUNNER_TEMP/napi-wlk-readonly-key"
-          known_hosts="$RUNNER_TEMP/napi-wlk-known-hosts"
-          git_config="$RUNNER_TEMP/napi-gitconfig"
-          trap 'rm -f -- "$key_file" "$known_hosts" "$git_config"' EXIT
-          printf '%s\n' "$WLK_CI_READ_SSH_KEY" > "$key_file"
-          unset WLK_CI_READ_SSH_KEY
-          chmod 600 "$key_file"
-          curl --fail --silent --show-error --proto '=https' --tlsv1.2 \
-            https://api.github.com/meta | python3 -c '
-          import json, sys
-          keys = json.load(sys.stdin)["ssh_keys"]
-          if not keys:
-              raise SystemExit("GitHub meta returned no SSH host keys")
-          for key in keys:
-              print("github.com " + key)
-              print("ssh.github.com " + key)
-              print("[ssh.github.com]:443 " + key)
-          ' > "$known_hosts"
-          chmod 600 "$known_hosts"
-          git config --file "$git_config" \
-            'url.ssh://git@ssh.github.com:443/wasmerio/wlk.insteadOf' \
-            https://github.com/wasmerio/wlk
-          export GIT_CONFIG_GLOBAL="$git_config"
-          export GIT_CONFIG_NOSYSTEM=1
-          export CARGO_NET_GIT_FETCH_WITH_CLI=true
-          export GIT_SSH_COMMAND="ssh -F /dev/null -i \"$key_file\" -p 443 -o IdentitiesOnly=yes -o IdentityAgent=none -o BatchMode=yes -o StrictHostKeyChecking=yes -o GlobalKnownHostsFile=/dev/null -o UserKnownHostsFile=\"$known_hosts\" -o UpdateHostKeys=no"
           set +e
           cargo fetch --manifest-path "$CANDIDATE_DIR/lib/napi/Cargo.toml" --locked --target aarch64-apple-darwin > "$NAPI_EVIDENCE/cargo-fetch.log" 2>&1
           status=$?
@@ -186,12 +163,6 @@ jobs:
           cat "$NAPI_EVIDENCE/cargo-fetch.log"
           python3 "$RUNNER_TEMP/napi-disk-guard.py" after cargo-fetch 4294967296
           exit "$status"
-      - name: Remove WLK credentials after fetch, including failed or canceled fetches
-        if: always()
-        shell: bash
-        timeout-minutes: 1
-        run: |
-          rm -f -- "$RUNNER_TEMP/napi-wlk-readonly-key" "$RUNNER_TEMP/napi-wlk-known-hosts" "$RUNNER_TEMP/napi-gitconfig"
       - name: Check disk budget for native build and V8 archive fetch
         shell: bash
         timeout-minutes: 1
@@ -445,12 +416,11 @@ jobs:
           path: ${{ runner.temp }}/napi-evidence
           if-no-files-found: warn
           retention-days: 14
-      - name: Remove task-local credentials and build state
+      - name: Remove task-local build state
         if: always()
         shell: bash
         timeout-minutes: 2
         run: |
-          rm -f -- "$RUNNER_TEMP/napi-wlk-readonly-key" "$RUNNER_TEMP/napi-wlk-known-hosts" "$RUNNER_TEMP/napi-gitconfig"
           rm -rf -- "$RUNNER_TEMP/napi-cargo-home" "$RUNNER_TEMP/napi-rustup-home" \
             "$RUNNER_TEMP/napi-target" "$RUNNER_TEMP/napi-cargo-context" \
             "$RUNNER_TEMP/napi-disk-baselines" "$RUNNER_TEMP/napi-disk-guard.py"
