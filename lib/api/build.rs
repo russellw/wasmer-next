@@ -35,8 +35,7 @@ fn build_v8() {
             .map(|byte| format!("{byte:02x}"))
             .collect();
         assert_eq!(
-            actual,
-            expected,
+            actual, expected,
             "accepted wee8 {kind} checksum mismatch; remove the affected owned cache or use WASMER_V8_ARTIFACT_DIR"
         );
     }
