@@ -2,7 +2,9 @@ name: CI
 
 on:
   push:
+    paths: ["wlk/**", ".github/workflows/wlk.yml"]
   pull_request:
+    paths: ["wlk/**", ".github/workflows/wlk.yml"]
 
 permissions:
   contents: read
@@ -11,6 +13,10 @@ concurrency:
   group: wlk-${{ github.ref }}
   cancel-in-progress: true
 
+defaults:
+  run:
+    working-directory: wlk
+
 jobs:
   native:
     name: Native check, lint, and tests
@@ -18,6 +24,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+        with:
+          sparse-checkout: wlk
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.96 --profile minimal --component rustfmt --component clippy --target wasm32-unknown-unknown
       - name: Format
@@ -51,6 +59,8 @@ jobs:
       MACOSX_DEPLOYMENT_TARGET: "13.0"
     steps:
       - uses: actions/checkout@v4
+        with:
+          sparse-checkout: wlk
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.96 --profile minimal --component clippy
       - name: Terminal lease regressions
@@ -64,6 +74,8 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+        with:
+          sparse-checkout: wlk
       - name: Install pinned Rust toolchain and wasm target
         run: rustup toolchain install 1.96 --profile minimal --target wasm32-unknown-unknown
       - name: Check browser host
@@ -77,6 +89,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          sparse-checkout: wlk
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.96 --profile minimal
       - uses: taiki-e/install-action@cargo-audit

@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       candidate_ref:
-        description: Exact private WLK candidate commit
+        description: Exact wasmer-next candidate commit
         required: true
         type: string
 
@@ -25,6 +25,7 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         timeout-minutes: 3
         with:
+          repository: ${{ github.repository }}
           ref: ${{ inputs.candidate_ref }}
           path: candidate
           persist-credentials: false
@@ -119,7 +120,7 @@ jobs:
               uname=list(os.uname()), deployment_target=env["MACOSX_DEPLOYMENT_TARGET"],
               macos=subprocess.check_output(["sw_vers", "-productVersion"], text=True).strip(),
               run_id=env["GITHUB_RUN_ID"], run_attempt=env["GITHUB_RUN_ATTEMPT"]), indent=2))
-          channel = tomllib.loads((candidate / "rust-toolchain.toml").read_text())["toolchain"]["channel"]
+          channel = tomllib.loads((candidate / "wlk/rust-toolchain.toml").read_text())["toolchain"]["channel"]
           rustup = shutil.which("rustup")
           if not rustup:
               raise RuntimeError("preinstalled rustup missing")
@@ -135,7 +136,7 @@ jobs:
           env["PATH"] = str(tools) + os.pathsep + env["PATH"]
           env["RUSTUP_TOOLCHAIN"] = channel
           (evidence / "rust.txt").write_text(subprocess.check_output([str(tools / "rustc"), "-Vv"], env=env, text=True))
-          base = [str(cargo), "--manifest-path", str(candidate / "Cargo.toml")]
+          base = [str(cargo), "--manifest-path", str(candidate / "wlk/Cargo.toml")]
           # The subcommand must precede --manifest-path.
           def command(subcommand, *args):
               return [base[0], subcommand, *base[1:], "--locked", *args]

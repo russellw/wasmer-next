@@ -71,17 +71,14 @@ jobs:
           subprocess.run(["git", "-C", str(candidate), "diff", "HEAD", "--exit-code"], check=True)
           if subprocess.check_output(["uname", "-m"], text=True).strip() != "arm64":
               raise SystemExit("this gate requires a native arm64 runner")
-          revision = "3da3b97b18bd51d1d241805d102d4d84a95dc750"
-          expected = "git+https://github.com/wasmerio/wlk?branch=main#" + revision
+          revision = subprocess.check_output(["git", "-C", str(candidate), "rev-parse", "HEAD:wlk"], text=True).strip()
           manifest = tomllib.loads((candidate / "Cargo.toml").read_text())
           declared = {name: value for name, value in manifest["workspace"]["dependencies"].items()
-                      if isinstance(value, dict) and value.get("git") == "https://github.com/wasmerio/wlk"}
+                      if isinstance(value, dict) and value.get("path", "").startswith("wlk/crates/")}
           packages = tomllib.loads((candidate / "Cargo.lock").read_text())["package"]
-          locked = [p for p in packages if p.get("source", "").startswith("git+https://github.com/wasmerio/wlk")]
-          if len(declared) != 21 or any(v.get("branch") != "main" or "rev" in v or "tag" in v for v in declared.values()):
-              raise SystemExit("expected exactly 21 WLK Git-main declarations")
-          if len(locked) != 21 or any(p.get("source") != expected for p in locked) or set(declared) != {p["name"] for p in locked}:
-              raise SystemExit("expected the same 21 WLK lock packages at published 3da")
+          locked = [p for p in packages if p["name"] in declared]
+          if len(declared) != 21 or len(locked) != 21 or any("source" in p for p in locked):
+              raise SystemExit("expected exactly 21 source-free local WLK packages")
           temporary = Path(os.environ["RUNNER_TEMP"])
           paths = {"CARGO_HOME": temporary / "capi-cargo-home", "RUSTUP_HOME": temporary / "capi-rustup-home",
                    "CARGO_TARGET_DIR": temporary / "capi-target", "CAPI_CARGO_CONTEXT": temporary / "capi-cargo-context",
@@ -100,7 +97,7 @@ jobs:
           fixture.chmod(0o444)
           identity = {"candidate_sha": actual, "tree": subprocess.check_output(["git", "-C", str(candidate), "rev-parse", "HEAD^{tree}"], text=True).strip(),
                       "cargo_lock_sha256": hashlib.sha256((candidate / "Cargo.lock").read_bytes()).hexdigest(),
-                      "wlk_revision": revision, "wlk_declared": declared, "wlk_locked": locked,
+                      "wlk_tree": revision, "wlk_declared": declared, "wlk_locked": locked,
                       "fixture_bytes": len(guest), "fixture_sha256": guest_sha,
                       "fixture_provenance": "Root-supplied exact original reviewed imported-shared B9; OLD and native CURRENT positive",
                       "target": "aarch64-apple-darwin", "features": "cranelift,wasi; no default features"}
@@ -162,41 +159,13 @@ jobs:
             xcrun --sdk macosx --show-sdk-version
             xcrun clang --version
           } | tee "$CAPI_EVIDENCE/runner.txt"
-      - name: Fetch locked private dependencies with temporary read-only credentials
-        env:
-          WLK_CI_READ_SSH_KEY: ${{ secrets.WLK_CI_READ_SSH_KEY }}
+      - name: Fetch locked dependency graph
         shell: bash
         working-directory: ${{ runner.temp }}/capi-cargo-context
         timeout-minutes: 7
         run: |
           set -euo pipefail
-          umask 077
-          test -n "${WLK_CI_READ_SSH_KEY:-}"
           python3 "$RUNNER_TEMP/capi-disk-guard.py" before fetch 4294967296 | tee "$CAPI_EVIDENCE/disk-fetch.txt"
-          key_file="$RUNNER_TEMP/capi-wlk-readonly-key"
-          known_hosts="$RUNNER_TEMP/capi-wlk-known-hosts"
-          git_config="$RUNNER_TEMP/capi-gitconfig"
-          trap 'rm -f -- "$key_file" "$known_hosts" "$git_config"' EXIT
-          printf '%s\n' "$WLK_CI_READ_SSH_KEY" > "$key_file"
-          unset WLK_CI_READ_SSH_KEY
-          chmod 600 "$key_file"
-          curl --fail --silent --show-error --proto '=https' --tlsv1.2 \
-            --retry 3 --retry-all-errors --retry-delay 2 --retry-max-time 60 \
-            --connect-timeout 10 --max-time 20 --output "$CAPI_EVIDENCE/github-meta.json" https://api.github.com/meta
-          python3 -c '
-          import json, sys
-          keys = json.load(open(sys.argv[1], "rb"))["ssh_keys"]
-          if not keys:
-              raise SystemExit("GitHub meta returned no SSH host keys")
-          for key in keys:
-              print("github.com " + key)
-              print("ssh.github.com " + key)
-              print("[ssh.github.com]:443 " + key)
-          ' "$CAPI_EVIDENCE/github-meta.json" > "$known_hosts"
-          chmod 600 "$known_hosts"
-          git config --file "$git_config" 'url.ssh://git@ssh.github.com:443/wasmerio/wlk.insteadOf' https://github.com/wasmerio/wlk
-          export GIT_CONFIG_GLOBAL="$git_config" GIT_CONFIG_NOSYSTEM=1 CARGO_NET_GIT_FETCH_WITH_CLI=true
-          export GIT_SSH_COMMAND="ssh -F /dev/null -i \"$key_file\" -p 443 -o IdentitiesOnly=yes -o IdentityAgent=none -o BatchMode=yes -o StrictHostKeyChecking=yes -o GlobalKnownHostsFile=/dev/null -o UserKnownHostsFile=\"$known_hosts\" -o UpdateHostKeys=no"
           set +e
           cargo fetch --manifest-path "$CANDIDATE_DIR/lib/c-api/Cargo.toml" --locked --target aarch64-apple-darwin > "$CAPI_EVIDENCE/fetch.log" 2>&1
           status=$?
@@ -204,18 +173,13 @@ jobs:
           cat "$CAPI_EVIDENCE/fetch.log"
           python3 "$RUNNER_TEMP/capi-disk-guard.py" after fetch 4294967296 | tee -a "$CAPI_EVIDENCE/disk-fetch.txt"
           exit "$status"
-      - name: Remove fetch credentials even after failure or cancellation
-        if: always()
-        shell: bash
-        timeout-minutes: 1
-        run: rm -f -- "$RUNNER_TEMP/capi-wlk-readonly-key" "$RUNNER_TEMP/capi-wlk-known-hosts" "$RUNNER_TEMP/capi-gitconfig"
       - name: Record the exact CAPI package and normal dependency closure
         shell: bash
         working-directory: ${{ runner.temp }}/capi-cargo-context
         timeout-minutes: 2
         run: |
           set -euo pipefail
-          cargo metadata --manifest-path "$CANDIDATE_DIR/Cargo.toml" --locked --offline --no-deps --format-version=1 > "$CAPI_EVIDENCE/metadata.json"
+          cargo metadata --manifest-path "$CANDIDATE_DIR/Cargo.toml" --locked --offline --format-version=1 > "$CAPI_EVIDENCE/metadata.json"
           cargo tree --manifest-path "$CANDIDATE_DIR/Cargo.toml" --locked --offline -p wasmer-c-api --no-default-features --features cranelift,wasi --target aarch64-apple-darwin --edges normal --prefix none > "$CAPI_EVIDENCE/normal-dependencies.txt"
           python3 - <<'PY'
           import json, os, re
@@ -227,6 +191,12 @@ jobs:
           if len(selected) != 1:
               raise SystemExit("expected exactly one actual candidate CAPI package")
           (evidence / "capi-package-id.txt").write_text(selected[0]["id"] + "\n")
+          names = set(json.loads((evidence / "candidate.json").read_text())["wlk_declared"])
+          core = [p for p in json.loads((evidence / "metadata.json").read_text())["packages"] if p["name"] in names]
+          root = (Path(os.environ["CANDIDATE_DIR"]) / "wlk/crates").resolve()
+          if len(core) != 21 or any(p.get("source") is not None or not Path(p["manifest_path"]).resolve().is_relative_to(root) for p in core):
+              raise SystemExit("expected exactly 21 local WLK manifests under wlk/crates")
+          (evidence / "wlk-manifests.json").write_text(json.dumps(core, indent=2) + "\n")
           for line in (evidence / "normal-dependencies.txt").read_text().splitlines():
               if re.match(r"^(wasmer-wasix|wasmer-wasix-types|wasmer-journal|virtual-fs|virtual-net|virtual-mio)\s", line):
                   raise SystemExit("legacy dependency in the normal native CAPI closure: " + line)
@@ -860,13 +830,12 @@ jobs:
           path: ${{ runner.temp }}/capi-evidence
           if-no-files-found: warn
           retention-days: 14
-      - name: Remove only task-local credentials and build state
+      - name: Remove only task-local build state
         if: always()
         shell: bash
         timeout-minutes: 2
         run: |
-          rm -f -- "$RUNNER_TEMP/capi-wlk-readonly-key" "$RUNNER_TEMP/capi-wlk-known-hosts" "$RUNNER_TEMP/capi-gitconfig" \
-            "$RUNNER_TEMP/capi-copying-fork.wasm" "$RUNNER_TEMP/capi-disk-guard.py" \
+          rm -f -- "$RUNNER_TEMP/capi-copying-fork.wasm" "$RUNNER_TEMP/capi-disk-guard.py" \
             "$RUNNER_TEMP/capi-cc-audit.py" "$RUNNER_TEMP/capi_macho.py" "$RUNNER_TEMP/capi_lldb.py" "$RUNNER_TEMP"/capi-disk-*.bytes
           rm -rf -- "$RUNNER_TEMP/capi-cargo-home" "$RUNNER_TEMP/capi-rustup-home" \
             "$RUNNER_TEMP/capi-target" "$RUNNER_TEMP/capi-cargo-context"
