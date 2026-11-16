@@ -259,6 +259,8 @@ pub async fn handle_stat(
     let mut raw = match result {
         Ok(value) => value.to_raw(),
         Err(SysErr::Errno(errno)) => -(errno.0 as i64),
+        Err(SysErr::NamespaceBoundary) => -(libc::ENOENT as i64),
+        Err(SysErr::NamespaceMutation) => -(libc::EACCES as i64),
         Err(
             SysErr::Restart
             | SysErr::RestartNoIntr
