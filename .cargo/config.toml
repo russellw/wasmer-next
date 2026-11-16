@@ -8,5 +8,6 @@ global-min-publish-age = "3 days"
 [resolver]
 incompatible-publish-age = "deny"
 
+# Private runtime dependencies use the standard Git/gh credential helper.
 [net]
 git-fetch-with-cli = true
