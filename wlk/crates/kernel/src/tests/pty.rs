@@ -233,6 +233,28 @@ fn the_masters_terminal_ioctls_act_on_the_slave() {
     assert_eq!(got, winsize);
     let dev = crate::tty::encode_dev(136, 0) as i32;
     assert_eq!(m.get_int(&caller, master, IoctlRequest::TIOCGDEV), Ok(dev));
+    for value in [0, u16::MAX] {
+        let winsize = Winsize {
+            ws_row: value,
+            ws_col: value,
+            ws_xpixel: value,
+            ws_ypixel: value,
+        };
+        block_on(write_value(&memory, GuestPtrMut::new(0x20), &winsize)).unwrap();
+        assert_eq!(
+            m.ioctl(&caller, slave, IoctlRequest::TIOCSWINSZ, 0x20),
+            Ok(0)
+        );
+        assert_eq!(
+            m.ioctl(&caller, master, IoctlRequest::TIOCGWINSZ, 0x30),
+            Ok(0)
+        );
+        let got: Winsize = block_on(read_value(&memory, GuestPtr::new(0x30))).unwrap();
+        assert_eq!(
+            got, winsize,
+            "both PTY endpoints share all four Linux-sized fields"
+        );
+    }
 }
 
 /// `TCGETA` and `TCSETA` see the low 16 bits of each flag word and keep the rest.

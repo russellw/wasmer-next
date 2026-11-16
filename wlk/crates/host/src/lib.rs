@@ -108,6 +108,24 @@ pub struct WindowSize {
     pub ypixel: u16,
 }
 
+impl WindowSize {
+    /// Projects frontend dimensions onto Linux's four 16-bit window-size fields.
+    ///
+    /// Frontends keep accepting all `u32` values. Each field retains its low 16 bits,
+    /// without rejection or clamping; exact wider terminal dimensions remain a separate
+    /// compatibility follow-up. Use this conversion at compatibility and host boundaries
+    /// so they update the same kernel size rather than maintaining frontend shadow state.
+    /// Arguments are rows, columns, horizontal pixels and vertical pixels, in that order.
+    pub const fn from_u32(rows: u32, cols: u32, xpixel: u32, ypixel: u32) -> Self {
+        Self {
+            rows: rows as u16,
+            cols: cols as u16,
+            xpixel: xpixel as u16,
+            ypixel: ypixel as u16,
+        }
+    }
+}
+
 /// A source that is always at end of stream, like `/dev/null`.
 pub struct EmptySource;
 
@@ -394,6 +412,30 @@ impl dyn Executor + '_ {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frontend_window_dimensions_use_the_linux_low_16_bits() {
+        assert_eq!(
+            WindowSize::from_u32(40, 120, 960, 640),
+            WindowSize {
+                rows: 40,
+                cols: 120,
+                xpixel: 960,
+                ypixel: 640
+            },
+        );
+        for (input, expected) in [(0, 0), (65535, 65535), (65536, 0), (u32::MAX, 65535)] {
+            assert_eq!(
+                WindowSize::from_u32(input, input, input, input),
+                WindowSize {
+                    rows: expected,
+                    cols: expected,
+                    xpixel: expected,
+                    ypixel: expected
+                },
+            );
+        }
+    }
 
     /// A host whose clock moves only when it sleeps, to observe `sleep_until`'s requests.
     #[derive(Default)]
