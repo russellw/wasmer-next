@@ -1,9 +1,10 @@
 # wasixv2-tests
 
-The test suite for wasixv2: programs under `suite/`, and three upstream suites under `upstream/`,
+The wasixv2 test suite lives here, in `tests/wasixv2/` in the Wasmer repository.
+It contains programs under `suite/` and three upstream suites under `upstream/`,
 built with [wasixcc](https://github.com/wasix-org/wasixcc) for `wasm32-wasixv2` against
 [libc2](https://github.com/wasix-org/libc2), and run with
-[wasmer](https://github.com/wasmerio/wasmer)'s `wasmer run`.
+this checkout's `wasmer run`.
 
 | Suite | Names | Source |
 | --- | --- | --- |
@@ -19,11 +20,10 @@ the few patches LTP needs here: it compares wasixv2 as newer than any kernel ver
 The test library forks each test run as upstream does, sharing the IPC region with its parent. The upstream code keeps its own licenses
 (LTP and the Open POSIX suite are GPLv2+), separate from this repository's.
 
-This repository has no CI of its own. It is a submodule of wasmer (`tests/wasixv2`) and libc2
-(`wasixv2/tests`), and each of them runs it against its own build:
-
-- wasmer: `make test-wasixv2`, with the wasmer it builds
-- libc2: `make wasixv2-test`, with the sysroot it builds
+Run `make test-wasixv2` from the repository root to build Wasmer and run the suite
+against that binary. The commands below run from `tests/wasixv2/`. Browser tooling
+is checked by the repository's WASIX v2 browser workflow; the full native suite
+is not yet run in CI.
 
 Many tests fail until wasixv2 is complete. `expected-failures/<suite>.txt` tracks them, so a run
 is green when nothing regressed and nothing started passing silently. Upstream tests that cannot

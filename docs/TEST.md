@@ -43,13 +43,12 @@ WASIX guest-side tests live in `lib/wasix-legacy/tests/wasm_tests/`. They need
 
 ## WASIX v2 Test Suite
 
-The wasixv2 suite lives in its own repository,
-[wasixv2-tests](https://github.com/wasix-org/wasixv2-tests), checked out at
-`tests/wasixv2`; libc2 runs the same suite. `make test-wasixv2` builds the
+The wasixv2 suite and runner live in `tests/wasixv2/`. Its upstream suites
+remain submodules; initialize them with `git submodule update --init --recursive`. `make test-wasixv2` builds the
 `wasmer` CLI and runs it. It needs `wasixcc` with `wasm32-wasixv2` support on
-PATH; `WASIXCC_LLVM_LOCATION` and `WASIXCC_SYSROOT` point it at a local LLVM
-fork and libc2 sysroot. Most tests are expected to fail until wasixv2 is
-complete: the suite's `expected-failures.txt` lists them. CI does not run it
+PATH; `WASIXCC_LLVM_LOCATION` and `WASIXCC_SYSROOT_PREFIX` point it at a local LLVM
+fork and libc2's EH and asyncify sysroots. Most tests are expected to fail until wasixv2 is
+complete: the suite's `expected-failures/<suite>.txt` lists them. CI does not run it
 yet.
 
 ## CI Coverage Gaps

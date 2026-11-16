@@ -884,7 +884,7 @@ jobs:
           TARGET_DIR: target/${{ matrix.metadata.target }}/release
           CARGO_TARGET: ${{ matrix.metadata.target }}
   # TODO(wasixv2): run the wasixv2 test suite (`make test-wasixv2`, the tests/wasixv2
-  # submodule) in CI. It MUST be enabled before wasixv2 ships: today nothing in CI checks that
+  # directory) in CI. It MUST be enabled before wasixv2 ships: today nothing in CI checks that
   # wasmer still runs real libc2 programs, and a regression only shows up when someone runs the
   # suite by hand. The suite is green while every failure is listed in its
   # expected-failures.txt, so the job can be required from the start. It needs:

@@ -28,10 +28,10 @@ for the legacy crates that still need replacements before removal.
 
 ## Submodules
 
-Four submodules: `tests/wast/spec`, `lib/napi/quickjs/deps/quickjs`,
-`wasmer-test-files`, and `tests/wasixv2`
-([wasixv2-tests](https://github.com/wasix-org/wasixv2-tests), the wasixv2 test
-suite, run with `make test-wasixv2`).
+Submodules: `tests/wast/spec`, `lib/napi/quickjs/deps/quickjs`,
+`wasmer-test-files`, and the four upstream dependencies under
+`tests/wasixv2/upstream/{ltp,libc-test,libcap,libaio}`. The wasixv2 test suite
+and runner are tracked source in `tests/wasixv2`; run with `make test-wasixv2`.
 
 `lib/wasix/codegen` owns the canonical annotated WIT and `wasixv2-codegen`
 generator as tracked source, with its upstream license and provenance. The

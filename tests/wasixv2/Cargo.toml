@@ -5,11 +5,10 @@ description = "The wasixv2 test suite and its runner"
 publish = false
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/wasix-org/wasixv2-tests"
+repository = "https://github.com/wasmerio/wasmer-next"
 rust-version = "1.96"
 
-# Its own workspace, so that it builds the same standalone and as a submodule inside wasmer's
-# tree, without becoming a member there.
+# Keep the suite and its runner independent of the root Cargo workspace.
 [workspace]
 
 [dependencies]

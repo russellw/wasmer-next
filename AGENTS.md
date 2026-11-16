@@ -85,16 +85,14 @@ prints `Running wast <path>`.
 
 ## Testing WASIX v2
 
-WASIX v2 (`lib/wasix`, design in `lib/wasix/DESIGN.md`) spans three
-repositories besides this one, all wired in as submodules. Run
-`git submodule update --init --recursive` first: a missing submodule stops the
-cargo workspace from loading, and the test suite has submodules of its own.
+The WASIX v2 test suite and runner live in `tests/wasixv2/`. Run
+`git submodule update --init --recursive` first to initialize its upstream
+suites and this repository's other submodules.
 
 | Repository | Here | Holds |
 | ---------- | ---- | ----- |
 | [wasixv2-abi](https://github.com/wasix-org/wasixv2-abi) | `lib/wasix/codegen` | The ABI (annotated WIT) and `wasixv2-codegen` |
-| [wasixv2-tests](https://github.com/wasix-org/wasixv2-tests) | `tests/wasixv2` | The test suite and its runner |
-| [libc2](https://github.com/wasix-org/libc2) | (not a submodule) | The musl-based libc; mounts both repos above under `wasixv2/` |
+| [libc2](https://github.com/wasix-org/libc2) | (not a submodule) | The musl-based libc and sysroots |
 
 ### Crate tests
 
@@ -135,17 +133,16 @@ Filter tests with `WASIXV2_TESTS_ARGS=<filter>`, for example `ltp/` or
 `posix/`. Many tests are expected to fail until wasixv2 is complete:
 `tests/wasixv2/expected-failures/<suite>.txt` lists them, and a listed test
 that starts passing fails the run. Regenerate the lists with
-`WASIXV2_TESTS_BLESS=1`, then commit them in wasixv2-tests. Upstream tests
+`WASIXV2_TESTS_BLESS=1`, then commit them here. Upstream tests
 that cannot make sense on wasixv2 (root, block devices, kernel modules, ...)
 are excluded rather than listed; see `tests/wasixv2/excluded.txt`. CI does
 not run the suite yet.
 
 ### Rules
 
-- Do not add wasixv2 program tests to this repository, and never check in
-  prebuilt wasm for them. New tests go to wasixv2-tests, built from source
-  with `wasixcc`.
-- WASIX v1 tests stay in `lib/wasix-legacy/tests`; never copy them to wasixv2-tests.
+- New wasixv2 program tests go in `tests/wasixv2/suite/`, built from source
+  with `wasixcc`. Never check in prebuilt wasm for them.
+- WASIX v1 tests stay in `lib/wasix-legacy/tests`; never copy them to `tests/wasixv2/`.
 - An ABI change lands in wasixv2-abi first. Then bump the submodule in both
   wasmer and libc2 to the same commit, regenerating in the same commit as
   the bump.
