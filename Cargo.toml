@@ -309,8 +309,8 @@ termios = "0.3"
 test-log = { version = "0.2", default-features = false }
 thiserror = "2.0.17"
 time = { version = "0.3.47", default-features = false }
-# MIO 1.0 starts at tokio version 1.39, hence the minimum requirement.
-tokio = { version = "1.39.0", default-features = false }
+# Match the patched Tokio minimum used by the sealed kernel.
+tokio = { version = "1.53.3", default-features = false }
 tokio-serde = "0.9"
 tokio-stream = "0.1"
 tokio-tungstenite = "0.28.0"
@@ -367,6 +367,10 @@ xxhash-rust = { version = "0.8.10", default-features = false }
 xz = "0.1.0"
 zip = { version = "8.1.0", default-features = false }
 libwild = { version = "0.10.0", default-features = false }
+
+[patch.crates-io]
+# Keep WebC and the kernel on the same reviewed buffer implementation.
+shared-buffer = { path = "wlk/third-party/shared-buffer" }
 
 [build-dependencies]
 test-generator = { path = "tests/lib/test-generator" }
