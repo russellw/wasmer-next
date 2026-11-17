@@ -241,10 +241,11 @@ distclean: clean
 # $(WASIXV2_OUT)/sysroot-wasixv2-asyncify, which wasixcc picks for WASM_EXCEPTIONS=no. Both compile
 # with wasixcc in PURE mode, which passes everything through to the clang of the LLVM wasixcc uses
 # for wasm32-wasixv2, so the libc and the programs built against it share a toolchain.
-# wasixv2-test builds both sysroots and runs the wasixv2 test suite (the wasixv2/tests submodule)
+# wasixv2-test builds both sysroots and runs the wasixv2 test suite (../../tests/wasixv2)
 # against them. Both need wasixcc with wasm32-wasixv2 support on PATH; the suite also needs a
 # wasmer that runs wasixv2 modules (on PATH, or WASIXV2_TESTS_WASMER). Pass test filters with
 # WASIXV2_TESTS_ARGS.
+WASIXV2_CODEGEN ?= ../../lib/wasix/codegen
 WASIXV2_OUT ?= build-wasixv2
 WASIXV2_TOOLS = WASIXCC_TARGET=wasm32-wasixv2 WASIXCC_PURE=yes CC=wasixcc AR=wasixar RANLIB=wasixranlib
 
@@ -256,7 +257,13 @@ wasixv2-sysroot-asyncify:
 
 wasixv2-test: wasixv2-sysroot wasixv2-sysroot-asyncify
 	env -u WASIXCC_SYSROOT WASIXCC_SYSROOT_PREFIX="$(abspath $(WASIXV2_OUT))" \
-		cargo run --release --locked --manifest-path wasixv2/tests/Cargo.toml -- $(WASIXV2_TESTS_ARGS)
+		cargo run --release --locked --manifest-path ../../tests/wasixv2/Cargo.toml -- $(WASIXV2_TESTS_ARGS)
 
 .PHONY: all clean install install-libs install-headers install-tools wasixv2-sysroot \
 	wasixv2-sysroot-asyncify wasixv2-test
+
+# Regenerate guest glue from the canonical in-repository ABI.
+wasixv2-codegen:
+	cargo run --locked --manifest-path $(WASIXV2_CODEGEN)/Cargo.toml -- c --wit $(WASIXV2_CODEGEN)/wit --libc .
+
+.PHONY: wasixv2-codegen

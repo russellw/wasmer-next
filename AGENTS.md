@@ -92,7 +92,7 @@ suites and this repository's other submodules.
 | Repository | Here | Holds |
 | ---------- | ---- | ----- |
 | [wasixv2-abi](https://github.com/wasix-org/wasixv2-abi) | `lib/wasix/codegen` | The ABI (annotated WIT) and `wasixv2-codegen` |
-| [libc2](https://github.com/wasix-org/libc2) | (not a submodule) | The musl-based libc and sysroots |
+| [libc2](https://github.com/wasix-org/libc2) | `guest/libc` (tracked source) | The musl-based libc and sysroots |
 
 ### Crate tests
 
@@ -121,8 +121,8 @@ with that `wasmer`. It needs, from the environment:
   wasix-org/wasixcc#87).
 - The wasix-org LLVM fork (`wasix-22.1.8` branch), via
   `WASIXCC_LLVM_LOCATION`.
-- The libc2 sysroots, via `WASIXCC_SYSROOT_PREFIX=<libc2>/build-wasixv2` after
-  `make wasixv2-sysroot wasixv2-sysroot-asyncify` in libc2. Tests that fork build
+- The libc2 sysroots, via `WASIXCC_SYSROOT_PREFIX=$PWD/guest/libc/build-wasixv2` after
+  `make -C guest/libc wasixv2-sysroot wasixv2-sysroot-asyncify` from the repo root. Tests that fork build
   for the asyncify configuration (`WASIXCC_WASM_EXCEPTIONS=no`), whose sysroot is
   `sysroot-wasixv2-asyncify`; `WASIXCC_SYSROOT` names one sysroot for every test,
   so those tests fail with it.
@@ -144,9 +144,9 @@ not run the suite yet.
   with `wasixcc`. Never check in prebuilt wasm for them.
 - The legacy implementation and its fixtures are removed. Keep v1 adapter/product
   compatibility tests here; never copy legacy fixtures into `tests/wasixv2/`.
-- An ABI change lands in wasixv2-abi first. Then bump the submodule in both
-  wasmer and libc2 to the same commit, regenerating in the same commit as
-  the bump.
+- ABI changes land here in one commit: canonical WIT/generator, kernel, import
+  shim, libc C glue and wrappers, and tests. Regenerate libc with
+  `WASIXV2_LIBC_BLESS=1 cargo test -p wasixv2-codegen --test guest_libc --locked`.
 
 ## Personal execution preferences
 

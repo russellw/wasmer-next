@@ -1,0 +1,161 @@
+name: Guest libc
+
+on:
+  pull_request:
+    paths: ["guest/**", "lib/wasix/codegen/**", "Cargo.toml", "Cargo.lock", "rust-toolchain*", ".github/workflows/guest-libc.yml"]
+  push:
+    branches: [main]
+    paths: ["guest/**", "lib/wasix/codegen/**", "Cargo.toml", "Cargo.lock", "rust-toolchain*", ".github/workflows/guest-libc.yml"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: guest-libc-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    working-directory: guest/libc
+
+jobs:
+  generated-c:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Mint cross-dependency token
+        id: cross-dependency-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.CROSS_DEPENDENCY_GITHUB_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CROSS_DEPENDENCY_GITHUB_APP_PRIVATE_KEY }}
+          owner: wasmerio
+          repositories: wasmer-runtime
+          permission-contents: read
+      - name: Configure private runtime access for workspace resolution
+        uses: ./.github/actions/setup-runtime
+        with:
+          token: ${{ steps.cross-dependency-token.outputs.token }}
+      - name: Check generated C glue
+        working-directory: .
+        run: cargo test -p wasixv2-codegen --test guest_libc --locked
+
+  sysroot:
+    name: sysroot (upstream LLVM)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # git describe in build-info.json
+
+      - name: Load toolchain pins
+        run: grep -E '^[A-Z0-9_]+=' wasixv2/toolchain.env >> "$GITHUB_ENV"
+
+      - name: Install build tools
+        run: |
+          # libxml2: needed by the LLVM release's lld
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends ninja-build libxml2
+
+      - name: Cache LLVM
+        uses: actions/cache@v6
+        with:
+          path: ~/llvm
+          key: llvm-${{ env.LLVM_TARBALL_SHA256 }}
+
+      - name: Fetch LLVM
+        run: wasixv2/fetch-llvm.sh "$HOME/llvm"
+
+      - name: Cache llvm-project source (compiler-rt, C++ runtimes)
+        uses: actions/cache@v6
+        with:
+          path: guest/libc/build-wasixv2/src
+          key: llvm-src-${{ env.LLVM_COMMIT }}
+
+      - name: Install wasm-tools
+        run: |
+          v=$WASM_TOOLS_VERSION
+          curl -fsSL "https://github.com/bytecodealliance/wasm-tools/releases/download/v$v/wasm-tools-$v-x86_64-linux.tar.gz" |
+            tar -xz -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/wasm-tools-$v-x86_64-linux" >> "$GITHUB_PATH"
+
+      - name: Build sysroot
+        # Upstream clang has no wasm32-wasixv2 target, which the C++ runtimes need.
+        run: LLVM_BIN=$HOME/llvm/bin wasixv2/build-sysroot.sh -o build-wasixv2 --no-cxx --package
+
+      - name: Smoke test
+        run: LLVM_BIN=$HOME/llvm/bin wasixv2/test/run.sh build-wasixv2/sysroot-wasixv2 build-wasixv2/smoke
+
+      # Best effort: a full artifact quota should not fail the build.
+      - uses: actions/upload-artifact@v7
+        continue-on-error: true
+        with:
+          name: sysroot-wasixv2
+          retention-days: 14
+          path: |
+            guest/libc/build-wasixv2/sysroot-wasixv2.tar.gz
+            guest/libc/build-wasixv2/sha256sums.txt
+          if-no-files-found: error
+
+  # Builds with a wasix-org/llvm-project release (--target=wasm32-wasixv2).
+  # Skipped until the repository variable WASIXV2_LLVM_TAG names a fork
+  # release, e.g. 22.1.801.
+  sysroot-fork:
+    name: sysroot (wasix-org LLVM ${{ vars.WASIXV2_LLVM_TAG }})
+    if: vars.WASIXV2_LLVM_TAG != ''
+    runs-on: ubuntu-24.04
+    env:
+      WASIXV2_LLVM_TAG: ${{ vars.WASIXV2_LLVM_TAG }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Load toolchain pins
+        run: grep -E '^[A-Z0-9_]+=' wasixv2/toolchain.env >> "$GITHUB_ENV"
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends ninja-build libxml2
+
+      - name: Fetch wasix-org LLVM
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/llvm-dl" "$HOME/llvm-fork"
+          gh release download "$WASIXV2_LLVM_TAG" -R wasix-org/llvm-project \
+            -p LLVM-Linux-x86_64.tar.gz -D "$RUNNER_TEMP/llvm-dl"
+          tar -xzf "$RUNNER_TEMP/llvm-dl/LLVM-Linux-x86_64.tar.gz" -C "$HOME/llvm-fork"
+          clang=$(find "$HOME/llvm-fork" -path '*/bin/clang' | head -n1)
+          echo "LLVM_BIN=$(dirname "$clang")" >> "$GITHUB_ENV"
+
+      - name: Cache llvm-project source (compiler-rt, C++ runtimes)
+        uses: actions/cache@v6
+        with:
+          path: guest/libc/build-wasixv2/src
+          key: llvm-src-${{ env.LLVM_COMMIT }}
+
+      - name: Install wasm-tools
+        run: |
+          v=$WASM_TOOLS_VERSION
+          curl -fsSL "https://github.com/bytecodealliance/wasm-tools/releases/download/v$v/wasm-tools-$v-x86_64-linux.tar.gz" |
+            tar -xz -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/wasm-tools-$v-x86_64-linux" >> "$GITHUB_PATH"
+
+      - name: Build sysroot
+        run: wasixv2/build-sysroot.sh -o build-wasixv2 --target wasm32-wasixv2 --package
+
+      - name: Smoke test
+        run: wasixv2/test/run.sh build-wasixv2/sysroot-wasixv2 build-wasixv2/smoke
+      # Full tests/wasixv2 coverage still needs wasixcc v2 (PR #87), binaryen,
+      # both EH and asyncify sysroots, and a built wasmer. See docs/TEST.md.
+
+      - uses: actions/upload-artifact@v7
+        continue-on-error: true
+        with:
+          name: sysroot-wasixv2-fork-llvm
+          retention-days: 14
+          path: |
+            guest/libc/build-wasixv2/sysroot-wasixv2.tar.gz
+            guest/libc/build-wasixv2/sha256sums.txt

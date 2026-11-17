@@ -11,6 +11,7 @@ engine integration. The root Cargo.toml lists its members.
 | lib/wasix/{api,exec,dylink,wasix1,codegen} | V2 facade, engine glue, v1 guest adapter and canonical generator |
 | lib/package, lib/package-sdk, lib/config, lib/backend-api, lib/cache | Packaging, registry/configuration and module caching |
 | lib/wasi-types | Native dev-only ABI oracle for v2 adapter layout tests |
+| guest/libc | Musl-based WASIX v2 libc and sysroot builder (plain source import) |
 | tests/integration, tests/wasixv2 | Product and guest integration suites |
 
 The engine (API, VM, compilers, types, derive, middlewares, WAST/compiler tests

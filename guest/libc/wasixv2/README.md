@@ -17,24 +17,21 @@ libc2 is a fork of [musl](https://musl.libc.org/) v1.2.6 with a `wasm32` port th
   extensions in the same `wasixv2` module, e.g. `wasixv2.startup_get`. Their names never collide
   with syscall names.
 
-The interface is defined in WIT in [wasixv2-abi](https://github.com/wasix-org/wasixv2-abi), a
-submodule at `wasixv2/abi` here and at `lib/wasixv2/codegen` in wasmer. Its `wasixv2-codegen` tool
-generates both wasmer's host-side Rust code and the C glue in this repository. Building the
-sysroot does not need the submodule.
-
-Upstream musl history is preserved. `main` is upstream `v1.2.6` plus a few upstream fixes
-cherry-picked with `-x`, plus the wasm32 commits.
+The canonical WIT and generator live at `../../../lib/wasix/codegen` relative to
+this directory (`../../lib/wasix/codegen` from the libc root). Generated C is
+checked by `cargo test -p wasixv2-codegen --test guest_libc --locked` at the
+repository root. This is a plain import of libc2 without its upstream history;
+see `../SOURCE.md`.
 
 ## Test suite
 
-The wasixv2 test suite, [wasixv2-tests](https://github.com/wasix-org/wasixv2-tests), is a
-submodule at `wasixv2/tests`; wasmer runs the same suite. Besides its own programs it runs
+The wasixv2 test suite is tracked at `../../tests/wasixv2` from the libc root. Besides its own programs it runs
 musl's libc-test, the Open POSIX Test Suite and LTP, which are submodules of it, so check it out
 recursively. `make wasixv2-test` builds the sysroots in `build-wasixv2/` (see below) and runs the
 suite against them:
 
 ```sh
-git submodule update --init --recursive wasixv2/tests
+git -C ../.. submodule update --init --recursive
 make wasixv2-test
 ```
 
@@ -246,36 +243,23 @@ that it imports only `env.memory` and `wasixv2.*`, and compiles `wasixv2/test/ua
 includes the Linux UAPI headers together with libc's. If the sysroot has the C++ runtimes, it links
 and checks `wasixv2/test/smoke.cpp` the same way (iostream, threads and, in the `eh`
 configuration, an exception). It does not run the modules; running v2
-programs is tested in the wasmer repo (`lib/wasixv2`, `lib/wasix-tests`). Needs wasm-tools.
+programs is tested in the wasmer repo (`lib/wasix`, `tests/wasixv2`). Needs wasm-tools.
 
 ## CI and releases
 
-- `.github/workflows/ci.yml` runs on pull requests and pushes to `main`. It downloads the pinned
+- the repository-root `.github/workflows/guest-libc.yml` runs on pull requests and pushes to `main`. It downloads the pinned
   upstream LLVM release (`wasixv2/fetch-llvm.sh`, checksum in `wasixv2/toolchain.env`), runs
   `build-sysroot.sh --package` and the smoke test, and uploads the tarball as an artifact (best
   effort).
   A second job builds with a wasix-org/llvm-project release. It is skipped until the repository
   variable `WASIXV2_LLVM_TAG` is set to a fork release tag (e.g. `22.1.801`, asset
   `LLVM-Linux-x86_64.tar.gz`).
-- `.github/workflows/release.yml` runs on tags `vYYYY-MM-DD.N`. It runs the same build and smoke
-  test (the composite action `.github/actions/build-sysroot`, shared with CI) and creates a GitHub
-  **prerelease** with `sysroot-wasixv2.tar.gz` (top-level directory `sysroot-wasixv2/`) and
-  `sha256sums.txt`, uploaded directly without GitHub artifact storage. The release notes include `build-info.json`.
+- The standalone libc2 release workflow is retired. Wasmer tags do not publish
+  libc sysroots; a guest-specific release policy remains to be defined.
 
-The tarball is reproducible for a given commit and toolchain: archive members are sorted, owned by
-0:0 and dated to the commit time, and gzip omits the timestamp.
-
-**Versioning.** Tags are date based, `vYYYY-MM-DD.N` with `N` starting at 1 (e.g. `v2026-10-15.1`),
-the same scheme as wasix-libc. The musl version is not a useful release number: libc2 stays on
-musl 1.2.6 while the wasixv2 ABI and the port change. wasixcc's tag handling already accepts these
-tags. The musl base, compiler and compiler-rt version are recorded in `build-info.json` and the
-release notes.
-
-To release:
-
-```sh
-git tag -a v2026-10-15.1 -m "libc2 v2026-10-15.1" && git push origin v2026-10-15.1
-```
+The tarball is reproducible for a given commit and toolchain: archive members are
+sorted, owned by 0:0 and dated to the commit time, and gzip omits the timestamp.
+Build-info revision fields now identify the containing Wasmer checkout.
 
 ## How the syscall layer works
 
@@ -305,7 +289,7 @@ The only generic (non-arch) changes:
 
 ## Generated files
 
-The [wasixv2-codegen](https://github.com/wasmerio/wasmer/tree/main/lib/wasixv2/codegen) C
+The [wasixv2-codegen](https://github.com/wasmerio/wasmer/tree/main/lib/wasix/codegen) C
 backend owns these files. Do not edit them by hand:
 
 | File | Content |
@@ -315,15 +299,12 @@ backend owns these files. Do not edit them by hand:
 | `src/internal/wasm32/wasixv2_dyn.c` | `__syscall_dyn` switch |
 | `src/internal/wasm32/wasixv2_asserts.c` | `_Static_assert`s of musl types and constants against the WIT definitions |
 
-To change the ABI, land the change in wasixv2-abi, bump the `wasixv2/abi` submodule, and
-regenerate in the same commit. From this repository's root, then rebuild:
+ABI, kernel and libc changes now land together in this repository. Regenerate
+from the libc root with `make wasixv2-codegen`, or from the repository root:
 
 ```sh
-git submodule update --init wasixv2/abi
-cargo run --manifest-path wasixv2/abi/Cargo.toml -- c --wit wasixv2/abi/wit --libc .
+WASIXV2_LIBC_BLESS=1 cargo test -p wasixv2-codegen --test guest_libc --locked
 ```
-
-wasmer pins its own copy of the ABI; keep both submodules on the same commit.
 
 A drift between the WIT definitions and musl shows up as a compile error, either in an arm or in
 `wasixv2_asserts.c`.

@@ -27,7 +27,8 @@
       "revision": "ce830d6e76e8e999e4ee0396583300c235aaecf0",
       "branch": "snapshot/wasixv2-20261105",
       "repository": "https://github.com/wasix-org/libc2",
-      "base": "feaf375337e50ad521879ae252147b9aee4a5b7f"
+      "base": "feaf375337e50ad521879ae252147b9aee4a5b7f",
+      "source_ownership": "in-repository: guest/libc (plain import of historical snapshot revision above; no libc2 history)"
     },
     "wasixcc": {
       "revision": "29aba5dee92f1320adc22f2030709d0bc96287fd",

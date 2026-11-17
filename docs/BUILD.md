@@ -257,3 +257,15 @@ uses `CROSS_DEPENDENCY_GITHUB_APP_CLIENT_ID` and
 `wasmerio/wasmer-runtime`; checkout keeps its default `GITHUB_TOKEN`.
 WLK is local at wlk/ and retains its
 own workspace, toolchain and lockfile; root lint does not cover it.
+
+## Guest libc sysroots
+
+The musl-based libc is tracked at `guest/libc`, without nested ABI or test
+submodules. From the repository root, run
+`make -C guest/libc wasixv2-sysroot wasixv2-sysroot-asyncify`, with wasixcc v2
+on PATH and `WASIXCC_LLVM_LOCATION` pointing at the wasix-org LLVM fork
+(`wasix-22.1.8`). Set `WASIXCC_SYSROOT_PREFIX=$PWD/guest/libc/build-wasixv2`
+for the guest suite. The builder's source/tool pins are in
+`guest/libc/wasixv2/toolchain.env`; binaryen is needed by asyncify programs.
+The separate, non-required `guest-libc.yml` workflow builds with upstream LLVM
+and optionally the fork (`WASIXV2_LLVM_TAG` repository variable).
