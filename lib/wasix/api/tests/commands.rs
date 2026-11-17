@@ -196,6 +196,182 @@ async fn a_command_is_an_executable_file_in_bin_and_usr_bin() {
     .await;
 }
 
+struct HostEcho;
+
+impl wasixv2::VirtualCommand for HostEcho {
+    fn name(&self) -> &str {
+        "host-echo"
+    }
+
+    fn run<'a>(
+        &'a self,
+        cx: wasixv2::CommandContext<'a>,
+    ) -> LocalFuture<'a, wasixv2::CommandOutcome> {
+        Box::pin(async move {
+            let mut output = cx.args().join(&b' ');
+            output.push(b'\n');
+            cx.write_all(wasixv2_abi::Fd(1), &output).await.unwrap();
+            wasixv2::CommandOutcome::Exit(42)
+        })
+    }
+}
+
+#[tokio::test]
+async fn virtual_command_is_an_executable_file_and_survives_root_rebuild() {
+    local(async {
+        let command = Arc::new(HostEcho);
+        let mut machine = Machine::builder()
+            .command("/bin/echo", command.clone())
+            .command("/usr/bin/echo", command.clone())
+            .build();
+        machine
+            .install_commands(commands(&[
+                ("main", &wat(MAIN)),
+                ("echo", &echo("package")),
+                ("script", b"#!/bin/echo -x\n"),
+            ]))
+            .await
+            .unwrap();
+        let (status, out) = run_file(&machine, "/bin/main", &["main"]).await;
+        assert_eq!((status.unwrap(), out.as_str()), (42, "echo from-main\n"));
+        let (status, out) = run_file(&machine, "/bin/script", &["script", "argument"]).await;
+        assert_eq!(
+            (status.unwrap(), out.as_str()),
+            (42, "/bin/echo -x /bin/script argument\n")
+        );
+
+        // Duplicate paths fail at boot, before a kernel can start.
+        let result = Machine::builder()
+            .command("/bin/echo", command.clone())
+            .command("/bin/echo", command)
+            .try_build();
+        assert_eq!(result.err().unwrap().kind(), io::ErrorKind::AlreadyExists);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn virtual_command_copy_up_removes_dispatch() {
+    local(async {
+        use wasixv2_vfs::{Cred, Ctx, OpenHow};
+        let machine = Machine::builder()
+            .command("/bin/echo", Arc::new(HostEcho))
+            .build();
+        let vfs = machine.vfs();
+        let root = vfs.root();
+        let cx = Ctx {
+            cred: &Cred::root(),
+            root: &root,
+            umask: 0,
+            task: 0,
+            leases: None,
+        };
+        let handle = vfs
+            .open(
+                &cx,
+                &root,
+                b"/bin/echo",
+                &OpenHow {
+                    flags: wasixv2_abi::OpenFlags::O_WRONLY,
+                    mode: 0,
+                    lookup: Default::default(),
+                },
+            )
+            .await
+            .unwrap();
+        drop(handle);
+        let (status, _) = run_file(&machine, "/bin/echo", &["echo"]).await;
+        assert_eq!(execve_errno(status), ENOEXEC);
+    })
+    .await;
+}
+
+// The vfork, file actions, exec and wait sequence used by posix_spawn, with a
+// directly exported vfork continuation in place of libc's longjmp wrapper.
+const SPAWN_HOST_COMMAND: &str = r#"
+(module
+  (import "wasixv2" "openat" (func $open (param i32 i32 i32 i32) (result i32)))
+  (import "wasixv2" "faccessat2" (func $access (param i32 i32 i32 i32) (result i32)))
+  (import "wasixv2" "getdents64" (func $list (param i32 i32 i32) (result i32)))
+  (import "wasixv2" "pipe2" (func $pipe (param i32 i32) (result i32)))
+  (import "wasixv2" "dup3" (func $dup (param i32 i32 i32) (result i32)))
+  (import "wasixv2" "close" (func $close (param i32) (result i32)))
+  (import "wasixv2" "read" (func $read (param i32 i32 i32) (result i32)))
+  (import "wasixv2" "write" (func $write (param i32 i32 i32) (result i32)))
+  (import "wasixv2" "clone" (func $clone (param i32 i32 i32 i32 i32) (result i32)))
+  (import "wasixv2" "execve" (func $exec (param i32 i32 i32) (result i32)))
+  (import "wasixv2" "waitid" (func $wait (param i32 i32 i32 i32 i32) (result i32)))
+  (import "wasixv2" "exit_group" (func $exit (param i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 16) "/bin\00")
+  (data (i32.const 32) "/bin/echo\00")
+  (data (i32.const 64) "echo\00")
+  (data (i32.const 80) "from-child\00")
+  (data (i32.const 96) "\40\00\00\00\50\00\00\00\00\00\00\00")
+  (tag $continued (param i32))
+  (func (export "wasixv2_vfork_return") (param i32)
+    (throw $continued (local.get 0)))
+  (func $check (param $result i32) (result i32)
+    (if (i32.lt_s (local.get $result) (i32.const 0))
+      (then (call $exit (i32.sub (i32.const 0) (local.get $result))) unreachable))
+    (local.get $result))
+  (func (export "_start") (local $dir i32) (local $n i32) (local $at i32) (local $pid i32)
+    (drop (call $check (call $access (i32.const -100) (i32.const 32) (i32.const 1) (i32.const 0))))
+    (local.set $dir (call $check
+      (call $open (i32.const -100) (i32.const 16) (i32.const 0) (i32.const 0))))
+    (local.set $n (call $check (call $list (local.get $dir) (i32.const 256) (i32.const 512))))
+    (local.set $at (i32.const 256))
+    (block $found
+      (loop $next
+        (if (i32.ge_u (local.get $at) (i32.add (i32.const 256) (local.get $n)))
+          (then (call $exit (i32.const 100)) unreachable))
+        ;; linux_dirent64: DT_REG at 18 and the name at 19.
+        (if (i32.and
+          (i32.eq (i32.load8_u offset=18 (local.get $at)) (i32.const 8))
+          (i32.eq (i32.load offset=19 (local.get $at)) (i32.const 0x6f686365)))
+          (then (br $found)))
+        (local.set $at (i32.add (local.get $at) (i32.load16_u offset=16 (local.get $at))))
+        (br $next)))
+    (drop (call $close (local.get $dir)))
+    (drop (call $check (call $pipe (i32.const 128) (i32.const 0))))
+    (block $parent (result i32)
+      (try_table (catch $continued $parent)
+        ;; CLONE_VM | CLONE_VFORK | SIGCHLD
+        (drop (call $check (call $clone (i32.const 0x4111) (i32.const 0)
+          (i32.const 0) (i32.const 0) (i32.const 0))))
+        (drop (call $check (call $dup (i32.load (i32.const 132)) (i32.const 1) (i32.const 0))))
+        (drop (call $close (i32.load (i32.const 128))))
+        (drop (call $close (i32.load (i32.const 132))))
+        (drop (call $check (call $exec (i32.const 32) (i32.const 96) (i32.const 0))))
+        (call $exit (i32.const 101)))
+      unreachable)
+    (local.set $pid)
+    (drop (call $close (i32.load (i32.const 132))))
+    (local.set $n (call $check (call $read (i32.load (i32.const 128)) (i32.const 256) (i32.const 80))))
+    (drop (call $write (i32.const 1) (i32.const 256) (local.get $n)))
+    ;; P_PID, WEXITED, and si_status in the returned siginfo.
+    (drop (call $check (call $wait (i32.const 1) (local.get $pid)
+      (i32.const 512) (i32.const 4) (i32.const 0))))
+    (call $exit (i32.load (i32.const 532)))
+    unreachable))
+"#;
+
+#[tokio::test]
+async fn virtual_command_spawn_is_listed_and_uses_the_childs_redirected_stdio() {
+    local(async {
+        let mut machine = Machine::builder()
+            .command("/bin/echo", Arc::new(HostEcho))
+            .build();
+        machine
+            .install_commands(commands(&[("spawn", &wat(SPAWN_HOST_COMMAND))]))
+            .await
+            .unwrap();
+        let (status, out) = run_file(&machine, "/bin/spawn", &["spawn"]).await;
+        assert_eq!((status.unwrap(), out.as_str()), (42, "echo from-child\n"));
+    })
+    .await;
+}
+
 /// The first command of a name wins, as the resolver orders the tree: the root package's,
 /// then its dependencies'.
 #[tokio::test]

@@ -77,9 +77,13 @@ pub use wasixv2_host::{
     WindowSize,
 };
 pub use wasixv2_kernel::{
-    ConsoleInputEof, Credentials, PowerRequest, ProcessConfig, Stdio, Uname, UnameError,
+    CommandContext, CommandCred, CommandFile, CommandOutcome, CommandSpec, ConsoleInputEof,
+    Credentials, Executed, PowerRequest, ProcessConfig, Stdio, TaskFs, Uname, UnameError,
+    VirtualCommand,
 };
-use wasixv2_kernel::{FilesystemType, FsParam, HostClock, Kernel, SyscallEntry, Timekeeper};
+use wasixv2_kernel::{
+    Commands, FilesystemType, FsParam, HostClock, Kernel, SyscallEntry, Timekeeper,
+};
 pub use wasixv2_pages::{BudgetExceeded, MemoryBudget};
 use wasixv2_pages::{Provider, SharedPages};
 use wasixv2_syscalls::{Layered, TaskId};
@@ -219,6 +223,8 @@ impl Host for TaskHost {
 /// Processes run as the machine's user ([`MachineBuilder::user`]), which also owns the root
 /// filesystem, mapped host directories and package volumes.
 pub struct Machine {
+    commands: Commands,
+    command_paths: Vec<String>,
     memory: MemoryConfig,
     syscalls: Arc<Stack>,
     /// The guest ABIs programs may target: `wasixv2`, then WASIX v1 with the `wasix1` feature.
@@ -284,6 +290,7 @@ impl Default for Machine {
 /// # Ok::<(), wasixv2::UnameError>(())
 /// ```
 pub struct MachineBuilder {
+    commands: Vec<(String, CommandSpec)>,
     memory_budget: Option<Arc<dyn MemoryBudget>>,
     host: Arc<dyn Host>,
     task_executor: Option<Arc<dyn Executor>>,
@@ -338,6 +345,7 @@ impl MachineBuilder {
     pub fn new(host: Arc<dyn Host>) -> Self {
         Self {
             host,
+            commands: Vec::new(),
             memory_budget: None,
             task_executor: None,
             network: None,
@@ -377,6 +385,26 @@ impl MachineBuilder {
     #[cfg(feature = "wasix1")]
     pub fn wasix1_initial_command(mut self, enabled: bool) -> Self {
         self.wasix1_initial_command = enabled;
+        self
+    }
+
+    /// Registers a host command at `path`, with root ownership and mode 0755.
+    pub fn command(self, path: &str, command: Arc<dyn VirtualCommand>) -> Self {
+        self.command_spec(
+            path,
+            CommandSpec {
+                command,
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
+            },
+        )
+    }
+
+    /// Registers a host command with explicit permissions and ownership.
+    /// Invalid or duplicate paths are reported by [`Self::try_build`].
+    pub fn command_spec(mut self, path: &str, spec: CommandSpec) -> Self {
+        self.commands.push((path.to_owned(), spec));
         self
     }
 
@@ -561,6 +589,7 @@ impl MachineBuilder {
     pub fn try_build(self) -> io::Result<Machine> {
         let Self {
             host,
+            commands,
             memory_budget,
             task_executor,
             network,
@@ -651,13 +680,26 @@ impl MachineBuilder {
             wasix1.files.clone(),
         )?;
         let abis = Arc::new(configured_abis);
+        let mut registry = Commands::builder();
+        let mut command_paths = Vec::with_capacity(commands.len());
+        for (path, spec) in commands {
+            registry.register_spec(&path, spec).map_err(errno_to_io)?;
+            command_paths.push(path);
+        }
+        let commands = registry.build();
+        let mut lowers = Vec::new();
+        if !commands.is_empty() {
+            lowers.push(commands.filesystem());
+        }
         #[cfg(feature = "resolved-packages")]
-        let boot_root = match &runtime_packages {
-            Some(packages) => OverlayFs::new(Some(root.clone()), vec![packages.shim.clone()]),
-            None => root.clone(),
+        if let Some(packages) = &runtime_packages {
+            lowers.push(packages.shim.clone());
+        }
+        let boot_root = if lowers.is_empty() {
+            root.clone()
+        } else {
+            OverlayFs::new(Some(root.clone()), lowers)
         };
-        #[cfg(not(feature = "resolved-packages"))]
-        let boot_root = root.clone();
         let kernel = boot(
             &time,
             &memory,
@@ -670,6 +712,7 @@ impl MachineBuilder {
                 .as_ref()
                 .map(|(console, _)| (console, console_input_eof)),
             abis.clone(),
+            commands.clone(),
         )?
         .with_guest_task_limit(max_guest_tasks);
         now(mount_kernel_filesystems(&kernel, &host, &memory))?;
@@ -681,6 +724,8 @@ impl MachineBuilder {
             !Arc::ptr_eq(&host, &task_host),
         );
         Ok(Machine {
+            commands,
+            command_paths,
             memory,
             syscalls,
             abis,
@@ -831,7 +876,7 @@ impl Machine {
         if self.root_lowers.len()
             + layers.len()
             + usize::from(self.skeleton.is_some())
-            + self.runtime_package_lowers()
+            + self.command_lowers()
             > MAX_LOWERS
         {
             return Err(io::Error::other("too many layers stacked under the root"));
@@ -858,7 +903,7 @@ impl Machine {
             return Err(errno_to_io(Errno::EBUSY));
         }
         if self.skeleton.is_none() {
-            if self.root_lowers.len() + self.runtime_package_lowers() == MAX_LOWERS {
+            if self.root_lowers.len() + self.command_lowers() == MAX_LOWERS {
                 return Err(io::Error::other("too many layers stacked under the root"));
             }
             self.skeleton = Some(self.root_upper.clone());
@@ -882,12 +927,11 @@ impl Machine {
         self.set_root_upper(upper).await
     }
 
-    fn runtime_package_lowers(&self) -> usize {
+    fn command_lowers(&self) -> usize {
+        let commands = usize::from(!self.commands.is_empty());
         #[cfg(feature = "resolved-packages")]
-        if self.runtime_packages.is_some() {
-            return 1;
-        }
-        0
+        let commands = commands + usize::from(self.runtime_packages.is_some());
+        commands
     }
 
     async fn reboot_root(&mut self) -> io::Result<()> {
@@ -896,6 +940,9 @@ impl Machine {
         #[cfg(feature = "resolved-packages")]
         if let Some(packages) = &self.runtime_packages {
             lowers.insert(0, packages.shim.clone());
+        }
+        if !self.commands.is_empty() {
+            lowers.insert(0, self.commands.filesystem());
         }
         let root = OverlayFs::new(Some(self.root_upper.clone()), lowers);
         // Nothing lives in the kernel yet, so a new one on the new root replaces it, with the
@@ -912,6 +959,7 @@ impl Machine {
                 .as_ref()
                 .map(|(console, _)| (console, self.console_input_eof)),
             self.abis.clone(),
+            self.commands.clone(),
         )?
         .with_guest_task_limit(self.max_guest_tasks);
         mount_kernel_filesystems(&kernel, &self.host, &self.memory).await?;
@@ -1045,8 +1093,18 @@ impl Machine {
         self.vfs()
             .mount(guest.as_bytes(), fs, flags, true)
             .await
-            .map(drop)
-            .map_err(errno_to_io)
+            .map_err(errno_to_io)?;
+        let mount_path = guest.trim_end_matches('/');
+        for path in &self.command_paths {
+            if path == mount_path
+                || path
+                    .strip_prefix(mount_path)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+            {
+                tracing::warn!(command = %path, mount = guest, "mount covers a virtual command");
+            }
+        }
+        Ok(())
     }
 
     /// Captures a host directory as an owned, unattached directory capability.
@@ -1514,12 +1572,14 @@ fn boot(
     init: bool,
     console: Option<(&Console, ConsoleInputEof)>,
     abis: Arc<Abis<Stack>>,
+    commands: Commands,
 ) -> io::Result<Kernel> {
     let host: Arc<dyn Host> = time.clone();
     let host = &host;
     let network_policy = network.policy();
     let mut kernel = Kernel::with_timekeeper(time.clone(), root)
         .with_memory_budget(memory.budget.clone())
+        .with_commands(commands)
         .with_binfmt(abis)
         .with_network(network.clone())
         .with_network_factory(move || {
