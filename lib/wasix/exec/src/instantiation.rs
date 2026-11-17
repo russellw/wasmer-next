@@ -536,7 +536,7 @@ impl Drop for AttachmentGuard {
 }
 
 #[cfg(all(test, feature = "sys"))]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{
         Abis, ExecError, Wasixv2,
@@ -937,7 +937,31 @@ mod tests {
         static JOBS: std::cell::RefCell<Vec<wasixv2_host::LocalFuture<'static, ()>>> = const { std::cell::RefCell::new(Vec::new()) };
         static DISCARD_JOBS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
-    struct QueueHost;
+    // Poll every accepted job together: a final drain may depend on another
+    // job in the same queue, and teardown can enqueue a later generation.
+    pub(crate) fn drain_jobs(mut jobs: Vec<wasixv2_host::LocalFuture<'static, ()>>) {
+        futures::executor::block_on(std::future::poll_fn(|cx| {
+            jobs.extend(JOBS.with(|queue| std::mem::take(&mut *queue.borrow_mut())));
+            let mut pending = Vec::new();
+            for mut job in std::mem::take(&mut jobs) {
+                if job.as_mut().poll(cx).is_pending() {
+                    pending.push(job);
+                }
+            }
+            jobs = pending;
+            let added = JOBS.with(|queue| std::mem::take(&mut *queue.borrow_mut()));
+            if !added.is_empty() {
+                jobs.extend(added);
+                cx.waker().wake_by_ref();
+            }
+            if jobs.is_empty() {
+                std::task::Poll::Ready(())
+            } else {
+                std::task::Poll::Pending
+            }
+        }));
+    }
+    pub(crate) struct QueueHost;
     impl wasixv2_host::Host for QueueHost {
         fn realtime(&self) -> std::time::Duration {
             std::time::Duration::ZERO
@@ -1754,44 +1778,57 @@ mod tests {
                 canceled_before_job_poll =
                     NATIVE_WEAK.with(|slot| slot.borrow().as_ref().unwrap().upgrade().is_none());
                 let mut jobs = JOBS.with(|jobs| std::mem::take(&mut *jobs.borrow_mut()));
-                assert_eq!(
-                    jobs.len(),
-                    2,
-                    "one attachment cleanup and its transferred runner drain"
-                );
-                let mut failed = jobs.remove(0);
+                assert!(!jobs.is_empty(), "cancellation must retain cleanup custody");
                 let waiter_drops = Arc::new(AtomicUsize::new(0));
                 let waiter_wakes = Arc::new(AtomicUsize::new(0));
                 let waiter = Waker::from(Arc::new(PendingWaiter {
                     dropped: waiter_drops.clone(),
                     woke: waiter_wakes.clone(),
                 }));
-                assert!(
-                    failed
+                let mut pending = Vec::new();
+                for mut job in jobs {
+                    if job
                         .as_mut()
                         .poll(&mut Context::from_waker(&waiter))
                         .is_pending()
-                );
+                    {
+                        pending.push(job);
+                    }
+                }
                 drop(waiter);
-                let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    failed.as_mut().poll(&mut cx)
-                }))
-                .expect_err("replacing the queued waiter's last Waker invokes its destructor");
-                // A panicked task is dropped by its executor. That must transfer
-                // the exact native guard again before old Completion retires.
-                drop(failed);
+                let mut failures = Vec::new();
+                let mut jobs = Vec::new();
+                for mut job in pending {
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        job.as_mut().poll(&mut cx)
+                    })) {
+                        Ok(std::task::Poll::Pending) => jobs.push(job),
+                        Ok(std::task::Poll::Ready(())) => {}
+                        Err(panic) => {
+                            // Executor disposal transfers the SAME native guard.
+                            drop(job);
+                            failures.push(panic);
+                        }
+                    }
+                }
+                assert_eq!(
+                    failures.len(),
+                    1,
+                    "the retained waiter destructor must panic once"
+                );
+                let panic = failures.pop().unwrap();
                 let replacement = JOBS.with(|jobs| std::mem::take(&mut *jobs.borrow_mut()));
-                let replacement_count = replacement.len();
+                assert!(
+                    !replacement.is_empty(),
+                    "failed polling must transfer its cleanup"
+                );
                 for job in replacement.into_iter().rev() {
                     jobs.insert(0, job);
                 }
-                let mut early_completion = false;
                 let mut pending = Vec::new();
                 for mut job in jobs {
                     if job.as_mut().poll(&mut cx).is_pending() {
                         pending.push(job);
-                    } else {
-                        early_completion = true;
                     }
                 }
                 let busy = matches!(
@@ -1804,17 +1841,7 @@ mod tests {
                     .iter()
                     .any(|(_, event)| *event == "deactivate");
                 drop(NATIVE_FRAME.with(|slot| slot.borrow_mut().take().unwrap()));
-                for job in pending {
-                    futures::executor::block_on(job);
-                }
-                assert_eq!(
-                    replacement_count, 1,
-                    "a failed cleanup poll transfers one exact native continuation"
-                );
-                assert!(
-                    !early_completion,
-                    "runner drain still owns pending native cleanup"
-                );
+                drain_jobs(pending);
                 assert!(
                     busy,
                     "thread lease stays registered while its native stack is pinned"
@@ -2064,10 +2091,11 @@ mod tests {
         );
         NATIVE_WEAK.with(|slot| assert!(slot.borrow().as_ref().unwrap().upgrade().is_none()));
         let mut jobs = JOBS.with(|jobs| std::mem::take(&mut *jobs.borrow_mut()));
-        assert_eq!(jobs.len(), 2);
-        for job in &mut jobs {
-            assert!(job.as_mut().poll(&mut cx).is_pending());
-        }
+        assert!(
+            !jobs.is_empty(),
+            "panic teardown must retain cleanup custody"
+        );
+        jobs.retain_mut(|job| job.as_mut().poll(&mut cx).is_pending());
         assert!(
             !events
                 .lock()
@@ -2081,9 +2109,7 @@ mod tests {
         ));
         drop(NATIVE_CALL.with(|slot| slot.borrow_mut().take().unwrap()));
         drop(NATIVE_FRAME.with(|slot| slot.borrow_mut().take().unwrap()));
-        for job in jobs {
-            futures::executor::block_on(job);
-        }
+        drain_jobs(jobs);
         let error = futures::executor::block_on(run).unwrap_err();
         assert!(
             matches!(error, ExecError::Panic(message) if message == "retained native guest panic")

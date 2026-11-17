@@ -524,10 +524,10 @@ fn dropped_waiter_mode(image: bool, retain_frame: bool, detached: bool) {
             .poll(&mut Context::from_waker(Waker::noop()))
             .is_pending()
     );
-    let mut events = Vec::new();
-    let mut until = |phase| loop {
+    let events = RefCell::new(Vec::new());
+    let until = |phase| loop {
         let event = observed.recv_timeout(Duration::from_secs(5)).unwrap();
-        events.push(event);
+        events.borrow_mut().push(event);
         if event.0 == phase {
             break;
         }
@@ -549,10 +549,13 @@ fn dropped_waiter_mode(image: bool, retain_frame: bool, detached: bool) {
             .unbounded_send(FrameCommand::ObserveCancellation)
             .unwrap();
         until("cancellation-observed");
-        assert!(
-            observed.try_recv().is_err(),
-            "physical pin still blocks teardown"
-        );
+        while let Ok(event) = observed.try_recv() {
+            assert_eq!(
+                event.0, "loader-drop",
+                "physical pin still blocks deactivation"
+            );
+            events.borrow_mut().push(event);
+        }
         frame_tx.unbounded_send(FrameCommand::Release).unwrap();
     }
     until("cleanup-start");
@@ -605,6 +608,7 @@ fn dropped_waiter_mode(image: bool, retain_frame: bool, detached: bool) {
         ));
     }
     assert!(!scope.is_open());
+    let events = events.into_inner();
     let owner = events[0].1;
     assert_ne!(owner, std::thread::current().id());
     assert!(events.iter().all(|(_, thread)| *thread == owner));

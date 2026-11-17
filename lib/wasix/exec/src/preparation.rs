@@ -342,7 +342,8 @@ pub(crate) mod tests {
     use super::*;
     use crate::{
         AbiInstance, Abis, Entry, EntryReturn, Sigreturn, VforkResume, Wasixv2,
-        process::tests::{NoThreads, Recorder},
+        instantiation::tests::{QueueHost, drain_jobs},
+        process::tests::Recorder,
     };
     use std::{
         future::Future,
@@ -624,14 +625,15 @@ pub(crate) mod tests {
             probe: probe.clone(),
             mode: Mode::Prepared,
         })));
+        let scope = wasixv2_host::LoaderCleanup::new(Arc::new(QueueHost));
         let ready = futures::executor::block_on(crate::instantiate(
             store,
             &module,
             recorder,
             TaskId(1),
-            Arc::new(NoThreads),
+            Arc::new(QueueHost),
             Arc::new(abis),
-            wasixv2_host::LoaderCleanup::new(Arc::new(NoThreads)),
+            scope.clone(),
             None,
         ))
         .unwrap();
@@ -642,6 +644,7 @@ pub(crate) mod tests {
         assert!(matches!(ended, crate::Ended::Exited(3)));
         assert_eq!(probe.claims.load(Ordering::Relaxed), 1);
         assert!(probe.roles.lock().unwrap().is_empty());
+        drain_jobs(vec![Box::pin(async move { scope.run(async {}).await })]);
     }
     struct Attachment {
         imports: Imports,
@@ -772,14 +775,15 @@ pub(crate) mod tests {
     #[test]
     fn real_memory_preparation_supplies_imports_and_consumes_bind_before_entry() {
         let (store, module, recorder, probe, abis) = setup(Mode::Prepared);
+        let scope = wasixv2_host::LoaderCleanup::new(Arc::new(QueueHost));
         let ready = futures::executor::block_on(crate::instantiate(
             store,
             &module,
             recorder.clone(),
             TaskId(1),
-            Arc::new(NoThreads),
+            Arc::new(QueueHost),
             abis,
-            wasixv2_host::LoaderCleanup::new(Arc::new(NoThreads)),
+            scope.clone(),
             None,
         ))
         .unwrap();
@@ -802,6 +806,7 @@ pub(crate) mod tests {
         let admitted = gate.claim_image(&probe.owner).unwrap();
         admitted.bind(TaskId(1)).unwrap();
         gate.leave(TaskId(1));
+        drain_jobs(vec![Box::pin(async move { scope.run(async {}).await })]);
     }
     #[test]
     fn failed_prepared_bind_and_invalid_memory_or_layout_release_frame_and_closing() {
@@ -812,14 +817,15 @@ pub(crate) mod tests {
             Mode::NoneAfterBootstrap,
         ] {
             let (store, module, recorder, probe, abis) = setup(mode);
+            let scope = wasixv2_host::LoaderCleanup::new(Arc::new(QueueHost));
             let result = futures::executor::block_on(crate::instantiate(
                 store,
                 &module,
                 recorder.clone(),
                 TaskId(1),
-                Arc::new(NoThreads),
+                Arc::new(QueueHost),
                 abis,
-                wasixv2_host::LoaderCleanup::new(Arc::new(NoThreads)),
+                scope.clone(),
                 None,
             ));
             assert!(result.is_err());
@@ -829,19 +835,21 @@ pub(crate) mod tests {
             let admitted = gate.claim_image(&probe.owner).unwrap();
             admitted.bind(TaskId(1)).unwrap();
             gate.leave(TaskId(1));
+            drain_jobs(vec![Box::pin(async move { scope.run(async {}).await })]);
         }
     }
     #[test]
     fn canceled_preparation_reopens_admission_and_leaves_registered_store() {
         let (store, module, recorder, probe, abis) = setup(Mode::Pending);
+        let scope = wasixv2_host::LoaderCleanup::new(Arc::new(QueueHost));
         let mut future = Box::pin(crate::instantiate(
             store,
             &module,
             recorder.clone(),
             TaskId(1),
-            Arc::new(NoThreads),
+            Arc::new(QueueHost),
             abis,
-            wasixv2_host::LoaderCleanup::new(Arc::new(NoThreads)),
+            scope.clone(),
             None,
         ));
         assert!(
@@ -859,5 +867,6 @@ pub(crate) mod tests {
         admitted.bind(TaskId(1)).unwrap();
         gate.leave(TaskId(1));
         assert_eq!(probe.guest_calls.load(Ordering::Relaxed), 0);
+        drain_jobs(vec![Box::pin(async move { scope.run(async {}).await })]);
     }
 }
