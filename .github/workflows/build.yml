@@ -117,8 +117,7 @@ jobs:
           owner: wasmerio
           repositories: wasmer-runtime
           permission-contents: read
-      - name: Use kernel Git mirror on Windows
-        if: runner.os == 'Windows'
+      - name: Use kernel Git mirror
         shell: bash
         run: git config --global url."https://kernel.googlesource.com/pub/scm/".insteadOf https://git.kernel.org/pub/scm/
       - uses: actions/checkout@v6
@@ -319,6 +318,9 @@ jobs:
           owner: wasmerio
           repositories: wasmer-runtime
           permission-contents: read
+      - name: Use kernel Git mirror
+        shell: bash
+        run: git config --global url."https://kernel.googlesource.com/pub/scm/".insteadOf https://git.kernel.org/pub/scm/
       - uses: actions/checkout@v6
         with:
           # libaio on pagure.io uses dumb HTTP and cannot be shallow-cloned.
@@ -427,6 +429,9 @@ jobs:
           owner: wasmerio
           repositories: wasmer-runtime
           permission-contents: read
+      - name: Use kernel Git mirror
+        shell: bash
+        run: git config --global url."https://kernel.googlesource.com/pub/scm/".insteadOf https://git.kernel.org/pub/scm/
       - uses: actions/checkout@v6
         with:
           # libaio on pagure.io uses dumb HTTP and cannot be shallow-cloned.
@@ -510,6 +515,9 @@ jobs:
     runs-on: ubuntu-latest
     needs: setup
     steps:
+      - name: Use kernel Git mirror
+        shell: bash
+        run: git config --global url."https://kernel.googlesource.com/pub/scm/".insteadOf https://git.kernel.org/pub/scm/
       - uses: actions/checkout@v6
         with:
           # libaio on pagure.io uses dumb HTTP and cannot be shallow-cloned.
@@ -533,6 +541,9 @@ jobs:
     runs-on: ubuntu-latest
     if: (needs.setup.outputs.DOING_RELEASE == '1' || github.event.inputs.release != '') && github.event_name != 'pull_request'
     steps:
+      - name: Use kernel Git mirror
+        shell: bash
+        run: git config --global url."https://kernel.googlesource.com/pub/scm/".insteadOf https://git.kernel.org/pub/scm/
       - uses: actions/checkout@v6
         with:
           # libaio on pagure.io uses dumb HTTP and cannot be shallow-cloned.

@@ -39,6 +39,9 @@ jobs:
           owner: wasmerio
           repositories: wasmer-runtime
           permission-contents: read
+      - name: Use kernel Git mirror
+        shell: bash
+        run: git config --global url."https://kernel.googlesource.com/pub/scm/".insteadOf https://git.kernel.org/pub/scm/
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         timeout-minutes: 3
         with:

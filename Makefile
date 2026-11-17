@@ -340,6 +340,12 @@ capi_compilers_engines_exclude :=
 capi_compiler_features := --features $(subst $(space),$(comma),$(filter-out llvm, $(compilers))),wasmer-artifact-create,static-artifact-create,wasmer-artifact-load,static-artifact-load
 capi_compilers_engines_exclude += llvm
 
+# Native Windows and cross-checks must use the engine's supported Windows backend.
+ifneq ($(filter 1,$(IS_WINDOWS))$(findstring windows,$(CARGO_TARGET)),)
+compiler_features := --no-default-features --features v8-default
+capi_compiler_features := --features v8-default
+endif
+
 # We exclude singlepass because it doesn't support multivalue (required in wasm-c-api tests)
 capi_compilers_engines_exclude += singlepass
 
