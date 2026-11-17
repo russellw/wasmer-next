@@ -6883,7 +6883,7 @@ dependencies = [
 [[package]]
 name = "wasmer"
 version = "7.5.0"
-source = "git+https://github.com/wasmerio/wasmer-runtime?branch=next#9cc2b035f6715cbf47b3efa9f481673f2949705d"
+source = "git+https://github.com/wasmerio/wasmer-runtime?branch=next#93ebbc98e695c0727f9107c444edfb166bf22ac6"
 dependencies = [
  "bindgen",
  "bytes",
@@ -7166,7 +7166,7 @@ dependencies = [
 [[package]]
 name = "wasmer-compiler"
 version = "7.5.0"
-source = "git+https://github.com/wasmerio/wasmer-runtime?branch=next#9cc2b035f6715cbf47b3efa9f481673f2949705d"
+source = "git+https://github.com/wasmerio/wasmer-runtime?branch=next#93ebbc98e695c0727f9107c444edfb166bf22ac6"
 dependencies = [
  "addr2line 0.27.1",
  "backtrace",
@@ -7208,7 +7208,7 @@ dependencies = [
 [[package]]
 name = "wasmer-compiler-cranelift"
 version = "7.5.0"
-source = "git+https://github.com/wasmerio/wasmer-runtime?branch=next#9cc2b035f6715cbf47b3efa9f481673f2949705d"
+source = "git+https://github.com/wasmerio/wasmer-runtime?branch=next#93ebbc98e695c0727f9107c444edfb166bf22ac6"
 dependencies = [
  "cranelift-codegen",
  "cranelift-entity",
@@ -7230,7 +7230,7 @@ dependencies = [
 [[package]]
 name = "wasmer-compiler-llvm"
 version = "7.5.0"
-source = "git+https://github.com/wasmerio/wasmer-runtime?branch=next#9cc2b035f6715cbf47b3efa9f481673f2949705d"
+source = "git+https://github.com/wasmerio/wasmer-runtime?branch=next#93ebbc98e695c0727f9107c444edfb166bf22ac6"
 dependencies = [
  "byteorder",
  "crossbeam-channel",
@@ -7253,7 +7253,7 @@ dependencies = [
 [[package]]
 name = "wasmer-compiler-singlepass"
 version = "7.5.0"
-source = "git+https://github.com/wasmerio/wasmer-runtime?branch=next#9cc2b035f6715cbf47b3efa9f481673f2949705d"
+source = "git+https://github.com/wasmerio/wasmer-runtime?branch=next#93ebbc98e695c0727f9107c444edfb166bf22ac6"
 dependencies = [
  "byteorder",
  "dynasm",
@@ -7299,7 +7299,7 @@ dependencies = [
 [[package]]
 name = "wasmer-derive"
 version = "7.5.0"
-source = "git+https://github.com/wasmerio/wasmer-runtime?branch=next#9cc2b035f6715cbf47b3efa9f481673f2949705d"
+source = "git+https://github.com/wasmerio/wasmer-runtime?branch=next#93ebbc98e695c0727f9107c444edfb166bf22ac6"
 dependencies = [
  "proc-macro-error2",
  "proc-macro2",
@@ -7341,7 +7341,7 @@ version = "7.5.0"
 [[package]]
 name = "wasmer-middlewares"
 version = "7.5.0"
-source = "git+https://github.com/wasmerio/wasmer-runtime?branch=next#9cc2b035f6715cbf47b3efa9f481673f2949705d"
+source = "git+https://github.com/wasmerio/wasmer-runtime?branch=next#93ebbc98e695c0727f9107c444edfb166bf22ac6"
 dependencies = [
  "wasmer",
  "wasmer-types",
@@ -7513,7 +7513,7 @@ dependencies = [
 [[package]]
 name = "wasmer-types"
 version = "7.5.0"
-source = "git+https://github.com/wasmerio/wasmer-runtime?branch=next#9cc2b035f6715cbf47b3efa9f481673f2949705d"
+source = "git+https://github.com/wasmerio/wasmer-runtime?branch=next#93ebbc98e695c0727f9107c444edfb166bf22ac6"
 dependencies = [
  "bytecheck",
  "crc32fast",
@@ -7537,7 +7537,7 @@ dependencies = [
 [[package]]
 name = "wasmer-vm"
 version = "7.5.0"
-source = "git+https://github.com/wasmerio/wasmer-runtime?branch=next#9cc2b035f6715cbf47b3efa9f481673f2949705d"
+source = "git+https://github.com/wasmerio/wasmer-runtime?branch=next#93ebbc98e695c0727f9107c444edfb166bf22ac6"
 dependencies = [
  "backtrace",
  "bytesize",
@@ -7587,7 +7587,7 @@ dependencies = [
 [[package]]
 name = "wasmer-wast"
 version = "7.5.0"
-source = "git+https://github.com/wasmerio/wasmer-runtime?branch=next#9cc2b035f6715cbf47b3efa9f481673f2949705d"
+source = "git+https://github.com/wasmerio/wasmer-runtime?branch=next#93ebbc98e695c0727f9107c444edfb166bf22ac6"
 dependencies = [
  "anyhow",
  "serde",
