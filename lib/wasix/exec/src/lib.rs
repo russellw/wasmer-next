@@ -348,26 +348,34 @@ pub fn thread_exit_status(error: &RuntimeError) -> Option<i32> {
 /// and the exit of its thread group, and atomic waits that a signal interrupts. A module they
 /// cannot be added to still has its start deferred, with a warning; [`is_preemptible`] tells.
 /// Start runs after memory/ABI binding and attachment configuration, before ABI entry.
-/// Custom compilers and caches must use [`instrument`] before compiling a module.
+/// Custom compilers and caches should use [`prepare_for_compile`].
 pub fn load(engine: &Engine, wasm: &[u8]) -> Result<Module, CompileError> {
+    let (source, warning) =
+        prepare_for_compile(wasm).map_err(|err| CompileError::Validate(err.to_string()))?;
+    let module = Module::new(engine, source)?;
+    if let Some(warning) = warning {
+        warn_not_preemptible(&warning);
+    }
+    Ok(module)
+}
+
+/// Prepares bytes for custom compilers and caches. The output always defers Wasm start.
+/// When only preemption rewriting fails, the output omits preemption points and
+/// carries the warning for [`warn_not_preemptible`]. Cache by the returned bytes.
+pub fn prepare_for_compile(
+    wasm: &[u8],
+) -> Result<(Vec<u8>, Option<InstrumentError>), InstrumentError> {
     match instrument(wasm) {
-        Ok(instrumented) => Module::new(engine, instrumented),
-        Err(err) => {
-            let deferred = err
-                .fallback_source(wasm)
-                .map_err(|err| CompileError::Validate(err.to_string()))?;
-            let module = Module::new(engine, deferred)?;
-            warn_not_preemptible(&err);
-            Ok(module)
+        Ok(source) => Ok((source, None)),
+        Err(error) if error.permits_uninstrumented() => {
+            Ok((preempt::defer_start(wasm)?, Some(error)))
         }
+        Err(error) => Err(error),
     }
 }
 
-/// `wasm` with deferred start and the preemption points [`load`] adds, for an embedder that compiles (and caches)
-/// modules itself. Fails for an invalid module or a rewrite it cannot handle. Use [`load`]
-/// for the supported fallback that still defers start without preemption. A guest without
-/// preemption that computes without syscalls, or blocks in `memory.atomic.wait`, cannot
-/// notice signals or its group's exit; [`warn_not_preemptible`] says so.
+/// Strict preparation with deferred start and preemption points. Fails if either rewrite
+/// cannot be applied. [`prepare_for_compile`] also supports a deferred-start-only fallback.
 pub fn instrument(wasm: &[u8]) -> Result<Vec<u8>, InstrumentError> {
     preempt::instrument(wasm)
 }
@@ -1225,7 +1233,7 @@ impl<S: Send + Sync + 'static> Drop for Ready<S> {
 /// engines without ModuleInfo need the source transform's explicit profile.
 fn verify_start_profile(module: &Module, engine: &Engine) -> Result<(), ExecError> {
     // A compiled engine start cannot be delayed without its original source.
-    // Custom loaders/caches must use load/instrument before compilation.
+    // Custom loaders/caches must prepare the source before compilation.
     let prepared = module
         .custom_sections(preempt::START_PROFILE)
         .next()
@@ -1244,7 +1252,7 @@ fn verify_start_profile(module: &Module, engine: &Engine) -> Result<(), ExecErro
     let engine_start = !prepared;
     if engine_start {
         return Err(ExecError::CustomBinding(RuntimeError::new(
-            "Wasm start must be deferred with wasixv2_exec::load or instrument",
+            "Wasm start must be deferred with wasixv2_exec::load or prepare_for_compile",
         )));
     }
     #[cfg(not(feature = "sys"))]

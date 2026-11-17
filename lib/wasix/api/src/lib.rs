@@ -63,7 +63,8 @@ use wasixv2_exec::{Abis, Wasixv2};
 pub use wasixv2_exec::{Compile, load};
 pub use wasixv2_exec::{
     ExecEnv, ExecError, Image, ImageId, InstanceAttachment, InstantiationHook, InstrumentError,
-    LoadError, Loader, instrument, is_preemptible, is_wasixv2_module, warn_not_preemptible,
+    LoadError, Loader, instrument, is_preemptible, is_wasixv2_module, prepare_for_compile,
+    warn_not_preemptible,
 };
 #[cfg(not(target_family = "wasm"))]
 pub use wasixv2_host::BlockingSource;

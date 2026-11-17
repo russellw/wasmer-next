@@ -225,10 +225,10 @@ impl CachedLoader {
     async fn compile(&self, wasm: &[u8]) -> Result<(Engine, Module), Error> {
         let engine = self.engine_for(wasm)?;
         let prepared = wasixv2_dylink::prepare_image(wasm)?;
-        let (instrumented, failed) = match wasixv2::instrument(&prepared) {
-            Ok(instrumented) => (instrumented, None),
-            Err(err) if prepared == wasm => (err.fallback_source(&prepared)?, Some(err)),
-            Err(err) => return Err(err.into()),
+        let (instrumented, failed) = if prepared == wasm {
+            wasixv2::prepare_for_compile(&prepared)?
+        } else {
+            (wasixv2::instrument(&prepared)?, None)
         };
         // Key the persistent cache by the actual compiler input, never the source's
         // legacy instrument-only hash or a package atom's unprepared hash.

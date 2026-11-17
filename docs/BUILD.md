@@ -266,7 +266,7 @@ and optionally the fork (`WASIXV2_LLVM_TAG` repository variable).
 
 ## Wasm start and custom bindings
 
-`wasixv2_exec::load` and `instrument` defer the module's Wasm start section.
+`wasixv2_exec::load` and `prepare_for_compile` defer the module's Wasm start section.
 Exec applies data segments, freezes the image, binds the ABI and attaches its
 actual memory to the kernel, then calls `InstanceAttachment::configure` before
 invoking the original start. Start uses the normal asynchronous invocation and
@@ -274,10 +274,11 @@ cleanup custody; a start failure remains `ExecError::Instantiate(Start(..))`.
 ABI explicit initializers and process/thread entry follow start. No separate
 post-start attachment method is needed.
 
-Custom compilers/loaders must use `instrument` before compiling and invalidate
-cached artifacts created with the old start behavior. On an instrumentation
-failure, `InstrumentError::fallback_source(&original_bytes)` supplies an allowed
-uninstrumented fallback that still defers start, or rejects reserved metadata. Native compiled modules
+Custom compilers/loaders use `prepare_for_compile` before compiling, and cache
+the returned bytes. It returns a warning alongside a deferred-start-only
+fallback if preemption rewriting fails. Use `instrument` for strict preparation
+that requires preemption. Invalidate cached artifacts created with the old
+start behavior. Native compiled modules
 with an engine start are rejected before hook preparation; backends without
 module metadata require the source transform's deferred-start profile. External
 instantiation through `embedding` remains the embedder's lifecycle responsibility.

@@ -73,16 +73,6 @@ pub(crate) const BUDGET: i32 = 1 << 16;
 pub struct InstrumentError(String, bool);
 
 impl InstrumentError {
-    /// The same source with start deferred but without preemption, for a custom
-    /// compiler/cache's fallback after instrumentation fails. Reserved execution
-    /// metadata errors cannot fall back. Pass the original failed input unchanged.
-    pub fn fallback_source(&self, wasm: &[u8]) -> Result<Vec<u8>, InstrumentError> {
-        if !self.permits_uninstrumented() {
-            return Err(InstrumentError(self.0.clone(), false));
-        }
-        defer_start(wasm)
-    }
-
     pub(crate) fn permits_uninstrumented(&self) -> bool {
         self.1
     }
@@ -618,7 +608,8 @@ mod tests {
             r#"(module (func $s (param i32)) (start $s))"#,
             r#"(module (func (export "__wasix_exec_start")))"#,
         ] {
-            let error = instrument(&wat::parse_str(source).unwrap()).unwrap_err();
+            let wasm = wat::parse_str(source).unwrap();
+            let error = crate::prepare_for_compile(&wasm).unwrap_err();
             assert!(!error.permits_uninstrumented());
         }
     }
@@ -832,8 +823,12 @@ mod tests {
     fn uninstrumented_fallback_still_defers_start() {
         let source = wat::parse_str("(module (func $s) (start $s))").unwrap();
         let engine = wasmer::Engine::default();
-        let module = crate::load(&engine, &with_bad_name_section(source)).unwrap();
+        let (prepared, warning) =
+            crate::prepare_for_compile(&with_bad_name_section(source)).unwrap();
+        assert!(warning.is_some());
+        let module = wasmer::Module::new(&engine, prepared).unwrap();
         assert!(!instrumented(&module));
+        assert!(module.custom_sections(START_PROFILE).next().is_some());
         #[cfg(feature = "sys")]
         if engine.is_sys() {
             assert!(module.info().start_function.is_none());

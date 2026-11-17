@@ -96,10 +96,10 @@ impl NativeLoader {
     }
     pub(crate) async fn compile(&self, bytes: &[u8]) -> anyhow::Result<(Engine, Module)> {
         let prepared = wasixv2_dylink::prepare_image(bytes)?;
-        let (input, failed) = match wasixv2::instrument(&prepared) {
-            Ok(input) => (input, None),
-            Err(error) if prepared == bytes => (error.fallback_source(&prepared)?, Some(error)),
-            Err(error) => return Err(error.into()),
+        let (input, failed) = if prepared == bytes {
+            wasixv2::prepare_for_compile(&prepared)?
+        } else {
+            (wasixv2::instrument(&prepared)?, None)
         };
         let engine = self.owner.engine(&input)?;
         let module = load_module(
