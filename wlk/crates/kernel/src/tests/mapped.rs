@@ -920,6 +920,49 @@ fn host_mapped_files_retain_core_note_provenance_after_splitting() {
 }
 
 #[test]
+fn tmpfs_mapping_space_exhaustion_is_enomem() {
+    use wasixv2_vfs_mem::Limits;
+
+    let host: Arc<dyn Host> = Arc::new(SharedHost);
+    let clock = Arc::new(HostClock(host.clone()));
+    let root = MemFs::new(clock.clone(), 0o755, 1, 1);
+    let shm = MemFs::with_limits(
+        clock,
+        0o1777,
+        0,
+        0,
+        Limits {
+            max_bytes: Some(u64::from(PAGE)),
+            ..Limits::UNLIMITED
+        },
+    )
+    .with_shared_pages(Arc::new(SharedHost));
+    let kernel = Kernel::new(host, Arc::new(root)).with_shm(Arc::new(shm));
+    let (kernel, task, _) = spawn_on(kernel, Arc::new(Input(Mutex::new(Vec::new()))), &[], &[]);
+    let memory = MappedMemory::new(2, false);
+    let caller = Caller::new(task, &memory);
+    let fd = memfd(&kernel, &caller, MemfdFlags::empty());
+    ftruncate(&kernel, &caller, fd, i64::from(2 * PAGE));
+
+    assert_eq!(
+        block_on(kernel.mmap(&caller, 0, 2 * PAGE, RW, MapFlags::MAP_SHARED, fd, 0)),
+        Err(SysErr::Errno(Errno::ENOMEM))
+    );
+    let addr = map_file(&kernel, &caller, fd, PAGE, RW);
+    assert_eq!(
+        block_on(kernel.mremap(
+            &caller,
+            addr,
+            PAGE,
+            2 * PAGE,
+            MremapFlags::MREMAP_MAYMOVE,
+            0
+        )),
+        Err(SysErr::Errno(Errno::ENOMEM))
+    );
+}
+
+#[test]
 fn tmpfs_mapping_quota_covers_mremap_growth_and_duplicates_before_changing_memory() {
     use wasixv2_abi::{IfDqblk, QuotaMisc};
     use wasixv2_vfs::QuotaOps;
