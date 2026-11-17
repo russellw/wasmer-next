@@ -67,13 +67,14 @@ pub(crate) async fn futex_wait<S: Syscalls + Control + 'static>(
     .await
 }
 
-/// Wakes at most `count` waiters on `futex`; whether any woke.
+/// Wakes at most `count` waiters. v1 reports successful wake operations as true
+/// even when nobody waited; old libc's __wake retries while that output is false.
 async fn wake<S: Syscalls + Control + 'static>(
     frame: &Frame<'_, S>,
     futex: i32,
     count: u32,
-) -> V1Result<bool> {
-    let woken = frame
+) -> V1Result<()> {
+    frame
         .syscalls
         .futex_time64(
             &frame.caller(),
@@ -85,7 +86,7 @@ async fn wake<S: Syscalls + Control + 'static>(
             0,
         )
         .await?;
-    Ok(woken > 0)
+    Ok(())
 }
 
 async fn write_bool<S: Syscalls + Control + 'static>(
@@ -104,8 +105,8 @@ pub(crate) async fn futex_wake<S: Syscalls + Control + 'static>(
     woken_out: i32,
 ) -> Result<i32, RuntimeError> {
     shim::errno(&env, async |frame| {
-        let woken = wake(frame, futex, 1).await?;
-        write_bool(frame, woken_out, woken).await
+        wake(frame, futex, 1).await?;
+        write_bool(frame, woken_out, true).await
     })
     .await
 }
@@ -117,8 +118,8 @@ pub(crate) async fn futex_wake_all<S: Syscalls + Control + 'static>(
     woken_out: i32,
 ) -> Result<i32, RuntimeError> {
     shim::errno(&env, async |frame| {
-        let woken = wake(frame, futex, i32::MAX as u32).await?;
-        write_bool(frame, woken_out, woken).await
+        wake(frame, futex, i32::MAX as u32).await?;
+        write_bool(frame, woken_out, true).await
     })
     .await
 }

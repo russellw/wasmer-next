@@ -136,6 +136,38 @@ fn signals() {
     assert_eq!(status(SIGNALS), 0);
 }
 
+/// An exported callback is a capability, not a registration on a fresh pthread.
+/// v1 discarded sibling copies of process signals in such instances.
+#[test]
+fn fresh_thread_does_not_run_an_unregistered_signal_callback() {
+    assert_eq!(
+        status(
+            r#"(module
+      (import "env" "memory" (memory 1 1 shared))
+      (import "wasix_32v1" "callback_signal" (func $callback (param i32 i32)))
+      (import "wasix_32v1" "thread_spawn_v2" (func $spawn (param i32 i32) (result i32)))
+      (import "wasix_32v1" "thread_signal" (func $signal (param i32 i32) (result i32)))
+      (import "wasix_32v1" "thread_join" (func $join (param i32) (result i32)))
+      (import "wasi_snapshot_preview1" "sched_yield" (func $yield (result i32)))
+      (data (i32.const 16) "__wasm_signal")
+      (func (export "__wasm_signal") (param i32) unreachable)
+      (func (export "wasi_thread_start") (param i32 i32)
+        (i32.atomic.store (i32.const 200) (i32.const 1))
+        (loop $wait
+          (br_if $wait (i32.eqz (i32.atomic.load (i32.const 204)))))
+        (drop (call $yield)))
+      (func (export "_start")
+        (call $callback (i32.const 16) (i32.const 13))
+        (if (call $spawn (i32.const 100) (i32.const 104)) (then unreachable))
+        (loop $ready (br_if $ready (i32.eqz (i32.atomic.load (i32.const 200)))))
+        (if (call $signal (i32.load (i32.const 104)) (i32.const 15)) (then unreachable))
+        (i32.atomic.store (i32.const 204) (i32.const 1))
+        (if (call $join (i32.load (i32.const 104))) (then unreachable))))"#
+        ),
+        0
+    );
+}
+
 /// wasix-libc before v2026-07-30.1 holds signals back in `pthread_create` and never ends the
 /// hold (its `__restore_sigs` is compiled out). The spawn ends it, for the creating thread and
 /// the new one: both still take signals afterwards.
@@ -156,6 +188,8 @@ const SPAWN_HOLD: &str = r#"
   (func (export "wasi_thread_start") (param $tid i32) (param $arg i32)
     (i32.atomic.store (i32.const 208) (local.get $tid))
     (drop (memory.atomic.notify (i32.const 208) (i32.const 1)))
+    ;; Like v1, an instance must register its callback before it can run a handler.
+    (call $callback (i32.const 16) (i32.const 13))
     ;; Waits until the main thread signalled it; the handler's mark is the proof.
     (block $done
       (loop $again
@@ -331,9 +365,9 @@ const THREADS: &str = r#"
     (if (call $wait (i32.const 400) (i32.const 1) (i32.const 0) (i32.const 304))
       (then (call $exit (i32.const 7))))
     (if (i32.eqz (i32.load8_u (i32.const 304))) (then (call $exit (i32.const 8))))
-    ;; nobody waits
+    ;; v1 reports a successful wake even when nobody waits
     (if (call $wake (i32.const 400) (i32.const 304)) (then (call $exit (i32.const 9))))
-    (if (i32.load8_u (i32.const 304)) (then (call $exit (i32.const 10))))
+    (if (i32.eqz (i32.load8_u (i32.const 304))) (then (call $exit (i32.const 10))))
     (if (call $parallelism (i32.const 312)) (then (call $exit (i32.const 11))))
     (if (i32.eqz (i32.load (i32.const 312))) (then (call $exit (i32.const 12))))
     (call $exit (i32.const 0))))
@@ -342,6 +376,29 @@ const THREADS: &str = r#"
 #[test]
 fn threads_and_futexes() {
     assert_eq!(status(THREADS), 0);
+}
+
+/// v1 libc's __wake loops until woken_out is true, even during single-threaded
+/// mutex teardown. Zero kernel waiters must not turn a successful wake into a retry.
+#[test]
+fn futex_wakes_without_waiters_report_success_to_legacy_libc() {
+    assert_eq!(
+        status(
+            r#"(module
+      (import "wasix_32v1" "futex_wake" (func $wake (param i32 i32) (result i32)))
+      (import "wasix_32v1" "futex_wake_all" (func $all (param i32 i32) (result i32)))
+      (import "wasix_32v1" "proc_exit2" (func $exit (param i32)))
+      (memory (export "memory") 1)
+      (func (export "_start")
+        (if (call $wake (i32.const 400) (i32.const 304)) (then unreachable))
+        (if (i32.ne (i32.load8_u (i32.const 304)) (i32.const 1)) (then unreachable))
+        (i32.store8 (i32.const 304) (i32.const 0))
+        (if (call $all (i32.const 400) (i32.const 304)) (then unreachable))
+        (if (i32.ne (i32.load8_u (i32.const 304)) (i32.const 1)) (then unreachable))
+        (call $exit (i32.const 0))))"#
+        ),
+        0
+    );
 }
 
 /// `memory.atomic.wait32` and `wait64` wait on the kernel's futexes: `SIGALRM` interrupts a
@@ -396,7 +453,7 @@ const ATOMIC_WAITS: &str = r#"
       (then (call $exit (i32.const 6))))
     (if (i32.ne (memory.atomic.wait64 (i32.const 408) (i64.const 0) (i64.const -1)) (i32.const 1))
       (then (call $exit (i32.const 7))))
-    ;; nobody waits
+    ;; v1 reports a successful wake even when nobody waits
     (if (memory.atomic.notify (i32.const 400) (i32.const 1)) (then (call $exit (i32.const 8))))
     (if (call $spawn (i32.const 100) (i32.const 104)) (then (call $exit (i32.const 9))))
     (call $await (i32.const 1))

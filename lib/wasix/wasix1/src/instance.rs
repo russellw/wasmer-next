@@ -70,6 +70,8 @@ pub struct Wasix1Instance {
     /// The export `callback_signal` last named that exists: `__wasm_signal` unless libc
     /// named another.
     signal: Mutex<Option<Function>>,
+    /// Only the instance that called callback_signal owns guest signal delivery.
+    pub(crate) signal_registered: AtomicBool,
     /// Whether this instance's thread holds signals back: `callback_signal` named an export the
     /// module does not have (see `calls::signal`).
     blocked: AtomicBool,
@@ -358,6 +360,7 @@ impl Wasix1Instance {
             entry: None,
             table_cacheable,
             signal: Mutex::new(function(SIGNAL_CALLBACK)),
+            signal_registered: AtomicBool::new(false),
             exports,
             blocked: AtomicBool::new(false),
             started: AtomicBool::new(false),
@@ -408,6 +411,7 @@ impl Wasix1Instance {
     /// Makes `name` the signal callback if the instance exports a function by that name, and
     /// says whether it does; signals are held back while it does not.
     pub(crate) fn select_signal_callback(&self, name: &str) -> bool {
+        self.signal_registered.store(true, Ordering::Relaxed);
         let found = match self.exports.get_function(name) {
             Ok(function) => {
                 *self.signal.lock().unwrap() = Some(function.clone());
@@ -564,6 +568,15 @@ impl<S: Send + Sync + 'static> AbiInstance<S> for Wasix1Instance {
         restart: bool,
     ) -> LocalFuture<'a, Result<Sigreturn, RuntimeError>> {
         Box::pin(async move {
+            // V1 process signals were queued to siblings, but only instances
+            // that registered a callback ran guest handlers. A fresh pthread's
+            // exported __wasm_signal alone is not a registration.
+            if !self.signal_registered.load(Ordering::Relaxed) {
+                return Ok(Sigreturn {
+                    mask: Some(frame.mask),
+                    restart,
+                });
+            }
             let Some(callback) = self.signal.lock().unwrap().clone() else {
                 return Err(RuntimeError::new(format!(
                     "a signal handler must run, but the guest has no `{SIGNAL_CALLBACK}`"

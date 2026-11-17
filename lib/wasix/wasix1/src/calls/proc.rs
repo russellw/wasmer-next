@@ -680,7 +680,7 @@ pub(crate) async fn proc_fork<S: Syscalls + Control + 'static>(
             payload,
         }) => {
             let state = payload
-                .and_then(|payload| payload.downcast::<ProcState>().ok())
+                .and_then(|payload| payload.downcast::<(Arc<ProcState>, bool)>().ok())
                 .ok_or_else(|| RuntimeError::new("a v1 fork child without its parent's state"))?;
             // The state carries the startup (and preopens) the child inherited.
             with_instance(&env, |instance| instance.set_started()).await?;
@@ -688,7 +688,11 @@ pub(crate) async fn proc_fork<S: Syscalls + Control + 'static>(
             return shim::errno(&env, async |frame| {
                 let process = frame.process();
                 if let Some(state) = &state {
-                    frame.instance().adopt(process, state.clone());
+                    frame.instance().adopt(process, state.0.clone());
+                    frame
+                        .instance()
+                        .signal_registered
+                        .store(state.1, Ordering::Relaxed);
                 }
                 frame.write(pid_out, &0u32).await
             })
@@ -713,7 +717,8 @@ pub(crate) async fn proc_fork<S: Syscalls + Control + 'static>(
         // The guest unwinds once the kernel made the child, and calls again on both sides.
         return shim::errno(&env, async |frame| {
             let state = frame.proc().await?.fork();
-            import::set_fork_payload(frame.env, Arc::new(state)).await;
+            let registered = frame.instance().signal_registered.load(Ordering::Relaxed);
+            import::set_fork_payload(frame.env, Arc::new((Arc::new(state), registered))).await;
             frame
                 .syscalls
                 .clone(
