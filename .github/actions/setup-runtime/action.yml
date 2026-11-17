@@ -1,5 +1,5 @@
-name: Private runtime access
-description: Configure Cargo Git CLI access to the private engine
+name: Runtime access
+description: Configure authenticated Cargo Git CLI access to the runtime
 inputs:
   token:
     description: GitHub App installation token with Contents-read access to wasmerio/wasmer-runtime

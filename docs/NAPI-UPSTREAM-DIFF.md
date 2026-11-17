@@ -18,6 +18,6 @@ and browser adaptations. It does not revert to upstream's legacy WASIX integrati
 Relative path dependencies such as `../wasix/*` continue to resolve in-tree.
 
 CI checkouts must use recursive submodules to fetch NAPI and QuickJS. NAPI is
-public and needs no additional private-repository credentials; private engine
-access remains separate. Cargo.lock is unchanged by the extraction. Local builds
+public and needs no additional private-repository credentials. The runtime is
+public too; CI retains its separate GitHub App authentication setup. Cargo.lock is unchanged by the extraction. Local builds
 and tests were intentionally deferred to CI by owner instruction.
