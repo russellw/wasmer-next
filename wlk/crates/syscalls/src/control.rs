@@ -16,11 +16,13 @@ use crate::{
     memory::{LocalFuture, PageAccess},
 };
 
-/// Execution-owned provenance of a fault that won a process's group exit.
+/// The execution-layer cause of an invocation ending abruptly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExecutionFault {
     /// An actual guest invocation returned an unhandled WebAssembly trap.
     WasmTrap,
+    /// The embedder interrupted the store before it could finish the invocation.
+    HostInterrupt,
 }
 
 /// Work the execution layer must do before control returns to the guest.
@@ -336,7 +338,9 @@ pub trait Control:
         true
     }
 
-    /// Like [`Self::fault`], with provenance supplied only by the guest invocation.
+    /// Like [`Self::fault`], with the reason the invocation ended.
+    /// A host interrupt may finish a pending fatal signal instead of raising the fallback
+    /// `signal`. Returns false in that case because the reported fault did not kill the group.
     /// Providers without completion provenance retain their ordinary fault behavior.
     fn fault_with_cause(&self, task: TaskId, signal: i32, cause: ExecutionFault) -> bool {
         let _ = cause;

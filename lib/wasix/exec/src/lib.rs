@@ -84,8 +84,8 @@ pub use wasixv2::{Wasixv2, is_wasixv2_module};
 use wasixv2_abi::Signal;
 use wasixv2_host::Host;
 use wasixv2_syscalls::{
-    Caller, Control, Errno, GuestAction, Resume, SysErr, SysResult, Syscalls, TaskId, VforkParent,
-    WorkFlag,
+    Caller, Control, Errno, ExecutionFault, GuestAction, Resume, SysErr, SysResult, Syscalls,
+    TaskId, VforkParent, WorkFlag,
 };
 pub use wasixv2_syscalls::{Image, ImageId};
 use wasmer::{
@@ -706,12 +706,18 @@ async fn ended<S: Syscalls + Control + Send + Sync + 'static>(
         .with(|env, _| (env.syscalls.clone(), env.task, env.proc.handoff.clone()))
         .await;
     let message = err.to_string();
-    let execution_fault = original_error && guest_trap(origin, &err);
+    let cause = if err.clone().to_trap() == Some(TrapCode::HostInterrupt) {
+        Some(ExecutionFault::HostInterrupt)
+    } else if original_error && guest_trap(origin, &err) {
+        Some(ExecutionFault::WasmTrap)
+    } else {
+        None
+    };
     let signal = fault_signal(err);
     // The trap's signal ends the task (`force_sig_fault`), then `exit_mm` while the memory is
     // still there, which dumps core if the signal does, as for an `exit_group`.
-    let killed = if execution_fault {
-        syscalls.fault_with_cause(task, signal, wasixv2_syscalls::ExecutionFault::WasmTrap)
+    let killed = if let Some(cause) = cause {
+        syscalls.fault_with_cause(task, signal, cause)
     } else {
         syscalls.fault(task, signal)
     };
@@ -755,6 +761,7 @@ fn signal_name(signal: i32) -> &'static str {
         Signal::SIGILL => "SIGILL",
         Signal::SIGFPE => "SIGFPE",
         Signal::SIGBUS => "SIGBUS",
+        Signal::SIGKILL => "SIGKILL",
         _ => "SIGSEGV",
     }
 }
@@ -767,6 +774,8 @@ fn fault_signal(err: RuntimeError) -> i32 {
         // `ud2` and `__builtin_trap`.
         Some(TrapCode::UnreachableCodeReached) => Signal::SIGILL,
         Some(TrapCode::UnalignedAtomic | TrapCode::HeapMisaligned) => Signal::SIGBUS,
+        // The embedder can interrupt the store before it queues a process signal.
+        Some(TrapCode::HostInterrupt) => Signal::SIGKILL,
         // Bad accesses, the stack running out, calls through bad pointers, and everything the
         // host cannot run on: a signal frame that does not fit, an exception nobody caught.
         _ => Signal::SIGSEGV,

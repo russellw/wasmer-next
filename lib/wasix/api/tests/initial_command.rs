@@ -373,6 +373,100 @@ async fn plain_files_and_execve_return_the_command_status() {
         .await;
 }
 
+#[cfg(unix)]
+struct InterruptHook(Arc<Mutex<Option<wasmer::Interrupter>>>);
+
+#[cfg(unix)]
+impl InstantiationHook<MachineSyscalls> for InterruptHook {
+    fn prepare_imports(
+        &self,
+        _: &Module,
+        store: &mut StoreMut<'_>,
+        _: &FunctionEnv<ExecEnv<MachineSyscalls>>,
+        _: &mut Imports,
+    ) -> Result<Option<Box<dyn InstanceAttachment>>, RuntimeError> {
+        use wasmer::AsStoreMut;
+
+        *self.0.lock().unwrap() = Some(store.objects_mut().interrupter());
+        Ok(None)
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn atomic_wait_keeps_fatal_signal_after_store_interrupt() {
+    // The native debug build needs a larger host stack for exec admission.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            tokio::task::LocalSet::new().block_on(&runtime, check_atomic_wait_interrupt());
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[cfg(unix)]
+async fn check_atomic_wait_interrupt() {
+    use std::time::{Duration, Instant};
+
+    // Waits on the second memory are left as native instructions, so the engine
+    // interrupt can end the invocation before WASIX takes the process signal.
+    const WAIT: &str = r#"(module
+        (import "wasi_snapshot_preview1" "fd_write"
+            (func $write (param i32 i32 i32 i32) (result i32)))
+        (memory (export "memory") 1)
+        (memory $wait_mem 1 1 shared)
+        (data (i32.const 16) "waiting\0a")
+        (data (i32.const 32) "\10\00\00\00\08\00\00\00")
+        (func (export "_start")
+            (drop (call $write (i32.const 1) (i32.const 32) (i32.const 1) (i32.const 48)))
+            (drop (memory.atomic.wait32 $wait_mem (i32.const 0) (i32.const 0) (i64.const 5000000000)))
+            unreachable))"#;
+
+    let interrupter = Arc::new(Mutex::new(None));
+    let mut machine = Machine::builder()
+        .instantiation_hook(Arc::new(InterruptHook(interrupter.clone())))
+        .build();
+    machine
+        .install_commands([(
+            "wait".into(),
+            OwnedBuffer::from(wat::parse_str(WAIT).unwrap()),
+        )])
+        .await
+        .unwrap();
+    let engine = Engine::default();
+    let timeout = Duration::from_secs(10);
+    for (signal, expected) in [(Some(9), 128 + 9), (Some(15), 128 + 15), (None, 128 + 9)] {
+        let stdout = Arc::new(Capture::default());
+        let signaller = machine.signaller();
+        let interrupt = tokio::task::spawn_blocking({
+            let (stdout, interrupter) = (stdout.clone(), interrupter.clone());
+            move || {
+                let deadline = Instant::now() + timeout;
+                while stdout.0.lock().unwrap().as_slice() != b"waiting\n" {
+                    assert!(Instant::now() < deadline, "guest reached the atomic wait");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                if let Some(signal) = signal {
+                    signaller.signal(signal).unwrap();
+                }
+                interrupter.lock().unwrap().take().unwrap().interrupt();
+            }
+        });
+        let status = Box::pin(machine.run_file(&engine, "/bin/wait", config(stdout)))
+            .await
+            .unwrap();
+        interrupt.await.unwrap();
+        assert_eq!(status, expected, "pending signal: {signal:?}");
+    }
+    machine.shutdown().await;
+}
+
 #[tokio::test]
 async fn plain_hook_imports_configure_memory_before_wasm_start() {
     tokio::task::LocalSet::new()

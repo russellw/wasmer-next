@@ -4762,6 +4762,21 @@ impl Control for Kernel {
         signal: i32,
         cause: wasixv2_syscalls::ExecutionFault,
     ) -> bool {
+        if cause == wasixv2_syscalls::ExecutionFault::HostInterrupt {
+            let signals = self
+                .state
+                .read_or_recover()
+                .tasks
+                .get(&task)
+                .map(|entry| entry.signals.clone());
+            if let Some(pending) = signals.and_then(|signals| signals.fatal_pending()) {
+                // The invocation stopped before it could take the signal at its
+                // return-to-guest boundary. Finish the same fatal group exit here.
+                self.force_fatal_signal(task, pending);
+                return false;
+            }
+            return self.force_fatal_signal(task, signal);
+        }
         self.force_fatal_signal_with_cause(task, signal, Some(cause))
     }
 

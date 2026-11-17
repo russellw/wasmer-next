@@ -80,6 +80,7 @@ js-sys.workspace = true
 [target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "windows")))'.dev-dependencies]
 wasmer = { workspace = true, default-features = false, features = [
   "cranelift",
+  "experimental-host-interrupt",
 ] }
 
 [target.'cfg(target_os = "windows")'.dev-dependencies]
