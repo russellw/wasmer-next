@@ -26,14 +26,14 @@ pub use package::{
 };
 
 #[cfg(feature = "resolved-packages")]
-pub use package::runtime::InstalledRuntimePackage;
+pub use package::import::ImportedRuntimePackage;
 #[cfg(feature = "resolved-packages")]
 pub use package::wasmer_command::{
     RuntimeCommandDefaults, RuntimePackage, RuntimePackageResolver, WasmerCommandConfig,
 };
 #[cfg(feature = "resolved-packages")]
 use package::{
-    runtime::RuntimePackages,
+    import::RuntimePackages,
     wasmer_command::{RuntimePackageConfig, WasmerCommand},
 };
 
@@ -687,8 +687,6 @@ impl MachineBuilder {
             .map(|config| {
                 let packages = RuntimePackages::new(
                     config.limit,
-                    &memory,
-                    &host,
                     owner,
                     #[cfg(feature = "wasix1")]
                     wasix1.files.clone(),
@@ -713,11 +711,12 @@ impl MachineBuilder {
         if !commands.is_empty() {
             lowers.push(commands.filesystem());
         }
-        let boot_root = if lowers.is_empty() {
-            root.clone()
-        } else {
-            OverlayFs::new(Some(root.clone()), lowers)
-        };
+        let boot_root = boot_overlay(
+            root.clone(),
+            lowers,
+            #[cfg(feature = "resolved-packages")]
+            runtime_packages.as_deref(),
+        );
         let kernel = boot(
             &time,
             &memory,
@@ -770,6 +769,22 @@ impl MachineBuilder {
             console_input_eof,
             console_stdio_outputs,
         })
+    }
+}
+
+fn boot_overlay(
+    upper: Arc<dyn Filesystem>,
+    lowers: Vec<Arc<dyn Filesystem>>,
+    #[cfg(feature = "resolved-packages")] packages: Option<&RuntimePackages>,
+) -> Arc<dyn Filesystem> {
+    #[cfg(feature = "resolved-packages")]
+    if let Some(packages) = packages {
+        return packages.overlay(Some(upper), lowers);
+    }
+    if lowers.is_empty() {
+        upper
+    } else {
+        OverlayFs::new(Some(upper), lowers)
     }
 }
 
@@ -955,7 +970,12 @@ impl Machine {
         if !self.commands.is_empty() {
             lowers.insert(0, self.commands.filesystem());
         }
-        let root = OverlayFs::new(Some(self.root_upper.clone()), lowers);
+        let root = boot_overlay(
+            self.root_upper.clone(),
+            lowers,
+            #[cfg(feature = "resolved-packages")]
+            self.runtime_packages.as_deref(),
+        );
         // Nothing lives in the kernel yet, so a new one on the new root replaces it, with the
         // kernel's filesystems mounted afresh; a host directory's layer answers asynchronously.
         let kernel = boot(
@@ -1051,7 +1071,7 @@ impl Machine {
             task: 0,
             leases: None,
         };
-        let mut table = wasixv2_wasix1::Commands::default();
+        let mut resolved = Vec::new();
         for (name, defaults) in names {
             for dir in COMMAND_DIRS {
                 let path = format!("/{dir}/{name}");
@@ -1071,10 +1091,14 @@ impl Machine {
                     dev: (dev.major, dev.minor),
                     ino: attr.ino,
                 };
-                table.insert(id, defaults.clone());
+                resolved.push((id, defaults.clone()));
             }
         }
-        *self.wasix1.files.write().unwrap() = table;
+        // Publish the initial table as a unit, preserving any live imports added meanwhile.
+        let mut files = self.wasix1.files.write().unwrap();
+        for (id, defaults) in resolved {
+            files.insert(id, defaults);
+        }
     }
 
     /// The machine's network namespace, e.g. to [`Net::publish`] a host port to a guest
@@ -1168,7 +1192,7 @@ impl Machine {
     /// made and checked once; each writable mount has changes of its own.
     pub async fn mount_layer(&self, guest: &str, layer: &Layer, writable: bool) -> io::Result<()> {
         let lower = layer.0.clone();
-        let fs = if writable {
+        let upper = if writable {
             let (uid, gid) = self.owner;
             let upper: Arc<dyn Filesystem> = Arc::new(
                 self.memory
@@ -1180,9 +1204,18 @@ impl Machine {
                     ))
                     .map_err(errno_to_io)?,
             );
-            OverlayFs::new(Some(upper), vec![lower])
+            Some(upper)
         } else {
-            lower
+            None
+        };
+        #[cfg(feature = "resolved-packages")]
+        if let Some(packages) = &self.runtime_packages {
+            let fs = packages.overlay(upper, vec![lower]);
+            return self.mount(guest, fs, !writable).await;
+        }
+        let fs = match upper {
+            Some(upper) => OverlayFs::new(Some(upper), vec![lower]),
+            None => lower,
         };
         self.mount(guest, fs, !writable).await
     }

@@ -1037,7 +1037,8 @@ mod runtime_packages {
         let manifest = serde_json::from_value(serde_json::json!({
             "package": { "fs": [
                 { "volume_name": "assets", "mount_path": "/" },
-                { "volume_name": "assets", "mount_path": "/runtime-volume" }
+                { "volume_name": "assets", "mount_path": "/runtime-volume" },
+                { "volume_name": "assets", "mount_path": "/tmp/hidden" }
             ]}
         }))
         .unwrap();
@@ -1123,7 +1124,7 @@ mod runtime_packages {
 "#;
 
     #[tokio::test]
-    async fn wasmer_imports_live_aliases_and_scoped_volumes_with_a_cap() {
+    async fn wasmer_imports_at_original_paths_preserving_boot_content() {
         local(async {
             let resolver = Arc::new(Resolver(layout().await, AtomicUsize::new(0)));
             let mut machine = Machine::builder()
@@ -1142,46 +1143,48 @@ mod runtime_packages {
             assert_eq!(status.unwrap(), 0);
             assert_eq!(output, "package-echo first second\npackage");
 
-            for alias in ["/bin/echo", "/usr/bin/echo"] {
-                let (status, output) = run_file(&machine, alias, &["echo"]).await;
+            for path in ["/bin/echo", "/usr/bin/echo"] {
+                let (status, output) = run_file(&machine, path, &["echo"]).await;
                 assert_eq!(status.unwrap(), 0);
-                assert_eq!(output, "echo\npackage");
+                assert_eq!(output, "echo\nboot");
             }
 
-            let package = machine
-                .install_runtime_package(&resolver.package(1))
-                .await
-                .unwrap();
-            let host = machine.vfs();
-            let root = host.root();
-            let cred = wasixv2_vfs::Cred::root();
-            let cx = wasixv2_vfs::Ctx {
-                cred: &cred,
-                root: &root,
-                umask: 0,
-                task: 0,
-                leases: None,
-            };
-            for relative in ["runtime-marker", "runtime-volume/runtime-marker"] {
-                let path = format!("{}/{relative}", package.root);
-                assert!(
-                    host.lookup(&cx, &root, path.as_bytes(), Default::default())
-                        .await
-                        .is_ok()
-                );
+            let source = resolver.package(1);
+            let (package, duplicate) = tokio::join!(
+                machine.import_runtime_package(&source),
+                machine.import_runtime_package(&source),
+            );
+            for imported in [package.unwrap(), duplicate.unwrap()] {
+                assert_eq!(imported.identity, [1; 32]);
+                assert_eq!(imported.entrypoint, "/bin/echo");
+                assert!(!imported.entrypoint_visible);
+                assert_eq!(imported.hidden, ["/tmp/hidden"]);
             }
-            for path in [b"/runtime-marker".as_slice(), b"/runtime-volume"] {
+            for path in ["/runtime-marker", "/runtime-volume/runtime-marker"] {
+                let data = guest_file(machine.vfs(), path).await.unwrap();
                 assert!(
-                    host.lookup(&cx, &root, path, Default::default())
-                        .await
-                        .is_err()
+                    data.shared_contents().await.is_some(),
+                    "WEBC-backed file at {path}"
                 );
+                let mut bytes = [0; 7];
+                assert_eq!(data.read_at(&mut bytes, 0).await.unwrap(), bytes.len());
+                assert_eq!(&bytes, b"mounted");
             }
+            assert!(
+                guest_file(machine.vfs(), "/tmp/hidden/runtime-marker")
+                    .await
+                    .is_err()
+            );
+            assert!(
+                guest_file(machine.vfs(), "/run/wasmer/packages")
+                    .await
+                    .is_err()
+            );
             let (status, _) = run_file(&machine, "/bin/wasmer", &["wasmer", "run", "test/b"]).await;
             assert_eq!(status.unwrap(), 1);
             assert_eq!(
                 machine
-                    .install_runtime_package(&resolver.package(2))
+                    .import_runtime_package(&resolver.package(2))
                     .await
                     .unwrap_err()
                     .raw_os_error(),
@@ -1195,7 +1198,7 @@ mod runtime_packages {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn runtime_aliases_leave_a_persistent_upper_untouched() {
+    async fn runtime_import_leaves_a_persistent_upper_untouched() {
         use std::os::unix::fs::PermissionsExt;
 
         local(async {
@@ -1216,13 +1219,16 @@ mod runtime_packages {
                 let (status, _) =
                     run_file(&first, "/bin/wasmer", &["wasmer", "run", "test/a"]).await;
                 assert_eq!(status.unwrap(), 0);
-                for path in ["/bin/echo", "/usr/bin/echo"] {
+                for (path, expected) in [("/bin/echo", "persistent"), ("/usr/bin/echo", "package")]
+                {
                     let (status, output) = run_file(&first, path, &["echo"]).await;
                     assert_eq!(status.unwrap(), 0);
-                    assert_eq!(output, "echo\npackage");
+                    assert_eq!(output, format!("echo\n{expected}"));
                 }
                 assert_eq!(std::fs::read(&persistent_command).unwrap(), original);
                 assert!(!upper.path().join("usr/bin/echo").exists());
+                assert!(!upper.path().join("runtime-marker").exists());
+                assert!(!upper.path().join("runtime-volume").exists());
             }
             let mut second = Machine::builder()
                 .runtime_package_resolver(resolver)
@@ -1237,6 +1243,285 @@ mod runtime_packages {
         .await;
     }
 
+    async fn guest_file(
+        vfs: &Arc<wasixv2_vfs::Vfs>,
+        path: &str,
+    ) -> wasixv2_vfs::PathResult<wasixv2_vfs::File> {
+        use wasixv2_vfs::{Cred, Ctx, OpenHow};
+        let root = vfs.root();
+        let cx = Ctx {
+            cred: &Cred::root(),
+            root: &root,
+            umask: 0,
+            task: 0,
+            leases: None,
+        };
+        vfs.open(
+            &cx,
+            &root,
+            path.as_bytes(),
+            &OpenHow {
+                flags: wasixv2_abi::OpenFlags::O_RDONLY,
+                mode: 0,
+                lookup: wasixv2_vfs::LookupFlags::follow(),
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn an_earlier_import_and_its_whiteouts_win_and_images_stay_shared() {
+        local(async {
+            let resolver = Arc::new(Resolver(layout().await, AtomicUsize::new(0)));
+            let machine = Machine::builder()
+                .runtime_package_resolver(resolver.clone())
+                .loader(Arc::new(SharedLoader::default()))
+                .build();
+            let mut first = resolver.package(1);
+            let first_atom = OwnedBuffer::from(echo("package"));
+            first.layout.override_commands(vec![ResolvedCommand {
+                name: "echo".into(),
+                atom: first_atom.clone(),
+                defaults: CommandDefaults::default(),
+            }]);
+            let visible = machine.import_runtime_package(&first).await.unwrap();
+            assert!(visible.entrypoint_visible);
+            let vfs = machine.vfs();
+            let root = vfs.root();
+            let cx = wasixv2_vfs::Ctx {
+                cred: &wasixv2_vfs::Cred::root(),
+                root: &root,
+                umask: 0,
+                task: 0,
+                leases: None,
+            };
+            let keep = guest_file(vfs, "/runtime-marker").await.unwrap();
+            vfs.unlink(&cx, &root, b"runtime-marker").await.unwrap();
+            let mut later = resolver.package(2);
+            later.layout.override_commands(vec![ResolvedCommand {
+                name: "echo".into(),
+                atom: OwnedBuffer::from(echo("later")),
+                defaults: CommandDefaults::default(),
+            }]);
+            let hidden = machine.import_runtime_package(&later).await.unwrap();
+            assert!(!hidden.entrypoint_visible);
+            assert!(guest_file(vfs, "/runtime-marker").await.is_err());
+            let mut bytes = [0; 7];
+            assert_eq!(keep.read_at(&mut bytes, 0).await.unwrap(), 7);
+            assert_eq!(&bytes, b"mounted");
+
+            let visible = guest_file(vfs, "/bin/echo")
+                .await
+                .unwrap()
+                .shared_contents()
+                .await
+                .unwrap();
+            assert!(std::ptr::eq((*visible).as_ref(), first_atom.as_ref()));
+            let (status, out) = run_file(&machine, "/bin/echo", &["echo"]).await;
+            assert_eq!((status.unwrap(), out.as_str()), (0, "echo\npackage"));
+            let (status, out) =
+                run_file(&machine, "/bin/wasmer", &["wasmer", "run", "test/a"]).await;
+            assert_eq!(
+                (status.unwrap(), out.as_str()),
+                (0, "package-echo first\npackage")
+            );
+        })
+        .await;
+    }
+
+    #[derive(Default)]
+    struct SharedLoader(Mutex<Option<wasixv2::ImageId>>);
+
+    impl Loader for SharedLoader {
+        fn load<'a>(
+            &'a self,
+            engine: &'a Engine,
+            image: &'a Image,
+        ) -> LocalFuture<'a, Result<(Engine, Module), LoadError>> {
+            let id = image
+                .identity()
+                .expect("package atoms retain an image cache identity");
+            let previous = self.0.lock().unwrap().replace(id);
+            if let Some(previous) = previous {
+                assert_eq!(id, previous, "a second exec uses the same byte identity");
+            }
+            Compile.load(engine, image)
+        }
+    }
+
+    #[tokio::test]
+    async fn the_default_runtime_import_limit_is_128_distinct_layouts() {
+        local(async {
+            let resolver = Arc::new(Resolver(layout().await, AtomicUsize::new(0)));
+            let machine = Machine::builder()
+                .runtime_package_resolver(resolver.clone())
+                .build();
+            let mut package = resolver.package(0);
+            // Only commands here, so this covers the limit without hundreds of volume paths.
+            let atom = OwnedBuffer::from(echo("package"));
+            package.layout = ResolvedLayout::default();
+            package.layout.override_commands(vec![ResolvedCommand {
+                name: "echo".into(),
+                atom,
+                defaults: CommandDefaults::default(),
+            }]);
+            for id in 0..128 {
+                package.identity = [id; 32];
+                machine.import_runtime_package(&package).await.unwrap();
+            }
+            package.identity = [128; 32];
+            assert_eq!(
+                machine
+                    .import_runtime_package(&package)
+                    .await
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(28)
+            );
+            package.identity = [127; 32];
+            assert!(machine.import_runtime_package(&package).await.is_ok());
+        })
+        .await;
+    }
+
+    struct HeldInput(Mutex<tokio::sync::oneshot::Receiver<()>>);
+
+    impl wasixv2::ByteSource for HeldInput {
+        fn poll_read(
+            &self,
+            cx: &mut std::task::Context<'_>,
+            _: &mut [u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            let mut rx = self.0.lock().unwrap();
+            std::pin::Pin::new(&mut *rx).poll(cx).map(|_| Ok(0))
+        }
+    }
+
+    const LIVE_CWD: &str = r#"
+(module
+  (import "wasixv2" "openat" (func $open (param i32 i32 i32 i32) (result i32)))
+  (import "wasixv2" "read" (func $read (param i32 i32 i32) (result i32)))
+  (import "wasixv2" "write" (func $write (param i32 i32 i32) (result i32)))
+  (import "wasixv2" "exit_group" (func $exit (param i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 128) "runtime-marker\00")
+  (func (export "_start") (local $fd i32)
+    (drop (call $write (i32.const 1) (i32.const 128) (i32.const 1)))
+    (drop (call $read (i32.const 0) (i32.const 256) (i32.const 1)))
+    (local.set $fd (call $open (i32.const -100) (i32.const 128) (i32.const 0) (i32.const 0)))
+    (if (i32.lt_s (local.get $fd) (i32.const 0))
+      (then (call $exit (i32.const 10)) unreachable))
+    (drop (call $write (i32.const 1) (i32.const 256)
+      (call $read (local.get $fd) (i32.const 256) (i32.const 7))))
+    (call $exit (i32.const 0))
+    unreachable))
+"#;
+
+    #[tokio::test]
+    async fn a_running_guest_sees_imports_from_its_existing_cwd() {
+        local(async {
+            let resolver = Arc::new(Resolver(layout().await, AtomicUsize::new(0)));
+            let mut machine = Machine::builder()
+                .runtime_package_resolver(resolver.clone())
+                .build();
+            let layer = machine
+                .commands_layer([("boot".to_owned(), OwnedBuffer::from(echo("boot")))])
+                .unwrap()
+                .unwrap();
+            machine
+                .mount_layer("/runtime-volume", &layer, false)
+                .await
+                .unwrap();
+            machine.set_working_dir("/runtime-volume");
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let ready = Arc::new(tokio::sync::Notify::new());
+            let printed = Arc::new(Capture::default());
+            let output = Arc::new(wasixv2::FnSink({
+                let (ready, printed) = (ready.clone(), printed.clone());
+                move |bytes: &[u8]| {
+                    printed.0.lock().unwrap().extend_from_slice(bytes);
+                    ready.notify_one();
+                }
+            }));
+            let wasm = wat(LIVE_CWD);
+            let run = machine.run_process(
+                &wasm,
+                ProcessConfig {
+                    args: Vec::new(),
+                    env: Vec::new(),
+                    stdio: Stdio {
+                        stdin: Arc::new(HeldInput(Mutex::new(rx))),
+                        stdout: output,
+                        stderr: Arc::new(Capture::default()),
+                    },
+                },
+            );
+            let import = async {
+                ready.notified().await;
+                let result = machine
+                    .import_runtime_package(&resolver.package(1))
+                    .await
+                    .unwrap();
+                assert_eq!(result.hidden, ["/tmp/hidden"]);
+                tx.send(()).unwrap();
+            };
+            let (status, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::join!(run, import)
+            })
+            .await
+            .unwrap();
+            assert_eq!(status.unwrap(), 0);
+            assert_eq!(&*printed.0.lock().unwrap(), b"rmounted");
+        })
+        .await;
+    }
+
+    #[derive(Default)]
+    struct PendingResolver {
+        entered: tokio::sync::Notify,
+        dropped: std::sync::atomic::AtomicBool,
+    }
+
+    impl RuntimePackageResolver for PendingResolver {
+        fn resolve<'a>(&'a self, _: &'a str) -> LocalFuture<'a, io::Result<RuntimePackage>> {
+            Box::pin(async {
+                struct DropFlag<'a>(&'a std::sync::atomic::AtomicBool);
+                impl Drop for DropFlag<'_> {
+                    fn drop(&mut self) {
+                        self.0.store(true, Ordering::Relaxed);
+                    }
+                }
+                let _guard = DropFlag(&self.dropped);
+                self.entered.notify_one();
+                std::future::pending().await
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn killed_wasmer_drops_its_active_resolver() {
+        local(async {
+            let resolver = Arc::new(PendingResolver::default());
+            let machine = Machine::builder()
+                .runtime_package_resolver(resolver.clone())
+                .build();
+            let run = run_file(&machine, "/bin/wasmer", &["wasmer", "run", "test/a"]);
+            let kill = async {
+                resolver.entered.notified().await;
+                machine.signal(wasixv2_abi::Signal::SIGKILL.0).unwrap();
+            };
+            let ((status, _), ()) =
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    tokio::join!(run, kill)
+                })
+                .await
+                .unwrap();
+            assert_eq!(status.unwrap(), 137);
+            assert!(resolver.dropped.load(Ordering::Relaxed));
+        })
+        .await;
+    }
+
     #[tokio::test]
     async fn disabled_machine_has_no_runtime_command_or_install() {
         local(async {
@@ -1246,7 +1531,7 @@ mod runtime_packages {
             assert_eq!(execve_errno(status), 2);
             assert_eq!(
                 machine
-                    .install_runtime_package(&resolver.package(1))
+                    .import_runtime_package(&resolver.package(1))
                     .await
                     .unwrap_err()
                     .raw_os_error(),

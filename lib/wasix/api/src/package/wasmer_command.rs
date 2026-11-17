@@ -7,7 +7,7 @@ use wasixv2_abi::{Fd, OpenFlags};
 use wasixv2_vfs::FileType;
 use wasmer_config::package::PackageSource;
 
-use super::runtime::RuntimePackages;
+use super::import::{RuntimePackages, matches_atom};
 use crate::{
     CommandContext, CommandFile, CommandOutcome, Errno, Image, LocalFuture, MachineBuilder,
     MemoryBudget, ResolvedLayout, VirtualCommand, errno_to_io,
@@ -167,12 +167,31 @@ impl WasmerCommand {
             Err(error) => return error.print(&cx).await,
         };
 
-        let installed = match self.packages.install(&cx.fs().vfs, &package, true).await {
-            Ok(installed) => installed,
+        let imported = match self.packages.import(&cx.fs().vfs, &package).await {
+            Ok(imported) => imported,
             Err(error) => return CommandError::install(error).print(&cx).await,
         };
         let (argv, env) = default_args(&cx, &package, args);
-        execute(cx, installed.executable.as_bytes(), argv, env).await
+        let path = imported.public.entrypoint.as_bytes();
+        match cx.open(path, OpenFlags::O_RDONLY).await {
+            Ok(file) if matches_atom(file.shared_contents().await, &imported.atom) => {
+                // Execute the file we matched, even if its name is replaced before exec.
+                return finish_exec(cx.exec_file(file.file(), argv, env).await, false).await;
+            }
+            Err(Errno::ENOENT | Errno::ENOTDIR | Errno::ELOOP) | Ok(_) => {}
+            Err(error) => {
+                tracing::debug!(?error, "cannot access runtime package entrypoint");
+                return CommandError::NOT_EXECUTABLE.print(&cx).await;
+            }
+        }
+        tracing::warn!(entrypoint = %imported.public.entrypoint, "runtime package entrypoint is shadowed");
+        match imported.open_entrypoint(&cx.fs().vfs).await {
+            Ok(file) => finish_exec(cx.exec_file(&file, argv, env).await, true).await,
+            Err(error) => {
+                tracing::debug!(%error, "cannot open shadowed runtime package entrypoint");
+                CommandError::NOT_EXECUTABLE.print(&cx).await
+            }
+        }
     }
 
     async fn source(&self, cx: &CommandContext<'_>, target: &[u8]) -> Result<Source, CommandError> {
@@ -249,11 +268,18 @@ async fn execute(
     args: Vec<Vec<u8>>,
     env: Vec<Vec<u8>>,
 ) -> CommandOutcome {
-    match cx.exec(path, args, env).await {
+    finish_exec(cx.exec(path, args, env).await, false).await
+}
+
+async fn finish_exec(
+    result: Result<crate::Executed, (CommandContext<'_>, Errno)>,
+    shadowed: bool,
+) -> CommandOutcome {
+    match result {
         Ok(executed) => CommandOutcome::Exec(executed),
         Err((cx, error)) => {
             tracing::debug!(?error, "wasmer command could not exec");
-            if error == Errno::ENOENT {
+            if error == Errno::ENOENT && !shadowed {
                 CommandError::NOT_FOUND.print(&cx).await
             } else {
                 CommandError::NOT_EXECUTABLE.print(&cx).await

@@ -1,7 +1,7 @@
 //! Byte-backed package assembly. Acquisition, credentials and persistent caches belong
 //! to the embedder; execution remains ordinary VFS exec (`fs/exec.c:kernel_execve`).
 #[cfg(feature = "resolved-packages")]
-pub(crate) mod runtime;
+pub(crate) mod import;
 #[cfg(feature = "resolved-packages")]
 pub(crate) mod wasmer_command;
 
