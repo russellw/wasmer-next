@@ -40,8 +40,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ steps.load_toolchain.outputs.rust_toolchain }}
-      - name: Check out LTP for runner unit tests
-        run: git submodule update --init --recursive --checkout -- tests/wasixv2/upstream/ltp
+      - name: Check out LTP and libc-test for runner unit tests
+        run: git submodule update --init --recursive --checkout -- tests/wasixv2/upstream/ltp tests/wasixv2/upstream/libc-test
       - name: Check native exporter tooling (unit tests only)
         env:
           CARGO_INCREMENTAL: "0"
