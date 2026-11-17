@@ -1054,6 +1054,7 @@ impl Machine {
             task: 0,
             leases: None,
         };
+        let mut table = wasixv2_wasix1::Commands::default();
         for (name, defaults) in names {
             for dir in COMMAND_DIRS {
                 let path = format!("/{dir}/{name}");
@@ -1073,13 +1074,10 @@ impl Machine {
                     dev: (dev.major, dev.minor),
                     ino: attr.ino,
                 };
-                self.wasix1
-                    .files
-                    .write()
-                    .unwrap()
-                    .insert(id, defaults.clone());
+                table.insert(id, defaults.clone());
             }
         }
+        *self.wasix1.files.write().unwrap() = table;
     }
 
     /// The machine's network namespace, e.g. to [`Net::publish`] a host port to a guest
