@@ -39,8 +39,8 @@ pub use cred::{
 };
 pub use dentry::Dentry;
 pub use driver::{
-    AppendOutcome, Filesystem, Handle, Link, LookupEntry, MAX_DIR_COOKIE, NamespaceComponent, Node,
-    ObservedAttr, SharedContents,
+    AppendOutcome, CommandMark, Filesystem, Handle, Link, LookupEntry, MAX_DIR_COOKIE,
+    NamespaceComponent, Node, ObservedAttr, SharedContents,
 };
 pub use export::{HandleKind, MAX_HANDLE_SZ};
 pub use file::{DIR_POS_EOD, File, FileWriteGuard};

@@ -444,6 +444,10 @@ pub enum AppendOutcome {
     OffsetUnknown { count: usize },
 }
 
+/// Opaque identity of a registered virtual command.
+#[derive(Clone)]
+pub struct CommandMark(pub Arc<dyn Any + Send + Sync>);
+
 /// An object opened for data access (Linux's `file_operations`).
 ///
 /// Data methods are called on regular files only and `readdir` on directories only.
@@ -582,6 +586,11 @@ pub trait Handle: Send + Sync {
     /// as long as anyone holds them, such as a read-only image's: `execve` shares them instead
     /// of reading the file into a copy. `None` (the default) for everything else.
     async fn shared_contents(&self) -> Option<SharedContents> {
+        None
+    }
+
+    /// The command registered for this open file, if any.
+    async fn virtual_command(&self) -> Option<CommandMark> {
         None
     }
 

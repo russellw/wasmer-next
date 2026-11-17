@@ -1805,7 +1805,14 @@ impl Kernel {
         let path = crate::fs::read_path(caller.memory(), filename).await?;
         let args = read_strings(caller, argv).await?;
         let env = read_strings(caller, envp).await?;
-        self.do_execveat(caller, dfd, path, args, env, flags).await
+        self.do_execveat(
+            caller,
+            ExecTarget::At(dfd, path, flags),
+            args,
+            env,
+            &mut false,
+        )
+        .await
     }
 
     /// `kernel_execve`, as Linux starts init: makes `task`, a process [`Kernel::spawn`] started
@@ -1821,34 +1828,42 @@ impl Kernel {
         args: Vec<Vec<u8>>,
         env: Vec<Vec<u8>>,
     ) -> Result<Image, Errno> {
-        let memory = NoMemory;
-        let caller = Caller::new(task, &memory);
-        let cwd = Fd(wasixv2_abi::AtFd::AT_FDCWD.0);
-        self.do_execveat(&caller, cwd, path.to_vec(), args, env, AtFlags(0))
+        let target = ExecTarget::At(Fd(wasixv2_abi::AtFd::AT_FDCWD.0), path.to_vec(), AtFlags(0));
+        self.exec_host(task, target, args, env)
             .await
-            .map_err(|err| match err {
-                SysErr::Errno(errno) => errno,
-                SysErr::NamespaceBoundary => Errno::ENOENT,
-                SysErr::NamespaceMutation => Errno::EACCES,
-                // Nothing waits here for a signal to interrupt.
-                _ => Errno::EINTR,
-            })?;
-        // There is no guest to return to: the image goes to the caller, not through the work
-        // queue. Only the execve's own action goes; whatever else is queued, such as an exit
-        // the embedder asked for before the image started, stays, and so does the work flag.
-        self.with_task(task, |t| t.work.take_exec())
-            .ok_or(Errno::EINTR)
+            .and_then(|image| image.0.ok_or(Errno::EINTR))
+    }
+
+    pub(crate) async fn exec_host(
+        &self,
+        task: TaskId,
+        target: ExecTarget,
+        args: Vec<Vec<u8>>,
+        env: Vec<Vec<u8>>,
+    ) -> Result<crate::Executed, Errno> {
+        let mut committed = false;
+        let caller = Caller::new(task, &NoMemory);
+        match self
+            .do_execveat(&caller, target, args, env, &mut committed)
+            .await
+        {
+            Ok(_) => {
+                let image = self.with_task(task, |t| t.work.take_exec());
+                Ok(crate::Executed(image))
+            }
+            Err(_) if committed => Ok(crate::Executed(None)),
+            Err(err) => Err(crate::command::context::errno(err)),
+        }
     }
 
     /// `do_execveat_common` once the arguments are in the kernel.
     async fn do_execveat(
         &self,
         caller: &Caller<'_>,
-        dfd: Fd,
-        path: Vec<u8>,
+        target: ExecTarget,
         mut args: Vec<Vec<u8>>,
         env: Vec<Vec<u8>>,
-        flags: AtFlags,
+        committed: &mut bool,
     ) -> SysResult<i32> {
         let _admission = self
             .mm(caller.task())
@@ -1860,22 +1875,34 @@ impl Kernel {
             args.push(Vec::new());
         }
         check_arg_size(&args, &env)?;
-        // The name the binary is known by: what the caller passed, or `/dev/fd/N` for an fd.
-        let fd_relative = !path.starts_with(b"/") && dfd.0 != wasixv2_abi::AtFd::AT_FDCWD.0;
-        let name = match (path.is_empty(), fd_relative) {
-            (true, _) => format!("/dev/fd/{}", dfd.0).into_bytes(),
-            (false, false) => path.clone(),
-            (false, true) => format!("/dev/fd/{}/", dfd.0)
-                .into_bytes()
-                .into_iter()
-                .chain(path.iter().copied())
-                .collect(),
+        let (name, inaccessible, (mut file, mut binary)) = match target {
+            ExecTarget::Path(path) => {
+                let name = self.vfs.d_path(&path, &self.env(caller).fs.root);
+                (name, false, self.open_exec_path(caller, path).await?)
+            }
+            ExecTarget::At(dfd, path, flags) => {
+                // The name the binary is known by: what the caller passed, or `/dev/fd/N` for an fd.
+                let fd_relative = !path.starts_with(b"/") && dfd.0 != wasixv2_abi::AtFd::AT_FDCWD.0;
+                let name = match (path.is_empty(), fd_relative) {
+                    (true, _) => format!("/dev/fd/{}", dfd.0).into_bytes(),
+                    (false, false) => path.clone(),
+                    (false, true) => format!("/dev/fd/{}/", dfd.0)
+                        .into_bytes()
+                        .into_iter()
+                        .chain(path.iter().copied())
+                        .collect(),
+                };
+                // `BINPRM_FLAGS_PATH_INACCESSIBLE`: a script named through a close-on-exec descriptor
+                // could not be opened by its interpreter.
+                let inaccessible = (path.is_empty() || fd_relative)
+                    && self.files(caller.task()).lock_or_recover().cloexec(dfd) == Some(true);
+                (
+                    name,
+                    inaccessible,
+                    self.open_exec(caller, dfd, &path, flags).await?,
+                )
+            }
         };
-        // `BINPRM_FLAGS_PATH_INACCESSIBLE`: a script named through a close-on-exec descriptor
-        // could not be opened by its interpreter.
-        let inaccessible = (path.is_empty() || fd_relative)
-            && self.files(caller.task()).lock_or_recover().cloexec(dfd) == Some(true);
-        let (mut file, mut binary) = self.open_exec(caller, dfd, &path, flags).await?;
         // `bprm->interp`: the name a script is passed to its interpreter by.
         let mut script = name.clone();
         let mut rewrites = 0;
@@ -1885,7 +1912,14 @@ impl Kernel {
         let mut handover = ExecHandover::default();
         // `search_binary_handler`: a script hands over to its interpreter; anything else must
         // be an image of one of the embedder's formats, decided before the point of no return.
-        let (image, binary) = loop {
+        let (image, binary, comm) = loop {
+            if !self.commands.is_empty()
+                && let Some(mark) = file.virtual_command().await
+                && let Some(entry) = self.commands.recognise(mark)
+            {
+                let comm = Comm::new(entry.spec.command.name().as_bytes());
+                break (Image::command(entry), binary, comm);
+            }
             // `prepare_binprm`: the first bytes tell the format.
             let header = read_header(&file).await?;
             // `load_misc_binary`, which comes first: the interpreter of a registered format
@@ -1929,7 +1963,7 @@ impl Kernel {
                         self.binfmt.probe(&header)?;
                         let image = read_image(&file, binary.size).await?;
                         self.binfmt.check(&image)?;
-                        break (image, binary);
+                        break (image, binary, Comm::from_path(&name));
                     };
                     if inaccessible {
                         return Err(Errno::ENOENT.into());
@@ -1970,6 +2004,7 @@ impl Kernel {
         // `old_vpid`: the caller's tid as its tracer saw it before `de_thread`.
         let old_vpid = self.tid_for_tracer(task);
         let exec = self.zap_threads(task)?;
+        *committed = true;
         // Past the point of no return: the old image's io_uring requests go
         // (`io_uring_task_cancel`).
         self.io_uring_cancel(task, crate::io_uring::Cancel::All);
@@ -1989,7 +2024,7 @@ impl Kernel {
         let threads = self.take_group_futex_states(task);
         self.exit_futexes(caller, threads).await;
         self.mm_release(caller).await;
-        self.exec_commit(task, &name, args, env, image, (binary, handover))
+        self.exec_commit(task, comm, args, env, image, (binary, handover))
             .await;
         if task != leader {
             self.task_signals(leader)
@@ -2118,7 +2153,7 @@ impl Kernel {
     async fn exec_commit(
         &self,
         caller: TaskId,
-        name: &[u8],
+        comm: Comm,
         args: Vec<Vec<u8>>,
         env: Vec<Vec<u8>>,
         image: Option<Image>,
@@ -2241,7 +2276,7 @@ impl Kernel {
             }
         }
         self.with_task(task, |t| {
-            t.comm = Comm::from_path(name);
+            t.comm = comm;
             // `exec_mmap`: the new image gets its own address space. A vfork child leaves its
             // parent's untouched.
             // Linux kernel/fork.c:mm_init also initializes exec's mm from the
@@ -3102,6 +3137,11 @@ fn check_arg_size(args: &[Vec<u8>], env: &[Vec<u8>]) -> SysResult<()> {
         return Err(Errno::E2BIG.into());
     }
     Ok(())
+}
+
+pub(crate) enum ExecTarget {
+    At(Fd, Vec<u8>, AtFlags),
+    Path(Path),
 }
 
 /// Memory for kernel work outside any syscall, where no guest pointer is followed.

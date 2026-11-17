@@ -158,7 +158,15 @@ pub struct ProcessConfig {
 
 pub use fs::bootstrap::{BootstrappedProcess, DirectoryBootstrap, NamespaceBootstrap};
 
+pub use command::{
+    CommandContext, CommandCred, CommandFile, CommandOutcome, CommandSpec, Commands,
+    CommandsBuilder, Executed, TaskFs, VirtualCommand,
+};
+
+mod command;
+
 pub struct Kernel {
+    commands: Commands,
     descriptor_owner: Arc<()>,
     /// The machine's clocks: [`Kernel::time`] as a host, whose wall clock is the machine's.
     host: Arc<dyn Host>,
@@ -571,6 +579,7 @@ impl Kernel {
             procs,
             pids,
             binfmt: Arc::new(process::WasmMagic),
+            commands: Commands::default(),
             binfmt_misc,
             epoll_nesting: Mutex::default(),
             sigqueue_users: Arc::default(),
@@ -639,6 +648,12 @@ impl Kernel {
     /// `memfd_create`'s files. Seals work only on a tmpfs.
     pub fn with_shm(mut self, fs: Arc<dyn Filesystem>) -> Self {
         self.shm = Some(self.vfs.kern_mount(fs));
+        self
+    }
+
+    /// Installs the registry whose command files this kernel may execute. Set before boot.
+    pub fn with_commands(mut self, commands: Commands) -> Self {
+        self.commands = commands;
         self
     }
 
@@ -4833,6 +4848,14 @@ impl Control for Kernel {
     fn take_image(&self, task: TaskId) -> Option<Image> {
         let mut state = self.state.lock_or_recover();
         state.tasks.get_mut(&task)?.work.take_image()
+    }
+
+    fn run_command(
+        &self,
+        task: TaskId,
+        image: wasixv2_syscalls::Image,
+    ) -> LocalFuture<'_, wasixv2_syscalls::CommandEnd> {
+        Box::pin(command::run::run(self, task, image))
     }
 
     fn exec_wait(&self, task: TaskId) -> LocalFuture<'_, Result<(), i32>> {

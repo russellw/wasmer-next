@@ -1704,6 +1704,10 @@ impl Handle for FileHandle {
     }
 
     /// The lower file's, until a copy-up makes the upper one current.
+    async fn virtual_command(&self) -> Option<wasixv2_vfs::CommandMark> {
+        self.current().await.ok()?.virtual_command().await
+    }
+
     async fn shared_contents(&self) -> Option<SharedContents> {
         self.current().await.ok()?.shared_contents().await
     }

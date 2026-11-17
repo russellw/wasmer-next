@@ -260,6 +260,11 @@ impl File {
         Ok(n)
     }
 
+    /// The registered command associated with this open file.
+    pub async fn virtual_command(&self) -> Option<crate::CommandMark> {
+        self.handle().ok()?.virtual_command().await
+    }
+
     /// The file's contents as its driver shares them, if it does ([`Handle::shared_contents`]):
     /// a read of the whole file without a copy.
     pub async fn shared_contents(&self) -> Option<SharedContents> {
