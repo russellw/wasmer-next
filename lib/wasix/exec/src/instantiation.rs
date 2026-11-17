@@ -940,26 +940,31 @@ pub(crate) mod tests {
     // Poll every accepted job together: a final drain may depend on another
     // job in the same queue, and teardown can enqueue a later generation.
     pub(crate) fn drain_jobs(mut jobs: Vec<wasixv2_host::LocalFuture<'static, ()>>) {
-        futures::executor::block_on(std::future::poll_fn(|cx| {
+        use std::{
+            task::{Context, Waker},
+            time::{Duration, Instant},
+        };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut cx = Context::from_waker(Waker::noop());
+        loop {
             jobs.extend(JOBS.with(|queue| std::mem::take(&mut *queue.borrow_mut())));
             let mut pending = Vec::new();
             for mut job in std::mem::take(&mut jobs) {
-                if job.as_mut().poll(cx).is_pending() {
+                if job.as_mut().poll(&mut cx).is_pending() {
                     pending.push(job);
                 }
             }
             jobs = pending;
-            let added = JOBS.with(|queue| std::mem::take(&mut *queue.borrow_mut()));
-            if !added.is_empty() {
-                jobs.extend(added);
-                cx.waker().wake_by_ref();
-            }
+            jobs.extend(JOBS.with(|queue| std::mem::take(&mut *queue.borrow_mut())));
             if jobs.is_empty() {
-                std::task::Poll::Ready(())
-            } else {
-                std::task::Poll::Pending
+                return;
             }
-        }));
+            assert!(
+                Instant::now() < deadline,
+                "native teardown queue did not drain"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
     pub(crate) struct QueueHost;
     impl wasixv2_host::Host for QueueHost {
@@ -1777,7 +1782,7 @@ pub(crate) mod tests {
                 drop(run);
                 canceled_before_job_poll =
                     NATIVE_WEAK.with(|slot| slot.borrow().as_ref().unwrap().upgrade().is_none());
-                let mut jobs = JOBS.with(|jobs| std::mem::take(&mut *jobs.borrow_mut()));
+                let jobs = JOBS.with(|jobs| std::mem::take(&mut *jobs.borrow_mut()));
                 assert!(!jobs.is_empty(), "cancellation must retain cleanup custody");
                 let waiter_drops = Arc::new(AtomicUsize::new(0));
                 let waiter_wakes = Arc::new(AtomicUsize::new(0));

@@ -281,6 +281,8 @@ Additional reference-lifetime test draft:
   block this delivery on per-Machine CPU/affinity/procfs configuration.
 - macOS support targets 13 and newer, explicitly approved by the user. The
   descriptor-safe host-filesystem port and its validation remain required.
+- V1 binaries relying on resurrecting returned `setjmp` frames are unsupported.
+  `longjmp` must target a still-live saving frame; valid-frame regressions remain bugs.
 - RTLD_NEXT: deferred. Full Linux compatibility is not the completion criterion.
 - Full-image dynamic copying fork / multi-module asyncify, TLS-dependent initializer
   snapshots and unsupported dynamic relocation forms require their own consumer-backed
