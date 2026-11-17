@@ -24,6 +24,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
+          # libaio on pagure.io uses dumb HTTP and cannot be shallow-cloned.
+          fetch-depth: 0
           submodules: recursive
       - uses: actions/setup-node@v4
         with:
@@ -99,6 +101,8 @@ jobs:
           permission-contents: read
       - uses: actions/checkout@v6
         with:
+          # libaio on pagure.io uses dumb HTTP and cannot be shallow-cloned.
+          fetch-depth: 0
           submodules: recursive
       - name: Configure private runtime access
         uses: ./.github/actions/setup-runtime
@@ -167,6 +171,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
+          # libaio on pagure.io uses dumb HTTP and cannot be shallow-cloned.
+          fetch-depth: 0
           submodules: recursive
       - uses: ./.github/actions/load_toolchain
         id: load_toolchain
@@ -243,6 +249,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
+          # libaio on pagure.io uses dumb HTTP and cannot be shallow-cloned.
+          fetch-depth: 0
           submodules: recursive
       - uses: actions/setup-node@v4
         with:

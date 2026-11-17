@@ -94,7 +94,7 @@ fn fork_needs_an_address_space_that_can_be_duplicated() {
 /// `CAP_SYS_ADMIN` (`EPERM`). What a failed fork made is undone: the first process of a pid
 /// namespace that a failed fork would have started is still pid 1 there.
 #[test]
-fn a_fork_that_cannot_copy_memory_reports_copy_processs_errors_first() {
+fn a_fork_that_cannot_copy_memory_reports_copy_process_errors_first() {
     let (kernel, task, memory) = super::cred::machine_as(0, 0);
     let caller = Caller::new(task, &memory);
     let newpid = CloneFlags::CLONE_NEWPID.0 as u32;

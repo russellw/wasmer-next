@@ -834,7 +834,7 @@ fn a_zombies_cpu_clock_stops_and_a_reaped_process_has_none() {
 /// A timer may run on another process's CPU clock; its signal goes to its creator. It stops
 /// when that process exits, and once it is reaped, setting the timer fails with ESRCH.
 #[test]
-fn a_timer_on_another_processs_cpu_clock_signals_its_creator() {
+fn a_timer_on_another_process_cpu_clock_signals_its_creator() {
     let t = Fixture::new();
     t.block(SIGUSR1);
     let other = spawn_quiet(&t.kernel);
@@ -914,7 +914,7 @@ fn clock_nanosleep_sleeps_on_another_tasks_cpu_clock() {
 /// The clock of a process that exited stops, so a sleep on it only ends with a signal; a
 /// relative one then goes on through `restart_syscall` with the time left written out.
 #[test]
-fn a_sleep_on_a_dead_processs_cpu_clock_ends_only_with_a_signal() {
+fn a_sleep_on_a_dead_process_cpu_clock_ends_only_with_a_signal() {
     let t = Fixture::new();
     let child = t.fork();
     t.exit(child);

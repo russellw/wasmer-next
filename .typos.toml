@@ -25,6 +25,9 @@ extend-exclude = [
   "*.md.out",
   "CHANGELOG.md",
   "**/CHANGELOG.md",
+  # Imported upstream suites and vendored code
+  "tests/wasixv2/upstream",
+  "**/third-party",
   # external submodule
   "lib/napi",
 
@@ -58,7 +61,38 @@ SME = "SME"
 usig = "usig"
 wronly = "wronly"
 
+# Kernel/ABI abbreviations, compiler flags, and deliberately split test payloads
+nd = "nd"
+caf = "caf"
+thr = "thr"
+mak = "mak"
+ond = "ond"
+hel = "hel"
+ba = "ba"
+oif = "oif"
+exportfs = "exportfs"
+iif = "iif"
+rto = "rto"
+Iinclude = "Iinclude"
+fo = "fo"
+ACCES = "ACCES"
+iput = "iput"
+Inh = "Inh"
+sems = "sems"
+filp = "filp"
+unparented = "unparented"
+childs = "childs"
+parms = "parms"
+unx = "unx"
+anc = "anc"
+helo = "helo"
+PN = "PN"
+writeable = "writeable"
+expireds = "expireds"
+worl = "worl"
+
 [default.extend-identifiers]
 as_slice_arbitary = "as_slice_arbitary"
 test_named_sems = "test_named_sems"
 __WASI_ERRNO_ACCES = "__WASI_ERRNO_ACCES"
+fae0ded = "fae0ded"

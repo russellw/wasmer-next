@@ -31,6 +31,8 @@ jobs:
           permission-contents: read
       - uses: actions/checkout@v6
         with:
+          # libaio on pagure.io uses dumb HTTP and cannot be shallow-cloned.
+          fetch-depth: 0
           submodules: recursive
       - name: Configure private runtime access
         uses: ./.github/actions/setup-runtime

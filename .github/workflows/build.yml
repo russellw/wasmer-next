@@ -117,6 +117,8 @@ jobs:
           permission-contents: read
       - uses: actions/checkout@v6
         with:
+          # libaio on pagure.io uses dumb HTTP and cannot be shallow-cloned.
+          fetch-depth: 0
           submodules: recursive
       - name: Configure private runtime access
         uses: ./.github/actions/setup-runtime
@@ -312,6 +314,8 @@ jobs:
           permission-contents: read
       - uses: actions/checkout@v6
         with:
+          # libaio on pagure.io uses dumb HTTP and cannot be shallow-cloned.
+          fetch-depth: 0
           submodules: recursive
       - name: Configure private runtime access
         uses: ./.github/actions/setup-runtime
@@ -416,6 +420,8 @@ jobs:
           permission-contents: read
       - uses: actions/checkout@v6
         with:
+          # libaio on pagure.io uses dumb HTTP and cannot be shallow-cloned.
+          fetch-depth: 0
           submodules: recursive
       - name: Configure private runtime access
         uses: ./.github/actions/setup-runtime
@@ -497,6 +503,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
+          # libaio on pagure.io uses dumb HTTP and cannot be shallow-cloned.
+          fetch-depth: 0
           submodules: recursive
       - name: Package full source archive
         shell: bash
@@ -518,6 +526,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
+          # libaio on pagure.io uses dumb HTTP and cannot be shallow-cloned.
+          fetch-depth: 0
           submodules: recursive
       - name: Download the Artifacts
         uses: actions/download-artifact@v4
