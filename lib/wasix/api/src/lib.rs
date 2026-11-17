@@ -72,7 +72,8 @@ pub use wasixv2_kernel::{
     ConsoleInputEof, Credentials, PowerRequest, ProcessConfig, Stdio, Uname, UnameError,
 };
 use wasixv2_kernel::{FilesystemType, FsParam, HostClock, Kernel, SyscallEntry, Timekeeper};
-use wasixv2_pages::{Provider, SharedPages};
+pub use wasixv2_pages::{BudgetExceeded, MemoryBudget};
+use wasixv2_pages::{BudgetedPages, Provider, SharedPages};
 use wasixv2_syscalls::{Layered, TaskId};
 use wasixv2_trace::Trace;
 use wasixv2_vfs::{Cred, Ctx, Errno, LookupFlags, MountFlags, Vfs};
@@ -133,11 +134,76 @@ fn stack(kernel: Kernel) -> Stack {
     Layered::new(SyscallEntry(Trace), kernel)
 }
 
+#[derive(Clone, Default)]
+struct MemoryConfig {
+    budget: Option<Arc<dyn MemoryBudget>>,
+    // File data is block-charged by MemFs. Bypass BudgetedHost to avoid charging twice.
+    pages_host: Option<Arc<dyn Host>>,
+}
+
+impl MemoryConfig {
+    fn apply(&self, fs: MemFs) -> Result<MemFs, Errno> {
+        match &self.budget {
+            Some(budget) => fs.try_with_memory_budget(budget.clone()),
+            None => Ok(fs),
+        }
+    }
+}
+
+struct BudgetedHost {
+    host: Arc<dyn Host>,
+    budget: Arc<dyn MemoryBudget>,
+}
+
 /// Two executor views of one machine, like Linux's guest tasks and kernel threads
 /// (`kernel/kthread.c:kthread_create_on_node`), without a second timekeeper.
 struct TaskHost {
     host: Arc<dyn Host>,
     executor: Arc<dyn Executor>,
+}
+
+impl Host for BudgetedHost {
+    fn realtime(&self) -> std::time::Duration {
+        self.host.realtime()
+    }
+    fn monotonic(&self) -> std::time::Duration {
+        self.host.monotonic()
+    }
+    fn sleep(&self, duration: std::time::Duration) -> LocalFuture<'_, ()> {
+        self.host.sleep(duration)
+    }
+    fn sleep_until(&self, deadline: std::time::Duration) -> LocalFuture<'_, ()> {
+        self.host.sleep_until(deadline)
+    }
+    fn sleep_until_range(
+        &self,
+        deadline: std::time::Duration,
+        slack: std::time::Duration,
+    ) -> LocalFuture<'_, ()> {
+        self.host.sleep_until_range(deadline, slack)
+    }
+    fn thread_cpu_time(&self) -> Option<std::time::Duration> {
+        self.host.thread_cpu_time()
+    }
+    fn thread_cpu_clock(&self) -> Option<Arc<dyn wasixv2_host::ThreadCpuClock>> {
+        self.host.thread_cpu_clock()
+    }
+    fn random(&self, buf: &mut [u8]) {
+        self.host.random(buf);
+    }
+    fn executor(&self) -> &dyn Executor {
+        self.host.executor()
+    }
+    fn report(&self, message: &str) {
+        self.host.report(message);
+    }
+    fn shared_pages(&self, size: u64) -> io::Result<Arc<dyn SharedPages>> {
+        Ok(Arc::new(BudgetedPages::new(
+            size,
+            self.budget.clone(),
+            || self.host.shared_pages(size),
+        )?))
+    }
 }
 
 impl Host for TaskHost {
@@ -196,6 +262,7 @@ impl Host for TaskHost {
 /// Processes run as the machine's user ([`MachineBuilder::user`]), which also owns the root
 /// filesystem, mapped host directories and package volumes.
 pub struct Machine {
+    memory: MemoryConfig,
     syscalls: Arc<Stack>,
     /// The guest ABIs programs may target: `wasixv2`, then WASIX v1 with the `wasix1` feature.
     abis: Arc<Abis<Stack>>,
@@ -258,6 +325,7 @@ impl Default for Machine {
 /// # Ok::<(), wasixv2::UnameError>(())
 /// ```
 pub struct MachineBuilder {
+    memory_budget: Option<Arc<dyn MemoryBudget>>,
     host: Arc<dyn Host>,
     task_executor: Option<Arc<dyn Executor>>,
     network: Option<Arc<Net>>,
@@ -308,6 +376,7 @@ impl MachineBuilder {
     pub fn new(host: Arc<dyn Host>) -> Self {
         Self {
             host,
+            memory_budget: None,
             task_executor: None,
             network: None,
             network_policy: None,
@@ -483,9 +552,27 @@ impl MachineBuilder {
         self
     }
 
+    /// Budgets the default root, `/tmp`, `/dev/shm`, `/dev`, memfd, guest tmpfs mounts and
+    /// writable package/layer uppers (allocated 4 KiB blocks and inode/xattr space), plus
+    /// kernel anonymous shared memory, SysV shm, io_uring and AIO objects (object size).
+    /// Engine linear memories and NAPI/V8 require their own accountants sharing this limit.
+    /// Persistent volumes, package lowers and kernel heap bookkeeping are not charged.
+    /// Embedder-supplied filesystems must opt in separately. Use `try_build` for refusal.
+    pub fn memory_budget(mut self, budget: Arc<dyn MemoryBudget>) -> Self {
+        self.memory_budget = Some(budget);
+        self
+    }
+
     pub fn build(self) -> Machine {
+        self.try_build()
+            .expect("machine memory budget admits its initial filesystems")
+    }
+
+    /// Boots the machine, returning allocation and filesystem budget refusals to the caller.
+    pub fn try_build(self) -> io::Result<Machine> {
         let Self {
             host,
+            memory_budget,
             task_executor,
             network,
             network_policy,
@@ -513,6 +600,17 @@ impl MachineBuilder {
         } = self;
         let owner = (user.uid(), user.gid());
         // The machine's wall clock is its own: setting it leaves the embedder's alone.
+        let memory = MemoryConfig {
+            budget: memory_budget,
+            pages_host: Some(host.clone()),
+        };
+        let host = match &memory.budget {
+            Some(budget) => Arc::new(BudgetedHost {
+                host,
+                budget: budget.clone(),
+            }) as Arc<dyn Host>,
+            None => host,
+        };
         let time = Timekeeper::new(host);
         let host: Arc<dyn Host> = time.clone();
         let task_host = match task_executor {
@@ -526,8 +624,16 @@ impl MachineBuilder {
         let network = network.unwrap_or_else(|| default_network(dns, vsock, network_policy));
         #[cfg(not(all(feature = "host-network", unix)))]
         let network = network.unwrap_or_else(|| default_network(dns, network_policy));
-        let root = root
-            .unwrap_or_else(|| default_root(&host, &network.resolv_conf(), &user, uname.release()));
+        let root = match root {
+            Some(root) => root,
+            None => default_root_with_memory(
+                &host,
+                &network.resolv_conf(),
+                &user,
+                uname.release(),
+                &memory,
+            )?,
+        };
         #[cfg(feature = "wasix1")]
         let wasix1 = Wasix1Commands::new(http_provider, wasix1_limits, wasix1_initial_command);
         let mut configured_abis = abis(
@@ -543,6 +649,7 @@ impl MachineBuilder {
         let abis = Arc::new(configured_abis);
         let kernel = boot(
             &time,
+            &memory,
             root.clone(),
             &network,
             &user,
@@ -552,9 +659,9 @@ impl MachineBuilder {
                 .as_ref()
                 .map(|(console, _)| (console, console_input_eof)),
             abis.clone(),
-        )
+        )?
         .with_guest_task_limit(max_guest_tasks);
-        now(mount_kernel_filesystems(&kernel, &host));
+        now(mount_kernel_filesystems(&kernel, &host, &memory))?;
         let syscalls = Arc::new(stack(kernel));
         Helpers::install(
             &syscalls,
@@ -562,7 +669,8 @@ impl MachineBuilder {
             &task_host,
             !Arc::ptr_eq(&host, &task_host),
         );
-        Machine {
+        Ok(Machine {
+            memory,
             syscalls,
             abis,
             #[cfg(feature = "wasix1")]
@@ -585,11 +693,16 @@ impl MachineBuilder {
             console,
             console_input_eof,
             console_stdio_outputs,
-        }
+        })
     }
 }
 
 impl Machine {
+    /// The budget to share with embedder-created memory filesystems.
+    pub fn memory_budget(&self) -> Option<&Arc<dyn MemoryBudget>> {
+        self.memory.budget.as_ref()
+    }
+
     /// A machine on [`TokioHost`] with the default configuration. Drive it on a tokio runtime
     /// with timers enabled, inside a `tokio::task::LocalSet`, which background host work is
     /// spawned onto.
@@ -701,7 +814,7 @@ impl Machine {
         for Layer(lower) in layers {
             self.root_lowers.insert(0, lower);
         }
-        self.reboot_root().await;
+        self.reboot_root().await?;
         Ok(())
     }
 
@@ -713,6 +826,8 @@ impl Machine {
     /// Only a fresh machine can change its root: returns `EBUSY` after a mount, process or
     /// signaller. Calling this twice replaces the upper without demoting the previous one.
     /// Asynchronous filesystems are supported; kernel filesystems are mounted afresh.
+    /// Embedder-supplied memory uppers must already carry the machine's budget (see
+    /// [`MemFs::try_with_memory_budget`] and [`Self::memory_budget`]).
     pub async fn set_root_upper(&mut self, upper: Arc<dyn Filesystem>) -> io::Result<()> {
         if *self.in_use.get_mut() {
             return Err(errno_to_io(Errno::EBUSY));
@@ -724,7 +839,7 @@ impl Machine {
             self.skeleton = Some(self.root_upper.clone());
         }
         self.root_upper = upper;
-        self.reboot_root().await;
+        self.reboot_root().await?;
         Ok(())
     }
 
@@ -742,7 +857,7 @@ impl Machine {
         self.set_root_upper(upper).await
     }
 
-    async fn reboot_root(&mut self) {
+    async fn reboot_root(&mut self) -> io::Result<()> {
         let mut lowers = self.root_lowers.clone();
         lowers.extend(self.skeleton.iter().cloned());
         let root = OverlayFs::new(Some(self.root_upper.clone()), lowers);
@@ -750,6 +865,7 @@ impl Machine {
         // kernel's filesystems mounted afresh; a host directory's layer answers asynchronously.
         let kernel = boot(
             &self.time,
+            &self.memory,
             root,
             &self.network,
             &self.user,
@@ -759,9 +875,9 @@ impl Machine {
                 .as_ref()
                 .map(|(console, _)| (console, self.console_input_eof)),
             self.abis.clone(),
-        )
+        )?
         .with_guest_task_limit(self.max_guest_tasks);
-        mount_kernel_filesystems(&kernel, &self.host).await;
+        mount_kernel_filesystems(&kernel, &self.host, &self.memory).await?;
         self.syscalls = Arc::new(stack(kernel));
         Helpers::install(
             &self.syscalls,
@@ -769,6 +885,7 @@ impl Machine {
             &self.task_host,
             !Arc::ptr_eq(&self.host, &self.task_host),
         );
+        Ok(())
     }
 
     /// Makes the volume `volume` of the webc v3 package `reader` a read-only layer of the root
@@ -947,12 +1064,16 @@ impl Machine {
         let lower = layer.0.clone();
         let fs = if writable {
             let (uid, gid) = self.owner;
-            let upper: Arc<dyn Filesystem> = Arc::new(MemFs::new(
-                Arc::new(HostClock(self.host.clone())),
-                0o755,
-                uid,
-                gid,
-            ));
+            let upper: Arc<dyn Filesystem> = Arc::new(
+                self.memory
+                    .apply(MemFs::new(
+                        Arc::new(HostClock(self.host.clone())),
+                        0o755,
+                        uid,
+                        gid,
+                    ))
+                    .map_err(errno_to_io)?,
+            );
             OverlayFs::new(Some(upper), vec![lower])
         } else {
             lower
@@ -1348,6 +1469,7 @@ impl Signaller {
 #[allow(clippy::too_many_arguments)]
 fn boot(
     time: &Arc<Timekeeper>,
+    memory: &MemoryConfig,
     root: Arc<dyn Filesystem>,
     network: &Arc<Net>,
     user: &Credentials,
@@ -1355,7 +1477,7 @@ fn boot(
     init: bool,
     console: Option<(&Console, ConsoleInputEof)>,
     abis: Arc<Abis<Stack>>,
-) -> Kernel {
+) -> io::Result<Kernel> {
     let host: Arc<dyn Host> = time.clone();
     let host = &host;
     let network_policy = network.policy();
@@ -1370,16 +1492,16 @@ fn boot(
             };
             Net::new(config, None)
         })
-        .with_shm(shm_filesystem(host))
+        .with_shm(shm_filesystem(host, memory).map_err(errno_to_io)?)
         .with_credentials(user.clone())
         .with_uname(uname);
     if init {
         kernel = kernel.with_init();
     }
-    match console {
+    Ok(match console {
         Some((console, policy)) => kernel.with_console_eof(console.clone(), policy),
         None => kernel,
-    }
+    })
 }
 
 /// The package commands WASIX v1 programs start with their defaults: the names registered,
@@ -1752,8 +1874,11 @@ const HOSTNAME: &str = "localhost\n";
 /// The kernel's internal tmpfs for `memfd_create` (`shm_mnt`): its root is root's, mode 1777,
 /// and like Linux's internal mount it has no size limit of its own. Its files live in host
 /// shared memory, as `/dev/shm`'s do.
-fn shm_filesystem(host: &Arc<dyn Host>) -> Arc<dyn Filesystem> {
-    Arc::new(shared_tmpfs(host, 0o1777, 0, 0))
+fn shm_filesystem(
+    host: &Arc<dyn Host>,
+    memory: &MemoryConfig,
+) -> Result<Arc<dyn Filesystem>, Errno> {
+    Ok(Arc::new(shared_tmpfs(host, 0o1777, 0, 0, memory)?))
 }
 
 /// A tmpfs whose files processes share by mapping them: its regular files live in the host's
@@ -1762,18 +1887,32 @@ fn shm_filesystem(host: &Arc<dyn Host>) -> Arc<dyn Filesystem> {
 /// tmpfs keeps its files in shmem. Only on Linux, where an object can change its size: a macOS
 /// object's size is fixed once set, so there the files stay in the filesystem's own memory and
 /// their mappings are copies kept in sync at syscalls.
-fn shared_tmpfs(host: &Arc<dyn Host>, mode: u32, uid: u32, gid: u32) -> MemFs {
-    let fs = MemFs::new(Arc::new(HostClock(host.clone())), mode, uid, gid);
+fn shared_tmpfs(
+    host: &Arc<dyn Host>,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    memory: &MemoryConfig,
+) -> Result<MemFs, Errno> {
+    let fs = memory.apply(MemFs::new(
+        Arc::new(HostClock(host.clone())),
+        mode,
+        uid,
+        gid,
+    ))?;
     if cfg!(any(target_os = "linux", target_os = "android")) {
-        return fs.with_shared_pages(Arc::new(HostPages(host.clone())));
+        return Ok(fs.with_shared_pages(Arc::new(HostPages(
+            memory.pages_host.as_ref().unwrap_or(host).clone(),
+        ))));
     }
-    fs
+    Ok(fs)
 }
 
 /// `tmpfs`, the filesystem type `mount -t tmpfs` makes: a memory filesystem whose files live in
 /// host shared memory as [`shared_tmpfs`]'s, with `mm/shmem.c`'s options. It keeps track of
 /// its instances to change their limits on remount.
 struct Tmpfs {
+    memory: MemoryConfig,
     host: Arc<dyn Host>,
     instances: Mutex<Vec<Weak<MemFs>>>,
 }
@@ -1791,8 +1930,9 @@ struct TmpfsOptions {
 }
 
 impl Tmpfs {
-    fn new(host: Arc<dyn Host>) -> Self {
+    fn new(host: Arc<dyn Host>, memory: MemoryConfig) -> Self {
         Self {
+            memory,
             host,
             instances: Mutex::default(),
         }
@@ -1881,9 +2021,22 @@ impl Tmpfs {
             Some(gid) => ns.make_kgid(gid).ok_or(Errno::EINVAL)?,
             None => cred.fsgid,
         };
-        let mut fs = MemFs::with_limits_and_quotas(clock, mode, uid, gid, limits, options.quotas)?;
+        let mut fs = self.memory.apply(MemFs::with_limits_and_quotas(
+            clock,
+            mode,
+            uid,
+            gid,
+            limits,
+            options.quotas,
+        )?)?;
         if cfg!(any(target_os = "linux", target_os = "android")) {
-            fs = fs.with_shared_pages(Arc::new(HostPages(self.host.clone())));
+            fs = fs.with_shared_pages(Arc::new(HostPages(
+                self.memory
+                    .pages_host
+                    .as_ref()
+                    .unwrap_or(&self.host)
+                    .clone(),
+            )));
         }
         let fs = Arc::new(fs);
         self.adopt(&fs);
@@ -2056,9 +2209,21 @@ pub fn default_root(
     user: &Credentials,
     release: &str,
 ) -> Arc<dyn Filesystem> {
+    default_root_with_memory(host, resolv_conf, user, release, &MemoryConfig::default())
+        .expect("a new memory filesystem takes the default layout")
+}
+
+fn default_root_with_memory(
+    host: &Arc<dyn Host>,
+    resolv_conf: &str,
+    user: &Credentials,
+    release: &str,
+    memory: &MemoryConfig,
+) -> io::Result<Arc<dyn Filesystem>> {
     let (uid, gid) = (user.uid(), user.gid());
     // mm/shmem.c shmem_mmap_prepare: root tmpfs files share their pages across fork too.
-    let root: Arc<dyn Filesystem> = Arc::new(shared_tmpfs(host, 0o755, uid, gid));
+    let root: Arc<dyn Filesystem> =
+        Arc::new(shared_tmpfs(host, 0o755, uid, gid, memory).map_err(errno_to_io)?);
     let vfs = Vfs::new(root.clone());
     let cred = Cred::root();
     let top = vfs.root();
@@ -2122,8 +2287,8 @@ pub fn default_root(
         }
         Ok::<_, wasixv2_vfs::PathError>(())
     };
-    now(layout).expect("a new memory filesystem takes the default layout");
-    root
+    now(layout).map_err(|err| errno_to_io(err.errno()))?;
+    Ok(root)
 }
 
 /// `modules.builtin`: the Linux modules the kernel has built in, by their paths under
@@ -2189,9 +2354,13 @@ fn group(gid: u32) -> String {
 /// `/proc/self/fd`), memory filesystems at `/dev/shm` for POSIX shared memory and at `/tmp`,
 /// world-writable and sticky, and the pty filesystem at `/dev/pts`. The memory filesystems are
 /// instances of `tmpfs`, which `mount` can make more of, and `/dev` is `devtmpfs`.
-async fn mount_kernel_filesystems(kernel: &Kernel, host: &Arc<dyn Host>) {
+async fn mount_kernel_filesystems(
+    kernel: &Kernel,
+    host: &Arc<dyn Host>,
+    memory: &MemoryConfig,
+) -> io::Result<()> {
     let vfs = kernel.vfs();
-    let tmpfs_type = Arc::new(Tmpfs::new(host.clone()));
+    let tmpfs_type = Arc::new(Tmpfs::new(host.clone(), memory.clone()));
     kernel
         .register_filesystem("tmpfs", tmpfs_type.clone())
         .expect("a new kernel has no tmpfs yet");
@@ -2201,7 +2370,7 @@ async fn mount_kernel_filesystems(kernel: &Kernel, host: &Arc<dyn Host>) {
         fs
     };
     // mm/shmem.c shmem_mmap_prepare: every tmpfs mount supplies shared pages, including /tmp.
-    let tmpfs = |mode| adopt(shared_tmpfs(host, mode, 0, 0));
+    let tmpfs = |mode| shared_tmpfs(host, mode, 0, 0, memory).map(adopt);
     let flags = |nodev, noexec| MountFlags {
         nosuid: true,
         nodev,
@@ -2244,7 +2413,7 @@ async fn mount_kernel_filesystems(kernel: &Kernel, host: &Arc<dyn Host>) {
             // Where systemd and container runtimes look for the cgroup v2 hierarchy.
             mount("/sys/fs/cgroup", kernel.cgroupfs(), flags(true, true)).await;
         }
-        let dev = tmpfs(0o755);
+        let dev = tmpfs(0o755)?;
         kernel
             .register_filesystem("devtmpfs", Arc::new(Devtmpfs(dev.clone())))
             .expect("a new kernel has no devtmpfs yet");
@@ -2259,16 +2428,14 @@ async fn mount_kernel_filesystems(kernel: &Kernel, host: &Arc<dyn Host>) {
                 vfs.symlink(&cx, target.as_bytes(), &top, link.as_bytes())
                     .await?;
             }
-            let shm = adopt(shared_tmpfs(host, 0o1777, 0, 0));
+            let shm = adopt(shared_tmpfs(host, 0o1777, 0, 0, memory)?);
             mount("/dev/shm", shm, flags(true, false)).await;
             mount("/dev/pts", kernel.devpts(), flags(false, true)).await;
         }
-        mount("/tmp", tmpfs(0o1777), flags(true, false)).await;
+        mount("/tmp", tmpfs(0o1777)?, flags(true, false)).await;
         Ok::<_, wasixv2_vfs::PathError>(())
     };
-    mounts
-        .await
-        .expect("the kernel's filesystems take their layout");
+    mounts.await.map_err(|err| errno_to_io(err.errno()))
 }
 
 /// Runs `future`, which never waits: memory filesystems and the kernel's own complete every
@@ -2880,7 +3047,7 @@ mod tests {
     }
 
     fn tmpfs() -> Tmpfs {
-        Tmpfs::new(Arc::new(TokioHost::default()))
+        Tmpfs::new(Arc::new(TokioHost::default()), MemoryConfig::default())
     }
 
     /// Linux mm/shmem.c shmem_mmap_prepare: the boot-time tmpfs mounts use the same shared

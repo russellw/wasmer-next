@@ -991,8 +991,11 @@ fn memory_budget_shared_mapping_is_eager_and_not_double_charged() {
 #[test]
 fn memory_budget_metadata_and_local_limits_share_the_same_accounting() {
     let budget = CountingBudget::new(u64::MAX);
-    let fs = limited(Limits { max_bytes: Some(BLOCK), max_inodes: Some(4) })
-        .with_memory_budget(budget.clone());
+    let fs = limited(Limits {
+        max_bytes: Some(BLOCK),
+        max_inodes: Some(4),
+    })
+    .with_memory_budget(budget.clone());
     let root = fs.root();
     let file = block_on(root.create(b"f", &new(NewKind::Regular))).unwrap();
     block_on(root.link(b"link", &file)).unwrap();

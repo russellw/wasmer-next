@@ -728,3 +728,174 @@ mod root_upper {
             .await;
     }
 }
+#[derive(Default)]
+struct MemoryBudget {
+    used: std::sync::atomic::AtomicU64,
+    limit: std::sync::atomic::AtomicU64,
+    charges: Mutex<Vec<u64>>,
+}
+impl MemoryBudget {
+    fn new(limit: u64) -> Arc<Self> {
+        Arc::new(Self {
+            limit: std::sync::atomic::AtomicU64::new(limit),
+            ..Self::default()
+        })
+    }
+    fn used(&self) -> u64 {
+        self.used.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+impl wasixv2::MemoryBudget for MemoryBudget {
+    fn charge(&self, bytes: u64) -> Result<(), wasixv2::BudgetExceeded> {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.used
+            .fetch_update(Relaxed, Relaxed, |n| {
+                n.checked_add(bytes)
+                    .filter(|&n| n <= self.limit.load(Relaxed))
+            })
+            .map_err(|_| wasixv2::BudgetExceeded)?;
+        self.charges.lock().unwrap().push(bytes);
+        Ok(())
+    }
+    fn release(&self, bytes: u64) {
+        assert!(
+            self.used
+                .fetch_sub(bytes, std::sync::atomic::Ordering::Relaxed)
+                >= bytes
+        );
+    }
+}
+
+#[tokio::test]
+async fn machine_memory_budget_covers_filesystems_and_writable_layers_once() {
+    use wasixv2_abi::OpenFlags;
+    use wasixv2_vfs::{Cred, Ctx, LookupFlags, OpenHow};
+    let budget = MemoryBudget::new(u64::MAX);
+    let machine = Machine::builder()
+        .memory_budget(budget.clone())
+        .try_build()
+        .unwrap();
+    assert!(machine.memory_budget().is_some());
+    let layer = machine
+        .commands_layer([("hello".to_string(), b"hello".to_vec().into())])
+        .unwrap()
+        .unwrap();
+    machine.mount_layer("/layer", &layer, true).await.unwrap();
+    {
+        let vfs = machine.vfs();
+        let root = vfs.root();
+        let cred = Cred::root();
+        let cx = Ctx {
+            cred: &cred,
+            root: &root,
+            umask: 0,
+            task: 0,
+            leases: None,
+        };
+        let how = OpenHow {
+            flags: OpenFlags::O_CREAT | OpenFlags::O_RDWR,
+            mode: 0o600,
+            lookup: LookupFlags::follow(),
+        };
+        for path in [
+            b"/new".as_slice(),
+            b"/tmp/new",
+            b"/dev/shm/new",
+            b"/dev/new",
+            b"/layer/new",
+        ] {
+            let baseline = budget.used();
+            let file = vfs.open(&cx, &root, path, &how).await.unwrap();
+            assert_eq!(budget.used(), baseline + 1024, "inode: {path:?}");
+            file.write_at(b"x", 0).await.unwrap();
+            assert_eq!(budget.used(), baseline + 1024 + 4096, "block: {path:?}");
+            file.write_at(b"y", 1).await.unwrap();
+            assert_eq!(budget.used(), baseline + 1024 + 4096);
+            file.set_size(0).await.unwrap();
+            assert_eq!(budget.used(), baseline + 1024);
+            drop(file);
+            vfs.unlink(&cx, &root, path).await.unwrap();
+            // VFS dentry caching may retain the empty inode until machine drop.
+        }
+    }
+    machine.shutdown().await;
+    drop(machine);
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
+fn machine_memory_budget_refuses_initial_layout_without_leaking() {
+    for limit in [0, 1024, 8192, 32768] {
+        let budget = MemoryBudget::new(limit);
+        let result = Machine::builder().memory_budget(budget.clone()).try_build();
+        assert!(result.is_err(), "limit {limit} unexpectedly admitted boot");
+        assert_eq!(result.err().unwrap().raw_os_error(), Some(28)); // ENOSPC
+        assert_eq!(budget.used(), 0);
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[tokio::test]
+async fn machine_memory_budget_covers_memfd_and_anonymous_shared_objects() {
+    let budget = MemoryBudget::new(u64::MAX);
+    let machine = Machine::builder()
+        .memory_budget(budget.clone())
+        .try_build()
+        .unwrap();
+    budget.charges.lock().unwrap().clear();
+    let wat = r#"(module
+      (import "wasixv2" "memfd_create" (func $memfd (param i32 i32) (result i32)))
+      (import "wasixv2" "write" (func $write (param i32 i32 i32) (result i32)))
+      (import "wasixv2" "close" (func $close (param i32) (result i32)))
+      (import "wasixv2" "mmap" (func $mmap (param i32 i32 i32 i32 i32 i64) (result i32)))
+      (import "wasixv2" "munmap" (func $munmap (param i32 i32) (result i32)))
+      (import "wasixv2" "exit_group" (func $exit (param i32)))
+      (memory (export "memory") 1)
+      (data (i32.const 16) "name\00")
+      (func (export "_start") (local $fd i32) (local $p i32)
+        (local.set $fd (call $memfd (i32.const 16) (i32.const 0)))
+        (if (i32.lt_s (local.get $fd) (i32.const 0)) (then (call $exit (i32.const 1))))
+        (if (i32.ne (call $write (local.get $fd) (i32.const 16) (i32.const 1)) (i32.const 1))
+          (then (call $exit (i32.const 2))))
+        (drop (call $close (local.get $fd)))
+        (local.set $p (call $mmap (i32.const 0) (i32.const 65536) (i32.const 3) (i32.const 0x21) (i32.const -1) (i64.const 0)))
+        (if (i32.lt_s (local.get $p) (i32.const 0)) (then (call $exit (i32.const 3))))
+        (drop (call $munmap (local.get $p) (i32.const 65536)))
+        (call $exit (i32.const 0))))"#;
+    assert_eq!(run(machine, wat).await.0, 0);
+    let charges = budget.charges.lock().unwrap();
+    assert!(charges.contains(&1024), "memfd inode: {charges:?}");
+    assert!(charges.contains(&4096), "memfd block: {charges:?}");
+    assert!(charges.contains(&65536), "anonymous object: {charges:?}");
+    assert_eq!(budget.used(), 0);
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[tokio::test]
+async fn machine_memory_budget_refusal_is_enospc_for_files_and_enomem_for_shared_objects() {
+    let budget = MemoryBudget::new(u64::MAX);
+    let machine = Machine::builder()
+        .memory_budget(budget.clone())
+        .try_build()
+        .unwrap();
+    budget
+        .limit
+        .store(budget.used() + 1024, std::sync::atomic::Ordering::Relaxed);
+    let wat = r#"(module
+      (import "wasixv2" "openat" (func $open (param i32 i32 i32 i32) (result i32)))
+      (import "wasixv2" "write" (func $write (param i32 i32 i32) (result i32)))
+      (import "wasixv2" "mmap" (func $mmap (param i32 i32 i32 i32 i32 i64) (result i32)))
+      (import "wasixv2" "exit_group" (func $exit (param i32)))
+      (memory (export "memory") 1)
+      (data (i32.const 16) "/tmp/full\00")
+      (func (export "_start") (local $fd i32)
+        (local.set $fd (call $open (i32.const -100) (i32.const 16) (i32.const 65) (i32.const 384)))
+        (if (i32.lt_s (local.get $fd) (i32.const 0)) (then (call $exit (i32.const 1))))
+        (if (i32.ne (call $write (local.get $fd) (i32.const 16) (i32.const 1)) (i32.const -28))
+          (then (call $exit (i32.const 2))))
+        (if (i32.ne (call $mmap (i32.const 0) (i32.const 65536) (i32.const 3) (i32.const 0x21) (i32.const -1) (i64.const 0)) (i32.const -12))
+          (then (call $exit (i32.const 3))))
+        (call $exit (i32.const 0))))"#;
+    assert_eq!(run(machine, wat).await.0, 0);
+    assert_eq!(budget.used(), 0);
+}
