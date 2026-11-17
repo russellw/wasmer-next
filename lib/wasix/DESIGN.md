@@ -526,6 +526,10 @@ dnotify follows `fs/notify/dnotify/dnotify.c` (kernel `fs/dnotify.rs`): `F_NOTIF
 - **Package commands.** `PackageFs::from_files` builds the same read-only tree from (relative path, `OwnedBuffer`) pairs, with the directories the paths imply. `Machine::install_commands` uses it to put each command's atom at `/bin/<name>` and `/usr/bin/<name>`: a root lower layer over the package volumes, so a command hides a volume file of its name (v1 wrote commands into the root after merging volumes), shared with the atom buffer, first name winning. `wasmer run` installs the commands of the whole tree in the resolver's order (the root's, then its dependencies' in topological order, each name taken by the first package that has it) and starts the entry command by executing `/bin/<name>`, so the kernel never knows commands from other files.
 - **Read-only.** `FsInfo::read_only` makes the VFS answer `EROFS` and `statfs` report `ST_RDONLY`; the driver also returns `EROFS` for every mutation. `f_type` is `0x77656263` ("webc"), blocks are the volume's size and none are free. There are no extended attributes (`ENODATA`, empty list) and no holes. v3 symlinks are served as symlinks.
 
+For packages injected with `wasmer run --use`, the program's resolved layout has
+priority at a shared mount path. Among injected layouts, earlier flags have
+higher priority. The same source order resolves duplicate command names.
+
 ### Overlay filesystem
 
 `wasixv2-vfs-overlay` follows Linux overlayfs. `OverlayFs::new(upper, lowers)` stacks an optional writable upper layer over read-only lower layers, topmost first. Every layer can be any driver. Without an upper layer, the overlay is read-only and every change returns `EROFS`.

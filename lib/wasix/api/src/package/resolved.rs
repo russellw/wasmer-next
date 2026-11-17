@@ -227,16 +227,19 @@ impl ResolvedLayout {
         Ok(layout)
     }
 
-    /// Add injected packages in CLI order: their volumes under the program's,
-    /// their commands after its names. Preserve the supplied exec-default sequence.
+    /// Add injected packages in input order. For volumes at the same mount path
+    /// and commands of the same name, the program has priority, followed by
+    /// earlier injected packages. Preserve the supplied exec-default sequence.
     pub fn using(mut self, used: impl IntoIterator<Item = Self>) -> Self {
-        let mut volumes = Vec::new();
+        let mut injected_volumes = Vec::new();
         for package in used {
-            volumes.extend(package.volumes);
+            injected_volumes.push(package.volumes);
             self.commands.extend(package.commands);
             #[cfg(feature = "wasix1")]
             self.defaults.extend(package.defaults);
         }
+        // Filesystem layers are installed from lowest to highest priority.
+        let mut volumes: Vec<_> = injected_volumes.into_iter().rev().flatten().collect();
         volumes.append(&mut self.volumes);
         volumes.sort_by_key(|volume| Path::new(&volume.mount_path).components().count());
         self.volumes = volumes;
@@ -469,22 +472,22 @@ mod tests {
         )
     }
 
-    fn archive(fs: bool) -> OwnedBuffer {
-        let manifest = if fs {
-            serde_json::from_value(
-                serde_json::json!({"package":{"fs":[{"volume_name":"atom","mount_path":"/data"}]}}),
-            )
-            .unwrap()
-        } else {
-            webc::metadata::Manifest::default()
-        };
+    fn archive_at(mount_path: &str, volume: Directory<'_>) -> OwnedBuffer {
+        let manifest = serde_json::from_value(serde_json::json!({
+            "package": {"fs": [{"volume_name": "atom", "mount_path": mount_path}]}
+        }))
+        .unwrap();
         let mut writer = Writer::new(ChecksumAlgorithm::Sha256)
             .write_manifest(&manifest)
             .unwrap()
             .write_atoms(BTreeMap::new())
             .unwrap();
-        writer.write_volume("atom", volume()).unwrap();
+        writer.write_volume("atom", volume).unwrap();
         OwnedBuffer::from_bytes(writer.finish(SignatureAlgorithm::None).unwrap())
+    }
+
+    fn archive() -> OwnedBuffer {
+        archive_at("/data", volume())
     }
 
     async fn loaded(bytes: OwnedBuffer) -> LoadedPackage {
@@ -529,7 +532,7 @@ mod tests {
 
     #[tokio::test]
     async fn opaque_memory_v3_volume_survives_source_drop_with_symlinks_and_empty_directories() {
-        let package = loaded(archive(true)).await;
+        let package = loaded(archive()).await;
         let layout = ResolvedLayout::new(&package, false, None).unwrap();
         let mut machine = Machine::new();
         crate::install_package_sources(
@@ -565,7 +568,7 @@ mod tests {
     #[tokio::test]
     async fn noncanonical_resolved_root_mounts_remain_root_layers() {
         for spelling in ["//", "/./"] {
-            let mut package = loaded(archive(true)).await;
+            let mut package = loaded(archive()).await;
             for mapping in &mut package.resolution.package.filesystem {
                 mapping.mount_path = spelling.into();
             }
@@ -626,7 +629,7 @@ mod tests {
 
     #[tokio::test]
     async fn selected_provider_failure_is_final_and_keeps_the_original_error() {
-        let package = loaded(archive(true)).await;
+        let package = loaded(archive()).await;
         let identity = Arc::new(());
         let calls = Cell::new(0);
         let provider = |_: ResolvedVolumeRequest<'_>| -> io::Result<Option<ResolvedReaderVolume>> {
@@ -725,7 +728,7 @@ mod tests {
 
     #[tokio::test]
     async fn providers_are_called_only_for_selected_mappings() {
-        let mut package = loaded(archive(true)).await;
+        let mut package = loaded(archive()).await;
         let root = package.resolution.package.root_package.clone();
         let unused = PackageId::Hash(PackageHash::from_sha256_bytes([1; 32]));
         package
@@ -740,6 +743,40 @@ mod tests {
             };
         ResolvedLayout::new(&package, false, Some(&provider)).unwrap();
         assert_eq!(calls.get(), package.resolution.package.filesystem.len());
+    }
+
+    #[tokio::test]
+    async fn injected_root_layers_give_the_first_package_priority() {
+        async fn root_layout(files: &[(&str, &[u8])]) -> ResolvedLayout {
+            let volume = Directory::new(
+                files
+                    .iter()
+                    .map(|(name, bytes)| {
+                        (
+                            name.parse().unwrap(),
+                            DirEntry::File(FileEntry::borrowed(bytes, Timestamps::default())),
+                        )
+                    })
+                    .collect(),
+                Timestamps::default(),
+            );
+            let package = loaded(archive_at("/", volume)).await;
+            ResolvedLayout::new(&package, false, None).unwrap()
+        }
+
+        let main = root_layout(&[("shared", b"main")]).await;
+        let first = root_layout(&[("shared", b"first"), ("dependency", b"first")]).await;
+        let second = root_layout(&[("shared", b"second"), ("dependency", b"second")]).await;
+        let layout = main.using([first, second]);
+        let mut machine = Machine::new();
+        crate::install_package_sources(
+            &mut machine,
+            &[super::super::PackageInstallSource::Resolved(&layout)],
+        )
+        .await
+        .unwrap();
+        assert_eq!(read(&machine, b"/shared").await, b"main");
+        assert_eq!(read(&machine, b"/dependency").await, b"first");
     }
 
     #[cfg(feature = "wasix1")]
@@ -783,7 +820,7 @@ mod tests {
     #[cfg(feature = "wasix1")]
     #[tokio::test]
     async fn unselected_malformed_defaults_are_tolerated_but_cli_can_validate_eagerly() {
-        let mut package = loaded(archive(true)).await;
+        let mut package = loaded(archive()).await;
         let id = package.resolution.package.root_package.clone();
         let atom = OwnedBuffer::from_bytes(wat::parse_str("(module)").unwrap());
         let hash = wasmer_package::resolver::WebcHash::sha256(&atom).as_bytes();
