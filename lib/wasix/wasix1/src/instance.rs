@@ -11,10 +11,10 @@ use std::{
 };
 
 use wasixv2_exec::{
-    AbiInstance, Entry, EntryReturn, ExecEnv, Role, Sigreturn, VforkResume, asyncify::StackId,
-    call_guest,
+    AbiInstance, Entry, EntryReturn, ExecEnv, GuestMemory, Outcome, Role, Sigreturn, VforkResume,
+    asyncify::StackId, call_guest, caller_parts, complete,
 };
-use wasixv2_syscalls::{LocalFuture, SignalFrame, TaskId};
+use wasixv2_syscalls::{Caller, Control, LocalFuture, SignalFrame, Syscalls, TaskId};
 use wasmer::{AsyncFunctionEnvMut, Exports, Function, Instance, RuntimeError, Value};
 
 use crate::process::{Commands, HostOwner, ProcState, Procs};
@@ -235,7 +235,9 @@ impl HostProcessState {
     }
 
     /// The process's import binding before the engine has produced an instance.
-    pub fn unattached<S: Send + Sync + 'static>(&self) -> Arc<dyn AbiInstance<S>> {
+    pub fn unattached<S: Syscalls + Control + Send + Sync + 'static>(
+        &self,
+    ) -> Arc<dyn AbiInstance<S>> {
         let mut binding = Wasix1Instance::from_exports(
             self.0.procs.clone(),
             self.0.commands.clone(),
@@ -251,7 +253,7 @@ impl HostProcessState {
     /// Captures an actual instance's handles without requiring or running `_start`.
     /// The environment explicitly selects the returned binding; calling a function
     /// from an older instance does not select that instance again.
-    pub fn attach<S: Send + Sync + 'static>(
+    pub fn attach<S: Syscalls + Control + Send + Sync + 'static>(
         &self,
         instance: &Instance,
         store: &mut wasmer::StoreMut<'_>,
@@ -473,7 +475,7 @@ impl Drop for Wasix1Instance {
     }
 }
 
-impl<S: Send + Sync + 'static> AbiInstance<S> for Wasix1Instance {
+impl<S: Syscalls + Control + Send + Sync + 'static> AbiInstance<S> for Wasix1Instance {
     fn retain_exec_process(
         &self,
         process: TaskId,
@@ -558,12 +560,6 @@ impl<S: Send + Sync + 'static> AbiInstance<S> for Wasix1Instance {
         EntryReturn::Exit(0)
     }
 
-    fn signal_trap_exit_status(&self) -> Option<i32> {
-        // V1 process_signals_internal returned WasiError::Exit(Errno::Intr)
-        // for a trapping guest callback, instead of a process SIGSEGV.
-        Some(i32::from(crate::abi::Errno::INTR.0))
-    }
-
     /// libc keeps the dispositions and runs the handler from its callback, `__wasm_signal(sig)`;
     /// the host only decides that it runs. The mask in force before delivery is restored
     /// afterwards. v1's handler has no frame to cancel a restart through, so `restart` stands.
@@ -588,7 +584,21 @@ impl<S: Send + Sync + 'static> AbiInstance<S> for Wasix1Instance {
                     "a signal handler must run, but the guest has no `{SIGNAL_CALLBACK}`"
                 )));
             };
-            call_guest(env, &callback, &[Value::I32(frame.signo())]).await?;
+            if let Err(error) = call_guest(env, &callback, &[Value::I32(frame.signo())]).await {
+                // V1 mapped an engine trap in the callback to WasiError::Exit(Errno::Intr).
+                if error.clone().to_trap().is_some() {
+                    let (syscalls, task) = caller_parts(env).await;
+                    let memory = GuestMemory::new(env);
+                    let caller = Caller::new(task, &memory);
+                    let status = i32::from(crate::abi::Errno::INTR.0);
+                    if syscalls.exit_group(&caller, status).await.is_ok()
+                        && let Outcome::Unwind(exit) = complete(env, &*syscalls, task, Ok(())).await
+                    {
+                        return Err(exit);
+                    }
+                }
+                return Err(error);
+            }
             Ok(Sigreturn {
                 mask: Some(frame.mask),
                 restart,

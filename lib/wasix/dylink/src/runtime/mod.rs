@@ -2198,9 +2198,6 @@ impl<S: Syscalls + Control + Send + Sync + 'static> AbiInstance<S> for StoreImag
     fn on_thread_return(&self) -> EntryReturn {
         self.inner.on_thread_return()
     }
-    fn signal_trap_exit_status(&self) -> Option<i32> {
-        self.inner.signal_trap_exit_status()
-    }
     fn deliver_signal<'a>(
         &'a self,
         env: &'a AsyncFunctionEnvMut<ExecEnv<S>>,

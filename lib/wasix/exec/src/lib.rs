@@ -1926,19 +1926,6 @@ async fn complete_inner<S: Syscalls + Control + 'static, T>(
                         }
                         Err(err) => {
                             syscalls.signal_return(task, None);
-                            if err.clone().to_trap().is_some()
-                                && let Some(status) = abi.signal_trap_exit_status()
-                            {
-                                let memory = GuestMemory { env };
-                                if syscalls
-                                    .exit_group(&Caller::new(task, &memory), status)
-                                    .await
-                                    .is_ok()
-                                {
-                                    // Consume the queued exit through the normal work loop.
-                                    continue;
-                                }
-                            }
                             return Outcome::Unwind(err);
                         }
                     }
