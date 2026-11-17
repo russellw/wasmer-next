@@ -136,6 +136,50 @@ fn signals() {
     assert_eq!(status(SIGNALS), 0);
 }
 
+/// V1 mapped a failing registered signal callback to exit(INTR), not a fatal
+/// execution fault. Older libc's corrupted/default handler indices hit this path.
+#[test]
+fn trapping_signal_callback_exits_with_the_legacy_status() {
+    assert_eq!(
+        status(
+            r#"(module
+      (type $handler (func (param i32)))
+      (import "wasix_32v1" "callback_signal" (func $callback (param i32 i32)))
+      (import "wasi_snapshot_preview1" "proc_raise" (func $raise (param i32) (result i32)))
+      (memory (export "memory") 1)
+      (table 1 funcref)
+      (data (i32.const 16) "__wasm_signal")
+      (func (export "__wasm_signal") (param $sig i32)
+        (call_indirect (type $handler) (local.get $sig) (i32.const 100)))
+      (func (export "_start")
+        (call $callback (i32.const 16) (i32.const 13))
+        (drop (call $raise (i32.const 15)))
+        unreachable))"#
+        ),
+        27
+    );
+}
+
+#[test]
+fn signal_callback_syscall_exit_preserves_its_status() {
+    assert_eq!(
+        status(
+            r#"(module
+      (import "wasix_32v1" "callback_signal" (func $callback (param i32 i32)))
+      (import "wasix_32v1" "proc_exit2" (func $exit (param i32)))
+      (import "wasi_snapshot_preview1" "proc_raise" (func $raise (param i32) (result i32)))
+      (memory (export "memory") 1)
+      (data (i32.const 16) "__wasm_signal")
+      (func (export "__wasm_signal") (param i32) (call $exit (i32.const 23)))
+      (func (export "_start")
+        (call $callback (i32.const 16) (i32.const 13))
+        (drop (call $raise (i32.const 15)))
+        unreachable))"#
+        ),
+        23
+    );
+}
+
 /// An exported callback is a capability, not a registration on a fresh pthread.
 /// v1 discarded sibling copies of process signals in such instances.
 #[test]

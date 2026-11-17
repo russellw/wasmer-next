@@ -396,6 +396,13 @@ pub trait AbiInstance<S: 'static>: Send + Sync {
         restart: bool,
     ) -> LocalFuture<'a, Result<Sigreturn, RuntimeError>>;
 
+    /// Optional legacy exit status for an engine trap in a signal callback.
+    /// Syscall exits and other guest unwinds still pass through unchanged.
+    /// Native ABIs retain ordinary execution-fault handling by default.
+    fn signal_trap_exit_status(&self) -> Option<i32> {
+        None
+    }
+
     /// Resumes a vfork parent after its child `child`, whose pid the parent sees as `pid`,
     /// ended (exited or loaded a new image). The instance already runs as the parent again.
     fn vfork_resume<'a>(

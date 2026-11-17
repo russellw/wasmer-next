@@ -558,6 +558,12 @@ impl<S: Send + Sync + 'static> AbiInstance<S> for Wasix1Instance {
         EntryReturn::Exit(0)
     }
 
+    fn signal_trap_exit_status(&self) -> Option<i32> {
+        // V1 process_signals_internal returned WasiError::Exit(Errno::Intr)
+        // for a trapping guest callback, instead of a process SIGSEGV.
+        Some(i32::from(crate::abi::Errno::INTR.0))
+    }
+
     /// libc keeps the dispositions and runs the handler from its callback, `__wasm_signal(sig)`;
     /// the host only decides that it runs. The mask in force before delivery is restored
     /// afterwards. v1's handler has no frame to cancel a restart through, so `restart` stands.
