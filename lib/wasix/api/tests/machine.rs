@@ -938,3 +938,55 @@ fn embedder_default_root_can_share_the_machine_budget_before_population() {
     );
     assert_eq!(budget.used(), 0);
 }
+
+#[tokio::test]
+async fn memory_budget_survives_root_upper_and_layer_reboots() {
+    use wasixv2_abi::OpenFlags;
+    use wasixv2_vfs::{Cred, Ctx, LookupFlags, OpenHow};
+    let host: Arc<dyn wasixv2::Host> = Arc::new(wasixv2::TokioHost::default());
+    let budget = MemoryBudget::new(u64::MAX);
+    let mut machine = wasixv2::MachineBuilder::new(host.clone())
+        .memory_budget(budget.clone())
+        .try_build()
+        .unwrap();
+    let upper = wasixv2_vfs_mem::MemFs::new(Arc::new(wasixv2_kernel::HostClock(host)), 0o755, 1, 1)
+        .try_with_memory_budget(machine.memory_budget().unwrap().clone())
+        .unwrap();
+    machine.set_root_upper(Arc::new(upper)).await.unwrap();
+    let baseline = budget.used();
+    machine
+        .install_commands([("hello".into(), b"hello".to_vec().into())])
+        .await
+        .unwrap();
+    assert_eq!(
+        budget.used(),
+        baseline,
+        "reboot releases the previous kernel's tmpfs instances"
+    );
+    {
+        let vfs = machine.vfs();
+        let root = vfs.root();
+        let cred = Cred::root();
+        let cx = Ctx {
+            cred: &cred,
+            root: &root,
+            umask: 0,
+            task: 0,
+            leases: None,
+        };
+        let how = OpenHow {
+            flags: OpenFlags::O_CREAT | OpenFlags::O_RDWR,
+            mode: 0o600,
+            lookup: LookupFlags::follow(),
+        };
+        for path in [b"/new".as_slice(), b"/tmp/new", b"/dev/shm/new"] {
+            let before = budget.used();
+            let file = vfs.open(&cx, &root, path, &how).await.unwrap();
+            file.write_at(b"x", 0).await.unwrap();
+            assert_eq!(budget.used(), before + 1024 + 4096, "{path:?}");
+        }
+    }
+    machine.shutdown().await;
+    drop(machine);
+    assert_eq!(budget.used(), 0);
+}
