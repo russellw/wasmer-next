@@ -541,6 +541,10 @@ jobs:
           owner: wasmerio
           repositories: wasmer-runtime
           permission-contents: read
+      - name: Use kernel Git mirror on Windows
+        if: runner.os == 'Windows'
+        shell: bash
+        run: git config --global url."https://kernel.googlesource.com/pub/scm/".insteadOf https://git.kernel.org/pub/scm/
       - uses: actions/checkout@v6
         with:
           # libaio on pagure.io uses dumb HTTP and cannot be shallow-cloned.
@@ -812,6 +816,10 @@ jobs:
           owner: wasmerio
           repositories: wasmer-runtime
           permission-contents: read
+      - name: Use kernel Git mirror on Windows
+        if: runner.os == 'Windows'
+        shell: bash
+        run: git config --global url."https://kernel.googlesource.com/pub/scm/".insteadOf https://git.kernel.org/pub/scm/
       - uses: actions/checkout@v6
         with:
           # libaio on pagure.io uses dumb HTTP and cannot be shallow-cloned.
