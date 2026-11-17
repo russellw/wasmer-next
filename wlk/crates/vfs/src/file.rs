@@ -196,6 +196,10 @@ impl File {
         file
     }
 
+    pub(crate) fn detached_namespace(&self) -> Option<&MntNs> {
+        self.detached.as_deref()
+    }
+
     pub fn node(&self) -> &Arc<dyn Node> {
         self.path.dentry.node()
     }

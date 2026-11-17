@@ -842,3 +842,239 @@ async fn run_file_leaves_no_zombie() {
     })
     .await;
 }
+
+#[cfg(feature = "resolved-packages")]
+mod runtime_packages {
+    use super::*;
+    use wasixv2::{
+        ResolvedCommand, ResolvedLayout, RuntimeCommandDefaults, RuntimePackage,
+        RuntimePackageResolver,
+    };
+    use wasmer_config::package::{PackageHash, PackageId};
+    use wasmer_package::{
+        loader::LoadedPackage,
+        resolver::{InMemorySource, PackageInfo, resolve},
+    };
+
+    async fn layout() -> ResolvedLayout {
+        use std::collections::HashMap;
+        let manifest = serde_json::from_value(serde_json::json!({
+            "package": { "fs": [
+                { "volume_name": "assets", "mount_path": "/" },
+                { "volume_name": "assets", "mount_path": "/runtime-volume" }
+            ]}
+        }))
+        .unwrap();
+        let mut writer = Writer::new(ChecksumAlgorithm::Sha256)
+            .write_manifest(&manifest)
+            .unwrap()
+            .write_atoms(BTreeMap::new())
+            .unwrap();
+        let volume = Directory::new(
+            BTreeMap::from([(
+                "runtime-marker".parse().unwrap(),
+                DirEntry::File(FileEntry::borrowed(b"mounted", Timestamps::default())),
+            )]),
+            Timestamps::default(),
+        );
+        writer.write_volume("assets", volume).unwrap();
+        let bytes = writer.finish(SignatureAlgorithm::None).unwrap();
+        let container = wasmer_package::utils::from_bytes(bytes).unwrap();
+        let id = PackageId::Hash(PackageHash::from_sha256_bytes([1; 32]));
+        let info =
+            PackageInfo::from_manifest(id.clone(), container.manifest(), container.version())
+                .unwrap();
+        let resolution = resolve(&id, &info, &InMemorySource::new()).await.unwrap();
+        let loaded =
+            LoadedPackage::from_containers(resolution, HashMap::from([(id, container)])).unwrap();
+        let mut layout = ResolvedLayout::new(&loaded, false, None).unwrap();
+        layout.override_commands(vec![ResolvedCommand {
+            name: "echo".to_owned(),
+            atom: OwnedBuffer::from(echo("package")),
+            defaults: CommandDefaults::default(),
+        }]);
+        layout
+    }
+
+    struct Resolver(ResolvedLayout, AtomicUsize);
+
+    impl Resolver {
+        fn package(&self, identity: u8) -> RuntimePackage {
+            RuntimePackage {
+                identity: [identity; 32],
+                layout: self.0.clone(),
+                entrypoint: "echo".into(),
+                defaults: RuntimeCommandDefaults {
+                    argv0: Some("package-echo".into()),
+                    args: vec!["first".into()],
+                    env: Vec::new(),
+                },
+            }
+        }
+    }
+
+    impl RuntimePackageResolver for Resolver {
+        fn resolve<'a>(
+            &'a self,
+            specifier: &'a str,
+        ) -> LocalFuture<'a, io::Result<RuntimePackage>> {
+            Box::pin(async move {
+                self.1.fetch_add(1, Ordering::Relaxed);
+                match specifier {
+                    "test/a" => Ok(self.package(1)),
+                    "test/b" => Ok(self.package(2)),
+                    _ => Err(io::ErrorKind::NotFound.into()),
+                }
+            })
+        }
+
+        fn resolve_local(&self, _: webc::Container) -> LocalFuture<'_, io::Result<RuntimePackage>> {
+            Box::pin(async move { Ok(self.package(1)) })
+        }
+    }
+
+    const V1_WASMER_RUN: &str = r#"
+(module
+  (import "wasix_32v1" "proc_exec3" (func $exec (param i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "proc_exit" (func $exit (param i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "wasmer")
+  (data (i32.const 16) "wasmer\nrun\ntest/a\n--\nsecond")
+  (func (export "_start")
+    (drop (call $exec (i32.const 0) (i32.const 6) (i32.const 16) (i32.const 27)
+      (i32.const 0) (i32.const 0) (i32.const 1) (i32.const 0) (i32.const 0)))
+    (call $exit (i32.const 99))))
+"#;
+
+    #[tokio::test]
+    async fn shim_imports_live_aliases_and_scoped_volumes_with_a_cap() {
+        local(async {
+            let resolver = Arc::new(Resolver(layout().await, AtomicUsize::new(0)));
+            let mut machine = Machine::builder()
+                .runtime_package_resolver(resolver.clone())
+                .runtime_package_limit(1)
+                .build();
+            machine
+                .install_commands(commands(&[
+                    ("echo", &echo("boot")),
+                    ("launcher", &wat(V1_WASMER_RUN)),
+                ]))
+                .await
+                .unwrap();
+
+            let (status, output) = run_file(&machine, "/bin/launcher", &["launcher"]).await;
+            assert_eq!(status.unwrap(), 0);
+            assert_eq!(output, "package-echo first second\npackage");
+
+            for alias in ["/bin/echo", "/usr/bin/echo"] {
+                let (status, output) = run_file(&machine, alias, &["echo"]).await;
+                assert_eq!(status.unwrap(), 0);
+                assert_eq!(output, "echo\npackage");
+            }
+
+            let package = machine
+                .install_runtime_package(&resolver.package(1))
+                .await
+                .unwrap();
+            let host = machine.vfs();
+            let root = host.root();
+            let cred = wasixv2_vfs::Cred::root();
+            let cx = wasixv2_vfs::Ctx {
+                cred: &cred,
+                root: &root,
+                umask: 0,
+                task: 0,
+                leases: None,
+            };
+            for relative in ["runtime-marker", "runtime-volume/runtime-marker"] {
+                let path = format!("{}/{relative}", package.root);
+                assert!(
+                    host.lookup(&cx, &root, path.as_bytes(), Default::default())
+                        .await
+                        .is_ok()
+                );
+            }
+            for path in [b"/runtime-marker".as_slice(), b"/runtime-volume"] {
+                assert!(
+                    host.lookup(&cx, &root, path, Default::default())
+                        .await
+                        .is_err()
+                );
+            }
+            let (status, _) = run_file(&machine, "/bin/wasmer", &["wasmer", "run", "test/b"]).await;
+            assert_eq!(status.unwrap(), 126);
+            assert_eq!(
+                machine
+                    .install_runtime_package(&resolver.package(2))
+                    .await
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(28),
+            );
+            let (status, _) = run_file(&machine, "/bin/wasmer", &["wasmer", "run", "test/a"]).await;
+            assert_eq!(status.unwrap(), 0);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn disabled_machine_has_no_runtime_command_or_install() {
+        local(async {
+            let machine = Machine::new();
+            let resolver = Resolver(layout().await, AtomicUsize::new(0));
+            let (status, _) = run_file(&machine, "/bin/wasmer", &["wasmer", "run", "test/a"]).await;
+            assert_eq!(execve_errno(status), 2);
+            assert_eq!(
+                machine
+                    .install_runtime_package(&resolver.package(1))
+                    .await
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(95),
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn shim_checks_guest_files_before_registry() {
+        local(async {
+            let resolver = Arc::new(Resolver(layout().await, AtomicUsize::new(0)));
+            let mut machine = Machine::builder()
+                .runtime_package_resolver(resolver.clone())
+                .build();
+            let bytes = Writer::new(ChecksumAlgorithm::Sha256)
+                .write_manifest(&webc::metadata::Manifest::default())
+                .unwrap()
+                .write_atoms(BTreeMap::new())
+                .unwrap()
+                .finish(SignatureAlgorithm::None)
+                .unwrap();
+            machine
+                .install_commands(commands(&[
+                    ("local.wasm", &echo("local")),
+                    ("local.webc", &bytes),
+                ]))
+                .await
+                .unwrap();
+            let (status, output) = run_file(
+                &machine,
+                "/bin/wasmer",
+                &["wasmer", "run", "/bin/local.wasm"],
+            )
+            .await;
+            assert_eq!(status.unwrap(), 0);
+            assert_eq!(output, "/bin/local.wasm\nlocal");
+            let (status, output) = run_file(
+                &machine,
+                "/bin/wasmer",
+                &["wasmer", "run", "/bin/local.webc"],
+            )
+            .await;
+            assert_eq!(status.unwrap(), 0);
+            assert_eq!(output, "package-echo first\npackage");
+            assert_eq!(resolver.1.load(Ordering::Relaxed), 0);
+        })
+        .await;
+    }
+}

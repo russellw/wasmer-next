@@ -25,6 +25,13 @@ pub use package::{
     ResolvedVolumeRequest, preflight_resolved_filesystem,
 };
 
+#[cfg(feature = "resolved-packages")]
+pub use package::runtime::{
+    InstalledRuntimePackage, RuntimeCommandDefaults, RuntimePackage, RuntimePackageResolver,
+};
+#[cfg(feature = "resolved-packages")]
+use package::runtime::{RuntimePackageConfig, RuntimePackages};
+
 mod directory;
 pub use directory::{DirectoryEntry, populate_directory};
 
@@ -276,6 +283,8 @@ pub struct Machine {
     syscalls: Arc<Stack>,
     /// The guest ABIs programs may target: `wasixv2`, then WASIX v1 with the `wasix1` feature.
     abis: Arc<Abis<Stack>>,
+    #[cfg(feature = "resolved-packages")]
+    runtime_packages: Option<Arc<RuntimePackages>>,
     /// The package commands WASIX v1 programs start with their defaults.
     #[cfg(feature = "wasix1")]
     wasix1: Wasix1Commands,
@@ -348,6 +357,8 @@ pub struct MachineBuilder {
     /// The embedder's loader; the ABIs' own default otherwise.
     loader: Option<Arc<dyn Loader>>,
     instantiation_hooks: Vec<Arc<dyn InstantiationHook<Stack>>>,
+    #[cfg(feature = "resolved-packages")]
+    runtime_package_config: RuntimePackageConfig,
     plain_commands: bool,
     #[cfg(feature = "js")]
     js_async_mode: wasmer::js::AsyncMode,
@@ -398,6 +409,8 @@ impl MachineBuilder {
             max_guest_tasks: None,
             loader: None,
             instantiation_hooks: Vec::new(),
+            #[cfg(feature = "resolved-packages")]
+            runtime_package_config: RuntimePackageConfig::default(),
             plain_commands: false,
             #[cfg(feature = "js")]
             js_async_mode: wasmer::js::AsyncMode::Blocking,
@@ -616,6 +629,8 @@ impl MachineBuilder {
             max_guest_tasks,
             loader,
             instantiation_hooks,
+            #[cfg(feature = "resolved-packages")]
+            runtime_package_config,
             plain_commands,
             #[cfg(feature = "js")]
             js_async_mode,
@@ -687,11 +702,28 @@ impl MachineBuilder {
         if plain_commands {
             configured_abis.push_plain_command();
         }
+        #[cfg(feature = "resolved-packages")]
+        let runtime_packages = RuntimePackages::configure(
+            runtime_package_config,
+            &mut configured_abis,
+            &memory,
+            &host,
+            owner,
+            #[cfg(feature = "wasix1")]
+            wasix1.files.clone(),
+        )?;
         let abis = Arc::new(configured_abis);
+        #[cfg(feature = "resolved-packages")]
+        let boot_root = match &runtime_packages {
+            Some(packages) => OverlayFs::new(Some(root.clone()), vec![packages.shim.clone()]),
+            None => root.clone(),
+        };
+        #[cfg(not(feature = "resolved-packages"))]
+        let boot_root = root.clone();
         let kernel = boot(
             &time,
             &memory,
-            root.clone(),
+            boot_root,
             &network,
             &user,
             &uname,
@@ -714,6 +746,8 @@ impl MachineBuilder {
             memory,
             syscalls,
             abis,
+            #[cfg(feature = "resolved-packages")]
+            runtime_packages,
             #[cfg(feature = "wasix1")]
             wasix1,
             network,
@@ -805,30 +839,38 @@ impl Machine {
         &self,
         commands: impl IntoIterator<Item = (String, OwnedBuffer)>,
     ) -> io::Result<Option<Layer>> {
-        let mut seen = HashSet::new();
-        let mut files = Vec::new();
-        for (name, image) in commands {
-            if matches!(name.as_str(), "" | "." | "..") || name.contains(['/', '\0']) {
-                return Err(errno_to_io(Errno::EINVAL));
-            }
-            if name.len() > NAME_MAX {
-                return Err(errno_to_io(Errno::ENAMETOOLONG));
-            }
-            if !seen.insert(name.clone()) {
-                continue;
-            }
-            for dir in COMMAND_DIRS {
-                files.push((format!("{dir}/{name}"), image.clone()));
-            }
-        }
-        if files.is_empty() {
-            return Ok(None);
-        }
-        let (uid, gid) = self.owner;
-        let layer = PackageFs::from_files(files, uid, gid).map_err(io::Error::other)?;
-        Ok(Some(Layer(Arc::new(layer))))
+        commands_layer(self.owner, commands)
     }
+}
 
+fn commands_layer(
+    (uid, gid): (u32, u32),
+    commands: impl IntoIterator<Item = (String, OwnedBuffer)>,
+) -> io::Result<Option<Layer>> {
+    let mut seen = HashSet::new();
+    let mut files = Vec::new();
+    for (name, image) in commands {
+        if matches!(name.as_str(), "" | "." | "..") || name.contains(['/', '\0']) {
+            return Err(errno_to_io(Errno::EINVAL));
+        }
+        if name.len() > NAME_MAX {
+            return Err(errno_to_io(Errno::ENAMETOOLONG));
+        }
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        for dir in COMMAND_DIRS {
+            files.push((format!("{dir}/{name}"), image.clone()));
+        }
+    }
+    if files.is_empty() {
+        return Ok(None);
+    }
+    let layer = PackageFs::from_files(files, uid, gid).map_err(io::Error::other)?;
+    Ok(Some(Layer(Arc::new(layer))))
+}
+
+impl Machine {
     /// Stacks `layers` under the root filesystem's top layer (the [`default_root`] or the
     /// embedder's root), which holds `/etc` and every change: each layer over the ones before
     /// it, and all of them over the layers earlier calls added. The kernel's filesystems are
@@ -848,7 +890,11 @@ impl Machine {
         if layers.is_empty() {
             return Ok(());
         }
-        if self.root_lowers.len() + layers.len() + usize::from(self.skeleton.is_some()) > MAX_LOWERS
+        if self.root_lowers.len()
+            + layers.len()
+            + usize::from(self.skeleton.is_some())
+            + self.runtime_package_lowers()
+            > MAX_LOWERS
         {
             return Err(io::Error::other("too many layers stacked under the root"));
         }
@@ -874,7 +920,7 @@ impl Machine {
             return Err(errno_to_io(Errno::EBUSY));
         }
         if self.skeleton.is_none() {
-            if self.root_lowers.len() == MAX_LOWERS {
+            if self.root_lowers.len() + self.runtime_package_lowers() == MAX_LOWERS {
                 return Err(io::Error::other("too many layers stacked under the root"));
             }
             self.skeleton = Some(self.root_upper.clone());
@@ -898,9 +944,21 @@ impl Machine {
         self.set_root_upper(upper).await
     }
 
+    fn runtime_package_lowers(&self) -> usize {
+        #[cfg(feature = "resolved-packages")]
+        if self.runtime_packages.is_some() {
+            return 1;
+        }
+        0
+    }
+
     async fn reboot_root(&mut self) -> io::Result<()> {
         let mut lowers = self.root_lowers.clone();
         lowers.extend(self.skeleton.iter().cloned());
+        #[cfg(feature = "resolved-packages")]
+        if let Some(packages) = &self.runtime_packages {
+            lowers.insert(0, packages.shim.clone());
+        }
         let root = OverlayFs::new(Some(self.root_upper.clone()), lowers);
         // Nothing lives in the kernel yet, so a new one on the new root replaces it, with the
         // kernel's filesystems mounted afresh; a host directory's layer answers asynchronously.
@@ -996,7 +1054,6 @@ impl Machine {
             task: 0,
             leases: None,
         };
-        let mut table = wasixv2_wasix1::Commands::default();
         for (name, defaults) in names {
             for dir in COMMAND_DIRS {
                 let path = format!("/{dir}/{name}");
@@ -1016,10 +1073,13 @@ impl Machine {
                     dev: (dev.major, dev.minor),
                     ino: attr.ino,
                 };
-                table.insert(id, defaults.clone());
+                self.wasix1
+                    .files
+                    .write()
+                    .unwrap()
+                    .insert(id, defaults.clone());
             }
         }
-        *self.wasix1.files.write().unwrap() = table;
     }
 
     /// The machine's network namespace, e.g. to [`Net::publish`] a host port to a guest

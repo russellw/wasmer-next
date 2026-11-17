@@ -6388,10 +6388,12 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "bincode 2.0.1",
+ "bytes",
  "futures-util",
  "js-sys",
  "serde",
  "serde_json",
+ "sha2",
  "shared-buffer",
  "tempfile",
  "thiserror 2.0.21",

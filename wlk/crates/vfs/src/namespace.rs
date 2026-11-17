@@ -224,6 +224,63 @@ impl Vfs {
         Ok(new.root_path())
     }
 
+    /// Adds a child to the anonymous namespace owned by a detached mount file.
+    /// Components are resolved beneath the detached root without following symlinks.
+    /// The owner must finish assembling the tree before attaching it.
+    pub async fn mount_detached(
+        &self,
+        tree: &File,
+        relative: &[u8],
+        fs: Arc<dyn Filesystem>,
+        flags: MountFlags,
+    ) -> FsResult<()> {
+        if !std::ptr::eq(self, &**tree.vfs()) {
+            return Err(Errno::EINVAL);
+        }
+        let ns = tree.detached_namespace().ok_or(Errno::EINVAL)?;
+        let root = ns.root();
+        if !check_mnt(&self.tree.lock(), ns, &root.mnt) {
+            return Err(Errno::EINVAL);
+        }
+        let cred = crate::Cred::root();
+        let cx = crate::Ctx {
+            cred: &cred,
+            root: &root,
+            umask: 0o022,
+            task: 0,
+            leases: None,
+        };
+        let mut target = root.clone();
+        let components = relative.split(|&byte| byte == b'/');
+        if components
+            .clone()
+            .any(|component| matches!(component, b"" | b"." | b".."))
+        {
+            return Err(Errno::EINVAL);
+        }
+        for component in components {
+            match self.mkdir(&cx, &target, component, 0o755).await {
+                Ok(()) | Err(crate::PathError::Errno(Errno::EEXIST)) => {}
+                Err(error) => return Err(error.errno()),
+            }
+            target = self
+                .lookup(
+                    &cx,
+                    &target,
+                    component,
+                    crate::LookupFlags {
+                        no_symlinks: true,
+                        directory: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(crate::PathError::errno)?;
+        }
+        let source = fs.info().name.as_bytes().to_vec();
+        self.new_mount(ns, &target, fs, source, flags, false, ns.owner().clone())
+    }
+
     /// `do_new_mount_fc` and `do_add_mount`.
     #[allow(clippy::too_many_arguments)]
     fn new_mount(

@@ -405,12 +405,16 @@ impl VolumeLayers {
         machine: &Machine,
         volume: &ResolvedVolume,
     ) -> io::Result<Layer> {
-        self.get_inner(machine, volume)
+        self.get_inner(machine.owner, volume)
             .await
             .map_err(|error| volume.context(error))
     }
 
-    async fn get_inner(&mut self, machine: &Machine, volume: &ResolvedVolume) -> io::Result<Layer> {
+    pub(super) async fn get_inner(
+        &mut self,
+        (uid, gid): (u32, u32),
+        volume: &ResolvedVolume,
+    ) -> io::Result<Layer> {
         let key = match &volume.backing {
             Backing::Reader { reader, name } => {
                 VolumeKey::Reader(Arc::as_ptr(reader) as usize, name.clone())
@@ -423,14 +427,14 @@ impl VolumeLayers {
             Some(layer) => layer.clone(),
             None => {
                 let layer = match &volume.backing {
-                    Backing::Reader { reader, name } => machine.package_layer(reader, name)?,
-                    Backing::Opaque { volume, .. } => {
-                        let (uid, gid) = machine.owner;
-                        Layer(Arc::new(
-                            crate::PackageFs::from_volume(volume, uid, gid)
-                                .map_err(io::Error::other)?,
-                        ))
-                    }
+                    Backing::Reader { reader, name } => Layer(Arc::new(
+                        crate::PackageFs::with_owner(reader, name, uid, gid)
+                            .map_err(io::Error::other)?,
+                    )),
+                    Backing::Opaque { volume, .. } => Layer(Arc::new(
+                        crate::PackageFs::from_volume(volume, uid, gid)
+                            .map_err(io::Error::other)?,
+                    )),
                 };
                 self.0.insert(key, layer.clone());
                 layer
