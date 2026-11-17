@@ -23,7 +23,8 @@ use std::convert::Infallible;
 
 use wasm_encoder::{
     BlockType, CodeSection, ConstExpr, EntityType, ExportKind, ExportSection, Function,
-    GlobalSection, GlobalType, ImportSection, Instruction, Module, SectionId, TypeSection, ValType,
+    GlobalSection, GlobalType, ImportSection, Instruction, MemArgTarget, Module, SectionId,
+    TypeSection, ValType,
     reencode::{Error, Reencode, utils},
 };
 use wasmparser::{
@@ -269,7 +270,7 @@ impl Points {
             _ => return None,
         };
         let offset = u32::try_from(memarg.offset).ok()?;
-        (memarg.memory_index == 0 && self.futex_memory == Some(true)).then(|| {
+        (memarg.target == MemArgTarget::Memory(0) && self.futex_memory == Some(true)).then(|| {
             [
                 Instruction::I32Const(offset as i32),
                 Instruction::Call(self.hook() + at),
