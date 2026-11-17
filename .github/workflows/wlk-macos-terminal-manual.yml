@@ -1,5 +1,4 @@
 name: Mac terminal leases (manual)
-
 on:
   workflow_dispatch:
     inputs:
@@ -15,10 +14,8 @@ on:
         options:
           - acceptance
           - diagnostic
-
 permissions:
   contents: read
-
 jobs:
   macos-terminal:
     runs-on: macos-15

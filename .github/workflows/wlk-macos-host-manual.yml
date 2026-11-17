@@ -1,5 +1,4 @@
 name: Mac host filesystem (manual)
-
 on:
   workflow_dispatch:
     inputs:
@@ -7,10 +6,8 @@ on:
         description: Exact wasmer-next candidate commit
         required: true
         type: string
-
 permissions:
   contents: read
-
 jobs:
   macos-host:
     runs-on: macos-15

@@ -1,5 +1,4 @@
 name: NAPI Darwin native v2 (manual)
-
 on:
   workflow_dispatch:
     inputs:
@@ -7,10 +6,8 @@ on:
         description: Candidate branch or commit to test
         required: true
         type: string
-
 permissions:
   contents: read
-
 jobs:
   macos-arm64:
     name: NAPI native arm64 on macOS 15 (deployment target 13)

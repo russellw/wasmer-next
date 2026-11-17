@@ -1,22 +1,17 @@
 name: CI
-
 on:
   push:
     paths: ["wlk/**", ".github/workflows/wlk.yml"]
   pull_request:
     paths: ["wlk/**", ".github/workflows/wlk.yml"]
-
 permissions:
   contents: read
-
 concurrency:
   group: wlk-${{ github.ref }}
   cancel-in-progress: true
-
 defaults:
   run:
     working-directory: wlk
-
 jobs:
   native:
     name: Native check, lint, and tests
@@ -46,7 +41,6 @@ jobs:
       - uses: taiki-e/install-action@nextest
       - name: Rust tests
         run: cargo nextest run --workspace --locked
-
   terminal:
     name: Native terminal leases (${{ matrix.os }})
     strategy:
@@ -67,7 +61,6 @@ jobs:
         run: cargo test --locked -p wasixv2-host --no-default-features --features terminal --lib terminal::tests
       - name: Terminal profile Clippy
         run: cargo clippy --locked -p wasixv2-host --no-default-features --features terminal --all-targets -- -D clippy::all
-
   wasm:
     name: wasm32 feature profiles
     runs-on: ubuntu-24.04
@@ -82,7 +75,6 @@ jobs:
         run: cargo check -p wasixv2-host --features browser --target wasm32-unknown-unknown --locked
       - name: Check web drivers
         run: cargo check -p wasixv2-stdio-web -p wasixv2-vfs-web -p wasixv2-vnet-web --target wasm32-unknown-unknown --locked
-
   security:
     name: Cargo audit
     runs-on: ubuntu-24.04

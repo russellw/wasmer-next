@@ -602,7 +602,7 @@ jobs:
         shell: bash
         run: |
           rustup target add x86_64-pc-windows-gnu
-      - name: Install Windows 10 SDK with xwin
+      - name: Install pinned Windows SDK with xwin
         if: ${{ matrix.metadata.build == 'windows-gnu' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -617,6 +617,7 @@ jobs:
           /tmp/xwin/target/release/xwin \
             --accept-license \
             --cache-dir /tmp/xwincache \
+            --sdk-version 10.0.22621 \
             --timeout 180s \
             splat \
             --output /tmp/xwindownload
