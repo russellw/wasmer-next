@@ -63,7 +63,7 @@ pub struct WasmFeatures {
     #[clap(long = "enable-multi-memory")]
     pub _multi_memory: bool,
 
-    /// Enable support for the memory64 proposal.
+    /// Request memory64 support (currently unsupported by the engine).
     #[clap(long = "enable-memory64")]
     pub memory64: bool,
 
@@ -351,6 +351,9 @@ impl RuntimeOptions {
     #[cfg(feature = "compiler")]
     /// Get the enabled Wasm features.
     pub fn get_features(&self, default_features: &Features) -> Result<Features> {
+        if self.features.memory64 {
+            bail!("memory64 is not supported by this engine");
+        }
         if self.features.all {
             return Ok(Features::all());
         }
@@ -416,9 +419,6 @@ impl RuntimeOptions {
         }
         if self.features.module_linking {
             features.module_linking(true);
-        }
-        if self.features.memory64 {
-            features.memory64(true);
         }
         if self.features.exceptions {
             features.exceptions(true);
