@@ -212,7 +212,7 @@ async fn decode(
         .ok_or_else(|| invalid("header list"))?;
     let records = read(mem, word(bytes, 24), size).await?;
     let mut headers = Vec::new();
-    for header in records.chunks_exact(16) {
+    for header in records.as_chunks::<16>().0 {
         headers.push((
             string(mem, header, 0).await?,
             read(mem, word(header, 8), word(header, 12)).await?,

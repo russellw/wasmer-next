@@ -123,8 +123,8 @@ impl Pagemap {
         let mut buf = vec![0u8; entries.len() * 8];
         let offset = (addr / self.page_size * 8) as u64;
         self.file.read_exact_at(&mut buf, offset)?;
-        for (entry, bytes) in entries.iter_mut().zip(buf.chunks_exact(8)) {
-            *entry = u64::from_ne_bytes(bytes.try_into().expect("8 bytes"));
+        for (entry, bytes) in entries.iter_mut().zip(buf.as_chunks::<8>().0) {
+            *entry = u64::from_ne_bytes(*bytes);
         }
         Ok(())
     }
