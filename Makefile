@@ -670,6 +670,12 @@ test-integration-cli-ci: require-nextest build-wasmer
 test-integration-ios:
 	$(CARGO_BINARY) test $(CARGO_TARGET_FLAG) -p wasmer-integration-tests-ios --locked
 
+# Registry package smoke tests; see tests/integration/real-packages/README.md.
+WASMER_BIN ?= $(abspath target/debug/wasmer)
+.PHONY: test-real-packages
+test-real-packages: build-wasmer-debug
+	WASMER_BIN="$(WASMER_BIN)" bash tests/integration/real-packages/run.sh $(REAL_PACKAGES_ARGS)
+
 # The wasixv2 test suite in tests/wasixv2, run against this checkout's wasmer.
 # Needs wasixcc with wasm32-wasixv2 support on PATH; WASIXCC_LLVM_LOCATION and WASIXCC_SYSROOT
 # select a local LLVM fork and libc2 sysroot. Pass test filters with WASIXV2_TESTS_ARGS. See
