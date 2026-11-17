@@ -68,13 +68,32 @@ jobs:
     runs-on: ubuntu-24.04
     continue-on-error: true
     steps:
+      - name: Check cross-dependency app credentials
+        shell: bash
+        env:
+          APP_CLIENT_ID: ${{ secrets.CROSS_DEPENDENCY_GITHUB_APP_CLIENT_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.CROSS_DEPENDENCY_GITHUB_APP_PRIVATE_KEY }}
+        run: |
+          if [ -z "$APP_CLIENT_ID" ] || [ -z "$APP_PRIVATE_KEY" ]; then
+            echo "::error::Cross-dependency GitHub App secrets are unavailable; cargo cannot fetch wasmerio/wasmer-runtime. Configure CROSS_DEPENDENCY_GITHUB_APP_CLIENT_ID and CROSS_DEPENDENCY_GITHUB_APP_PRIVATE_KEY. Fork PRs require a trusted run with these secrets."
+            exit 1
+          fi
+      - name: Mint cross-dependency token
+        id: cross-dependency-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.CROSS_DEPENDENCY_GITHUB_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CROSS_DEPENDENCY_GITHUB_APP_PRIVATE_KEY }}
+          owner: wasmerio
+          repositories: wasmer-runtime
+          permission-contents: read
       - uses: actions/checkout@v6
         with:
           submodules: recursive
       - name: Configure private runtime access
         uses: ./.github/actions/setup-runtime
         with:
-          ssh-key: ${{ secrets.RUNTIME_CI_READ_SSH_KEY }}
+          token: ${{ steps.cross-dependency-token.outputs.token }}
       - name: Install nightly Rust
         uses: dtolnay/rust-toolchain@nightly
       - name: Check for eligible dependency updates
@@ -85,13 +104,32 @@ jobs:
     name: Code lint
     runs-on: ${{ github.event_name == 'pull_request' && 'aux-pub-16cpu-amd64' || 'aux-pub-trusted-16cpu-amd64' }}
     steps:
+      - name: Check cross-dependency app credentials
+        shell: bash
+        env:
+          APP_CLIENT_ID: ${{ secrets.CROSS_DEPENDENCY_GITHUB_APP_CLIENT_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.CROSS_DEPENDENCY_GITHUB_APP_PRIVATE_KEY }}
+        run: |
+          if [ -z "$APP_CLIENT_ID" ] || [ -z "$APP_PRIVATE_KEY" ]; then
+            echo "::error::Cross-dependency GitHub App secrets are unavailable; cargo cannot fetch wasmerio/wasmer-runtime. Configure CROSS_DEPENDENCY_GITHUB_APP_CLIENT_ID and CROSS_DEPENDENCY_GITHUB_APP_PRIVATE_KEY. Fork PRs require a trusted run with these secrets."
+            exit 1
+          fi
+      - name: Mint cross-dependency token
+        id: cross-dependency-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.CROSS_DEPENDENCY_GITHUB_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CROSS_DEPENDENCY_GITHUB_APP_PRIVATE_KEY }}
+          owner: wasmerio
+          repositories: wasmer-runtime
+          permission-contents: read
       - uses: actions/checkout@v6
         with:
           submodules: recursive
       - name: Configure private runtime access
         uses: ./.github/actions/setup-runtime
         with:
-          ssh-key: ${{ secrets.RUNTIME_CI_READ_SSH_KEY }}
+          token: ${{ steps.cross-dependency-token.outputs.token }}
       - uses: ./.github/actions/load_toolchain
         id: load_toolchain
       - name: Install Rust
@@ -178,13 +216,32 @@ jobs:
       CARGO_INCREMENTAL: "0"
       CARGO_BUILD_JOBS: "3"
     steps:
+      - name: Check cross-dependency app credentials
+        shell: bash
+        env:
+          APP_CLIENT_ID: ${{ secrets.CROSS_DEPENDENCY_GITHUB_APP_CLIENT_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.CROSS_DEPENDENCY_GITHUB_APP_PRIVATE_KEY }}
+        run: |
+          if [ -z "$APP_CLIENT_ID" ] || [ -z "$APP_PRIVATE_KEY" ]; then
+            echo "::error::Cross-dependency GitHub App secrets are unavailable; cargo cannot fetch wasmerio/wasmer-runtime. Configure CROSS_DEPENDENCY_GITHUB_APP_CLIENT_ID and CROSS_DEPENDENCY_GITHUB_APP_PRIVATE_KEY. Fork PRs require a trusted run with these secrets."
+            exit 1
+          fi
+      - name: Mint cross-dependency token
+        id: cross-dependency-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.CROSS_DEPENDENCY_GITHUB_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CROSS_DEPENDENCY_GITHUB_APP_PRIVATE_KEY }}
+          owner: wasmerio
+          repositories: wasmer-runtime
+          permission-contents: read
       - uses: actions/checkout@v6
         with:
           submodules: recursive
       - name: Configure private runtime access
         uses: ./.github/actions/setup-runtime
         with:
-          ssh-key: ${{ secrets.RUNTIME_CI_READ_SSH_KEY }}
+          token: ${{ steps.cross-dependency-token.outputs.token }}
       - uses: ./.github/actions/load_toolchain
         id: load_toolchain
       - name: Install Rust
@@ -205,14 +262,33 @@ jobs:
     name: cargo-deny
     runs-on: ${{ github.event_name == 'pull_request' && 'aux-pub-16cpu-amd64' || 'aux-pub-trusted-16cpu-amd64' }}
     steps:
+      - name: Check cross-dependency app credentials
+        shell: bash
+        env:
+          APP_CLIENT_ID: ${{ secrets.CROSS_DEPENDENCY_GITHUB_APP_CLIENT_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.CROSS_DEPENDENCY_GITHUB_APP_PRIVATE_KEY }}
+        run: |
+          if [ -z "$APP_CLIENT_ID" ] || [ -z "$APP_PRIVATE_KEY" ]; then
+            echo "::error::Cross-dependency GitHub App secrets are unavailable; cargo cannot fetch wasmerio/wasmer-runtime. Configure CROSS_DEPENDENCY_GITHUB_APP_CLIENT_ID and CROSS_DEPENDENCY_GITHUB_APP_PRIVATE_KEY. Fork PRs require a trusted run with these secrets."
+            exit 1
+          fi
+      - name: Mint cross-dependency token
+        id: cross-dependency-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.CROSS_DEPENDENCY_GITHUB_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CROSS_DEPENDENCY_GITHUB_APP_PRIVATE_KEY }}
+          owner: wasmerio
+          repositories: wasmer-runtime
+          permission-contents: read
       - uses: actions/checkout@v6
         with:
           submodules: recursive
       - name: Configure private runtime access
         uses: ./.github/actions/setup-runtime
         with:
-          ssh-key: ${{ secrets.RUNTIME_CI_READ_SSH_KEY }}
-      # Run on the host so Git can use the task-local runtime deploy key.
+          token: ${{ steps.cross-dependency-token.outputs.token }}
+      # Run on the host so Git can use the job-local runtime app token.
       - uses: ./.github/actions/load_toolchain
         id: toolchain
       - uses: dtolnay/rust-toolchain@stable
@@ -226,13 +302,32 @@ jobs:
     name: Build docs.rs
     runs-on: ${{ github.event_name == 'pull_request' && 'aux-pub-16cpu-amd64' || 'aux-pub-trusted-16cpu-amd64' }}
     steps:
+      - name: Check cross-dependency app credentials
+        shell: bash
+        env:
+          APP_CLIENT_ID: ${{ secrets.CROSS_DEPENDENCY_GITHUB_APP_CLIENT_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.CROSS_DEPENDENCY_GITHUB_APP_PRIVATE_KEY }}
+        run: |
+          if [ -z "$APP_CLIENT_ID" ] || [ -z "$APP_PRIVATE_KEY" ]; then
+            echo "::error::Cross-dependency GitHub App secrets are unavailable; cargo cannot fetch wasmerio/wasmer-runtime. Configure CROSS_DEPENDENCY_GITHUB_APP_CLIENT_ID and CROSS_DEPENDENCY_GITHUB_APP_PRIVATE_KEY. Fork PRs require a trusted run with these secrets."
+            exit 1
+          fi
+      - name: Mint cross-dependency token
+        id: cross-dependency-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.CROSS_DEPENDENCY_GITHUB_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CROSS_DEPENDENCY_GITHUB_APP_PRIVATE_KEY }}
+          owner: wasmerio
+          repositories: wasmer-runtime
+          permission-contents: read
       - uses: actions/checkout@v6
         with:
           submodules: recursive
       - name: Configure private runtime access
         uses: ./.github/actions/setup-runtime
         with:
-          ssh-key: ${{ secrets.RUNTIME_CI_READ_SSH_KEY }}
+          token: ${{ steps.cross-dependency-token.outputs.token }}
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly
@@ -278,6 +373,25 @@ jobs:
             build-cmd: "make build-wasmer && make package-wasmer"
             name: "Wasmer-cli binary"
     steps:
+      - name: Check cross-dependency app credentials
+        shell: bash
+        env:
+          APP_CLIENT_ID: ${{ secrets.CROSS_DEPENDENCY_GITHUB_APP_CLIENT_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.CROSS_DEPENDENCY_GITHUB_APP_PRIVATE_KEY }}
+        run: |
+          if [ -z "$APP_CLIENT_ID" ] || [ -z "$APP_PRIVATE_KEY" ]; then
+            echo "::error::Cross-dependency GitHub App secrets are unavailable; cargo cannot fetch wasmerio/wasmer-runtime. Configure CROSS_DEPENDENCY_GITHUB_APP_CLIENT_ID and CROSS_DEPENDENCY_GITHUB_APP_PRIVATE_KEY. Fork PRs require a trusted run with these secrets."
+            exit 1
+          fi
+      - name: Mint cross-dependency token
+        id: cross-dependency-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.CROSS_DEPENDENCY_GITHUB_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CROSS_DEPENDENCY_GITHUB_APP_PRIVATE_KEY }}
+          owner: wasmerio
+          repositories: wasmer-runtime
+          permission-contents: read
       - uses: actions/checkout@v6
         with:
           submodules: recursive
@@ -290,7 +404,7 @@ jobs:
       - name: Configure private runtime access
         uses: ./.github/actions/setup-runtime
         with:
-          ssh-key: ${{ secrets.RUNTIME_CI_READ_SSH_KEY }}
+          token: ${{ steps.cross-dependency-token.outputs.token }}
       - name: Cache
         uses: runs-on/cache@v5
         with:
@@ -307,7 +421,7 @@ jobs:
         run: |
           ${{ matrix.build-what.build-cmd }}
         env:
-          CARGO_BINARY: docker run -v /var/run/docker.sock:/var/run/docker.sock -v ${HOME}/.gitconfig:/root/.gitconfig:ro -v ${RUNNER_TEMP}/wasmer-runtime-ssh:/runtime-ssh:ro -e CARGO_NET_GIT_FETCH_WITH_CLI=true -e 'GIT_SSH_COMMAND=ssh -i /runtime-ssh/key -o IdentitiesOnly=yes -o UserKnownHostsFile=/runtime-ssh/known_hosts -o StrictHostKeyChecking=yes' -v ${GITHUB_WORKSPACE}:/project -w /project wasmer/riscv64 cargo
+          CARGO_BINARY: docker run -v /var/run/docker.sock:/var/run/docker.sock -v ${HOME}/.gitconfig:/root/.gitconfig:ro -v ${RUNNER_TEMP}/wasmer_runtime_token:${RUNNER_TEMP}/wasmer_runtime_token:ro -e CARGO_NET_GIT_FETCH_WITH_CLI=true -v ${GITHUB_WORKSPACE}:/project -w /project wasmer/riscv64 cargo
           CROSS_DOCKER_IN_DOCKER: true
           CARGO_TARGET: riscv64gc-unknown-linux-gnu
           ENABLE_LLVM: 0
@@ -316,7 +430,7 @@ jobs:
         run: |
           make distribution
         env:
-          CARGO_BINARY: docker run -v /var/run/docker.sock:/var/run/docker.sock -v ${HOME}/.gitconfig:/root/.gitconfig:ro -v ${RUNNER_TEMP}/wasmer-runtime-ssh:/runtime-ssh:ro -e CARGO_NET_GIT_FETCH_WITH_CLI=true -e 'GIT_SSH_COMMAND=ssh -i /runtime-ssh/key -o IdentitiesOnly=yes -o UserKnownHostsFile=/runtime-ssh/known_hosts -o StrictHostKeyChecking=yes' -v ${GITHUB_WORKSPACE}:/project -w /project wasmer/riscv64 cargo
+          CARGO_BINARY: docker run -v /var/run/docker.sock:/var/run/docker.sock -v ${HOME}/.gitconfig:/root/.gitconfig:ro -v ${RUNNER_TEMP}/wasmer_runtime_token:${RUNNER_TEMP}/wasmer_runtime_token:ro -e CARGO_NET_GIT_FETCH_WITH_CLI=true -v ${GITHUB_WORKSPACE}:/project -w /project wasmer/riscv64 cargo
           CROSS_DOCKER_IN_DOCKER: true
           CARGO_TARGET: riscv64gc-unknown-linux-gnu
           PKG_CONFIG_PATH: /usr/lib/riscv64-linux-gnu/pkgconfig
@@ -396,13 +510,32 @@ jobs:
         run: |
           apk update
           apk add git bash openssh-client
+      - name: Check cross-dependency app credentials
+        shell: bash
+        env:
+          APP_CLIENT_ID: ${{ secrets.CROSS_DEPENDENCY_GITHUB_APP_CLIENT_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.CROSS_DEPENDENCY_GITHUB_APP_PRIVATE_KEY }}
+        run: |
+          if [ -z "$APP_CLIENT_ID" ] || [ -z "$APP_PRIVATE_KEY" ]; then
+            echo "::error::Cross-dependency GitHub App secrets are unavailable; cargo cannot fetch wasmerio/wasmer-runtime. Configure CROSS_DEPENDENCY_GITHUB_APP_CLIENT_ID and CROSS_DEPENDENCY_GITHUB_APP_PRIVATE_KEY. Fork PRs require a trusted run with these secrets."
+            exit 1
+          fi
+      - name: Mint cross-dependency token
+        id: cross-dependency-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.CROSS_DEPENDENCY_GITHUB_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CROSS_DEPENDENCY_GITHUB_APP_PRIVATE_KEY }}
+          owner: wasmerio
+          repositories: wasmer-runtime
+          permission-contents: read
       - uses: actions/checkout@v6
         with:
           submodules: recursive
       - name: Configure private runtime access
         uses: ./.github/actions/setup-runtime
         with:
-          ssh-key: ${{ secrets.RUNTIME_CI_READ_SSH_KEY }}
+          token: ${{ steps.cross-dependency-token.outputs.token }}
       - name: Set up Depot CLI
         uses: depot/setup-action@v1
       - name: Set up libstdc++ on Linux
@@ -650,13 +783,32 @@ jobs:
         run: |
           apk update
           apk add git bash openssh-client
+      - name: Check cross-dependency app credentials
+        shell: bash
+        env:
+          APP_CLIENT_ID: ${{ secrets.CROSS_DEPENDENCY_GITHUB_APP_CLIENT_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.CROSS_DEPENDENCY_GITHUB_APP_PRIVATE_KEY }}
+        run: |
+          if [ -z "$APP_CLIENT_ID" ] || [ -z "$APP_PRIVATE_KEY" ]; then
+            echo "::error::Cross-dependency GitHub App secrets are unavailable; cargo cannot fetch wasmerio/wasmer-runtime. Configure CROSS_DEPENDENCY_GITHUB_APP_CLIENT_ID and CROSS_DEPENDENCY_GITHUB_APP_PRIVATE_KEY. Fork PRs require a trusted run with these secrets."
+            exit 1
+          fi
+      - name: Mint cross-dependency token
+        id: cross-dependency-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.CROSS_DEPENDENCY_GITHUB_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CROSS_DEPENDENCY_GITHUB_APP_PRIVATE_KEY }}
+          owner: wasmerio
+          repositories: wasmer-runtime
+          permission-contents: read
       - uses: actions/checkout@v6
         with:
           submodules: recursive
       - name: Configure private runtime access
         uses: ./.github/actions/setup-runtime
         with:
-          ssh-key: ${{ secrets.RUNTIME_CI_READ_SSH_KEY }}
+          token: ${{ steps.cross-dependency-token.outputs.token }}
       - name: Load CI constants (musl)
         if: matrix.metadata.build == 'linux-musl'
         run: grep -v '^#' .github/ci-constants.env >> $GITHUB_ENV
@@ -804,12 +956,31 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     runs-on: ubuntu-24.04
     steps:
+      - name: Check cross-dependency app credentials
+        shell: bash
+        env:
+          APP_CLIENT_ID: ${{ secrets.CROSS_DEPENDENCY_GITHUB_APP_CLIENT_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.CROSS_DEPENDENCY_GITHUB_APP_PRIVATE_KEY }}
+        run: |
+          if [ -z "$APP_CLIENT_ID" ] || [ -z "$APP_PRIVATE_KEY" ]; then
+            echo "::error::Cross-dependency GitHub App secrets are unavailable; cargo cannot fetch wasmerio/wasmer-runtime. Configure CROSS_DEPENDENCY_GITHUB_APP_CLIENT_ID and CROSS_DEPENDENCY_GITHUB_APP_PRIVATE_KEY. Fork PRs require a trusted run with these secrets."
+            exit 1
+          fi
+      - name: Mint cross-dependency token
+        id: cross-dependency-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.CROSS_DEPENDENCY_GITHUB_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CROSS_DEPENDENCY_GITHUB_APP_PRIVATE_KEY }}
+          owner: wasmerio
+          repositories: wasmer-runtime
+          permission-contents: read
       - uses: actions/checkout@v6
         with:
           submodules: recursive
       - uses: ./.github/actions/setup-runtime
         with:
-          ssh-key: ${{ secrets.RUNTIME_CI_READ_SSH_KEY }}
+          token: ${{ steps.cross-dependency-token.outputs.token }}
       - uses: ./.github/actions/load_toolchain
         id: toolchain
       - uses: dtolnay/rust-toolchain@stable

@@ -1,29 +1,45 @@
 name: Private runtime access
 description: Configure Cargo Git CLI access to the private engine
 inputs:
-  ssh-key:
-    description: Read-only deploy key for wasmerio/wasmer-runtime
+  token:
+    description: GitHub App installation token with Contents-read access to wasmerio/wasmer-runtime
     required: true
 runs:
   using: composite
   steps:
-    - name: Configure runtime Git transport
+    - name: Configure git credentials for cargo
       shell: bash
       env:
-        RUNTIME_SSH_KEY: ${{ inputs.ssh-key }}
+        PRIVATE_DEPS_TOKEN: ${{ inputs.token }}
       run: |
-        set -euo pipefail
-        if [ -z "$RUNTIME_SSH_KEY" ]; then
-          echo 'RUNTIME_CI_READ_SSH_KEY must be a read-only deploy key for wasmerio/wasmer-runtime' >&2
+        set -Eeuo pipefail
+
+        if [ -z "${PRIVATE_DEPS_TOKEN:-}" ]; then
+          echo "::error::No token supplied; cargo cannot fetch wasmerio/wasmer-runtime."
           exit 1
         fi
-        runtime_ssh_dir="$RUNNER_TEMP/wasmer-runtime-ssh"
-        mkdir -p "$runtime_ssh_dir"
-        chmod 700 "$runtime_ssh_dir"
-        printf '%s\n' "$RUNTIME_SSH_KEY" > "$runtime_ssh_dir/key"
-        chmod 600 "$runtime_ssh_dir/key"
-        ssh-keyscan -t ed25519 github.com > "$runtime_ssh_dir/known_hosts"
-        chmod 600 "$runtime_ssh_dir/known_hosts"
-        git config --global url."ssh://git@github.com/wasmerio/wasmer-runtime".insteadOf https://github.com/wasmerio/wasmer-runtime
-        echo "GIT_SSH_COMMAND=ssh -i \"$runtime_ssh_dir/key\" -o IdentitiesOnly=yes -o UserKnownHostsFile=\"$runtime_ssh_dir/known_hosts\" -o StrictHostKeyChecking=yes" >> "$GITHUB_ENV"
+
+        token_file="$RUNNER_TEMP/wasmer_runtime_token"
+        # Git for Windows invokes credential helpers through its POSIX shell.
+        if command -v cygpath >/dev/null 2>&1; then
+          token_file="$(cygpath -u "$token_file")"
+        fi
+        install -m 600 /dev/null "$token_file"
+        printf '%s' "$PRIVATE_DEPS_TOKEN" > "$token_file"
+
+        git config --global credential.useHttpPath true
+        for u in \
+          "https://github.com/wasmerio/wasmer-runtime" \
+          "https://github.com/wasmerio/wasmer-runtime.git"; do
+          git config --global credential."$u".helper \
+            "!f() { test -r '$token_file' || return 0; \
+                    echo username=x-access-token; \
+                    echo \"password=\$(cat '$token_file')\"; }; f"
+          # Keep checkout's GITHUB_TOKEN from overriding runtime credentials.
+          git config --global http."$u".extraheader ''
+        done
+
         echo 'CARGO_NET_GIT_FETCH_WITH_CLI=true' >> "$GITHUB_ENV"
+        GIT_TERMINAL_PROMPT=0 git ls-remote --exit-code \
+          https://github.com/wasmerio/wasmer-runtime refs/heads/next >/dev/null
+        echo "cargo can reach wasmerio/wasmer-runtime"

@@ -23,6 +23,25 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: "0"
       MACOSX_DEPLOYMENT_TARGET: "13.0"
     steps:
+      - name: Check cross-dependency app credentials
+        shell: bash
+        env:
+          APP_CLIENT_ID: ${{ secrets.CROSS_DEPENDENCY_GITHUB_APP_CLIENT_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.CROSS_DEPENDENCY_GITHUB_APP_PRIVATE_KEY }}
+        run: |
+          if [ -z "$APP_CLIENT_ID" ] || [ -z "$APP_PRIVATE_KEY" ]; then
+            echo "::error::Cross-dependency GitHub App secrets are unavailable; cargo cannot fetch wasmerio/wasmer-runtime. Configure CROSS_DEPENDENCY_GITHUB_APP_CLIENT_ID and CROSS_DEPENDENCY_GITHUB_APP_PRIVATE_KEY. Fork PRs require a trusted run with these secrets."
+            exit 1
+          fi
+      - name: Mint cross-dependency token
+        id: cross-dependency-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.CROSS_DEPENDENCY_GITHUB_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CROSS_DEPENDENCY_GITHUB_APP_PRIVATE_KEY }}
+          owner: wasmerio
+          repositories: wasmer-runtime
+          permission-contents: read
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         timeout-minutes: 3
         with:
@@ -34,7 +53,7 @@ jobs:
       - name: Configure private runtime access
         uses: ./candidate/.github/actions/setup-runtime
         with:
-          ssh-key: ${{ secrets.RUNTIME_CI_READ_SSH_KEY }}
+          token: ${{ steps.cross-dependency-token.outputs.token }}
       - name: Create task-local build context and disk guard
         shell: bash
         timeout-minutes: 1

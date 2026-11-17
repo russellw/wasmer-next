@@ -18,13 +18,32 @@ jobs:
     permissions:
       contents: read
     steps:
+      - name: Check cross-dependency app credentials
+        shell: bash
+        env:
+          APP_CLIENT_ID: ${{ secrets.CROSS_DEPENDENCY_GITHUB_APP_CLIENT_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.CROSS_DEPENDENCY_GITHUB_APP_PRIVATE_KEY }}
+        run: |
+          if [ -z "$APP_CLIENT_ID" ] || [ -z "$APP_PRIVATE_KEY" ]; then
+            echo "::error::Cross-dependency GitHub App secrets are unavailable; cargo cannot fetch wasmerio/wasmer-runtime. Configure CROSS_DEPENDENCY_GITHUB_APP_CLIENT_ID and CROSS_DEPENDENCY_GITHUB_APP_PRIVATE_KEY. Fork PRs require a trusted run with these secrets."
+            exit 1
+          fi
+      - name: Mint cross-dependency token
+        id: cross-dependency-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.CROSS_DEPENDENCY_GITHUB_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CROSS_DEPENDENCY_GITHUB_APP_PRIVATE_KEY }}
+          owner: wasmerio
+          repositories: wasmer-runtime
+          permission-contents: read
       - uses: actions/checkout@v6
         with:
           submodules: recursive
       - name: Configure private runtime access
         uses: ./.github/actions/setup-runtime
         with:
-          ssh-key: ${{ secrets.RUNTIME_CI_READ_SSH_KEY }}
+          token: ${{ steps.cross-dependency-token.outputs.token }}
       - name: Load CI constants
         run: grep -v '^#' .github/ci-constants.env >> $GITHUB_ENV
       - name: Set up libstdc++ on Linux

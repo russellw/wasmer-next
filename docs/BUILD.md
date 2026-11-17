@@ -251,5 +251,9 @@ the host discards every executor job and every owner-thread driver.
 The engine is a private Git dependency, locked by Cargo.lock; Rust 1.99 and
 LLVM 23 are required. Engine implementation tests run in wasmer-runtime. See
 [RUNTIME-EXTRACTION.md](RUNTIME-EXTRACTION.md) for private fetch credentials,
-CI setup and coordinated engine patches. WLK is local at wlk/ and retains its
+CI setup, GitHub App owner prerequisites and coordinated engine patches. CI
+uses `CROSS_DEPENDENCY_GITHUB_APP_CLIENT_ID` and
+`CROSS_DEPENDENCY_GITHUB_APP_PRIVATE_KEY` to mint a Contents-read token for
+`wasmerio/wasmer-runtime`; checkout keeps its default `GITHUB_TOKEN`.
+WLK is local at wlk/ and retains its
 own workspace, toolchain and lockfile; root lint does not cover it.

@@ -6,8 +6,10 @@ same Git source identity. Rust 1.99 and LLVM 23 are required by that engine.
 
 For HTTPS access, configure `gh auth login` and `gh auth setup-git`. Cargo uses
 Git CLI fetching through .cargo/config.toml. CI jobs resolving Cargo dependencies
-need a read-only deploy key `RUNTIME_CI_READ_SSH_KEY` for wasmer-runtime. WLK is now local under wlk/. A token scoped only to this repository cannot fetch
-the private engine. Containers need the same credential setup inside them.
+mint a GitHub App installation token with Contents-read access to wasmer-runtime
+(see owner prerequisites below). WLK is now local under wlk/. A token scoped only
+to this repository cannot fetch the private engine. Containers need the same
+credential setup inside them.
 
 V8's Linux provider is a separate private wasmer-next asset (726693826). Its
 automatic download needs GH_TOKEN/GITHUB_TOKEN with read access here; that is
@@ -29,14 +31,38 @@ Private-engine release and public registry distribution policy is out of scope.
 
 ## CI setup and ownership
 
-Create repository/organization secret `RUNTIME_CI_READ_SSH_KEY`, containing an
-SSH private deploy key with read-only access to wasmerio/wasmer-runtime. Root
-workspace jobs call .github/actions/setup-runtime, which narrowly rewrites that
-HTTPS URL to SSH and enables Git CLI fetching. RISC-V Docker commands explicitly
-mount its key/known-hosts and Git configuration. Fork PRs without this secret
-cannot fetch the private engine and fail clearly rather than silently skipping
-required product checks. `ci_success` still rejects failed/cancelled jobs and
-accepts intentional skips. Sealed wlk-only jobs do not need runtime credentials.
+Owner prerequisites:
+
+- Create or reuse the cross-dependency GitHub App and grant it repository
+  **Contents: read-only** permission.
+- Install the app on the **wasmerio** organization with access to the private
+  **wasmer-runtime** repository; approve any pending installation/permission
+  request. No access to this product repository or public wasmerio/napi is needed.
+- Generate an app private key. Set Actions secrets
+  `CROSS_DEPENDENCY_GITHUB_APP_CLIENT_ID` (the app's client ID) and
+  `CROSS_DEPENDENCY_GITHUB_APP_PRIVATE_KEY` (the full PEM private key) on this
+  product repository, or as organization secrets with this repository included
+  in their access policy. Make them available to every runtime-consuming job.
+
+Each runtime-consuming job mints its own installation token before checkout with
+`actions/create-github-app-token@v3`, owner `wasmerio`, repository
+`wasmer-runtime`, and `permission-contents: read`. Checkout retains its default
+`GITHUB_TOKEN`, including for the public lib/napi submodule. The local
+`.github/actions/setup-runtime` action takes the minted token, stores it with
+mode 600 in `RUNNER_TEMP/wasmer_runtime_token`, configures path-scoped HTTPS
+credential helpers for the runtime URL with and without `.git`, verifies branch
+`next` using `git ls-remote --exit-code`, and enables Cargo Git CLI fetching.
+The action uses bash on Linux, macOS and Windows. RISC-V Docker commands mount
+the token file at the same path and mount the Git configuration read-only.
+Installation tokens expire after one hour and are revoked by the mint action
+when the job ends; dependency fetches must finish within that lifetime.
+
+Fork PRs and other jobs without the app secrets fail with an explicit error
+before checkout; required product checks are not silently skipped. Use a trusted
+run with secrets available; do not expose secrets to untrusted fork code.
+`ci_success` still rejects failed/cancelled jobs and accepts intentional skips.
+Sealed wlk-only jobs do not need runtime credentials. The old runtime SSH deploy
+key secret is no longer used and can be removed after migration.
 
 Existing GITHUB_TOKEN/GH_TOKEN use for V8 provider assets is separate; the
 provider remains in this repository. No additional V8 secret is introduced here.
