@@ -887,3 +887,273 @@ async fn a_custom_import_owns_protected_native_kernel_reservations() {
         })
         .await;
 }
+
+// Like HostLeaseHook, but keep the real kernel pin through startup and retire it
+// with the instance attachment on success, start trap, or a pending start import.
+#[derive(Default)]
+struct StartProbe {
+    events: Mutex<Vec<(&'static str, std::thread::ThreadId)>>,
+    lease: Mutex<Option<Box<dyn wasixv2_syscalls::HostMemoryLease>>>,
+    entered: tokio::sync::Notify,
+    retired: tokio::sync::Notify,
+}
+impl StartProbe {
+    fn record(&self, phase: &'static str) {
+        self.events
+            .lock()
+            .unwrap()
+            .push((phase, std::thread::current().id()));
+    }
+}
+struct StartHook {
+    probe: Arc<StartProbe>,
+    pending: bool,
+}
+struct StartState {
+    memory: Option<Memory>,
+    probe: Arc<StartProbe>,
+}
+struct StartAttachment {
+    state: FunctionEnv<StartState>,
+    exec: FunctionEnv<ExecEnv<MachineSyscalls>>,
+}
+impl InstantiationHook<MachineSyscalls> for StartHook {
+    fn requires_owning_thread(&self) -> bool {
+        true
+    }
+    fn prepare_imports(
+        &self,
+        _: &Module,
+        store: &mut StoreMut<'_>,
+        exec: &FunctionEnv<ExecEnv<MachineSyscalls>>,
+        imports: &mut Imports,
+    ) -> Result<Option<Box<dyn InstanceAttachment>>, RuntimeError> {
+        let state = FunctionEnv::new(
+            store,
+            StartState {
+                memory: None,
+                probe: self.probe.clone(),
+            },
+        );
+        imports.define(
+            "custom",
+            "memory",
+            Function::new_typed_with_env(store, &state, |env: FunctionEnvMut<StartState>| -> i32 {
+                let data = env.data();
+                let memory = data.memory.as_ref().expect("configured before start");
+                let mut byte = [0];
+                memory.view(&env).read(0, &mut byte).unwrap();
+                assert_eq!(byte, [42]);
+                memory.view(&env).write(0, &[43]).unwrap();
+                data.probe.record("memory");
+                43
+            }),
+        );
+        let probe = self.probe.clone();
+        let pending = self.pending;
+        imports.define(
+            "custom",
+            "lease",
+            Function::new_typed_with_env_async(
+                store,
+                exec,
+                move |env: wasmer::AsyncFunctionEnvMut<ExecEnv<MachineSyscalls>>| {
+                    let probe = probe.clone();
+                    async move {
+                        use wasixv2_syscalls::{Caller, LoaderControl};
+                        let (syscalls, task) = {
+                            let read = env.read().await;
+                            (read.data().syscalls().clone(), read.data().task())
+                        };
+                        let memory = wasixv2_exec::GuestMemory::new(&env);
+                        let caller = Caller::new(task, &memory);
+                        let lease = syscalls
+                            .loader_reserve_host(&caller, 17, 64)
+                            .await
+                            .map_err(|e| RuntimeError::new(format!("start lease: {e:?}")))?;
+                        // SAFETY: the exact lease exclusively owns this protected range.
+                        unsafe {
+                            lease.as_ptr().write(79);
+                        }
+                        *probe.lease.lock().unwrap() = Some(lease);
+                        probe.record("lease");
+                        probe.entered.notify_one();
+                        if pending {
+                            std::future::pending::<()>().await;
+                        }
+                        Ok::<(), RuntimeError>(())
+                    }
+                },
+            ),
+        );
+        Ok(Some(Box::new(StartAttachment {
+            state,
+            exec: exec.clone(),
+        })))
+    }
+}
+impl InstanceAttachment for StartAttachment {
+    fn configure(
+        &mut self,
+        _: &Module,
+        store: &mut StoreMut<'_>,
+        _: &Instance,
+        memory: &Memory,
+    ) -> Result<(), RuntimeError> {
+        assert_eq!(self.exec.as_ref(store).memory(), Some(memory));
+        let mut byte = [0];
+        memory.view(&*store).read(0, &mut byte).unwrap();
+        assert_eq!(byte, [41]); // active data was applied before configuration
+        memory.view(&*store).write(0, &[42]).unwrap();
+        let state = self.state.as_mut(store);
+        state.memory = Some(memory.clone());
+        state.probe.record("configure");
+        Ok(())
+    }
+    fn deactivate(&mut self, store: &mut StoreMut<'_>) {
+        let state = self.state.as_mut(store);
+        let lease = state.probe.lease.lock().unwrap().take();
+        if let Some(lease) = lease {
+            // SAFETY: the lease remained live throughout start and ABI entry.
+            assert_eq!(unsafe { lease.as_ptr().read() }, 79);
+            drop(lease);
+        }
+        state.memory = None;
+        state.probe.record("deactivate");
+        state.probe.retired.notify_one();
+    }
+}
+fn start_guest(tail: &str) -> Vec<u8> {
+    start_guest_layout(tail, "")
+}
+fn start_guest_layout(tail: &str, layout: &str) -> Vec<u8> {
+    start_guest_memory(tail, layout, true)
+}
+fn start_guest_memory(tail: &str, layout: &str, shared: bool) -> Vec<u8> {
+    let shared = if shared { "shared" } else { "" };
+    wat::parse_str(format!(
+        r#"(module
+        (import "env" "memory" (memory 1 16 {shared}))
+        (import "wasixv2" "exit_group" (func $exit (param i32)))
+        (import "custom" "memory" (func $memory (result i32)))
+        (import "custom" "lease" (func $lease))
+        {layout}
+        (data (i32.const 0) "\29")
+        (global $count (mut i32) (i32.const 0))
+        (func $init
+          i32.const 4 call $memory i32.store
+          global.get $count i32.const 1 i32.add global.set $count
+          call $lease {tail})
+        (start $init)
+        (func (export "_start")
+          i32.const 4 i32.load i32.const 43 i32.ne
+          global.get $count i32.const 1 i32.ne i32.or call $exit))"#
+    ))
+    .unwrap()
+}
+fn start_config() -> ProcessConfig {
+    ProcessConfig {
+        args: vec!["start-hook".into()],
+        env: vec![],
+        stdio: Stdio::from_fns(|_| {}, |_| {}),
+    }
+}
+#[tokio::test]
+async fn start_imports_use_configured_memory_and_retained_protected_leases() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            for (tail, shared) in [
+                ("", true),
+                ("", false),
+                ("unreachable", true),
+                ("unreachable", false),
+            ] {
+                let probe = Arc::new(StartProbe::default());
+                let machine = Machine::builder()
+                    .instantiation_hook(Arc::new(StartHook {
+                        probe: probe.clone(),
+                        pending: false,
+                    }))
+                    .build();
+                let result = machine
+                    .run_process(&start_guest_memory(tail, "", shared), start_config())
+                    .await;
+                if tail.is_empty() {
+                    assert_eq!(result.unwrap(), 0);
+                } else {
+                    assert!(result.unwrap_err().to_string().contains("unreachable"));
+                }
+                assert!(probe.lease.lock().unwrap().is_none());
+                let events = probe.events.lock().unwrap();
+                assert_eq!(
+                    events.iter().map(|(phase, _)| *phase).collect::<Vec<_>>(),
+                    ["configure", "memory", "lease", "deactivate"]
+                );
+                assert!(events.iter().all(|(_, thread)| *thread == events[0].1));
+            }
+        })
+        .await;
+}
+#[tokio::test]
+async fn canceling_start_retires_its_original_attachment_and_pin() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            for pending in [true, false] {
+                let probe = Arc::new(StartProbe::default());
+                let machine = Machine::builder()
+                    .instantiation_hook(Arc::new(StartHook {
+                        probe: probe.clone(),
+                        pending,
+                    }))
+                    .build();
+                let guest = start_guest(if pending { "" } else { "(loop br 0)" });
+                let mut run = Box::pin(machine.run_process(&guest, start_config()));
+                tokio::select! {
+                    _ = probe.entered.notified() => (),
+                    result = &mut run => panic!("pending start completed: {result:?}"),
+                }
+                drop(run);
+                tokio::time::timeout(std::time::Duration::from_secs(10), probe.retired.notified())
+                    .await
+                    .unwrap();
+                assert!(probe.lease.lock().unwrap().is_none());
+                assert_eq!(probe.events.lock().unwrap().last().unwrap().0, "deactivate");
+            }
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn start_cannot_replace_already_bound_memory_layout() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let probe = Arc::new(StartProbe::default());
+            let machine = Machine::builder()
+                .instantiation_hook(Arc::new(StartHook {
+                    probe: probe.clone(),
+                    pending: false,
+                }))
+                .build();
+            let guest = start_guest_layout(
+                "i32.const 65552 global.set $heap",
+                r#"
+            (global (export "__data_start") i32 (i32.const 0))
+            (global (export "__data_end") i32 (i32.const 32))
+            (global (export "__stack_pointer") (mut i32) (i32.const 32768))
+            (global $heap (export "__heap_base") (mut i32) (i32.const 65536))"#,
+            );
+            let error = machine
+                .run_process(&guest, start_config())
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("start changed bound ABI memory layout"),
+                "{error}"
+            );
+            assert!(probe.lease.lock().unwrap().is_none());
+            assert_eq!(probe.events.lock().unwrap().last().unwrap().0, "deactivate");
+        })
+        .await;
+}

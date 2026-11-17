@@ -14,10 +14,10 @@
 //! no further than the instance's ABI allows ([`crate::AbiInstance::memory_limit`]): an ABI may
 //! keep the top of the address space for itself, as WASIX v1's compat layer does.
 //!
-//! The rewrite only adds: six types, six function imports after the others (so defined
+//! The rewrite adds six types, six function imports after the others (so defined
 //! functions move up by six indices), one global, the check, and a constant with each atomic's
-//! offset before the call that replaces it. The start function gets only typed unreachable
-//! traps: it runs during instantiation, before the instance can take signals or wait for threads.
+//! offset before the call that replaces it. Start is exported for exec to invoke only after
+//! memory, ABI and custom attachments are bound, with the same instrumentation as other code.
 
 use std::convert::Infallible;
 
@@ -73,6 +73,16 @@ pub(crate) const BUDGET: i32 = 1 << 16;
 pub struct InstrumentError(String, bool);
 
 impl InstrumentError {
+    /// The same source with start deferred but without preemption, for a custom
+    /// compiler/cache's fallback after instrumentation fails. Reserved execution
+    /// metadata errors cannot fall back. Pass the original failed input unchanged.
+    pub fn fallback_source(&self, wasm: &[u8]) -> Result<Vec<u8>, InstrumentError> {
+        if !self.permits_uninstrumented() {
+            return Err(InstrumentError(self.0.clone(), false));
+        }
+        defer_start(wasm)
+    }
+
     pub(crate) fn permits_uninstrumented(&self) -> bool {
         self.1
     }
@@ -80,15 +90,90 @@ impl InstrumentError {
 
 /// `module` with preemption points.
 pub(crate) fn instrument(module: &[u8]) -> Result<Vec<u8>, InstrumentError> {
+    let deferred = defer_start(module)?;
     let mut out = Module::new();
     let mut points = Points {
         reflection: Reflection::parse(module)?,
         ..Points::default()
     };
-    match points.parse_core_module(&mut out, Parser::new(0), module) {
+    match points.parse_core_module(&mut out, Parser::new(0), &deferred) {
         Ok(()) => Ok(out.finish()),
         Err(err) => Err(InstrumentError(err.to_string(), true)),
     }
+}
+
+/// Reserved export invoked once by the owning runner, never by the engine.
+pub(crate) const START_PROFILE: &str = "wasixv2.exec.deferred-start.v1";
+pub(crate) const START: &str = "__wasix_exec_start";
+
+pub(crate) fn defer_start(source: &[u8]) -> Result<Vec<u8>, InstrumentError> {
+    let bad = |error: String| InstrumentError(error, false);
+    let mut start = None;
+    let mut exports = ExportSection::new();
+    for payload in Parser::new(0).parse_all(source) {
+        match payload.map_err(|e| bad(e.to_string()))? {
+            Payload::StartSection { func, .. } => start = Some(func),
+            Payload::ExportSection(section) => {
+                for export in section {
+                    let export = export.map_err(|e| bad(e.to_string()))?;
+                    if export.name == START {
+                        return Err(bad("reserved execution start export".into()));
+                    }
+                    let kind = match export.kind {
+                        wasmparser::ExternalKind::Func | wasmparser::ExternalKind::FuncExact => {
+                            ExportKind::Func
+                        }
+                        wasmparser::ExternalKind::Table => ExportKind::Table,
+                        wasmparser::ExternalKind::Memory => ExportKind::Memory,
+                        wasmparser::ExternalKind::Global => ExportKind::Global,
+                        wasmparser::ExternalKind::Tag => ExportKind::Tag,
+                    };
+                    exports.export(export.name, kind, export.index);
+                }
+            }
+            Payload::CustomSection(section) if section.name() == START_PROFILE => {
+                return Err(bad("reserved deferred-start profile".into()));
+            }
+            _ => (),
+        }
+    }
+    let mut output = Module::new();
+    let marker = wasm_encoder::CustomSection {
+        name: START_PROFILE.into(),
+        data: (&[][..]).into(),
+    };
+    let Some(start) = start else {
+        let mut bytes = source.to_vec();
+        use wasm_encoder::Encode;
+        bytes.push(0);
+        marker.encode(&mut bytes);
+        return Ok(bytes);
+    };
+    // Removing start would otherwise hide its required [] -> [] signature from
+    // the engine validator, including when start names an imported function.
+    wasmparser::Validator::new()
+        .validate_all(source)
+        .map_err(|e| bad(e.to_string()))?;
+    exports.export(START, ExportKind::Func, start);
+    let mut exported = false;
+    for payload in Parser::new(0).parse_all(source) {
+        let payload = payload.map_err(|e| bad(e.to_string()))?;
+        if let Some((id, range)) = payload.as_section() {
+            if id == SectionId::Export as u8 || id == SectionId::Start as u8 {
+                if !exported {
+                    output.section(&exports);
+                    exported = true;
+                }
+            } else {
+                output.section(&wasm_encoder::RawSection {
+                    id,
+                    data: &source[range.start as usize..range.end as usize],
+                });
+            }
+        }
+    }
+    output.section(&marker);
+    Ok(output.finish())
 }
 
 /// Whether `module` was compiled with preemption points.
@@ -112,9 +197,6 @@ struct Points {
     memory32: Option<bool>,
     imported_globals: u32,
     budget: Option<u32>,
-    start: Option<u32>,
-    /// Bodies seen so far.
-    bodies: u32,
     reflection: Reflection,
     reflection_exported: bool,
     stable_global: Option<u32>,
@@ -358,11 +440,6 @@ impl Reencode for Points {
         })
     }
 
-    fn start_section(&mut self, start: u32) -> Result<u32, Error> {
-        self.start = Some(start);
-        self.function_index(start)
-    }
-
     fn parse_type_section(
         &mut self,
         types: &mut TypeSection,
@@ -437,13 +514,8 @@ impl Reencode for Points {
         code: &mut CodeSection,
         func: FunctionBody<'_>,
     ) -> Result<(), Error> {
-        let index = self.hook() + self.bodies;
-        self.bodies += 1;
-        let checked = self.start != Some(index);
         let mut f = self.new_function_with_parsed_locals(&func)?;
-        if checked {
-            self.check(&mut f);
-        }
+        self.check(&mut f);
         let mut reader = func.get_operators_reader()?;
         while !reader.eof() {
             let instruction = self.parse_instruction(&mut reader)?;
@@ -454,12 +526,12 @@ impl Reencode for Points {
                 f.instruction(&Instruction::Drop);
             }
             let header = matches!(instruction, Instruction::Loop(_));
-            match self.atomic_call(&instruction).filter(|_| checked) {
+            match self.atomic_call(&instruction) {
                 Some([offset, call]) => {
                     f.instruction(&offset);
                     f.instruction(&call);
                 }
-                None => match self.grow_call(&instruction).filter(|_| checked) {
+                None => match self.grow_call(&instruction) {
                     Some(call) => {
                         f.instruction(&call);
                     }
@@ -468,7 +540,7 @@ impl Reencode for Points {
                     }
                 },
             }
-            if header && checked {
+            if header {
                 self.check(&mut f);
             }
         }
@@ -515,6 +587,27 @@ mod tests {
 
     fn print(wasm: &[u8]) -> String {
         wasmprinter::print_bytes(wasm).unwrap()
+    }
+
+    #[test]
+    fn deferred_start_handles_imports_missing_exports_and_rejects_invalid_signatures() {
+        for source in [
+            r#"(module (func $s (loop)) (start $s))"#,
+            r#"(module (import "host" "start" (func $s)) (start $s))"#,
+        ] {
+            let output = instrument(&wat::parse_str(source).unwrap()).unwrap();
+            wasmparser::validate(&output).unwrap();
+            let text = print(&output);
+            assert!(!text.contains("(start "), "{text}");
+            assert!(text.contains(START), "{text}");
+        }
+        for source in [
+            r#"(module (func $s (param i32)) (start $s))"#,
+            r#"(module (func (export "__wasix_exec_start")))"#,
+        ] {
+            let error = instrument(&wat::parse_str(source).unwrap()).unwrap_err();
+            assert!(!error.permits_uninstrumented());
+        }
     }
 
     #[test]
@@ -590,8 +683,12 @@ mod tests {
         // The defined functions moved up by six; `$call` still calls `$spin`.
         assert!(text.contains("call 7"), "{text}");
         assert!(text.contains("(export \"spin\" (func 7))"), "{text}");
-        assert!(text.contains("(start 9)"), "{text}");
-        assert_eq!(text.matches("call 1").count(), 3, "{text}");
+        assert!(!text.contains("(start "), "{text}");
+        assert!(
+            text.contains("(export \"__wasix_exec_start\" (func 9))"),
+            "{text}"
+        );
+        assert_eq!(text.matches("call 1").count(), 4, "{text}");
         assert!(
             text.contains("(global (;0;) (mut i32) i32.const 65536)"),
             "{text}"
@@ -658,12 +755,12 @@ mod tests {
         assert!(text.contains("i32.const 8\n    call 1"), "{text}");
         assert!(text.contains("i32.const 0\n    call 2"), "{text}");
         assert!(text.contains("i32.const 4\n    call 3"), "{text}");
-        // The start function keeps its instruction.
-        assert_eq!(text.matches("memory.atomic.").count(), 1, "{text}");
+        // Deferred start uses the same interruptible futex hooks.
+        assert_eq!(text.matches("memory.atomic.").count(), 0, "{text}");
     }
 
     /// `memory.grow` of a 32-bit memory 0 calls the grow hook (import 4 here) with its operand,
-    /// except in the start function; other memories grow as they do.
+    /// including the deferred start function; other memories grow as they do.
     #[test]
     fn memory_grow_becomes_a_call_of_the_grow_hook() {
         let wasm = wat::parse_str(
@@ -685,7 +782,7 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("i32.const 2\n    call 4"), "{text}");
-        assert_eq!(text.matches("memory.grow").count(), 2, "{text}");
+        assert_eq!(text.matches("memory.grow").count(), 1, "{text}");
 
         let wasm64 = wat::parse_str(
             r#"(module (memory i64 1) (func (export "f") (result i64) (memory.grow (i64.const 1))))"#,
@@ -716,6 +813,19 @@ mod tests {
         );
         let module = crate::load(&engine, &bad).unwrap();
         assert!(!crate::is_preemptible(&module));
+    }
+
+    #[test]
+    fn uninstrumented_fallback_still_defers_start() {
+        let source = wat::parse_str("(module (func $s) (start $s))").unwrap();
+        let engine = wasmer::Engine::default();
+        let module = crate::load(&engine, &with_bad_name_section(source)).unwrap();
+        assert!(!instrumented(&module));
+        #[cfg(feature = "sys")]
+        if engine.is_sys() {
+            assert!(module.info().start_function.is_none());
+        }
+        assert!(module.exports().any(|export| export.name() == START));
     }
 
     #[test]

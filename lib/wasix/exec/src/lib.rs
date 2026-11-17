@@ -337,27 +337,28 @@ pub fn thread_exit_status(error: &RuntimeError) -> Option<i32> {
 
 /// Compiles `wasm` for [`run`], with the preemption points that let a busy guest notice signals
 /// and the exit of its thread group, and atomic waits that a signal interrupts. A module they
-/// cannot be added to is compiled as it is, with a warning; [`is_preemptible`] tells.
+/// cannot be added to still has its start deferred, with a warning; [`is_preemptible`] tells.
+/// Start runs after memory/ABI binding and attachment configuration, before ABI entry.
+/// Custom compilers and caches must use [`instrument`] before compiling a module.
 pub fn load(engine: &Engine, wasm: &[u8]) -> Result<Module, CompileError> {
     match instrument(wasm) {
         Ok(instrumented) => Module::new(engine, instrumented),
         Err(err) => {
-            if !err.permits_uninstrumented() {
-                return Err(CompileError::Validate(err.to_string()));
-            }
-            let module = Module::new(engine, wasm)?;
+            let deferred = err
+                .fallback_source(wasm)
+                .map_err(|err| CompileError::Validate(err.to_string()))?;
+            let module = Module::new(engine, deferred)?;
             warn_not_preemptible(&err);
             Ok(module)
         }
     }
 }
 
-/// `wasm` with the preemption points [`load`] adds, for an embedder that compiles (and caches)
-/// modules itself. Fails for a module the rewrite cannot handle: an invalid one, which
-/// compiling then reports, or one using something the rewrite does not know. Such a module,
-/// compiled as it is, runs, but a guest that computes without making syscalls, or blocks in
-/// `memory.atomic.wait`, does not notice signals or its group's exit;
-/// [`warn_not_preemptible`] says so.
+/// `wasm` with deferred start and the preemption points [`load`] adds, for an embedder that compiles (and caches)
+/// modules itself. Fails for an invalid module or a rewrite it cannot handle. Use [`load`]
+/// for the supported fallback that still defers start without preemption. A guest without
+/// preemption that computes without syscalls, or blocks in `memory.atomic.wait`, cannot
+/// notice signals or its group's exit; [`warn_not_preemptible`] says so.
 pub fn instrument(wasm: &[u8]) -> Result<Vec<u8>, InstrumentError> {
     preempt::instrument(wasm)
 }
@@ -828,7 +829,7 @@ where
     S: Syscalls + Control + Send + Sync + 'static,
 {
     let ready = instantiate(store, module, syscalls, task, host, abis, cleanup, None).await?;
-    Ok(ready.start().await)
+    ready.start().await
 }
 
 /// Runs a fork child from `image`, the copy of its parent's instance, until it exits, traps or
@@ -961,6 +962,7 @@ async fn instantiate<S>(
 where
     S: Syscalls + Control + Send + Sync + 'static,
 {
+    verify_start_profile(module, store.engine())?;
     let cleanup = cleanup.into();
     abis.configure_store(&mut store)?;
     // Hook affinity governs the worker; each context import checks its actual Store custody.
@@ -1191,6 +1193,73 @@ impl<S: Send + Sync + 'static> Drop for Ready<S> {
     }
 }
 
+/// Compiled input cannot be rewritten here. Native no-start modules remain valid;
+/// engines without ModuleInfo need the source transform's explicit profile.
+fn verify_start_profile(module: &Module, engine: &Engine) -> Result<(), ExecError> {
+    // A compiled engine start cannot be delayed without its original source.
+    // Custom loaders/caches must use load/instrument before compilation.
+    let prepared = module
+        .custom_sections(preempt::START_PROFILE)
+        .next()
+        .is_some();
+    #[cfg(feature = "sys")]
+    let engine_start = if engine.is_sys() {
+        module.info().start_function.is_some()
+            || (!prepared
+                && module
+                    .exports()
+                    .any(|export| export.name() == preempt::START))
+    } else {
+        !prepared
+    };
+    #[cfg(not(feature = "sys"))]
+    let engine_start = !prepared;
+    if engine_start {
+        return Err(ExecError::CustomBinding(RuntimeError::new(
+            "Wasm start must be deferred with wasixv2_exec::load or instrument",
+        )));
+    }
+    #[cfg(not(feature = "sys"))]
+    let _ = engine;
+    Ok(())
+}
+
+/// Called inside the owning invocation driver, before ABI explicit initializers.
+/// A fork restore bypasses this path and rewinds its already-started image.
+async fn start_section<S>(
+    entry: &Entry<'_, S>,
+    instance: &Instance,
+    image_abi: &dyn Abi<S>,
+) -> Result<(), RuntimeError>
+where
+    S: Syscalls + Control + Send + Sync + 'static,
+{
+    let Ok(function) = instance.exports.get_function(preempt::START) else {
+        return Ok(());
+    };
+    let metadata = |env: &mut ExecEnv<S>, store: &mut wasmer::StoreMut<'_>| {
+        (
+            image_abi.main_stack(instance, store),
+            image_abi.image_layout(
+                instance,
+                env.memory().unwrap(),
+                store,
+                env.asyncify.is_some(),
+            ),
+            image_abi.guardable(instance, store),
+        )
+    };
+    let before = entry.with_store(metadata).await;
+    asyncify::prepare_buffer(entry.cx()).await?;
+    asyncify::call(entry.cx(), Some(preempt::START), function, &[]).await?;
+    if entry.with_store(metadata).await != before {
+        return Err(RuntimeError::new(
+            "Wasm start changed bound ABI memory layout",
+        ));
+    }
+    Ok(())
+}
+
 /// The instance's `__stack_pointer`, if it exports it.
 pub(crate) fn stack_pointer(instance: &Instance) -> Option<Global> {
     instance.exports.get_global("__stack_pointer").ok().cloned()
@@ -1274,7 +1343,7 @@ fn map_inherited(
 
 impl<S: Syscalls + Control + Send + Sync + 'static> Ready<S> {
     /// Runs the image from its ABI's entry point until it exits, traps or `execve` replaces it.
-    async fn start(mut self) -> Ended {
+    async fn start(mut self) -> Result<Ended, ExecError> {
         let hooks = self
             .env
             .as_ref(self.store.as_ref().unwrap())
@@ -1294,55 +1363,70 @@ impl<S: Syscalls + Control + Send + Sync + 'static> Ready<S> {
             std::mem::take(&mut self.invocations),
         );
         let entry = Entry::new(&self.env, &store);
-        let mut prepared = self.abi.prepare_entry(&entry).await;
-        let _registration = if prepared.is_ok() {
-            match self.admission.take() {
-                Some(binding) => {
-                    let syscalls = entry.with_store(|env, _| env.syscalls.clone()).await;
-                    match binding.finish(&*self.image_abi, &*syscalls).await {
-                        Ok(registration) => Some(registration),
-                        Err(error) => {
-                            prepared =
-                                Err(RuntimeError::new(format!("startup admission: {error:?}")));
-                            None
-                        }
+        // One driver and one invocation generation own start, ABI setup and entry.
+        // Physical settlement must precede context error resolution and deactivation.
+        let phase = Arc::new(std::sync::atomic::AtomicU8::new(u8::from(
+            self.instance.exports.get_function(preempt::START).is_err(),
+        )));
+        let registration = Arc::new(std::sync::Mutex::new(None));
+        let result = cooperative::drive(
+            &entry,
+            &*self.abi,
+            contexts::drive(&entry, &mut attachments, {
+                let abi = self.abi.clone();
+                let image_abi = self.image_abi.clone();
+                let instance = self.instance.clone();
+                let env = self.env.clone();
+                let store = entry.store();
+                let admission = self.admission.take();
+                let phase = phase.clone();
+                let registration = registration.clone();
+                async move {
+                    let entry = Entry::new(&env, &store);
+                    start_section(&entry, &instance, &*image_abi).await?;
+                    phase.store(1, std::sync::atomic::Ordering::Relaxed);
+                    abi.prepare_entry(&entry).await?;
+                    if let Some(binding) = admission {
+                        let syscalls = entry.with_store(|env, _| env.syscalls.clone()).await;
+                        let bound =
+                            binding
+                                .finish(&*image_abi, &*syscalls)
+                                .await
+                                .map_err(|error| {
+                                    RuntimeError::new(format!("startup admission: {error:?}"))
+                                })?;
+                        *registration.lock().unwrap_or_else(|e| e.into_inner()) = Some(bound);
                     }
+                    phase.store(2, std::sync::atomic::Ordering::Relaxed);
+                    abi.start(&entry).await
                 }
-                None => None,
-            }
-        } else {
-            drop(self.admission.take());
-            None
-        };
-        let (result, origin) = match prepared {
-            Ok(()) => {
-                let result = cooperative::drive(
-                    &entry,
-                    &*self.abi,
-                    contexts::drive(&entry, &mut attachments, {
-                        let abi = self.abi.clone();
-                        let env = self.env.clone();
-                        let store = entry.store();
-                        async move { abi.start(&Entry::new(&env, &store)).await }
-                    }),
-                )
-                .await;
-                (result, ErrorOrigin::GuestInvocation)
-            }
-            Err(e) => (Err(e), ErrorOrigin::Other),
-        };
+            }),
+        )
+        .await;
         let on_return = self.abi.on_entry_return();
         let result = match &mut attachments {
             Some(attachments) => attachments.finish(result).await,
             None => result,
         };
-        let ended = ended(entry.cx(), result, on_return, Role::Process, origin).await;
+        let phase = phase.load(std::sync::atomic::Ordering::Relaxed);
+        let ended = match (phase, result) {
+            (0, Err(error)) => Err(wasmer::InstantiationError::Start(error).into()),
+            (phase, result) => {
+                let origin = if phase == 2 {
+                    ErrorOrigin::GuestInvocation
+                } else {
+                    ErrorOrigin::Other
+                };
+                Ok(ended(entry.cx(), result, on_return, Role::Process, origin).await)
+            }
+        };
         if let Some(attachments) = &mut attachments {
             attachments.deactivate().await;
         }
         if let Err(error) = self.abi.retire(&entry).await {
             tracing::error!(%error, "loader store retirement failed");
         }
+        drop(registration);
         ended
     }
 

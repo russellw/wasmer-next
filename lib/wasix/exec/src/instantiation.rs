@@ -10,8 +10,8 @@ use crate::ExecEnv;
 
 /// Adds imports after ABI preparation. Existing imports must remain unchanged.
 /// Each successful preparation returns state belonging to this exact instance and Store.
-/// An engine-level Wasm `start` can call imports before configuration: imports that
-/// need the bound instance must reject calls until their attachment is configured.
+/// Modules compiled with [`crate::load`] or [`crate::instrument`] run their start
+/// function after configuration, with the actual guest memory and kernel attachment.
 /// A hook must not retain an owning Store/StoreAsync, including indirectly: images
 /// retain registered hooks for declarations and their Stores retain bound hook state.
 pub trait InstantiationHook<S>: Send + Sync + 'static {
@@ -42,7 +42,8 @@ pub trait InstantiationHook<S>: Send + Sync + 'static {
 
 /// Owned state paired with one hook's preparation and one actual instance.
 pub trait InstanceAttachment: Send + 'static {
-    /// Host-only setup before ABI entry and its explicit initializers.
+    /// Host-only setup after memory/ABI binding, before Wasm start and ABI entry
+    /// (including explicit initializers). Start traps still deactivate this attachment.
     /// Attachments must not retain an owning Store or StoreAsync, directly or through
     /// another resource: their Store already retains the prepared state.
     fn configure(
@@ -856,11 +857,11 @@ pub(crate) mod tests {
         let first = instantiate(first_store, &module, abis.clone()).unwrap();
         let second = instantiate(second_store, &module, abis).unwrap();
         assert!(matches!(
-            futures::executor::block_on(second.start()),
+            futures::executor::block_on(second.start()).unwrap(),
             crate::Ended::Exited(13)
         ));
         assert!(matches!(
-            futures::executor::block_on(first.start()),
+            futures::executor::block_on(first.start()).unwrap(),
             crate::Ended::Exited(11)
         ));
         let retired: Vec<_> = events
@@ -899,17 +900,15 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn wasm_start_imports_reject_unconfigured_instance_state() {
+    fn untransformed_engine_start_is_rejected_before_preparing_hooks() {
         let store = Store::default();
         let module = Module::new(
             &store,
             wat::parse_str(
                 r#"(module
-            (import "custom" "value" (func $value (result i32)))
-            (import "wasixv2" "exit_group" (func $exit (param i32)))
+            (import "wasixv2" "exit_group" (func (param i32)))
             (memory (export "memory") 1)
-            (func $init call $value drop)
-            (start $init)
+            (func $init) (start $init)
             (func (export "_start")))"#,
             )
             .unwrap(),
@@ -917,19 +916,11 @@ pub(crate) mod tests {
         .unwrap();
         let events = Arc::new(Mutex::new(Vec::new()));
         let error = match instantiate(store, &module, registry(events.clone(), Failure::None)) {
-            Ok(_) => panic!("start must not use an unconfigured binding"),
+            Ok(_) => panic!("an engine start could run before binding"),
             Err(error) => error,
         };
-        assert!(error.to_string().contains("binding is not configured"));
-        assert_eq!(
-            *events.lock().unwrap(),
-            [
-                (11, "prepare"),
-                (12, "prepare"),
-                (12, "deactivate"),
-                (11, "deactivate")
-            ]
-        );
+        assert!(error.to_string().contains("start must be deferred"));
+        assert!(events.lock().unwrap().is_empty());
     }
 
     // Same explicit local queue as dylink's lease_cancellation_tests; no detached jobs.
@@ -1412,7 +1403,7 @@ pub(crate) mod tests {
             drop(NATIVE_CALL.with(|slot| slot.borrow_mut().take().unwrap()));
             assert!(run.as_mut().poll(&mut cx).is_pending());
             drop(NATIVE_FRAME.with(|slot| slot.borrow_mut().take().unwrap()));
-            match (exec, futures::executor::block_on(run)) {
+            match (exec, futures::executor::block_on(run).unwrap()) {
                 (false, crate::Ended::Exited(37)) => (),
                 (true, crate::Ended::Exec(image)) => assert_eq!(image.bytes(), [17, 23]),
                 _ => panic!("physical settlement must release every error transport clone"),
@@ -1509,7 +1500,7 @@ pub(crate) mod tests {
                 };
                 drop(lock);
                 drop(NATIVE_FRAME.with(|slot| slot.borrow_mut().take().unwrap()));
-                let ended = futures::executor::block_on(run);
+                let ended = futures::executor::block_on(run).unwrap();
                 assert!(
                     writable,
                     "A's Store lock must be free while its physical frame remains pinned"
@@ -1580,7 +1571,7 @@ pub(crate) mod tests {
         assert!(run.as_mut().poll(&mut cx).is_pending());
         assert!(control.fault_causes.lock().unwrap().is_empty());
         drop(NATIVE_FRAME.with(|slot| slot.borrow_mut().take().unwrap()));
-        let crate::Ended::Fault { signal, .. } = futures::executor::block_on(run) else {
+        let crate::Ended::Fault { signal, .. } = futures::executor::block_on(run).unwrap() else {
             panic!("late original trap must replace successful logical return");
         };
         assert_eq!(signal, wasixv2_abi::Signal::SIGILL.0);
@@ -1863,7 +1854,7 @@ pub(crate) mod tests {
             } else {
                 drop(NATIVE_FRAME.with(|slot| slot.borrow_mut().take().unwrap()));
                 assert!(matches!(
-                    futures::executor::block_on(run),
+                    futures::executor::block_on(run).unwrap(),
                     crate::Ended::Fault { .. }
                 ));
                 assert_eq!(recorder.faulted.lock().unwrap().len(), 1);

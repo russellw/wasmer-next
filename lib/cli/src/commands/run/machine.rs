@@ -227,7 +227,7 @@ impl CachedLoader {
         let prepared = wasixv2_dylink::prepare_image(wasm)?;
         let (instrumented, failed) = match wasixv2::instrument(&prepared) {
             Ok(instrumented) => (instrumented, None),
-            Err(err) if prepared == wasm => (prepared, Some(err)),
+            Err(err) if prepared == wasm => (err.fallback_source(&prepared)?, Some(err)),
             Err(err) => return Err(err.into()),
         };
         // Key the persistent cache by the actual compiler input, never the source's
@@ -445,6 +445,34 @@ mod loader_tests {
                 0
             );
         }
+    }
+
+    #[test]
+    fn cached_loader_fallback_defers_start_and_rejects_reserved_metadata() {
+        let (loader, runtime, engine) = loader();
+        let mut source = wasm("(module (func $s unreachable) (start $s))");
+        // Same malformed name subsection as exec's fallback fixture.
+        source.extend_from_slice(&[0, 7, 4, b'n', b'a', b'm', b'e', 1, 0x7f]);
+        let (_, module) = block_on(loader.load(&engine, &Image::copied(source.clone()))).unwrap();
+        assert!(!wasixv2::is_preemptible(&module));
+        let requests = runtime.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_ne!(requests[0].hash(), &ModuleHash::new(&source));
+        let mut store = wasmer::Store::new(engine.clone());
+        // Instantiation succeeds even though the original start traps.
+        let instance = wasmer::Instance::new(&mut store, &module, &wasmer::Imports::new()).unwrap();
+        assert!(
+            instance
+                .exports
+                .get_function("__wasix_exec_start")
+                .unwrap()
+                .call(&mut store, &[])
+                .is_err()
+        );
+        drop(requests);
+        let reserved = wasm(r#"(module (func (export "__wasix_exec_start")))"#);
+        assert!(block_on(loader.load(&engine, &Image::copied(reserved))).is_err());
+        assert_eq!(runtime.requests.lock().unwrap().len(), 1);
     }
 
     #[test]

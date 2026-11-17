@@ -98,7 +98,7 @@ impl NativeLoader {
         let prepared = wasixv2_dylink::prepare_image(bytes)?;
         let (input, failed) = match wasixv2::instrument(&prepared) {
             Ok(input) => (input, None),
-            Err(error) if prepared == bytes => (prepared, Some(error)),
+            Err(error) if prepared == bytes => (error.fallback_source(&prepared)?, Some(error)),
             Err(error) => return Err(error.into()),
         };
         let engine = self.owner.engine(&input)?;

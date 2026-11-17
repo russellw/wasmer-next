@@ -640,7 +640,7 @@ pub(crate) mod tests {
         assert_eq!(probe.ordinary_binds.load(Ordering::Relaxed), 1);
         assert_eq!(probe.prepared_binds.load(Ordering::Relaxed), 0);
         assert_eq!(probe.claims.load(Ordering::Relaxed), 1);
-        let ended = futures::executor::block_on(ready.start());
+        let ended = futures::executor::block_on(ready.start()).unwrap();
         assert!(matches!(ended, crate::Ended::Exited(3)));
         assert_eq!(probe.claims.load(Ordering::Relaxed), 1);
         assert!(probe.roles.lock().unwrap().is_empty());
@@ -793,7 +793,7 @@ pub(crate) mod tests {
         assert_eq!(probe.claims.load(Ordering::Relaxed), 1);
         let gate = recorder.loader.as_ref().unwrap();
         assert!(gate.busy());
-        let ended = futures::executor::block_on(ready.start());
+        let ended = futures::executor::block_on(ready.start()).unwrap();
         assert!(matches!(ended, crate::Ended::Exited(17)));
         assert_eq!(probe.entries.load(Ordering::Relaxed), 1);
         assert_eq!(

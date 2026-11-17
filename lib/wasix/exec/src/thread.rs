@@ -439,6 +439,7 @@ where
         start_arg: u32,
         cleanup: crate::cleanup::RunCleanup,
     ) -> Result<Ended, ExecError> {
+        crate::verify_start_profile(&self.module, &self.engine)?;
         self.abi.attach_cleanup(&cleanup);
         let mut admission = if let Some(gate) = self.syscalls.loader_gate(task) {
             loop {
@@ -576,10 +577,10 @@ where
                         )
                         .map_err(ExecError::CustomBinding)?;
                 }
-                Ok(abi)
+                Ok((instance, abi))
             }));
-        let abi = match configured {
-            Ok(Ok(abi)) => abi,
+        let (instance, abi) = match configured {
+            Ok(Ok(bound)) => bound,
             other => {
                 invocations.close();
                 if let Some(hooks) = &hooks {
@@ -615,67 +616,77 @@ where
                 })
                 .await;
         }
-        let prepared = abi.prepare_entry(&entry).await;
-        let _registration = if prepared.is_ok() {
-            match admission {
-                Some(binding) => match binding.finish(&*self.abi, &*self.syscalls).await {
-                    Ok(registration) => Some(registration),
-                    Err(error) => {
-                        if let Some(attachments) = &mut attachments {
-                            attachments.settle().await;
-                        }
-                        return Err(ExecError::Load(crate::LoadError::Format(error)));
-                    }
-                },
-                None => None,
-            }
-        } else {
-            drop(admission);
-            None
-        };
-        if let Err(error) = prepared {
-            if let Some(attachments) = &mut attachments {
-                attachments.settle().await;
-            }
-            return Err(ExecError::Load(crate::LoadError::other(error)));
-        }
-        let (result, origin) = match crate::asyncify::prepare_buffer(entry.cx()).await {
-            Ok(()) => {
-                buffer.addr = entry
-                    .cx()
-                    .with(|env, _| env.asyncify.as_ref().and_then(|a| a.buffer_address()))
-                    .await;
-                let result = crate::cooperative::drive(
-                    &entry,
-                    &*abi,
-                    crate::contexts::drive(&entry, &mut attachments, {
-                        let abi = abi.clone();
-                        let env = entry.cx().env.clone();
-                        let store = entry.store();
-                        async move {
-                            abi.start_thread(&Entry::new(&env, &store), tid, start_arg)
+        let phase = Arc::new(std::sync::atomic::AtomicU8::new(u8::from(
+            instance
+                .exports
+                .get_function(crate::preempt::START)
+                .is_err(),
+        )));
+        let registration = Arc::new(std::sync::Mutex::new(None));
+        let result = crate::cooperative::drive(
+            &entry,
+            &*abi,
+            crate::contexts::drive(&entry, &mut attachments, {
+                let abi = abi.clone();
+                let image_abi = self.abi.clone();
+                let env = env.clone();
+                let store = entry.store();
+                let phase = phase.clone();
+                let registration = registration.clone();
+                let syscalls = self.syscalls.clone();
+                async move {
+                    let entry = Entry::new(&env, &store);
+                    crate::start_section(&entry, &instance, &*image_abi).await?;
+                    phase.store(1, std::sync::atomic::Ordering::Relaxed);
+                    abi.prepare_entry(&entry).await?;
+                    if let Some(binding) = admission {
+                        let bound =
+                            binding
+                                .finish(&*image_abi, &*syscalls)
                                 .await
-                        }
-                    }),
-                )
-                .await;
-                (result, crate::ErrorOrigin::GuestInvocation)
-            }
-            Err(err) => (Err(err), crate::ErrorOrigin::Other),
-        };
+                                .map_err(|error| {
+                                    wasmer::RuntimeError::new(format!(
+                                        "startup admission: {error:?}"
+                                    ))
+                                })?;
+                        *registration.lock().unwrap_or_else(|e| e.into_inner()) = Some(bound);
+                    }
+                    crate::asyncify::prepare_buffer(entry.cx()).await?;
+                    phase.store(2, std::sync::atomic::Ordering::Relaxed);
+                    abi.start_thread(&entry, tid, start_arg).await
+                }
+            }),
+        )
+        .await;
         let on_return = abi.on_thread_return();
         let result = match &mut attachments {
             Some(attachments) => attachments.finish(result).await,
             None => result,
         };
-        let ended = crate::ended(entry.cx(), result, on_return, Role::Thread, origin).await;
+        buffer.addr = entry
+            .with_store(|env, _| env.asyncify.as_ref().and_then(|a| a.buffer_address()))
+            .await;
+        let phase = phase.load(std::sync::atomic::Ordering::Relaxed);
+        let ended = match (phase, result) {
+            (0, Err(error)) => Err(wasmer::InstantiationError::Start(error).into()),
+            (1, Err(error)) => Err(ExecError::Load(crate::LoadError::other(error))),
+            (_, result) => Ok(crate::ended(
+                entry.cx(),
+                result,
+                on_return,
+                Role::Thread,
+                crate::ErrorOrigin::GuestInvocation,
+            )
+            .await),
+        };
         if let Some(attachments) = &mut attachments {
             attachments.deactivate().await;
         }
         abi.retire(&entry)
             .await
             .map_err(|e| ExecError::Load(crate::LoadError::other(e)))?;
-        Ok(ended)
+        drop(registration);
+        ended
     }
 }
 

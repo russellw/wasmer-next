@@ -262,3 +262,27 @@ for the guest suite. The builder's source/tool pins are in
 `guest/libc/wasixv2/toolchain.env`; binaryen is needed by asyncify programs.
 The separate, non-required `guest-libc.yml` workflow builds with upstream LLVM
 and optionally the fork (`WASIXV2_LLVM_TAG` repository variable).
+
+## Wasm start and custom bindings
+
+`wasixv2_exec::load` and `instrument` defer the module's Wasm start section.
+Exec applies data segments, freezes the image, binds the ABI and attaches its
+actual memory to the kernel, then calls `InstanceAttachment::configure` before
+invoking the original start. Start uses the normal asynchronous invocation and
+cleanup custody; a start failure remains `ExecError::Instantiate(Start(..))`.
+ABI explicit initializers and process/thread entry follow start. No separate
+post-start attachment method is needed.
+
+Custom compilers/loaders must use `instrument` before compiling and invalidate
+cached artifacts created with the old start behavior. On an instrumentation
+failure, `InstrumentError::fallback_source(&original_bytes)` supplies an allowed
+uninstrumented fallback that still defers start, or rejects reserved metadata. Native compiled modules
+with an engine start are rejected before hook preparation; backends without
+module metadata require the source transform's deferred-start profile. External
+instantiation through `embedding` remains the embedder's lifecycle responsibility.
+Fork restore rewinds the already-started image without rerunning start; new
+thread instances run start after configuration against their inherited memory.
+Dynamic side modules retain their existing validated no-auto-start initialization
+protocol. Start must preserve the ABI stack/layout/guard metadata used for
+binding; changing it fails startup, because protected leases may already depend
+on that exact address-space layout.
