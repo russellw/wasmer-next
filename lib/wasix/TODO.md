@@ -21,6 +21,10 @@ on the v2 kernel. Original fixtures and behavior evidence remain removal gates.
 | Browser SDK | Current/classic public APIs, packages, streams/mounts/transports, termination and resource retirement. |
 | Providers and coredumps | Optional configured-provider controls and compositional original-source trap coordinates. |
 
+Virtual command host work is outside guest task CPU accounting. Embedder wall-clock
+limits still apply. Future checkpoint support must refuse tasks running a host
+command, whose future has no guest stack to capture.
+
 Only WebC v3 containers are required. WebC v1 and v2 container compatibility
 are excluded; remove their compatibility paths and retain clear unsupported-format
 errors. This does not remove WASIX v1 guest compatibility through the v2 runtime.
