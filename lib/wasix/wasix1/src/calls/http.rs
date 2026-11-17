@@ -321,7 +321,12 @@ async fn write_response<S: Syscalls + Control + 'static>(
         .checked_mul(16)
         .ok_or_else(|| invalid("header list"))?;
     let mut headers = vec![0; size];
-    for (slot, (name, value)) in headers.chunks_exact_mut(16).zip(&response.headers) {
+    for (slot, (name, value)) in headers
+        .as_chunks_mut::<16>()
+        .0
+        .iter_mut()
+        .zip(&response.headers)
+    {
         pair(frame, slot, 0, name.as_bytes()).await?;
         pair(frame, slot, 8, value).await?;
     }
@@ -335,7 +340,7 @@ async fn write_response<S: Syscalls + Control + 'static>(
             .checked_mul(8)
             .ok_or_else(|| invalid("redirect list"))?;
         let mut redirects = vec![0; size];
-        for (slot, url) in redirects.chunks_exact_mut(8).zip(&urls) {
+        for (slot, url) in redirects.as_chunks_mut::<8>().0.iter_mut().zip(&urls) {
             pair(frame, slot, 0, url.as_bytes()).await?;
         }
         put(&mut record, 32, allocate(frame, &redirects, 4).await?);

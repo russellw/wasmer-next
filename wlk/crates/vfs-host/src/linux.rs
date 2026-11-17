@@ -637,7 +637,7 @@ fn map_acl(
 }
 
 /// `FS_IOC_FSGETXATTR` and `FS_IOC_FSSETXATTR`, which do not depend on the host's `long`.
-const FS_IOC_FSGETXATTR: libc::Ioctl = 0x801c_581f;
+const FS_IOC_FSGETXATTR: libc::Ioctl = 0x801c_581fu32 as libc::Ioctl;
 const FS_IOC_FSSETXATTR: libc::Ioctl = 0x401c_5820;
 
 /// The object behind `/proc/self/fd` path `path`, opened for an inode-flag request: read-only,

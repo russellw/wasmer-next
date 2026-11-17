@@ -102,7 +102,7 @@ impl<'a, S: 'static> CompatMemory<'a, S> {
             .collect::<SysResult<Vec<_>>>()?;
         let addr = self.alloc_raw(4 * (pointers.len() as u32 + 1), 4)?;
         self.with_scratch(addr, 4 * (pointers.len() + 1), |slot| {
-            for (chunk, pointer) in slot.chunks_exact_mut(4).zip(&pointers) {
+            for (chunk, pointer) in slot.as_chunks_mut::<4>().0.iter_mut().zip(&pointers) {
                 chunk.copy_from_slice(&pointer.addr().to_le_bytes());
             }
         });
