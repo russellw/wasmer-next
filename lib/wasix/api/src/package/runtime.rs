@@ -68,7 +68,7 @@ impl Default for RuntimePackageConfig {
     fn default() -> Self {
         Self {
             resolver: None,
-            limit: 32,
+            limit: 128,
         }
     }
 }
@@ -81,7 +81,7 @@ impl MachineBuilder {
     }
 
     /// Caps distinct runtime-installed layouts, including guest-local Wasm snapshots.
-    /// The default is 32. Zero disallows all installs.
+    /// The default is 128. Zero disallows all installs.
     pub fn runtime_package_limit(mut self, limit: usize) -> Self {
         self.runtime_package_config.limit = limit;
         self
