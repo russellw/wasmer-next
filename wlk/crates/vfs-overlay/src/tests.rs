@@ -1070,3 +1070,38 @@ fn private_metadata_prefix_precedence_preserves_definitive_negative_fallback() {
     block_on(directory.setxattr(b"user.overlay.opaque", b"x", XattrSet::Any)).unwrap();
     assert_eq!(block_on(dir_flags(&directory)), Ok((true, false)));
 }
+
+#[test]
+fn root_upper_changes_survive_overlay_reconstruction() {
+    let lower = mem();
+    let lower_root = lower.root();
+    write(&lower_root, b"copy", b"lower");
+    write(&lower_root, b"gone", b"lower");
+    mkdir(&lower_root, b"empty");
+    let upper = mem();
+    {
+        let overlay = OverlayFs::new(Some(upper.clone()), vec![lower.clone()]);
+        let root = overlay.root();
+        write(&root, b"new", b"created");
+        let copy = lookup(&root, b"copy").unwrap();
+        let handle = block_on(copy.open(OpenOptions {
+            write: true,
+            ..OpenOptions::default()
+        }))
+        .unwrap();
+        block_on(handle.write_at(b"UPPER", 0)).unwrap();
+        block_on(root.unlink(b"gone")).unwrap();
+        block_on(root.rmdir(b"empty")).unwrap();
+        mkdir(&root, b"empty");
+    }
+    // A new lower revision cannot override copy-ups or reveal entries under an opaque dir.
+    write(&lookup(&lower_root, b"empty").unwrap(), b"later", b"hidden");
+    let overlay = OverlayFs::new(Some(upper), vec![lower]);
+    let root = overlay.root();
+    assert_eq!(read(&lookup(&root, b"new").unwrap()), b"created");
+    assert_eq!(read(&lookup(&root, b"copy").unwrap()), b"UPPER");
+    assert_eq!(lookup(&root, b"gone").err(), Some(Errno::ENOENT));
+    assert!(list(&lookup(&root, b"empty").unwrap()).is_empty());
+    assert_eq!(read(&lookup(&lower_root, b"copy").unwrap()), b"lower");
+    assert!(lookup(&lower_root, b"gone").is_ok());
+}

@@ -52,6 +52,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
 wat.workspace = true
 
 [target.'cfg(unix)'.dependencies]

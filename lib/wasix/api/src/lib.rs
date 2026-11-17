@@ -227,6 +227,8 @@ pub struct Machine {
     root_upper: Arc<dyn Filesystem>,
     /// Read-only layers under `root_upper`, topmost first; see [`Machine::mount_root_layers`].
     root_lowers: Vec<Arc<dyn Filesystem>>,
+    /// Original root, below package layers once a persistent upper is installed.
+    skeleton: Option<Arc<dyn Filesystem>>,
     /// Set by the first mount, process or [`Signaller`]: from then on the root filesystem is
     /// fixed.
     in_use: AtomicBool,
@@ -578,6 +580,7 @@ impl MachineBuilder {
             max_guest_tasks,
             root_upper: root,
             root_lowers: Vec::new(),
+            skeleton: None,
             in_use: AtomicBool::new(false),
             console,
             console_input_eof,
@@ -691,13 +694,58 @@ impl Machine {
         if layers.is_empty() {
             return Ok(());
         }
-        if self.root_lowers.len() + layers.len() > MAX_LOWERS {
+        if self.root_lowers.len() + layers.len() + usize::from(self.skeleton.is_some()) > MAX_LOWERS
+        {
             return Err(io::Error::other("too many layers stacked under the root"));
         }
         for Layer(lower) in layers {
             self.root_lowers.insert(0, lower);
         }
-        let root = OverlayFs::new(Some(self.root_upper.clone()), self.root_lowers.clone());
+        self.reboot_root().await;
+        Ok(())
+    }
+
+    /// Makes `upper` the writable top layer of `/`. Changes persist with it, including
+    /// copy-ups and whiteouts. Submounts such as `/tmp`, `/dev` and `/proc` are separate.
+    /// The original root ([`default_root`] or [`MachineBuilder::root`]) becomes the lowest
+    /// read-only layer, below layers stacked with [`Self::mount_root_layers`].
+    ///
+    /// Only a fresh machine can change its root: returns `EBUSY` after a mount, process or
+    /// signaller. Calling this twice replaces the upper without demoting the previous one.
+    /// Asynchronous filesystems are supported; kernel filesystems are mounted afresh.
+    pub async fn set_root_upper(&mut self, upper: Arc<dyn Filesystem>) -> io::Result<()> {
+        if *self.in_use.get_mut() {
+            return Err(errno_to_io(Errno::EBUSY));
+        }
+        if self.skeleton.is_none() {
+            if self.root_lowers.len() == MAX_LOWERS {
+                return Err(io::Error::other("too many layers stacked under the root"));
+            }
+            self.skeleton = Some(self.root_upper.clone());
+        }
+        self.root_upper = upper;
+        self.reboot_root().await;
+        Ok(())
+    }
+
+    /// Uses a writable host directory as [`Self::set_root_upper`]'s upper. Files owned by
+    /// the host user appear as owned by the machine's user.
+    pub async fn set_root_upper_host_dir(&mut self, host_dir: &Path) -> io::Result<()> {
+        if *self.in_use.get_mut() {
+            return Err(errno_to_io(Errno::EBUSY));
+        }
+        let options = wasixv2_vfs_host::Options {
+            read_only: false,
+            owner: self.owner,
+        };
+        let upper = wasixv2_vfs_host::open(host_dir, self.host.clone(), options)?;
+        self.set_root_upper(upper).await
+    }
+
+    async fn reboot_root(&mut self) {
+        let mut lowers = self.root_lowers.clone();
+        lowers.extend(self.skeleton.iter().cloned());
+        let root = OverlayFs::new(Some(self.root_upper.clone()), lowers);
         // Nothing lives in the kernel yet, so a new one on the new root replaces it, with the
         // kernel's filesystems mounted afresh; a host directory's layer answers asynchronously.
         let kernel = boot(
@@ -721,7 +769,6 @@ impl Machine {
             &self.task_host,
             !Arc::ptr_eq(&self.host, &self.task_host),
         );
-        Ok(())
     }
 
     /// Makes the volume `volume` of the webc v3 package `reader` a read-only layer of the root

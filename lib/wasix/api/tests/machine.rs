@@ -476,3 +476,255 @@ async fn copies_fault_on_pages_the_page_map_keeps_from_them() {
     let (status, out) = run(Machine::new(), PROT_NONE_WAT).await;
     assert_eq!((status, out.as_slice()), (0, &b"ok"[..]));
 }
+
+// Root upper tests use the same node operations as vfs-overlay's copy-up tests.
+#[cfg(unix)]
+mod root_upper {
+    use super::*;
+    use wasixv2_vfs::{NewKind, NewNode, Node, OpenOptions};
+
+    async fn write(dir: &Arc<dyn Node>, name: &[u8], bytes: &[u8]) {
+        let node = match dir.lookup(name).await {
+            Ok(node) => node,
+            Err(_) => dir
+                .create(
+                    name,
+                    &NewNode {
+                        umask: 0,
+                        kind: NewKind::Regular,
+                        mode: 0o644,
+                        uid: 1,
+                        gid: 1,
+                        task: 0,
+                        quota_exempt: false,
+                    },
+                )
+                .await
+                .unwrap(),
+        };
+        let handle = node
+            .open(OpenOptions {
+                write: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(handle.write_at(bytes, 0).await.unwrap(), bytes.len());
+    }
+
+    async fn read(dir: &Arc<dyn Node>, name: &[u8]) -> Vec<u8> {
+        let node = dir.lookup(name).await.unwrap();
+        let handle = node
+            .open(OpenOptions {
+                read: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mut bytes = vec![0; 256];
+        let n = handle.read_at(&mut bytes, 0).await.unwrap();
+        bytes.truncate(n);
+        bytes
+    }
+
+    fn package(updated: bool) -> webc::v3::read::OwnedReader {
+        use std::collections::BTreeMap;
+        use webc::v3::{
+            ChecksumAlgorithm, SignatureAlgorithm, Timestamps,
+            write::{DirEntry, Directory, FileEntry, Writer},
+        };
+        let mut files = BTreeMap::new();
+        for name in ["copy", "gone"] {
+            files.insert(
+                name.parse().unwrap(),
+                DirEntry::File(FileEntry::borrowed(b"lower", Timestamps::default())),
+            );
+        }
+        let mut empty = BTreeMap::new();
+        if updated {
+            empty.insert(
+                "later".parse().unwrap(),
+                DirEntry::File(FileEntry::borrowed(b"hidden", Timestamps::default())),
+            );
+        }
+        files.insert(
+            "empty".parse().unwrap(),
+            DirEntry::Dir(Directory::new(empty, Timestamps::default())),
+        );
+        let mut writer = Writer::new(ChecksumAlgorithm::Sha256)
+            .write_manifest(&Default::default())
+            .unwrap()
+            .write_atoms(BTreeMap::new())
+            .unwrap();
+        writer
+            .write_volume("root", Directory::new(files, Timestamps::default()))
+            .unwrap();
+        webc::v3::read::OwnedReader::parse(writer.finish(SignatureAlgorithm::None).unwrap())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn host_root_upper_persists_copy_up_whiteouts_and_opaque_directories() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let upper = tempfile::tempdir().unwrap();
+                for upper_first in [false, true] {
+                    let mut machine = Machine::new();
+                    if upper_first {
+                        machine.set_root_upper_host_dir(upper.path()).await.unwrap();
+                    }
+                    machine
+                        .mount_root_lower(&package(upper_first), "root")
+                        .await
+                        .unwrap();
+                    if !upper_first {
+                        machine.set_root_upper_host_dir(upper.path()).await.unwrap();
+                    }
+                    let root_path = machine.vfs().root();
+                    let root = root_path.dentry.node();
+                    if !upper_first {
+                        write(root, b"new", b"created").await;
+                        write(root, b"copy", b"UPPER").await;
+                        root.unlink(b"gone").await.unwrap();
+                        root.rmdir(b"empty").await.unwrap();
+                        root.create(
+                            b"empty",
+                            &NewNode {
+                                umask: 0,
+                                kind: NewKind::Directory,
+                                mode: 0o755,
+                                uid: 1,
+                                gid: 1,
+                                task: 0,
+                                quota_exempt: false,
+                            },
+                        )
+                        .await
+                        .unwrap();
+                        let etc = root.lookup(b"etc").await.unwrap();
+                        write(&etc, b"hostname", b"persistent-hostname").await;
+                    }
+                    assert_eq!(read(root, b"new").await, b"created");
+                    assert_eq!(read(root, b"copy").await, b"UPPER");
+                    assert_eq!(
+                        root.lookup(b"gone").await.err(),
+                        Some(wasixv2_vfs::Errno::ENOENT)
+                    );
+                    assert_eq!(
+                        root.lookup(b"empty")
+                            .await
+                            .unwrap()
+                            .lookup(b"later")
+                            .await
+                            .err(),
+                        Some(wasixv2_vfs::Errno::ENOENT)
+                    );
+                    assert_eq!(
+                        read(&root.lookup(b"etc").await.unwrap(), b"hostname").await,
+                        b"persistent-hostname"
+                    );
+                    // Submounts are rebuilt on each machine and don't populate the upper.
+                    let cred = wasixv2_vfs::Cred::root();
+                    let cx = wasixv2_vfs::Ctx {
+                        cred: &cred,
+                        root: &root_path,
+                        umask: 0,
+                        task: 0,
+                        leases: None,
+                    };
+                    for name in ["proc", "dev", "tmp"] {
+                        let mounted = machine
+                            .vfs()
+                            .lookup(&cx, &root_path, name.as_bytes(), Default::default())
+                            .await
+                            .unwrap();
+                        assert_ne!(mounted.mnt.id, root_path.mnt.id, "{name} is mounted");
+                        if name == "tmp" {
+                            assert!(mounted.dentry.node().lookup(b"ephemeral").await.is_err());
+                            write(mounted.dentry.node(), b"ephemeral", b"temporary").await;
+                        }
+                        assert!(!upper.path().join(name).exists());
+                    }
+                }
+                assert_eq!(std::fs::read(upper.path().join("copy")).unwrap(), b"UPPER");
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn replacing_root_upper_does_not_demote_the_previous_upper() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let first = tempfile::tempdir().unwrap();
+                let second = tempfile::tempdir().unwrap();
+                std::fs::write(first.path().join("old"), b"old").unwrap();
+                let mut machine = Machine::new();
+                machine.set_root_upper_host_dir(first.path()).await.unwrap();
+                machine
+                    .set_root_upper_host_dir(second.path())
+                    .await
+                    .unwrap();
+                let root = machine.vfs().root();
+                assert_eq!(
+                    root.dentry.node().lookup(b"old").await.err(),
+                    Some(wasixv2_vfs::Errno::ENOENT)
+                );
+                assert!(root.dentry.node().lookup(b"etc").await.is_ok());
+                let fs = Machine::new().vfs().root().mnt.sb().fs.clone();
+                machine.mount("/volume", fs.clone(), false).await.unwrap();
+                assert_eq!(
+                    machine.set_root_upper(fs).await.unwrap_err().raw_os_error(),
+                    Some(16)
+                );
+                assert_eq!(
+                    machine
+                        .set_root_upper_host_dir(first.path())
+                        .await
+                        .unwrap_err()
+                        .raw_os_error(),
+                    Some(16)
+                );
+            })
+            .await;
+    }
+    #[tokio::test]
+    async fn root_upper_counts_the_skeleton_and_requires_no_signaller() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                use wasixv2_vfs_overlay::MAX_LOWERS;
+                let upper = tempfile::tempdir().unwrap();
+                let mut machine = Machine::new();
+                let layer = machine.package_layer(&package(false), "root").unwrap();
+                machine
+                    .mount_root_layers(vec![layer.clone(); MAX_LOWERS])
+                    .await
+                    .unwrap();
+                assert!(machine.set_root_upper_host_dir(upper.path()).await.is_err());
+                // The failed configuration left the original root usable.
+                assert_eq!(
+                    read(machine.vfs().root().dentry.node(), b"copy").await,
+                    b"lower"
+                );
+
+                let mut machine = Machine::new();
+                machine.set_root_upper_host_dir(upper.path()).await.unwrap();
+                machine
+                    .mount_root_layers(vec![layer.clone(); MAX_LOWERS - 1])
+                    .await
+                    .unwrap();
+                assert!(machine.mount_root_layers([layer]).await.is_err());
+                // Replacing an upper consumes no additional lower slot.
+                machine.set_root_upper_host_dir(upper.path()).await.unwrap();
+                let _signaller = machine.signaller();
+                assert_eq!(
+                    machine
+                        .set_root_upper_host_dir(upper.path())
+                        .await
+                        .unwrap_err()
+                        .raw_os_error(),
+                    Some(16)
+                );
+            })
+            .await;
+    }
+}
