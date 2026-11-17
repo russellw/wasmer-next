@@ -7723,7 +7723,7 @@ mod tests {
             Some(0)
         );
         assert_eq!(
-            unsafe { wasi_env_read_stdout(&mut environment, [0i8; 16].as_mut_ptr(), 16) },
+            unsafe { wasi_env_read_stdout(&mut environment, [0; 16].as_mut_ptr(), 16) },
             0,
             "unclaimed replacement must never execute"
         );
