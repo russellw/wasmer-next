@@ -451,8 +451,8 @@ fn change_mode(cooked: bool) {
 }
 
 fn get(fd: RawFd) -> io::Result<libc::termios> {
-    let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
-    // SAFETY: tcgetattr fills termios when it succeeds.
+    let mut termios = std::mem::MaybeUninit::<libc::termios>::zeroed();
+    // SAFETY: tcgetattr fills kernel fields; musl may leave trailing control slots untouched.
     if unsafe { libc::tcgetattr(fd, termios.as_mut_ptr()) } != 0 {
         return Err(io::Error::last_os_error());
     }
@@ -1053,7 +1053,7 @@ mod tests {
     fn macos_native_empty_pty_reinput_query_preserves_termios_snapshot() {
         let pty = Pty::open();
         let snapshot = || {
-            let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
+            let mut termios = std::mem::MaybeUninit::<libc::termios>::zeroed();
             // SAFETY: tcgetattr writes this live PTY's termios on success.
             assert_eq!(
                 unsafe { libc::tcgetattr(pty.slave, termios.as_mut_ptr()) },

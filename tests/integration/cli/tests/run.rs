@@ -837,13 +837,14 @@ const WASIXV2_EXEC_WAT: &str = r#"
         unreachable))
 "#;
 
-/// Writes `contents` to `path` as an executable (`0755`), which `execve` requires.
-#[cfg(unix)]
+/// Writes a guest executable, setting POSIX executable bits on Unix hosts.
 fn write_executable(path: &Path, contents: impl AsRef<[u8]>) {
-    use std::os::unix::fs::PermissionsExt;
-
     std::fs::write(path, contents).unwrap();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
 }
 
 fn wasixv2_echo(suffix: &str) -> Vec<u8> {

@@ -313,8 +313,8 @@ mod tests {
         }
     }
     fn settings(fd: libc::c_int) -> libc::termios {
-        let mut settings = std::mem::MaybeUninit::<libc::termios>::uninit();
-        // SAFETY: tcgetattr fills the complete structure on success.
+        let mut settings = std::mem::MaybeUninit::<libc::termios>::zeroed();
+        // SAFETY: tcgetattr fills kernel fields; fields absent from its layout are already zero.
         assert_eq!(unsafe { libc::tcgetattr(fd, settings.as_mut_ptr()) }, 0);
         unsafe { settings.assume_init() }
     }

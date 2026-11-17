@@ -79,8 +79,8 @@ impl Terminal {
 
     /// The terminal's settings now.
     fn termios(&self) -> libc::termios {
-        let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
-        // SAFETY: `tcgetattr` fills `termios` when it succeeds.
+        let mut termios = std::mem::MaybeUninit::<libc::termios>::zeroed();
+        // SAFETY: `tcgetattr` fills kernel fields; trailing control slots are already zero.
         assert_eq!(
             unsafe { libc::tcgetattr(self.slave.as_raw_fd(), termios.as_mut_ptr()) },
             0
