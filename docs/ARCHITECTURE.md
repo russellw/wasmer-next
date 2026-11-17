@@ -41,9 +41,10 @@ lib/wasix/exec/tests/generated.rs for Rust and the codegen `guest_libc` test
 for C. An ABI change is therefore one commit here: WIT, kernel, import shim,
 libc glue and wrappers, and tests (see AGENTS.md for the bless commands).
 
-Submodules are wasmer-test-files, lib/napi (wasmerio/napi, branch next), and the
-upstream suites at tests/wasixv2/upstream/{ltp,libc-test,libcap,libaio}. NAPI owns
-its nested QuickJS submodule. The v2 suite itself is tracked source. Initialize
-with `git submodule update --init --recursive` before builds. NAPI retains its
-WASIX v2 adaptations and path dependencies on this workspace; see
+The `lib/napi` submodule (wasmerio/napi) owns its nested QuickJS submodule.
+Initialize it before builds with `git submodule update --init --recursive -- lib/napi`.
+The test submodules use `update = none` so Cargo Git dependencies skip them.
+See [TEST.md](TEST.md) to check out `wasmer-test-files` and the upstream suites
+under `tests/wasixv2/upstream/`. The v2 suite itself is tracked source.
+NAPI retains its WASIX v2 adaptations and path dependencies on this workspace. See
 [NAPI-UPSTREAM-DIFF.md](NAPI-UPSTREAM-DIFF.md).

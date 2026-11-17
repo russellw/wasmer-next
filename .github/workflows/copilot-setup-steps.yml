@@ -45,6 +45,8 @@ jobs:
           # libaio on pagure.io uses dumb HTTP and cannot be shallow-cloned.
           fetch-depth: 0
           submodules: recursive
+      - name: Check out product test fixtures
+        run: git submodule update --init --recursive --checkout -- wasmer-test-files
       - name: Configure private runtime access
         uses: ./.github/actions/setup-runtime
         with:

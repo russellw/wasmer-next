@@ -40,6 +40,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ steps.load_toolchain.outputs.rust_toolchain }}
+      - name: Check out LTP for runner unit tests
+        run: git submodule update --init --recursive --checkout -- tests/wasixv2/upstream/ltp
       - name: Check native exporter tooling (unit tests only)
         env:
           CARGO_INCREMENTAL: "0"
@@ -48,7 +50,6 @@ jobs:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target/browser-adapter
         shell: bash
         run: |
-          git submodule update --init tests/wasixv2/upstream/ltp
           nice -n 19 taskset -c "$WASIX_BROWSER_CPUS" cargo test --manifest-path tests/wasixv2/Cargo.toml -p wasixv2-tests --locked -j3
           export RUSTFLAGS="$(sed -n 's/^lint-packages: RUSTFLAGS += \(.*\) # TODO:.*/\1/p' Makefile)"
           nice -n 19 taskset -c "$WASIX_BROWSER_CPUS" cargo clippy --manifest-path tests/wasixv2/Cargo.toml -p wasixv2-tests --all-targets --locked -j3 -- -D clippy::all

@@ -90,7 +90,7 @@ pub fn discover(excludes: &ExcludeList, excluded: &mut Excluded) -> Result<Vec<(
     let src = super::upstream_dir().join("libc-test/src");
     ensure!(
         src.is_dir(),
-        "upstream/libc-test is not checked out: run `git submodule update --init --recursive`"
+        "upstream/libc-test is not checked out: run `git submodule update --init --recursive --checkout -- upstream/libc-test` from tests/wasixv2"
     );
     let mut tests = Vec::new();
     for dir in DIRS {

@@ -2,7 +2,7 @@
 
 `lib/napi` is a submodule of public [wasmerio/napi](https://github.com/wasmerio/napi),
 branch `next`. The gitlink pins the exact revision; initialize it and its nested
-QuickJS dependency with `git submodule update --init --recursive`.
+QuickJS dependency with `git submodule update --init --recursive -- lib/napi`.
 
 The branch starts from upstream `82b328f50ddaac78de388b67b4707f21864b9245` and
 merges the product's `git subtree split --prefix=lib/napi main` history, also

@@ -705,6 +705,10 @@ jobs:
           TARGET: ${{ matrix.metadata.target }}
           TARGET_DIR: target/${{ matrix.metadata.target }}/release
           CARGO_TARGET: ${{ matrix.metadata.target }}
+      - name: Check out C API example fixtures
+        if: ${{ (matrix.build-what.key == 'capi' && matrix.metadata.build != 'linux-musl' && matrix.metadata.build != 'windows-gnu') || (matrix.build-what.key == 'capi-v8' && matrix.metadata.supports_v8) }}
+        shell: bash
+        run: git submodule update --init --recursive --checkout -- wasmer-test-files
       - name: C-API (V8)
         shell: bash
         run: ${{ matrix.build-what.build-cmd }}
@@ -861,6 +865,9 @@ jobs:
         uses: ./.github/actions/setup-runtime
         with:
           token: ${{ steps.cross-dependency-token.outputs.token }}
+      - name: Check out product test fixtures
+        shell: bash
+        run: git submodule update --init --recursive --checkout -- wasmer-test-files
       - name: Load CI constants (musl)
         if: matrix.metadata.build == 'linux-musl'
         run: grep -v '^#' .github/ci-constants.env >> $GITHUB_ENV

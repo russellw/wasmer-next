@@ -84,7 +84,7 @@ def make_release():
             "git",
             "clone",
             "git@github.com:wasmerio/wasmer.git",
-            "--recurse-submodules",
+            "--recurse-submodules=lib/napi",
             "--branch",
             "main",
             "--depth",

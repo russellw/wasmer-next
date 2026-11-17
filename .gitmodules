@@ -1,19 +1,24 @@
 [submodule "wasmer-test-files"]
 	path = wasmer-test-files
 	url = https://github.com/wasmerio/wasmer-test-files.git
+	update = none
 [submodule "tests/wasixv2/upstream/ltp"]
 	path = tests/wasixv2/upstream/ltp
 	url = https://github.com/wasix-org/ltp.git
 	branch = wasixv2
+	update = none
 [submodule "tests/wasixv2/upstream/libc-test"]
 	path = tests/wasixv2/upstream/libc-test
 	url = https://repo.or.cz/libc-test.git
+	update = none
 [submodule "tests/wasixv2/upstream/libcap"]
 	path = tests/wasixv2/upstream/libcap
 	url = https://kernel.googlesource.com/pub/scm/libs/libcap/libcap
+	update = none
 [submodule "tests/wasixv2/upstream/libaio"]
 	path = tests/wasixv2/upstream/libaio
 	url = https://pagure.io/libaio.git
+	update = none
 [submodule "lib/napi"]
 	path = lib/napi
 	url = https://github.com/wasmerio/napi.git

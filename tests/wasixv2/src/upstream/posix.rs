@@ -71,7 +71,7 @@ pub fn discover(excludes: &ExcludeList, excluded: &mut Excluded) -> Result<Vec<(
     let root = super::upstream_dir().join("ltp").join(SUITE_DIR);
     ensure!(
         root.is_dir(),
-        "upstream/ltp is not checked out: run `git submodule update --init --recursive`"
+        "upstream/ltp is not checked out: run `git submodule update --init --recursive --checkout -- upstream/ltp` from tests/wasixv2"
     );
     let mut tests = Vec::new();
     for dir in DIRS {

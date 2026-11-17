@@ -614,21 +614,25 @@ build-capi-headless-ios:
 #
 #####
 
+.PHONY: test-fixtures
+test-fixtures:
+	@test -f wasmer-test-files/examples/qjs.wasm || git submodule update --init --recursive --checkout -- wasmer-test-files
+
 # intentionally not using nextest as it runs tests in separate processes
-test-all:
+test-all: test-fixtures
 	$(CARGO_BINARY) nextest run $(CARGO_TARGET_FLAG) --workspace --release $(test_all_default_features) $(exclude_tests) --exclude wasmer-c-api-test-runner --exclude wasmer-capi-examples-runner $(test_compiler_features) --features $(test_all_features) --locked && \
 	$(CARGO_BINARY) test --doc $(CARGO_TARGET_FLAG) --workspace --release $(test_all_default_features) $(exclude_tests) --exclude wasmer-c-api-test-runner --exclude wasmer-capi-examples-runner $(test_compiler_features) --features $(test_all_features) --locked
 # wasmer-package splits into `execution` and `authoring`; each must build on its own.
-check-package-features:
+check-package-features: test-fixtures
 	$(CARGO_BINARY) check $(CARGO_TARGET_FLAG) --manifest-path lib/package/Cargo.toml --all-targets --no-default-features --features=execution --locked && \
 	$(CARGO_BINARY) check $(CARGO_TARGET_FLAG) --manifest-path lib/package/Cargo.toml --all-targets --no-default-features --features=authoring --locked && \
 	$(CARGO_BINARY) check $(CARGO_TARGET_FLAG) --manifest-path lib/package/Cargo.toml --all-targets --locked
-test-wasmer-cli:
+test-wasmer-cli: test-fixtures
 	$(CARGO_BINARY) test $(CARGO_TARGET_FLAG) --manifest-path lib/cli/Cargo.toml $(test_compiler_features) --release --locked
 # test examples
-test-examples:
+test-examples: test-fixtures
 	$(CARGO_BINARY) test $(CARGO_TARGET_FLAG) --no-default-features $(test_compiler_features) --features wasi,middlewares --examples --locked
-test-capi-integration-tests:
+test-capi-integration-tests: test-fixtures
 	$(CARGO_BINARY) test $(CARGO_TARGET_FLAG) --release --package wasmer-c-api-test-runner --locked && \
 	$(CARGO_BINARY) test $(CARGO_TARGET_FLAG) --release --package wasmer-capi-examples-runner --locked
 
@@ -656,14 +660,14 @@ lint-capi-crate-%:
 	WASMER_CAPI_CONFIG=$(shell echo $@ | sed -e s/lint-capi-crate-//) RUSTFLAGS="${RUSTFLAGS}" $(CARGO_BINARY) clippy $(CARGO_TARGET_FLAG) --manifest-path lib/c-api/Cargo.toml --release \
 		--no-default-features --features wat,compiler,wasi,middlewares $(capi_compiler_features) --locked -- -D clippy::all
 
-test-capi-integration-%:
+test-capi-integration-%: test-fixtures
 	# Test the Wasmer C API tests for C
 	cd lib/c-api/tests; WASMER_CAPI_CONFIG=$(shell echo $@ | sed -e s/test-capi-integration-//) WASMER_DIR=`pwd`/../../../package make test
 	# Test the Wasmer C API examples
 	cd lib/c-api/examples; WASMER_CAPI_CONFIG=$(shell echo $@ | sed -e s/test-capi-integration-//) WASMER_DIR=`pwd`/../../../package make run
 
 # Before running this in the CI, we need to set up link.tar.gz and /cache/wasmer-[target].tar.gz
-test-integration-cli-ci: require-nextest build-wasmer
+test-integration-cli-ci: test-fixtures require-nextest build-wasmer
 	rustup target add wasm32-wasip1
 	$(CARGO_BINARY) nextest run $(CARGO_TARGET_FLAG) -p wasmer-integration-tests-cli --locked
 
@@ -682,6 +686,7 @@ test-real-packages: build-wasmer-debug
 # tests/wasixv2/README.md.
 WASIXV2_TESTS_WASMER ?= $(abspath $(TARGET_DIR)/wasmer)
 test-wasixv2: build-wasmer
+	git submodule update --init --recursive --checkout -- tests/wasixv2/upstream
 	WASIXV2_TESTS_WASMER="$(WASIXV2_TESTS_WASMER)" $(CARGO_BINARY) run --release --locked \
 		--manifest-path tests/wasixv2/Cargo.toml -- $(WASIXV2_TESTS_ARGS)
 
@@ -924,7 +929,7 @@ lint-all: lint-formatting lint-packages lint-capi-ci lint-package-crate
 install-local: package
 	tar -C ~/.wasmer -zxvf wasmer.tar.gz
 
-test-minimal-versions:
+test-minimal-versions: test-fixtures
 	rm -f Cargo.lock
 	cargo +nightly build --tests -Z minimal-versions --all-features
 

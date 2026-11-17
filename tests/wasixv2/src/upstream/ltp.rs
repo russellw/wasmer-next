@@ -161,7 +161,7 @@ pub fn discover(
 ) -> Result<Vec<(String, Case)>> {
     ensure!(
         src().join("runtest").is_dir(),
-        "upstream/ltp is not checked out: run `git submodule update --init --recursive`"
+        "upstream/ltp is not checked out: run `git submodule update --init --recursive --checkout -- upstream/ltp` from tests/wasixv2"
     );
     let metadata = metadata(suite_build_root)?;
     let sources = source_index(&src());

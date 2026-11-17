@@ -85,9 +85,11 @@ use the Git engine pinned by Cargo.lock; see docs/RUNTIME-EXTRACTION.md.
 
 ## Testing WASIX v2
 
-The WASIX v2 test suite and runner live in `tests/wasixv2/`. Run
-`git submodule update --init --recursive` first to initialize its upstream
-suites and this repository's other submodules.
+The WASIX v2 test suite and runner live in `tests/wasixv2/`. The
+`make test-wasixv2` target checks out the upstream suites. To run the runner
+directly, first run
+`git submodule update --init --recursive --checkout -- tests/wasixv2/upstream`
+from the repository root.
 
 | Repository | Here | Holds |
 | ---------- | ---- | ----- |

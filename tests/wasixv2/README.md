@@ -13,8 +13,10 @@ this checkout's `wasmer run`.
 | The Open POSIX Test Suite | `posix/<path>` | `testcases/open_posix_testsuite` in `upstream/ltp` |
 | The [Linux Test Project](https://github.com/linux-test-project/ltp) | `ltp/<runtest list>/<tag>` | `upstream/ltp`: [wasix-org/ltp](https://github.com/wasix-org/ltp), branch `wasixv2` |
 
-The upstream suites are submodules, so check out recursively:
-`git submodule update --init --recursive`. LTP is wasix-org's fork, whose `wasixv2` branch adds
+`make test-wasixv2` checks out the upstream submodules. For direct runner use,
+check them out from the repository root with
+`git submodule update --init --recursive --checkout -- tests/wasixv2/upstream`.
+LTP is wasix-org's fork, whose `wasixv2` branch adds
 the few patches LTP needs here: it compares wasixv2 as newer than any kernel version, its
 `__linux__` checks also accept `__wasixv2__`, and callbacks have prototypes matching their APIs.
 The test library forks each test run as upstream does, sharing the IPC region with its parent. The upstream code keeps its own licenses

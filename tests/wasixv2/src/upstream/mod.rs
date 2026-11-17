@@ -115,9 +115,11 @@ pub fn source_copy_as(suite: &Suite, name: &str, variant: &str) -> Result<PathBu
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _guard = LOCK.lock().unwrap();
     let repo = upstream_dir().join(name);
-    let commit = git(&repo, &["rev-parse", "HEAD"]).with_context(|| {
-        format!("upstream/{name} is not checked out: run `git submodule update --init`")
-    })?;
+    ensure!(
+        repo.join(".git").exists(),
+        "upstream/{name} is not checked out: run `git submodule update --init --recursive --checkout -- upstream/{name}` from tests/wasixv2"
+    );
+    let commit = git(&repo, &["rev-parse", "HEAD"])?;
     let suffix = if variant.is_empty() {
         String::new()
     } else {
