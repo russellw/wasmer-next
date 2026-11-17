@@ -212,7 +212,7 @@ impl Root {
     }
     fn with_policy(source: Vec<u8>, policy: Arc<dyn LoadPolicy>) -> Arc<Self> {
         let parsed = (|| -> Result<(Graph, u32)> {
-            let mut main = Library::new(source, None)?;
+            let mut main = Library::with_policy(source, None, policy.as_ref())?;
             let stack = main
                 .metadata
                 .exports()

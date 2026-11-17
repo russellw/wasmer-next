@@ -210,7 +210,10 @@ cargo test -p wasixv2-dylink --no-default-features --features engine-tests
 
 Wasm32 WASIX v1 PIC mains use the same source preparation, host initialization,
 all-store publication and cleanup. Wasix1 supplies the base ABI and its legacy
-path, handle and symbol-scope policy. Its unchanged libc does not drain a loader
+path, handle and symbol-scope policy. As in the v1 linker, actual Wasm exports
+resolve by name even when their dylink flags mark them hidden/local; TLS and
+absolute-address flags still control addressing. Native v2 lookup keeps visibility
+strict. Its unchanged libc does not drain a loader
 constructor queue: each successful transaction instead claims its newly loaded
 side constructor batch and invokes it through normal instrumented guest entry,
 after admission reopens. Recursive loads own distinct batches. Resident reopens

@@ -555,7 +555,8 @@ async fn collect<S: Syscalls + Control + Send + Sync + 'static>(
         if flags.contains(DlFlags::RTLD_NOLOAD) {
             return Err(failure("RTLD_NOLOAD library is not loaded"));
         }
-        let mut library = Library::new(image.image.bytes().to_vec(), Some(image.identity))?;
+        let mut library =
+            Library::with_policy(image.image.bytes().to_vec(), Some(image.identity), policy)?;
         library.backing = Some(image.image.clone());
         library.path = path;
         library.request = name.to_vec();
@@ -599,7 +600,11 @@ async fn collect<S: Syscalls + Control + Send + Sync + 'static>(
             {
                 index
             } else {
-                let mut library = Library::new(image.image.bytes().to_vec(), Some(image.identity))?;
+                let mut library = Library::with_policy(
+                    image.image.bytes().to_vec(),
+                    Some(image.identity),
+                    policy,
+                )?;
                 library.backing = Some(image.image.clone());
                 library.path = path;
                 library.request = name.as_bytes().to_vec();

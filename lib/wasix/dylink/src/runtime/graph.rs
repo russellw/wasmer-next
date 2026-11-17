@@ -35,6 +35,23 @@ pub(super) struct Library {
     pub tls_align: u32,
 }
 impl Library {
+    pub fn with_policy(
+        source: Vec<u8>,
+        identity: Option<(u64, u64)>,
+        policy: &dyn super::LoadPolicy,
+    ) -> Result<Self> {
+        let mut library = Self::new(source, identity)?;
+        if !policy.honor_export_visibility() {
+            // v1's InstanceGroupState::resolve_exported_symbol searched actual
+            // Wasm exports regardless of these flags. Retain TLS/absolute metadata.
+            for export in library.metadata.exports.values_mut() {
+                export
+                    .flags
+                    .remove(SymbolFlags::VISIBILITY_HIDDEN | SymbolFlags::BINDING_LOCAL);
+            }
+        }
+        Ok(library)
+    }
     pub fn new(source: Vec<u8>, identity: Option<(u64, u64)>) -> Result<Self> {
         let metadata = Module::parse(&source).map_err(failure)?;
         let initialization = Arc::new(Initialization::parse(&source).map_err(failure)?);
@@ -941,6 +958,33 @@ mod tests {
                 .to_string()
                 .contains("alias cycle")
         );
+    }
+
+    #[test]
+    fn native_policy_keeps_hidden_tls_exports_private() {
+        let main = Library::with_policy(
+            crate::tests::bytes(
+                r#"(module (global (export "errno") i32 (i32.const 0)))"#,
+                [0; 4],
+                &[],
+                &[("errno", SymbolFlags::VISIBILITY_HIDDEN | SymbolFlags::TLS)],
+                &[],
+            ),
+            None,
+            &super::super::policy::NativePolicy,
+        )
+        .unwrap();
+        let side = lazy_library(r#"(module (import "GOT.mem" "errno" (global (mut i32))))"#);
+        let graph = Graph {
+            closures: Default::default(),
+            host_imports: None,
+            libraries: vec![main, side],
+            global: vec![0],
+            cursor: 3,
+            initialization: vec![0, 1],
+        };
+        assert!(graph.plan(1, 0).unwrap_err().to_string().contains("errno"));
+        assert!(graph.symbol(0, "errno", &[4096, 0]).is_err());
     }
 
     #[test]

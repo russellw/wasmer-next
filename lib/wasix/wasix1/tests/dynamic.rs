@@ -28,6 +28,16 @@ fn pic_with_import_flags(
     table_entries: u32,
     imports: &[(&str, &str, wasmparser::SymbolFlags)],
 ) -> Vec<u8> {
+    pic_with_symbol_flags(wat, needed, table_entries, &[], imports)
+}
+
+fn pic_with_symbol_flags(
+    wat: &str,
+    needed: &[&str],
+    table_entries: u32,
+    exports: &[(&str, wasmparser::SymbolFlags)],
+    imports: &[(&str, &str, wasmparser::SymbolFlags)],
+) -> Vec<u8> {
     let mut image = wat::parse_str(wat).unwrap();
     let mut section = vec![8];
     section.extend_from_slice(b"dylink.0");
@@ -49,6 +59,18 @@ fn pic_with_import_flags(
         leb(names.len() as u32, &mut section);
         section.extend(names);
     }
+    if !exports.is_empty() {
+        let mut flags = Vec::new();
+        leb(exports.len() as u32, &mut flags);
+        for (name, value) in exports {
+            leb(name.len() as u32, &mut flags);
+            flags.extend_from_slice(name.as_bytes());
+            leb(value.bits(), &mut flags);
+        }
+        section.push(3);
+        leb(flags.len() as u32, &mut section);
+        section.extend(flags);
+    }
     if !imports.is_empty() {
         let mut flags = Vec::new();
         leb(imports.len() as u32, &mut flags);
@@ -67,6 +89,50 @@ fn pic_with_import_flags(
     leb(section.len() as u32, &mut image);
     image.extend(section);
     image
+}
+
+#[test]
+fn legacy_hidden_main_tls_export_resolves_and_follows_the_live_base() {
+    let main = pic_with_symbol_flags(
+        r#"(module
+      (import "env" "memory" (memory 1 65536 shared))
+      (import "env" "__indirect_function_table" (table 3 funcref))
+      (import "env" "__stack_pointer" (global (mut i32)))
+      (import "env" "__memory_base" (global $base i32))
+      (import "env" "__table_base" (global i32))
+      (import "wasix_32v1" "proc_exit2" (func $exit (param i32)))
+      (import "env" "read_errno" (func $read (result i32)))
+      (global $tls (export "__tls_base") (mut i32) (i32.const 0))
+      (global (export "__tls_size") i32 (i32.const 4))
+      (global (export "__tls_align") i32 (i32.const 4))
+      (global (export "errno") i32 (i32.const 0))
+      (func (export "_start")
+        (global.set $tls (i32.add (global.get $base) (i32.const 128)))
+        (i32.store (global.get $tls) (i32.const 42))
+        (if (i32.ne (call $read) (i32.const 42)) (then unreachable))
+        (global.set $tls (i32.add (global.get $base) (i32.const 160)))
+        (i32.store (global.get $tls) (i32.const 84))
+        (if (i32.ne (call $read) (i32.const 84)) (then unreachable))
+        (call $exit (i32.const 0))))"#,
+        &["side.so"],
+        0,
+        &[(
+            "errno",
+            wasmparser::SymbolFlags::VISIBILITY_HIDDEN | wasmparser::SymbolFlags::TLS,
+        )],
+        &[],
+    );
+    let side = pic(
+        r#"(module
+      (import "env" "memory" (memory 1 65536 shared))
+      (import "env" "__indirect_function_table" (table 0 funcref))
+      (import "env" "__memory_base" (global i32))
+      (import "env" "__table_base" (global i32))
+      (import "GOT.mem" "errno" (global $errno (mut i32)))
+      (func (export "read_errno") (result i32) (i32.load (global.get $errno))))"#,
+        &[],
+    );
+    assert_eq!(run("hidden-main-tls", &main, &[("side.so", side)]), 0);
 }
 
 #[test]

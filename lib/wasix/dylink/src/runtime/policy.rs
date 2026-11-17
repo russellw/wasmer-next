@@ -16,6 +16,12 @@ pub trait LoadPolicy: Send + Sync + 'static {
     /// The module indices searched by this ABI's public symbol handle.
     fn scope(&self, handle: u32, count: usize, native: Vec<usize>) -> Option<Vec<usize>>;
 
+    /// Whether dynamic lookup honors hidden/local flags on actual Wasm exports.
+    /// Legacy v1 resolved every export by name; native images keep visibility strict.
+    fn honor_export_visibility(&self) -> bool {
+        true
+    }
+
     /// Startup environment policy; `None` distinguishes no variable from an
     /// explicitly empty search path in guest ABIs that give it meaning.
     fn startup_search(&self, environment: Option<&[u8]>) -> Option<Vec<u8>> {

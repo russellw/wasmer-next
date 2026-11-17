@@ -530,7 +530,8 @@ async fn collect<S: wasixv2_syscalls::LoaderControl>(
         {
             return Ok(index);
         }
-        let mut lib = Library::new(image.image.bytes().to_vec(), Some(image.identity))?;
+        let mut lib =
+            Library::with_policy(image.image.bytes().to_vec(), Some(image.identity), loader)?;
         lib.backing = Some(image.image);
         lib.path = path;
         lib.request = name.to_vec();

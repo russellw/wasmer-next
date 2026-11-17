@@ -93,6 +93,9 @@ impl wasixv2_dylink::LoadPolicy for Policy {
         let index = handle.checked_sub(1)? as usize;
         (index < count).then_some(vec![index])
     }
+    fn honor_export_visibility(&self) -> bool {
+        false
+    }
     fn startup_search(&self, environment: Option<&[u8]>) -> Option<Vec<u8>> {
         environment.map(<[u8]>::to_vec)
     }
