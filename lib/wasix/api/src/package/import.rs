@@ -11,7 +11,7 @@ use wasixv2_abi::OpenFlags;
 use wasixv2_vfs::{Cred, Ctx, File, LookupFlags, Mount, OpenHow, Path, Superblock, Vfs};
 use wasixv2_vfs_overlay::{OverlayAppender, PrefixFs};
 
-use super::{resolved::VolumeLayers, wasmer_command::RuntimePackage};
+use super::wasmer_command::RuntimePackage;
 use crate::{
     Errno, Filesystem, MAX_LOWERS, Machine, OverlayFs, OwnedBuffer, commands_layer, errno_to_io,
 };
@@ -225,7 +225,6 @@ impl RuntimePackages {
         let mut grouped = vec![(root_sb, root_appender, vec![commands.clone()])];
         let mut hidden = Vec::new();
         let root = vfs.namespace().entry_root();
-        let mut layers = VolumeLayers::default();
         // ResolvedLayout installs layers from low to high priority. An overlay takes
         // its lowers from top to bottom.
         for volume in package.layout.volumes.iter().rev() {
@@ -237,8 +236,8 @@ impl RuntimePackages {
                 continue;
             };
             let relative = relative_path(&mount, rest);
-            let layer = layers
-                .get_inner(self.owner, volume)
+            let layer = volume
+                .layer_for(self.owner)
                 .await
                 .map_err(|err| volume.context(err))?;
             let prefixed = PrefixFs::new(&relative, layer.0).map_err(errno_to_io)?;

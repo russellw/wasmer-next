@@ -560,7 +560,10 @@ pub enum CommandEnd {
 
 /// The executable image an `execve` loaded. Cheap to clone.
 #[derive(Clone)]
-pub struct Image(ImageKind);
+pub struct Image {
+    kind: ImageKind,
+    _owner: Option<Arc<dyn Send + Sync>>,
+}
 
 #[derive(Clone)]
 enum ImageKind {
@@ -574,39 +577,56 @@ enum ImageKind {
 impl Image {
     /// An image read into memory of its own.
     pub fn copied(bytes: Vec<u8>) -> Self {
-        Self(ImageKind::Bytes {
-            bytes: Arc::new(bytes),
-            shared: false,
-        })
+        Self {
+            kind: ImageKind::Bytes {
+                bytes: Arc::new(bytes),
+                shared: false,
+            },
+            _owner: None,
+        }
     }
 
     /// An image whose bytes its filesystem shares and never changes while anyone holds them,
     /// such as a file of a package volume.
     pub fn shared(bytes: Arc<dyn AsRef<[u8]> + Send + Sync>) -> Self {
-        Self(ImageKind::Bytes {
-            bytes,
-            shared: true,
-        })
+        Self {
+            kind: ImageKind::Bytes {
+                bytes,
+                shared: true,
+            },
+            _owner: None,
+        }
     }
 
     /// A host command, identified by the kernel's opaque token.
     pub fn command(token: Arc<dyn Any + Send + Sync>) -> Self {
-        Self(ImageKind::Command(token))
+        Self {
+            kind: ImageKind::Command(token),
+            _owner: None,
+        }
+    }
+
+    /// Retains an open file or another resource for the image's lifetime. The
+    /// shared bytes keep their own identity and [`Image::keep_alive`] only holds
+    /// those bytes independently of this open file.
+    pub fn with_owner(mut self, owner: Arc<dyn Send + Sync>) -> Self {
+        self._owner = Some(owner);
+        self
     }
 
     pub fn is_command(&self) -> bool {
-        matches!(self.0, ImageKind::Command(_))
+        matches!(self.kind, ImageKind::Command(_))
     }
 
     pub fn command_token(&self) -> Option<&Arc<dyn Any + Send + Sync>> {
-        match &self.0 {
+        match &self.kind {
             ImageKind::Command(token) => Some(token),
             ImageKind::Bytes { .. } => None,
         }
     }
 
     pub fn bytes(&self) -> &[u8] {
-        match &self.0 {
+        match &self.kind {
             ImageKind::Bytes { bytes, .. } => (**bytes).as_ref(),
             ImageKind::Command(_) => &[],
         }
@@ -618,7 +638,7 @@ impl Image {
         if let ImageKind::Bytes {
             bytes,
             shared: true,
-        } = &self.0
+        } = &self.kind
         {
             let bytes = (**bytes).as_ref();
             return Some(ImageId {
@@ -631,7 +651,7 @@ impl Image {
 
     /// Holds the bytes, and so keeps [`Image::identity`] theirs alone.
     pub fn keep_alive(&self) -> Arc<dyn AsRef<[u8]> + Send + Sync> {
-        match &self.0 {
+        match &self.kind {
             ImageKind::Bytes { bytes, .. } => bytes.clone(),
             ImageKind::Command(_) => Arc::new([]),
         }

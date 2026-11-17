@@ -3,10 +3,10 @@ use std::{
     collections::{BTreeMap, HashMap},
     io,
     path::Path,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
-use crate::{Layer, Machine, OwnedBuffer};
+use crate::{Layer, OwnedBuffer, PackageFs};
 use wasmer_config::package::PackageId;
 use wasmer_package::{
     commands::BinaryPackageCommand,
@@ -54,6 +54,7 @@ pub(super) struct ResolvedVolume {
     pub(super) mount_path: String,
     source_path: Option<String>,
     backing: Backing,
+    fs: Arc<Mutex<Option<PackageFs>>>,
 }
 
 /// One host command override or resolver-selected command.
@@ -105,6 +106,7 @@ impl ResolvedLayout {
         let mut layout = Self::default();
         let mut identities: HashMap<&PackageId, Arc<()>> = HashMap::new();
         let mut volumes: HashMap<&PackageId, BTreeMap<String, Volume>> = HashMap::new();
+        let mut filesystems = HashMap::<_, Arc<Mutex<Option<PackageFs>>>>::new();
         for mapping in package.filesystem.iter().rev() {
             if root_is_local_dir && mapping.package == package.root_package {
                 continue;
@@ -187,7 +189,9 @@ impl ResolvedLayout {
                     )
                 }
             };
+            let fs = filesystems.entry(backing.key()).or_default().clone();
             layout.volumes.push(ResolvedVolume {
+                fs,
                 mount_path: mount_path.to_owned(),
                 source_path,
                 backing,
@@ -407,56 +411,45 @@ enum VolumeKey {
     Opaque(usize, String),
 }
 
-#[derive(Default)]
-pub(super) struct VolumeLayers(HashMap<VolumeKey, Layer>);
-impl VolumeLayers {
-    pub(super) async fn get(
-        &mut self,
-        machine: &Machine,
-        volume: &ResolvedVolume,
-    ) -> io::Result<Layer> {
-        self.get_inner(machine.owner, volume)
-            .await
-            .map_err(|error| volume.context(error))
-    }
-
-    pub(super) async fn get_inner(
-        &mut self,
-        (uid, gid): (u32, u32),
-        volume: &ResolvedVolume,
-    ) -> io::Result<Layer> {
-        let key = match &volume.backing {
-            Backing::Reader { reader, name } => {
+impl Backing {
+    fn key(&self) -> VolumeKey {
+        match self {
+            Self::Reader { reader, name } => {
                 VolumeKey::Reader(Arc::as_ptr(reader) as usize, name.clone())
             }
-            Backing::Opaque { identity, name, .. } => {
+            Self::Opaque { identity, name, .. } => {
                 VolumeKey::Opaque(Arc::as_ptr(identity) as usize, name.clone())
             }
-        };
-        let layer = match self.0.get(&key) {
-            Some(layer) => layer.clone(),
-            None => {
-                let layer = match &volume.backing {
-                    Backing::Reader { reader, name } => Layer(Arc::new(
-                        crate::PackageFs::with_owner(reader, name, uid, gid)
-                            .map_err(io::Error::other)?,
-                    )),
-                    Backing::Opaque { volume, .. } => Layer(Arc::new(
-                        crate::PackageFs::from_volume(volume, uid, gid)
-                            .map_err(io::Error::other)?,
-                    )),
+        }
+    }
+}
+
+impl ResolvedVolume {
+    pub(super) async fn layer_for(&self, (uid, gid): (u32, u32)) -> io::Result<Layer> {
+        let layer = {
+            let mut slot = self
+                .fs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if slot.is_none() {
+                let fs = match &self.backing {
+                    Backing::Reader { reader, name } => {
+                        PackageFs::with_owner(reader, name, uid, gid)
+                    }
+                    Backing::Opaque { volume, .. } => PackageFs::from_volume(volume, uid, gid),
                 };
-                self.0.insert(key, layer.clone());
-                layer
+                *slot = Some(fs.map_err(io::Error::other)?);
             }
+            Layer(Arc::new(slot.as_ref().unwrap().for_owner(uid, gid)))
         };
-        super::volume_subtree(layer, volume.source_path.as_deref()).await
+        super::volume_subtree(layer, self.source_path.as_deref()).await
     }
 }
 
 #[cfg(all(test, feature = "tokio", not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+    use crate::Machine;
     use std::{cell::Cell, collections::BTreeMap};
     use wasixv2_vfs::{Cred, Ctx, LookupFlags, OpenHow};
     use wasmer_config::package::PackageHash;
@@ -545,6 +538,32 @@ mod tests {
         let count = file.read_at(&mut bytes, 0).await.unwrap();
         bytes.truncate(count);
         bytes
+    }
+
+    #[tokio::test]
+    async fn volume_mounts_share_file_bytes_with_different_owners() {
+        let package = loaded(archive()).await;
+        let layout = ResolvedLayout::new(&package, false, None).unwrap();
+        let mut contents = None;
+        for uid in [0, 42] {
+            let mut machine = Machine::builder()
+                .user(crate::Credentials::new(uid, uid))
+                .build();
+            crate::install_package_sources(
+                &mut machine,
+                &[super::super::PackageInstallSource::Resolved(&layout)],
+            )
+            .await
+            .unwrap();
+            let file = open(&machine, b"/data/msg").await;
+            let bytes = file.shared_contents().await.unwrap();
+            assert_eq!(machine.vfs().stat(&file.path).await.unwrap().uid, uid);
+            if let Some(first) = &contents {
+                assert!(Arc::ptr_eq(first, &bytes));
+            } else {
+                contents = Some(bytes);
+            }
+        }
     }
 
     #[tokio::test]

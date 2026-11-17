@@ -5,7 +5,7 @@ pub(crate) mod import;
 #[cfg(feature = "resolved-packages")]
 pub(crate) mod wasmer_command;
 
-use crate::{Filesystem, Layer, Machine, OwnedBuffer};
+use crate::{Filesystem, Layer, Machine, OwnedBuffer, PackageFs};
 #[cfg(feature = "resolved-packages")]
 mod resolved;
 #[cfg(feature = "resolved-packages")]
@@ -16,7 +16,7 @@ pub use resolved::{
 use std::{
     collections::{BTreeMap, HashSet},
     io,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 use webc::{Version, metadata::annotations::Wasi, v3::read::OwnedReader};
 
@@ -71,6 +71,7 @@ pub fn command_config(
 pub struct Package {
     reader: OwnedReader,
     dependencies: BTreeMap<String, Arc<Package>>,
+    volumes: Mutex<BTreeMap<String, PackageFs>>,
 }
 
 impl Package {
@@ -88,7 +89,22 @@ impl Package {
         Ok(Self {
             reader: OwnedReader::parse(bytes).map_err(io::Error::other)?,
             dependencies: BTreeMap::new(),
+            volumes: Mutex::default(),
         })
+    }
+
+    fn volume_layer(&self, volume: &str, (uid, gid): (u32, u32)) -> io::Result<Layer> {
+        let mut volumes = self
+            .volumes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(fs) = volumes.get(volume) {
+            return Ok(Layer(Arc::new(fs.for_owner(uid, gid))));
+        }
+        let fs = PackageFs::with_owner(&self.reader, volume, uid, gid).map_err(io::Error::other)?;
+        let layer = Layer(Arc::new(fs.for_owner(uid, gid)));
+        volumes.insert(volume.to_owned(), fs);
+        Ok(layer)
     }
 
     pub fn with_dependency(mut self, alias: impl Into<String>, package: Arc<Package>) -> Self {
@@ -253,8 +269,6 @@ pub struct PreparedPackageSources {
     #[cfg(feature = "wasix1")]
     defaults: Vec<(String, crate::CommandDefaults)>,
     mounts: Vec<(String, PreparedVolume, usize)>,
-    #[cfg(feature = "resolved-packages")]
-    volume_layers: resolved::VolumeLayers,
 }
 
 impl PreparedPackageSources {
@@ -262,11 +276,14 @@ impl PreparedPackageSources {
         self.mounts.iter().map(|(path, _, _)| path.as_str())
     }
 
-    async fn layer(&mut self, machine: &Machine, backing: &PreparedVolume) -> io::Result<Layer> {
+    async fn layer(&self, _machine: &Machine, backing: &PreparedVolume) -> io::Result<Layer> {
         match backing {
             PreparedVolume::Layer(layer) => Ok(layer.clone()),
             #[cfg(feature = "resolved-packages")]
-            PreparedVolume::Resolved(volume) => self.volume_layers.get(machine, volume).await,
+            PreparedVolume::Resolved(volume) => volume
+                .layer_for(_machine.owner)
+                .await
+                .map_err(|error| volume.context(error)),
         }
     }
 
@@ -461,7 +478,7 @@ pub async fn prepare_package_sources(
                 if !mapping.mount_path.starts_with('/') {
                     return Err(invalid("package mount must be absolute"));
                 }
-                let mut layer = machine.package_layer(&source.reader, &mapping.volume_name)?;
+                let mut layer = source.volume_layer(&mapping.volume_name, machine.owner)?;
                 if let Some(path) = mapping
                     .host_path
                     .as_deref()
@@ -504,8 +521,6 @@ pub async fn prepare_package_sources(
         #[cfg(feature = "wasix1")]
         defaults,
         mounts,
-        #[cfg(feature = "resolved-packages")]
-        volume_layers: resolved::VolumeLayers::default(),
     })
 }
 

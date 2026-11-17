@@ -86,6 +86,7 @@ pub enum PackageFsError {
 pub struct PackageFs {
     root: Arc<DirData>,
     vol: Arc<Volume>,
+    owner: (u32, u32),
 }
 
 /// Keeps the volume's buffers alive for the `'static` borrows in the directory tables. Everything
@@ -95,8 +96,6 @@ struct Volume {
     // `None` for a tree built from buffers, which own their data.
     _section: Option<VolumeSection>,
     size: u64,
-    /// The uid and gid every object reports.
-    owner: (u32, u32),
     /// The next inode number to hand out.
     next_ino: AtomicU64,
 }
@@ -136,11 +135,24 @@ impl PackageFs {
         let vol = Arc::new(Volume {
             _section: Some(section),
             size,
-            owner: (uid, gid),
             next_ino: AtomicU64::new(ROOT_INO + 1),
         });
         let root = Arc::new(DirData::new(root, vol.clone()));
-        Ok(Self { root, vol })
+        Ok(Self {
+            root,
+            vol,
+            owner: (uid, gid),
+        })
+    }
+
+    /// Reuses the same read-only tree and shared file owners in another mount,
+    /// where files report the supplied uid and gid.
+    pub fn for_owner(&self, uid: u32, gid: u32) -> Self {
+        Self {
+            root: self.root.clone(),
+            vol: self.vol.clone(),
+            owner: (uid, gid),
+        }
     }
 
     /// A read-only tree of the regular files `files`, each a relative path (such as
@@ -266,11 +278,14 @@ impl PackageFs {
         let vol = Arc::new(Volume {
             _section: None,
             size,
-            owner: (uid, gid),
             next_ino: AtomicU64::new(ROOT_INO + 1),
         });
         let root = tree.build(&vol)?;
-        Ok(Self { root, vol })
+        Ok(Self {
+            root,
+            vol,
+            owner: (uid, gid),
+        })
     }
 }
 
@@ -415,6 +430,7 @@ impl Filesystem for PackageFs {
             kind: Kind::Dir(self.root.clone()),
             ino: ROOT_INO,
             vol: self.vol.clone(),
+            owner: self.owner,
         })
     }
 
@@ -589,6 +605,7 @@ pub struct PackageNode {
     kind: Kind,
     ino: u64,
     vol: Arc<Volume>,
+    owner: (u32, u32),
 }
 
 impl PackageNode {
@@ -626,8 +643,8 @@ impl Node for PackageNode {
             file_type: self.kind.file_type(),
             mode,
             nlink,
-            uid: self.vol.owner.0,
-            gid: self.vol.owner.1,
+            uid: self.owner.0,
+            gid: self.owner.1,
             rdev: Device::default(),
             size,
             blocks: size.div_ceil(512),
@@ -655,6 +672,7 @@ impl Node for PackageNode {
             kind: child.kind.clone(),
             ino: child.ino,
             vol: self.vol.clone(),
+            owner: self.owner,
         }))
     }
 

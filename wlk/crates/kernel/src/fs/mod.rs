@@ -1227,18 +1227,9 @@ impl Kernel {
         let size = self.vfs.stat(&file.path).await?.size;
         let image = crate::process::read_image(&file, size).await?;
         drop(slot);
-        struct LibraryBytes {
-            image: wasixv2_syscalls::Image,
-            _file: wasixv2_vfs::File,
-        }
-        impl AsRef<[u8]> for LibraryBytes {
-            fn as_ref(&self) -> &[u8] {
-                self.image.bytes()
-            }
-        }
         Ok(wasixv2_syscalls::LibraryImage {
             identity,
-            image: wasixv2_syscalls::Image::shared(Arc::new(LibraryBytes { image, _file: file })),
+            image: image.with_owner(Arc::new(file)),
             path: Some(guest_path),
         })
     }
