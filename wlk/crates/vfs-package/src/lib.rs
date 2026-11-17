@@ -155,6 +155,20 @@ impl PackageFs {
         uid: u32,
         gid: u32,
     ) -> Result<Self, PackageFsError> {
+        Self::from_shared_files(
+            files.into_iter().map(|(path, data)| (path, Arc::new(data))),
+            uid,
+            gid,
+        )
+    }
+
+    /// Like [`Self::from_files`], retaining the supplied owner for each file so
+    /// opens of the same bytes can share one identity across filesystem trees.
+    pub fn from_shared_files(
+        files: impl IntoIterator<Item = (String, Arc<OwnedBuffer>)>,
+        uid: u32,
+        gid: u32,
+    ) -> Result<Self, PackageFsError> {
         let mut tree = Tree::default();
         let mut size = 0;
         for (path, data) in files {
@@ -223,7 +237,7 @@ impl PackageFs {
                             size = size
                                 .checked_add(data.len() as u64)
                                 .ok_or(PackageFsError::Malformed("the volume's size overflows"))?;
-                            TreeEntry::File(data)
+                            TreeEntry::File(Arc::new(data))
                         }
                         webc::Metadata::Symlink { target_length, .. } => {
                             let (target, _) = volume
@@ -266,7 +280,7 @@ struct Tree(BTreeMap<String, TreeEntry>);
 
 enum TreeEntry {
     Dir(Tree),
-    File(OwnedBuffer),
+    File(Arc<OwnedBuffer>),
     Symlink(String),
 }
 
@@ -310,7 +324,7 @@ impl Tree {
     /// deepest up.
     fn build(self, vol: &Arc<Volume>) -> Result<Arc<DirData>, PackageFsError> {
         enum Slot {
-            File(OwnedBuffer),
+            File(Arc<OwnedBuffer>),
             Symlink(String),
             /// The index of the subdirectory's table in `tables`.
             Dir(usize),
@@ -444,7 +458,7 @@ struct Child {
 #[derive(Clone)]
 enum Kind {
     Dir(Arc<DirData>),
-    File(OwnedBuffer),
+    File(Arc<OwnedBuffer>),
     Symlink(Cow<'static, str>),
 }
 
@@ -492,7 +506,7 @@ impl DirData {
                     subdirs += 1;
                     Kind::Dir(Arc::new(DirData::new(dir, self.vol.clone())))
                 }
-                WebcEntry::File(file) => Kind::File(file.bytes().clone()),
+                WebcEntry::File(file) => Kind::File(Arc::new(file.bytes().clone())),
                 WebcEntry::Symlink(link) => Kind::Symlink(Cow::Borrowed(link.target())),
             };
             entries.push(Child {
@@ -719,7 +733,7 @@ impl Node for PackageNode {
 }
 
 /// An open regular file: a slice of the container's buffer.
-struct FileHandle(OwnedBuffer);
+struct FileHandle(Arc<OwnedBuffer>);
 
 #[async_trait(?Send)]
 impl Handle for FileHandle {
@@ -735,7 +749,7 @@ impl Handle for FileHandle {
 
     /// The buffer itself: a volume never changes.
     async fn shared_contents(&self) -> Option<SharedContents> {
-        Some(Arc::new(self.0.clone()))
+        Some(self.0.clone())
     }
 
     async fn write_at(&self, _data: &[u8], _offset: u64) -> FsResult<usize> {

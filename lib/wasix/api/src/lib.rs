@@ -855,13 +855,18 @@ impl Machine {
         &self,
         commands: impl IntoIterator<Item = (String, OwnedBuffer)>,
     ) -> io::Result<Option<Layer>> {
-        commands_layer(self.owner, commands)
+        commands_layer(
+            self.owner,
+            commands
+                .into_iter()
+                .map(|(name, bytes)| (name, Arc::new(bytes))),
+        )
     }
 }
 
 fn commands_layer(
     (uid, gid): (u32, u32),
-    commands: impl IntoIterator<Item = (String, OwnedBuffer)>,
+    commands: impl IntoIterator<Item = (String, Arc<OwnedBuffer>)>,
 ) -> io::Result<Option<Layer>> {
     let mut seen = HashSet::new();
     let mut files = Vec::new();
@@ -882,7 +887,7 @@ fn commands_layer(
     if files.is_empty() {
         return Ok(None);
     }
-    let layer = PackageFs::from_files(files, uid, gid).map_err(io::Error::other)?;
+    let layer = PackageFs::from_shared_files(files, uid, gid).map_err(io::Error::other)?;
     Ok(Some(Layer(Arc::new(layer))))
 }
 

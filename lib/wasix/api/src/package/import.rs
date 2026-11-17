@@ -77,7 +77,7 @@ struct Plan {
     next: usize,
     import: Imported,
     #[cfg(feature = "wasix1")]
-    defaults: Vec<(String, OwnedBuffer, crate::CommandDefaults)>,
+    defaults: Vec<(String, Arc<OwnedBuffer>, crate::CommandDefaults)>,
 }
 
 struct Append {
@@ -89,7 +89,7 @@ struct Append {
 #[derive(Clone)]
 pub(super) struct Imported {
     pub(super) public: ImportedRuntimePackage,
-    pub(super) atom: OwnedBuffer,
+    pub(super) atom: Arc<OwnedBuffer>,
     commands: Arc<dyn Filesystem>,
 }
 
@@ -212,10 +212,7 @@ impl RuntimePackages {
     async fn plan(&self, vfs: &Arc<Vfs>, package: &RuntimePackage) -> io::Result<Plan> {
         let atom = package
             .layout
-            .commands
-            .iter()
-            .find(|(name, _)| *name == package.entrypoint)
-            .map(|(_, atom)| atom.clone())
+            .shared_command_atom(&package.entrypoint)
             .ok_or_else(|| errno_to_io(Errno::ENOEXEC))?;
         let commands = commands_layer(self.owner, package.layout.commands.clone())?
             .ok_or_else(|| errno_to_io(Errno::ENOEXEC))?
@@ -287,13 +284,7 @@ impl RuntimePackages {
                 .defaults
                 .iter()
                 .filter_map(|(name, defaults)| {
-                    let atom = package
-                        .layout
-                        .commands
-                        .iter()
-                        .find(|(key, _)| key == name)?
-                        .1
-                        .clone();
+                    let atom = package.layout.shared_command_atom(name)?;
                     Some((name.clone(), atom, defaults.clone()))
                 })
                 .collect(),
@@ -305,7 +296,7 @@ impl RuntimePackages {
         &self,
         vfs: &Arc<Vfs>,
         root: &Path,
-        commands: &[(String, OwnedBuffer, crate::CommandDefaults)],
+        commands: &[(String, Arc<OwnedBuffer>, crate::CommandDefaults)],
     ) {
         let mut resolved = Vec::new();
         for (name, atom, defaults) in commands {

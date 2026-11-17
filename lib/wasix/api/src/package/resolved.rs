@@ -70,7 +70,7 @@ pub struct ResolvedCommand {
 #[derive(Clone, Default)]
 pub struct ResolvedLayout {
     pub(super) volumes: Vec<ResolvedVolume>,
-    pub(super) commands: Vec<(String, OwnedBuffer)>,
+    pub(super) commands: Vec<(String, Arc<OwnedBuffer>)>,
     #[cfg(feature = "wasix1")]
     pub(super) defaults: Vec<(String, crate::CommandDefaults)>,
 }
@@ -199,7 +199,7 @@ impl ResolvedLayout {
         for command in commands {
             layout
                 .commands
-                .push((command.name().to_owned(), command.atom()));
+                .push((command.name().to_owned(), Arc::new(command.atom())));
             #[cfg(feature = "wasix1")]
             {
                 let annotation = command
@@ -251,12 +251,22 @@ impl ResolvedLayout {
     pub fn override_commands(&mut self, commands: Vec<ResolvedCommand>) {
         let mut atoms = Vec::with_capacity(commands.len() + self.commands.len());
         for command in commands {
-            atoms.push((command.name.clone(), command.atom));
+            atoms.push((command.name.clone(), Arc::new(command.atom)));
             #[cfg(feature = "wasix1")]
             self.defaults.push((command.name, command.defaults));
         }
         atoms.append(&mut self.commands);
         self.commands = atoms;
+    }
+
+    /// The selected atom's shared owner, also used for the executable files
+    /// installed from this layout. Pass this Arc to [`crate::Image::shared`]
+    /// to use the same image identity as guest exec through those files.
+    pub fn shared_command_atom(&self, name: &str) -> Option<Arc<OwnedBuffer>> {
+        self.commands
+            .iter()
+            .find(|(command, _)| command == name)
+            .map(|(_, atom)| atom.clone())
     }
 
     pub fn mount_paths(&self) -> impl Iterator<Item = &str> {
@@ -504,7 +514,7 @@ mod tests {
         LoadedPackage::from_containers(resolution, HashMap::from([(id, container)])).unwrap()
     }
 
-    async fn read(machine: &Machine, path: &[u8]) -> Vec<u8> {
+    async fn open(machine: &Machine, path: &[u8]) -> wasixv2_vfs::File {
         let vfs = machine.vfs();
         let root = vfs.root();
         let cred = Cred::root();
@@ -515,19 +525,22 @@ mod tests {
             task: 0,
             leases: None,
         };
-        let file = vfs
-            .open(
-                &cx,
-                &root,
-                path,
-                &OpenHow {
-                    flags: wasixv2_abi::OpenFlags::O_RDONLY,
-                    mode: 0,
-                    lookup: LookupFlags::follow(),
-                },
-            )
-            .await
-            .unwrap();
+        vfs.open(
+            &cx,
+            &root,
+            path,
+            &OpenHow {
+                flags: wasixv2_abi::OpenFlags::O_RDONLY,
+                mode: 0,
+                lookup: LookupFlags::follow(),
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn read(machine: &Machine, path: &[u8]) -> Vec<u8> {
+        let file = open(machine, path).await;
         let mut bytes = vec![0; 32];
         let count = file.read_at(&mut bytes, 0).await.unwrap();
         bytes.truncate(count);
@@ -819,6 +832,31 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["root", "used", "mapped"]
         );
+    }
+
+    #[cfg(feature = "wasix1")]
+    #[tokio::test]
+    async fn command_atoms_keep_the_same_owner_across_machine_mounts() {
+        let mut layout = ResolvedLayout::default();
+        layout.override_commands(vec![ResolvedCommand {
+            name: "main".into(),
+            atom: OwnedBuffer::from_bytes(b"main".as_slice()),
+            defaults: crate::CommandDefaults::default(),
+        }]);
+        let atom = layout.shared_command_atom("main").unwrap();
+        assert!(layout.shared_command_atom("missing").is_none());
+        let bytes: wasixv2_vfs::SharedContents = atom;
+        for path in [b"/bin/main".as_slice(), b"/usr/bin/main".as_slice()] {
+            let mut machine = Machine::new();
+            crate::install_package_sources(
+                &mut machine,
+                &[super::super::PackageInstallSource::Resolved(&layout)],
+            )
+            .await
+            .unwrap();
+            let mounted = open(&machine, path).await.shared_contents().await.unwrap();
+            assert!(Arc::ptr_eq(&bytes, &mounted));
+        }
     }
 
     #[cfg(feature = "wasix1")]

@@ -249,7 +249,7 @@ pub struct PreparedPackageSources {
     root_layers: Vec<PreparedVolume>,
     prepared_roots: Option<Vec<Layer>>,
     resolved: bool,
-    commands: Vec<(String, OwnedBuffer)>,
+    commands: Vec<(String, Arc<OwnedBuffer>)>,
     #[cfg(feature = "wasix1")]
     defaults: Vec<(String, crate::CommandDefaults)>,
     mounts: Vec<(String, PreparedVolume, usize)>,
@@ -278,9 +278,8 @@ impl PreparedPackageSources {
         for backing in self.root_layers.clone() {
             roots.push(self.layer(machine, &backing).await?);
         }
-        let commands = machine
-            .commands_layer(self.commands.clone())
-            .map_err(|source| {
+        let commands =
+            super::commands_layer(machine.owner, self.commands.clone()).map_err(|source| {
                 if self.resolved {
                     io::Error::new(source.kind(), CommandLayerError(source))
                 } else {
@@ -400,7 +399,7 @@ pub async fn prepare_package_sources(
             {
                 for (name, bytes) in *memory {
                     if names.insert(name.clone()) {
-                        commands.push((name.clone(), bytes.clone()));
+                        commands.push((name.clone(), Arc::new(bytes.clone())));
                     }
                 }
             }
@@ -408,7 +407,7 @@ pub async fn prepare_package_sources(
         };
         for name in package.commands() {
             if names.insert(name.to_owned()) {
-                commands.push((name.to_owned(), package.binary(name)?));
+                commands.push((name.to_owned(), Arc::new(package.binary(name)?)));
                 #[cfg(feature = "wasix1")]
                 if let Some(wasi) = package.annotation(name)? {
                     defaults.push((
