@@ -616,6 +616,17 @@ impl TreeState {
         debug_assert!(previous.is_none(), "one mount per mountpoint");
     }
 
+    /// Replaces a private leaf in place, keeping its mountpoint continuously marked.
+    pub(crate) fn replace_leaf(&mut self, old: &Mount, new: &Arc<Mount>, at: &Path, ns: u64) {
+        self.changing_mount(old);
+        self.changing_mount(new);
+        *new.parent.lock_or_recover() = Some(at.clone());
+        self.add_link(new, ns);
+        self.children.insert(key(at), new.clone());
+        *old.parent.lock_or_recover() = None;
+        self.links.remove(&old.id);
+    }
+
     /// Takes `mount` off its mountpoint (`umount_mnt`), returning where it was.
     pub(crate) fn detach(&mut self, mount: &Arc<Mount>) -> Option<Path> {
         self.changing_mount(mount);

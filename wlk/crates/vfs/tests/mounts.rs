@@ -1136,3 +1136,118 @@ fn fs_bind_rbind36_rbind_within_the_same_tree_root_to_unbindable_child() {
         umount parent",
     );
 }
+
+#[test]
+fn replace_mount_keeps_existing_paths_and_releases_the_old_mount() {
+    let view = View::initial(&Vfs::new(tmpfs()));
+    view.mkdir("/data");
+    let underneath = view.touch("/data/underneath");
+    drop(underneath);
+    view.mount_tmpfs("/data");
+    let old_file = view.touch("/data/file");
+    block_on(old_file.write_at(b"old", 0)).unwrap();
+    let old_cwd = view.path("/data").unwrap();
+    let old_mount = Arc::downgrade(&old_cwd.mnt);
+
+    let new_fs = tmpfs();
+    let new_view = View::initial(&Vfs::new(new_fs.clone()));
+    block_on(new_view.touch("/file").write_at(b"new", 0)).unwrap();
+    let replacement = view.vfs.replace_mount(&old_cwd, new_fs).unwrap();
+
+    let mut data = [0; 3];
+    block_on(view.touch("/data/file").read_at(&mut data, 0)).unwrap();
+    assert_eq!(&data, b"new");
+    block_on(old_file.read_at(&mut data, 0)).unwrap();
+    assert_eq!(&data, b"old");
+    let relative = block_on(
+        view.vfs
+            .lookup(&view.cx(), &old_cwd, b"file", LookupFlags::follow()),
+    )
+    .unwrap();
+    assert!(Arc::ptr_eq(&relative.mnt, &old_cwd.mnt));
+    assert!(Arc::ptr_eq(
+        &replacement.mnt,
+        &view.path("/data").unwrap().mnt
+    ));
+    assert!(!view.exists("/data/underneath"));
+    assert_eq!(view.mount_count(), 2);
+    assert!(view.vfs.replace_mount(&old_cwd, tmpfs()).is_err());
+
+    drop(relative);
+    drop(old_cwd);
+    drop(old_file);
+    assert!(old_mount.upgrade().is_none());
+}
+
+#[test]
+fn replace_mount_leaves_nested_mounts_attached() {
+    let view = View::initial(&Vfs::new(tmpfs()));
+    view.mkdir("/data");
+    view.mount_tmpfs("/data");
+    view.mkdir("/data/nested");
+    view.mount_tmpfs("/data/nested");
+    view.touch("/data/nested/file");
+    let result = view
+        .vfs
+        .replace_mount(&view.path("/data").unwrap(), tmpfs());
+    assert!(matches!(result, Err(Errno::EBUSY)));
+    assert!(view.exists("/data/nested/file"));
+    assert_eq!(view.mount_count(), 3);
+}
+
+#[test]
+fn concurrent_walks_see_a_complete_mount_replacement() {
+    let view = View::initial(&Vfs::new(tmpfs()));
+    view.mkdir("/data");
+    let filesystems = [tmpfs(), tmpfs()];
+    for (fs, byte) in filesystems.iter().zip([b'a', b'b']) {
+        let source = View::initial(&Vfs::new(fs.clone()));
+        source.mkdir("/dir");
+        let file = source.touch("/dir/file");
+        block_on(file.write_at(&[byte], 0)).unwrap();
+    }
+    let flags = MountFlags {
+        read_only: true,
+        ..Default::default()
+    };
+    block_on(
+        view.vfs
+            .mount(b"/data", filesystems[0].clone(), flags, false),
+    )
+    .unwrap();
+    let mut mounted = view.path("/data").unwrap();
+
+    let barrier = std::sync::Barrier::new(2);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let reader = View::initial(&view.vfs);
+            let how = OpenHow {
+                flags: OpenFlags::O_RDONLY,
+                mode: 0,
+                lookup: LookupFlags::follow(),
+            };
+            barrier.wait();
+            for _ in 0..1000 {
+                let file = block_on(reader.vfs.open(
+                    &reader.cx(),
+                    &reader.root,
+                    b"/data/dir/file",
+                    &how,
+                ))
+                .unwrap();
+                let mut data = [0];
+                assert_eq!(block_on(file.read_at(&mut data, 0)).unwrap(), 1);
+                assert!(matches!(data[0], b'a' | b'b'));
+            }
+        });
+        barrier.wait();
+        for i in 1..=1000 {
+            mounted = view
+                .vfs
+                .replace_mount(&mounted, filesystems[i % 2].clone())
+                .unwrap();
+            assert_eq!(mounted.mnt.flags(), flags);
+        }
+    });
+    assert_eq!(view.mount_count(), 2);
+}

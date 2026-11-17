@@ -185,6 +185,45 @@ impl Vfs {
         }
     }
 
+    /// Replaces a directory mount in the embedder's initial namespace and returns the new root.
+    /// The replacement keeps the old mount's flags. Paths already held by open files, directory
+    /// descriptors and working directories keep the detached mount; new walks use the replacement.
+    ///
+    /// Pass the original mount's root as `target`. The namespace root, locked mounts, propagation
+    /// links and stale mount paths are unsupported. Nested mounts (including anything stacked over
+    /// the target) cause `EBUSY` without changing the tree. Other namespaces are unaffected.
+    pub fn replace_mount(&self, target: &Path, fs: Arc<dyn Filesystem>) -> FsResult<Path> {
+        if !target.is_mount_root() || !target.dentry.is_dir() {
+            return Err(Errno::EINVAL);
+        }
+        let source = fs.info().name.as_bytes().to_vec();
+        let (root, _) = self.fs_root(fs, self.ns.owner().clone());
+        if !root.is_dir() {
+            return Err(Errno::ENOTDIR);
+        }
+        let old = &target.mnt;
+        let mut state = self.tree.lock();
+        let at = old.parent().ok_or(Errno::EINVAL)?;
+        if !check_mnt(&state, &self.ns, old)
+            || !state
+                .mounted_on(&at)
+                .is_some_and(|mnt| Arc::ptr_eq(&mnt, old))
+            || old.is_locked()
+        {
+            return Err(Errno::EINVAL);
+        }
+        if state.has_children(old) {
+            return Err(Errno::EBUSY);
+        }
+        if state.propagation_of(old) != (0, 0, false) || state.is_shared(&at.mnt) {
+            return Err(Errno::EINVAL);
+        }
+        let new = Arc::new(Mount::new(self.next_id(), root, old.flags(), source));
+        self.tree.seq.bump();
+        state.replace_leaf(old, &new, &at, self.ns.id());
+        Ok(new.root_path())
+    }
+
     /// `do_new_mount_fc` and `do_add_mount`.
     #[allow(clippy::too_many_arguments)]
     fn new_mount(
