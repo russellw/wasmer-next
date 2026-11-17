@@ -18,6 +18,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Use kernel Git mirror
+        working-directory: ${{ runner.temp }}
         shell: bash
         run: git config --global url."https://kernel.googlesource.com/pub/scm/".insteadOf https://git.kernel.org/pub/scm/
       - uses: actions/checkout@v7
