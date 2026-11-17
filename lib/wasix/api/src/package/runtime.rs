@@ -9,7 +9,7 @@ use wasixv2_syscalls::{Fd, UserMemory, read_cstr};
 use wasixv2_vfs::{Cred, Ctx, LookupFlags, MountFlags, Path, PathError, RenameMode, Vfs};
 use wasmer::{AsyncFunctionEnvMut, Function, FunctionEnv, Imports, Module, RuntimeError, StoreMut};
 
-use super::resolved::VolumeLayers;
+use super::{VolumeView, resolved::VolumeLayers};
 use crate::{
     Abis, COMMAND_DIRS, Errno, ExecEnv, Filesystem, Host, HostClock, Image, InstanceAttachment,
     InstantiationHook, LocalFuture, MAX_LOWERS, Machine, MachineBuilder, MemFs, MemoryBudget,
@@ -68,7 +68,7 @@ impl Default for RuntimePackageConfig {
     fn default() -> Self {
         Self {
             resolver: None,
-            limit: 128,
+            limit: 32,
         }
     }
 }
@@ -81,7 +81,7 @@ impl MachineBuilder {
     }
 
     /// Caps distinct runtime-installed layouts, including guest-local Wasm snapshots.
-    /// The default is 128. Zero disallows all installs.
+    /// The default is 32. Zero disallows all installs.
     pub fn runtime_package_limit(mut self, limit: usize) -> Self {
         self.runtime_package_config.limit = limit;
         self
@@ -120,6 +120,7 @@ pub(crate) struct RuntimePackages {
 #[derive(Default)]
 struct InstallState {
     prefix: Option<Path>,
+    alias_dirs: [Option<Path>; COMMAND_DIRS.len()],
     installed: HashSet<[u8; 32]>,
 }
 
@@ -222,8 +223,14 @@ impl RuntimePackages {
             if aliases {
                 let cred = Cred::root();
                 let top = vfs.root();
-                self.publish_aliases(vfs, &context(&cred, &top), &installed.root, &package.layout)
-                    .await;
+                self.publish_aliases(
+                    vfs,
+                    &context(&cred, &top),
+                    &mut state,
+                    &installed.root,
+                    &package.layout,
+                )
+                .await;
             }
             return Ok(installed);
         }
@@ -301,34 +308,106 @@ impl RuntimePackages {
 
         state.installed.insert(package.identity);
         if aliases {
-            self.publish_aliases(vfs, &cx, &installed.root, &package.layout)
+            self.publish_aliases(vfs, &cx, &mut state, &installed.root, &package.layout)
                 .await;
         }
         Ok(installed)
     }
 
-    async fn publish_aliases(&self, vfs: &Vfs, cx: &Ctx<'_>, root: &str, layout: &ResolvedLayout) {
+    async fn alias_directory(
+        &self,
+        vfs: &Arc<Vfs>,
+        cx: &Ctx<'_>,
+        dir: &str,
+        cached: &mut Option<Path>,
+    ) -> io::Result<Path> {
+        let absolute = format!("/{dir}");
+        if let Some(expected) = cached {
+            let visible = vfs
+                .lookup(cx, cx.root, absolute.as_bytes(), confined(true))
+                .await
+                .map_err(path_io)?;
+            return if visible == *expected {
+                Ok(visible)
+            } else {
+                Err(errno_to_io(Errno::EBUSY))
+            };
+        }
+
         let flags = LookupFlags {
             no_xdev: true,
             ..confined(true)
         };
-        for dir in COMMAND_DIRS {
-            let mut start = cx.root.clone();
-            if dir == "usr/bin" {
-                if mkdir(vfs, cx, &start, b"usr").await.is_err() {
+        let mut target = cx.root.clone();
+        for part in dir.split('/') {
+            mkdir(vfs, cx, &target, part.as_bytes()).await?;
+            target = vfs
+                .lookup(cx, &target, part.as_bytes(), flags)
+                .await
+                .map_err(path_io)?;
+        }
+        let attr = vfs.stat(&target).await.map_err(errno_to_io)?;
+        let flags = target.mnt.flags();
+        // Keep existing directory permissions and contents. Every alias and its rename
+        // live in the private upper, even when the root's writable layer is persistent.
+        let upper = self
+            .memory
+            .apply(MemFs::new(
+                Arc::new(HostClock(self.host.clone())),
+                attr.mode & 0o7777,
+                attr.uid,
+                attr.gid,
+            ))
+            .map_err(errno_to_io)?;
+        let lower = Arc::new(VolumeView {
+            fs: target.dentry.sb().fs.clone(),
+            root: target.dentry.node().clone(),
+        });
+        let overlay = OverlayFs::new(Some(Arc::new(upper)), vec![lower]);
+        let tree = vfs.create_mount(
+            overlay,
+            absolute.into_bytes(),
+            flags,
+            false,
+            vfs.namespace().owner().clone(),
+        );
+
+        // A mount beneath this directory already has an explicit place in the namespace.
+        if vfs
+            .mount_info(vfs.namespace(), cx.root)
+            .iter()
+            .any(|entry| {
+                let path = entry.mount.root_path();
+                vfs.is_path_reachable(&path.mnt, &path.dentry, &target)
+            })
+        {
+            return Err(errno_to_io(Errno::EBUSY));
+        }
+
+        vfs.move_mount(vfs.namespace(), &tree.path, &target, false)
+            .map_err(errno_to_io)?;
+        *cached = Some(tree.path.clone());
+        Ok(tree.path.clone())
+    }
+
+    async fn publish_aliases(
+        &self,
+        vfs: &Arc<Vfs>,
+        cx: &Ctx<'_>,
+        state: &mut InstallState,
+        root: &str,
+        layout: &ResolvedLayout,
+    ) {
+        for (index, dir) in COMMAND_DIRS.into_iter().enumerate() {
+            let parent = match self
+                .alias_directory(vfs, cx, dir, &mut state.alias_dirs[index])
+                .await
+            {
+                Ok(parent) => parent,
+                Err(error) => {
+                    tracing::debug!(%dir, %error, "could not prepare a private runtime command directory");
                     continue;
                 }
-                let Ok(usr) = vfs.lookup(cx, &start, b"usr", flags).await else {
-                    continue;
-                };
-                start = usr;
-            }
-            // A mounted command directory belongs to its filesystem.
-            if mkdir(vfs, cx, &start, b"bin").await.is_err() {
-                continue;
-            }
-            let Ok(parent) = vfs.lookup(cx, &start, b"bin", flags).await else {
-                continue;
             };
             let mut seen = HashSet::new();
             for (name, _) in &layout.commands {

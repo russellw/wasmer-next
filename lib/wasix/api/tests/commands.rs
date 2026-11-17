@@ -1017,6 +1017,50 @@ mod runtime_packages {
         .await;
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runtime_aliases_leave_a_persistent_upper_untouched() {
+        use std::os::unix::fs::PermissionsExt;
+
+        local(async {
+            let upper = tempfile::tempdir().unwrap();
+            let persistent_command = upper.path().join("bin/echo");
+            std::fs::create_dir(upper.path().join("bin")).unwrap();
+            let original = echo("persistent");
+            std::fs::write(&persistent_command, &original).unwrap();
+            std::fs::set_permissions(&persistent_command, std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+
+            let resolver = Arc::new(Resolver(layout().await, AtomicUsize::new(0)));
+            {
+                let mut first = Machine::builder()
+                    .runtime_package_resolver(resolver.clone())
+                    .build();
+                first.set_root_upper_host_dir(upper.path()).await.unwrap();
+                let (status, _) =
+                    run_file(&first, "/bin/wasmer", &["wasmer", "run", "test/a"]).await;
+                assert_eq!(status.unwrap(), 0);
+                for path in ["/bin/echo", "/usr/bin/echo"] {
+                    let (status, output) = run_file(&first, path, &["echo"]).await;
+                    assert_eq!(status.unwrap(), 0);
+                    assert_eq!(output, "echo\npackage");
+                }
+                assert_eq!(std::fs::read(&persistent_command).unwrap(), original);
+                assert!(!upper.path().join("usr/bin/echo").exists());
+            }
+            let mut second = Machine::builder()
+                .runtime_package_resolver(resolver)
+                .build();
+            second.set_root_upper_host_dir(upper.path()).await.unwrap();
+            let (status, output) = run_file(&second, "/bin/echo", &["echo"]).await;
+            assert_eq!(status.unwrap(), 0);
+            assert_eq!(output, "echo\npersistent");
+            let (status, _) = run_file(&second, "/usr/bin/echo", &["echo"]).await;
+            assert_eq!(execve_errno(status), 2);
+        })
+        .await;
+    }
+
     #[tokio::test]
     async fn disabled_machine_has_no_runtime_command_or_install() {
         local(async {
