@@ -4454,3 +4454,29 @@ fn contextual_names_keep_custom_spelling_without_policy_and_require_spelling_onl
     }
     assert!(resolver.resolver.questions().is_empty());
 }
+
+#[test]
+fn packet_backend_default_and_policy_admission() {
+    let backend = Arc::new(Recorder::default());
+    assert!(matches!(
+        backend.frames(0x0300, WaitQueue::new()),
+        Err(Errno::EOPNOTSUPP)
+    ));
+    let ordinary = Net::new(NetConfig::host_default(), Some(backend.clone()));
+    assert_ne!(ordinary.packet_uplink(), 0);
+    assert!(matches!(
+        ordinary.backend_frames(0x0300, WaitQueue::new()),
+        Err(Errno::EOPNOTSUPP)
+    ));
+    let guarded = Net::new(
+        NetConfig {
+            policy: Some(Arc::new(Admission::default())),
+            ..NetConfig::host_default()
+        },
+        Some(backend),
+    );
+    assert!(matches!(
+        guarded.backend_frames(0x0300, WaitQueue::new()),
+        Err(Errno::EPERM)
+    ));
+}

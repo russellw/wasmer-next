@@ -1818,8 +1818,8 @@ fn unix_datagrams_go_through_the_receivers_filter() {
     );
 }
 
-/// A packet socket keeps the filter tcpdump and DHCP clients attach, though no frame runs
-/// through it.
+/// A packet socket keeps the filter tcpdump and DHCP clients attach, even without
+/// a frame backend.
 #[test]
 fn packet_sockets_keep_their_filter() {
     let (kernel, task, memory) = super::cred::machine_with(|kernel| {
@@ -2443,3 +2443,413 @@ fn unpolled_host_lookup_with_pending_kill_or_stop_restarts_without_admission() {
 mod admission;
 
 mod readback;
+
+/// A backend endpoint with an arrival queue independent of the guest socket.
+#[derive(Default)]
+struct FrameLoop {
+    rx: Mutex<VecDeque<(Vec<u8>, wasixv2_vnet::FrameKind)>>,
+    queue: Mutex<Option<WaitQueue>>,
+    promisc: Mutex<bool>,
+    blocked: Mutex<bool>,
+}
+impl Pollable for FrameLoop {
+    fn poll(&self, _: Option<&mut PollTable<'_>>) -> PollMask {
+        let mut mask = if *self.blocked.lock().unwrap() {
+            PollMask(0)
+        } else {
+            PollMask::WRITABLE
+        };
+        if !self.rx.lock().unwrap().is_empty() {
+            mask |= PollMask::READABLE;
+        }
+        mask
+    }
+}
+impl wasixv2_vnet::BackendFrames for FrameLoop {
+    fn send(&self, data: &[u8]) -> Result<usize, Errno> {
+        if *self.blocked.lock().unwrap() {
+            return Err(Errno::EAGAIN);
+        }
+        self.rx
+            .lock()
+            .unwrap()
+            .push_back((data.to_vec(), wasixv2_vnet::FrameKind::OtherHost));
+        if let Some(q) = &*self.queue.lock().unwrap() {
+            q.wake(PollMask::READABLE);
+        }
+        Ok(data.len())
+    }
+    fn recv(&self, buf: &mut [u8]) -> Result<(usize, wasixv2_vnet::FrameKind), Errno> {
+        let (data, kind) = self.rx.lock().unwrap().pop_front().ok_or(Errno::EAGAIN)?;
+        let n = buf.len().min(data.len());
+        buf[..n].copy_from_slice(&data[..n]);
+        Ok((data.len(), kind))
+    }
+    fn set_promiscuous(&self, on: bool) -> Result<(), Errno> {
+        *self.promisc.lock().unwrap() = on;
+        Ok(())
+    }
+}
+struct FrameBackend(Arc<FrameLoop>);
+impl wasixv2_vnet::Backend for FrameBackend {
+    fn publish(
+        &self,
+        _: SocketAddr,
+        _: u32,
+        _: Arc<dyn wasixv2_vnet::InboundSink>,
+    ) -> Result<Box<dyn wasixv2_vnet::Publication>, std::io::Error> {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+    fn connect(
+        &self,
+        _: SocketAddr,
+        _: WaitQueue,
+    ) -> Result<Arc<dyn wasixv2_vnet::BackendStream>, Errno> {
+        Err(Errno::EOPNOTSUPP)
+    }
+    fn datagram(
+        &self,
+        _: Domain,
+        _: WaitQueue,
+    ) -> Result<Arc<dyn wasixv2_vnet::BackendDatagram>, Errno> {
+        Err(Errno::EOPNOTSUPP)
+    }
+    fn frames(
+        &self,
+        _: u16,
+        queue: WaitQueue,
+    ) -> Result<Arc<dyn wasixv2_vnet::BackendFrames>, Errno> {
+        *self.0.queue.lock().unwrap() = Some(queue);
+        Ok(self.0.clone())
+    }
+}
+fn packet_addr(protocol: u16, index: u32) -> Vec<u8> {
+    let mut addr = vec![0; 20];
+    addr[..2].copy_from_slice(&17u16.to_le_bytes());
+    addr[2..4].copy_from_slice(&protocol.to_be_bytes());
+    addr[4..8].copy_from_slice(&index.to_le_bytes());
+    addr[11] = 6;
+    addr[12..18].copy_from_slice(&[1, 2, 3, 4, 5, 6]);
+    addr
+}
+
+#[test]
+fn packet_backend_frames_filter_poll_peek_and_truncate() {
+    use wasixv2_vnet::{BackendFrames, Net, NetConfig};
+    let frames = Arc::new(FrameLoop::default());
+    let net = Net::new(
+        NetConfig::host_default(),
+        Some(Arc::new(FrameBackend(frames.clone()))),
+    );
+    let index = net.packet_uplink();
+    let (kernel, task, memory) =
+        super::cred::machine_with(|k| k.with_credentials(Credentials::new(0, 0)).with_network(net));
+    let caller = Caller::new(task, &memory);
+    let fd = block_on(kernel.socket(&caller, AddressFamily::AF_PACKET, 3 | 0x800, 0x0008)).unwrap();
+    put(&memory, 0x200, &packet_addr(0x0800, index));
+    assert_eq!(
+        block_on(kernel.bind(&caller, fd, GuestPtr::new(0x200), 20)),
+        Ok(0)
+    );
+    let file = kernel.file(task, fd).unwrap();
+    assert!(!file.poll(None).contains(PollMask::READABLE));
+    let recv = |flags, n| {
+        block_on(kernel.recvfrom(
+            &caller,
+            fd,
+            UserSliceMut::new(0x500, n),
+            flags,
+            GuestPtrMut::new(0x300),
+            GuestPtrMut::new(0x2f0),
+        ))
+    };
+    assert_eq!(errno(recv(MsgFlags(0), 100)), Errno::EAGAIN);
+    let mut frame = vec![1, 2, 3, 4, 5, 6, 6, 5, 4, 3, 2, 1, 0x86, 0xdd, 42, 43, 44];
+    frames.send(&frame).unwrap();
+    assert!(!file.poll(None).contains(PollMask::READABLE)); // ETH_P_IP rejects IPv6.
+    frame[12..14].copy_from_slice(&[8, 0]);
+    put(&memory, 0x400, &frame);
+    assert_eq!(
+        block_on(kernel.sendto(
+            &caller,
+            fd,
+            UserSlice::new(0x400, frame.len() as u32),
+            MsgFlags(0),
+            GuestPtr::new(0),
+            0
+        )),
+        Ok(frame.len() as u32)
+    );
+    assert!(file.poll(None).contains(PollMask::READABLE));
+    put(&memory, 0x2f0, &20u32.to_le_bytes());
+    assert_eq!(
+        recv(MsgFlags::MSG_PEEK | MsgFlags::MSG_TRUNC, 5),
+        Ok(frame.len() as u32)
+    );
+    assert_eq!(get(&memory, 0x500, 5), &frame[..5]);
+    let addr = get(&memory, 0x300, 20);
+    assert_eq!(&addr[2..4], &[8, 0]);
+    assert_eq!(&addr[4..8], &index.to_le_bytes());
+    assert_eq!(&addr[8..12], &[1, 0, 3, 6]);
+    assert_eq!(&addr[12..18], &frame[6..12]);
+    assert_eq!(recv(MsgFlags(0), 100), Ok(frame.len() as u32));
+    assert_eq!(get(&memory, 0x500, frame.len()), frame);
+    assert!(!file.poll(None).contains(PollMask::READABLE));
+    // A reject-all classic BPF program removes readiness as well as receive data.
+    put(&memory, 0x1000, &ret(0));
+    fprog(&memory, 0x800, 1, 0x1000);
+    assert_eq!(
+        setsockopt_at(
+            &kernel,
+            &caller,
+            fd,
+            SocketOption::SO_ATTACH_FILTER,
+            0x800,
+            8
+        ),
+        Ok(0)
+    );
+    frames.send(&frame).unwrap();
+    assert!(!file.poll(None).contains(PollMask::READABLE));
+    assert_eq!(errno(recv(MsgFlags(0), 100)), Errno::EAGAIN);
+    // Backpressure reaches the nonblocking guest unchanged.
+    *frames.blocked.lock().unwrap() = true;
+    assert_eq!(
+        errno(block_on(kernel.sendto(
+            &caller,
+            fd,
+            UserSlice::new(0x400, frame.len() as u32),
+            MsgFlags(0),
+            GuestPtr::new(0),
+            0
+        ))),
+        Errno::EAGAIN
+    );
+    assert!(!file.poll(None).contains(PollMask::WRITABLE));
+}
+
+#[test]
+fn packet_datagram_builds_header_and_promiscuous_memberships() {
+    use wasixv2_vnet::{Net, NetConfig};
+    let frames = Arc::new(FrameLoop::default());
+    let net = Net::new(
+        NetConfig::host_default(),
+        Some(Arc::new(FrameBackend(frames.clone()))),
+    );
+    let index = net.packet_uplink();
+    let mac = net
+        .interfaces()
+        .into_iter()
+        .find(|i| i.index == index)
+        .unwrap()
+        .mac;
+    let (kernel, task, memory) =
+        super::cred::machine_with(|k| k.with_credentials(Credentials::new(0, 0)).with_network(net));
+    let caller = Caller::new(task, &memory);
+    let fd =
+        block_on(kernel.socket(&caller, AddressFamily::AF_PACKET, DGRAM | 0x800, 0x0300)).unwrap();
+    put(&memory, 0x200, &packet_addr(0x0800, index));
+    put(&memory, 0x400, b"payload");
+    assert_eq!(
+        block_on(kernel.sendto(
+            &caller,
+            fd,
+            UserSlice::new(0x400, 7),
+            MsgFlags(0),
+            GuestPtr::new(0x200),
+            20
+        )),
+        Ok(7)
+    );
+    let wire = frames.rx.lock().unwrap().front().unwrap().0.clone();
+    assert_eq!(&wire[..6], &[1, 2, 3, 4, 5, 6]);
+    assert_eq!(&wire[6..12], &mac);
+    assert_eq!(&wire[12..], b"\x08\x00payload");
+    assert_eq!(
+        block_on(kernel.recvfrom(
+            &caller,
+            fd,
+            UserSliceMut::new(0x500, 100),
+            MsgFlags(0),
+            GuestPtrMut::new(0),
+            GuestPtrMut::new(0)
+        )),
+        Ok(7)
+    );
+    assert_eq!(get(&memory, 0x500, 7), b"payload");
+    let mut membership = vec![0; 16];
+    membership[..4].copy_from_slice(&index.to_le_bytes());
+    membership[4..6].copy_from_slice(&1u16.to_le_bytes());
+    put(&memory, 0x600, &membership);
+    let member = |opt| {
+        block_on(kernel.setsockopt(
+            &caller,
+            fd,
+            SocketLevel::SOL_PACKET,
+            opt,
+            UserSlice::new(0x600, 16),
+        ))
+    };
+    assert_eq!(member(1), Ok(0));
+    assert_eq!(member(1), Ok(0));
+    assert!(*frames.promisc.lock().unwrap());
+    assert_eq!(member(2), Ok(0));
+    assert!(*frames.promisc.lock().unwrap());
+    assert_eq!(member(2), Ok(0));
+    assert!(!*frames.promisc.lock().unwrap());
+    // Rebinding to loopback no longer uses the uplink endpoint.
+    put(&memory, 0x200, &packet_addr(3, 1));
+    assert_eq!(
+        block_on(kernel.bind(&caller, fd, GuestPtr::new(0x200), 20)),
+        Ok(0)
+    );
+    assert_eq!(
+        errno(block_on(kernel.recvfrom(
+            &caller,
+            fd,
+            UserSliceMut::new(0x500, 100),
+            MsgFlags(0),
+            GuestPtrMut::new(0),
+            GuestPtrMut::new(0)
+        ))),
+        Errno::EAGAIN
+    );
+    assert_eq!(
+        errno(block_on(kernel.sendto(
+            &caller,
+            fd,
+            UserSlice::new(0x400, 7),
+            MsgFlags(0),
+            GuestPtr::new(0x200),
+            20
+        ))),
+        Errno::EOPNOTSUPP
+    );
+}
+
+#[derive(Debug)]
+struct PacketPolicy;
+impl wasixv2_vnet::NetworkPolicy for PacketPolicy {
+    fn allows_socket(&self, _: SocketAddr, _: wasixv2_vnet::PolicyDirection) -> bool {
+        true
+    }
+    fn allows_domain(&self, _: &str) -> bool {
+        true
+    }
+    fn resolved_domain(&self, _: &str, _: &[std::net::IpAddr]) {}
+}
+
+#[test]
+fn packet_policy_refuses_before_backend_and_absent_backend_keeps_fallback() {
+    use wasixv2_vnet::{Net, NetConfig};
+    for policy in [false, true] {
+        let frames = Arc::new(FrameLoop::default());
+        let mut config = NetConfig::host_default();
+        if policy {
+            config.policy = Some(Arc::new(PacketPolicy));
+        }
+        let backend = if policy {
+            Some(Arc::new(FrameBackend(frames.clone())) as Arc<dyn wasixv2_vnet::Backend>)
+        } else {
+            None
+        };
+        let net = Net::new(config, backend);
+        let index = net.packet_uplink();
+        let (kernel, task, memory) = super::cred::machine_with(|k| {
+            k.with_credentials(Credentials::new(0, 0)).with_network(net)
+        });
+        let caller = Caller::new(task, &memory);
+        let fd =
+            block_on(kernel.socket(&caller, AddressFamily::AF_PACKET, 3 | 0x800, 0x0300)).unwrap();
+        put(&memory, 0x200, &packet_addr(3, index));
+        let bind = block_on(kernel.bind(&caller, fd, GuestPtr::new(0x200), 20));
+        if policy {
+            assert_eq!(errno(bind), Errno::EPERM);
+        } else {
+            assert_eq!(bind, Ok(0));
+        }
+        assert_eq!(
+            errno(block_on(kernel.recvfrom(
+                &caller,
+                fd,
+                UserSliceMut::new(0x500, 100),
+                MsgFlags(0),
+                GuestPtrMut::new(0),
+                GuestPtrMut::new(0)
+            ))),
+            if policy { Errno::EPERM } else { Errno::EAGAIN }
+        );
+        assert_eq!(
+            errno(block_on(kernel.sendto(
+                &caller,
+                fd,
+                UserSlice::new(0x400, 14),
+                MsgFlags(0),
+                GuestPtr::new(0x200),
+                20
+            ))),
+            if policy {
+                Errno::EPERM
+            } else {
+                Errno::EOPNOTSUPP
+            }
+        );
+        assert!(frames.queue.lock().unwrap().is_none());
+    }
+}
+
+#[test]
+fn packet_blocking_receive_is_woken_by_backend() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use wasixv2_vnet::{BackendFrames, Net, NetConfig};
+    struct Wakes(AtomicUsize);
+    impl std::task::Wake for Wakes {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let frames = Arc::new(FrameLoop::default());
+    let net = Net::new(
+        NetConfig::host_default(),
+        Some(Arc::new(FrameBackend(frames.clone()))),
+    );
+    let (kernel, task, memory) =
+        super::cred::machine_with(|k| k.with_credentials(Credentials::new(0, 0)).with_network(net));
+    let caller = Caller::new(task, &memory);
+    let fd = block_on(kernel.socket(&caller, AddressFamily::AF_PACKET, 3, 0x0300)).unwrap();
+    let wakes = Arc::new(Wakes(AtomicUsize::new(0)));
+    let waker = std::task::Waker::from(wakes.clone());
+    let mut cx = std::task::Context::from_waker(&waker);
+    let mut read = Box::pin(kernel.read(&caller, fd, UserSliceMut::new(0x500, 100)));
+    assert!(read.as_mut().poll(&mut cx).is_pending());
+    let frame = b"\x01\x02\x03\x04\x05\x06\x06\x05\x04\x03\x02\x01\x08\x00payload";
+    frames.send(frame).unwrap();
+    assert_ne!(wakes.0.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        read.as_mut().poll(&mut cx),
+        std::task::Poll::Ready(Ok(frame.len() as u32))
+    );
+    assert_eq!(get(&memory, 0x500, frame.len()), frame);
+    drop(read);
+    put(&memory, 0x400, frame);
+    *frames.blocked.lock().unwrap() = true;
+    let mut write = Box::pin(kernel.write(&caller, fd, UserSlice::new(0x400, frame.len() as u32)));
+    assert!(write.as_mut().poll(&mut cx).is_pending());
+    let before = wakes.0.load(Ordering::SeqCst);
+    *frames.blocked.lock().unwrap() = false;
+    frames
+        .queue
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .wake(PollMask::WRITABLE);
+    assert!(wakes.0.load(Ordering::SeqCst) > before);
+    assert_eq!(
+        write.as_mut().poll(&mut cx),
+        std::task::Poll::Ready(Ok(frame.len() as u32))
+    );
+}

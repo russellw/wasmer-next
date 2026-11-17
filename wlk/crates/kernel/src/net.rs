@@ -1051,7 +1051,18 @@ impl Kernel {
                 let mut wait = nl.blocking(io, SND, flags);
                 nl.sendmsg(&mut wait, &data, to, net_admin, &sender).await
             }
-            AnySock::Packet(_, p) => Ok(p.send(to)?),
+            AnySock::Packet(_, p) => {
+                let mut data = vec![0; src.len.min(packet::MAX_FRAME + 1)];
+                src.copy_in(memory, 0, &mut data).await?;
+                if src.len > packet::MAX_FRAME {
+                    return Err(Errno::EMSGSIZE.into());
+                }
+                let mut wait = p.blocking(io, SND, flags);
+                wait.wait(WaitOn::Queue(&p.queue()), PollMask::WRITABLE, || {
+                    p.send(&data, to)
+                })
+                .await
+            }
             AnySock::Vsock(_, v) => {
                 let mut wait = v.blocking(io, SND, flags);
                 let flags = flags & !(MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_NOSIGNAL);
@@ -1349,12 +1360,24 @@ impl Kernel {
             }
             AnySock::Packet(_, p) => {
                 let mut wait = p.blocking(io, RCV, flags);
-                let frame = p.recv(&mut wait).await?;
+                let (frame, from) = p
+                    .recv(&mut wait, flags.contains(MsgFlags::MSG_PEEK))
+                    .await?;
+                let len = dst.len.min(frame.len());
+                dst.copy_out(memory, 0, &frame[..len]).await?;
                 Ok(Got {
-                    len: frame.len(),
-                    result: frame.len(),
-                    from: None,
-                    flags: MsgFlags(0),
+                    len,
+                    result: if flags.contains(MsgFlags::MSG_TRUNC) {
+                        frame.len()
+                    } else {
+                        len
+                    },
+                    from: Some(from),
+                    flags: if len < frame.len() {
+                        MsgFlags::MSG_TRUNC
+                    } else {
+                        MsgFlags(0)
+                    },
                     controls: Vec::new(),
                     rights: Vec::new(),
                 })

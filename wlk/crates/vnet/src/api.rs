@@ -352,6 +352,21 @@ pub enum NewLinkKind {
 
 /// A network namespace: what the kernel's `socket` and the network pseudo files use.
 pub trait Network: Send + Sync {
+    /// The backend uplink's interface index, or 0 when there is none.
+    fn packet_uplink(&self) -> u32 {
+        0
+    }
+
+    /// Opens link-layer I/O, subject to the namespace's unfiltered-transport admission.
+    fn backend_frames(
+        &self,
+        protocol: u16,
+        wq: WaitQueue,
+    ) -> Result<Arc<dyn BackendFrames>, Errno> {
+        let _ = (protocol, wq);
+        Err(Errno::EOPNOTSUPP)
+    }
+
     /// Immutable opt-in for host-only contextual name lookup. No I/O or admission here.
     fn supports_contextual_lookup(&self) -> bool {
         false
@@ -941,6 +956,14 @@ pub trait Backend: Send + Sync {
     /// `wq`, the guest socket's queue, when datagrams or errors arrive.
     fn datagram(&self, domain: Domain, wq: WaitQueue) -> Result<Arc<dyn BackendDatagram>, Errno>;
 
+    /// Frames of the uplink for an AF_PACKET socket. `protocol` is an ETH_P_*
+    /// in network byte order, as socket(2) takes it (ETH_P_ALL for all frames).
+    /// The default preserves backends without link-layer I/O.
+    fn frames(&self, protocol: u16, wq: WaitQueue) -> Result<Arc<dyn BackendFrames>, Errno> {
+        let _ = (protocol, wq);
+        Err(Errno::EOPNOTSUPP)
+    }
+
     /// An ICMP endpoint for echo requests to outside addresses, of the given family: a host
     /// ICMP datagram socket. `send_to` takes an echo request and the address (port 0), which
     /// the host may give an identifier of its own; `recv_from` returns the echo replies, ICMP
@@ -1292,5 +1315,31 @@ pub trait Publication: Send + Sync {
     /// The guest listener's `listen` backlog changed: the host listener follows it.
     fn set_backlog(&self, backlog: u32) {
         let _ = backlog;
+    }
+}
+
+/// How a link-layer frame reached the backend uplink.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameKind {
+    Host,
+    Broadcast,
+    Multicast,
+    OtherHost,
+    Outgoing,
+}
+
+/// Non-blocking Ethernet frames of the backend uplink. Poll reports IN while
+/// frames are queued, OUT while send can proceed, and ERR/HUP for terminal errors.
+/// Like other backend objects, poll registers nothing. Wake the supplied queue
+/// on readiness changes, including OUT after a send returned EAGAIN.
+/// Data-plane methods must not synchronously reenter the kernel or network.
+pub trait BackendFrames: Pollable {
+    /// Sends one complete Ethernet frame; EAGAIN when it would block.
+    fn send(&self, frame: &[u8]) -> Result<usize, Errno>;
+    /// Consumes one frame, copying as much as fits and returning its full length.
+    fn recv(&self, buf: &mut [u8]) -> Result<(usize, FrameKind), Errno>;
+    fn set_promiscuous(&self, on: bool) -> Result<(), Errno> {
+        let _ = on;
+        Err(Errno::EOPNOTSUPP)
     }
 }

@@ -1210,6 +1210,22 @@ pub(crate) enum UdpRoute {
 }
 
 impl Network for Net {
+    fn packet_uplink(&self) -> u32 {
+        self.uplink_index()
+    }
+
+    fn backend_frames(
+        &self,
+        protocol: u16,
+        wq: WaitQueue,
+    ) -> NetResult<Arc<dyn crate::BackendFrames>> {
+        self.admit_unfiltered_transport()?;
+        self.backend
+            .as_ref()
+            .ok_or(Errno::EOPNOTSUPP)?
+            .frames(protocol, wq)
+    }
+
     fn supports_contextual_lookup(&self) -> bool {
         self.backend
             .as_ref()

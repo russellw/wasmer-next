@@ -33,13 +33,13 @@ mod allocations;
 mod tests;
 
 pub use api::{
-    Accepted, Answer, Backend, BackendDatagram, BackendStream, BindAdmission, Control,
-    DatagramReadback, DatagramReadbackAdmission, DatagramReadbackValue, Domain, EchoIgnore, Found,
-    GroupSources, IcmpEntry, InboundSink, Interface, Lookup, LookupContext, LookupDone,
-    LookupError, Network, NetworkPolicy, NewLink, NewLinkKind, OptionAdmission, PolicyDirection,
-    PortEntry, Publication, PublishedDatagram, QueuedError, RecvMsg, Room, SctpAssocEntry,
-    SctpEndpoint, SctpOps, SendMsg, Shutdown, Socket, SocketKind, StreamState, TcpOptionPolicy,
-    VsockInboundSink, VsockPublication,
+    Accepted, Answer, Backend, BackendDatagram, BackendFrames, BackendStream, BindAdmission,
+    Control, DatagramReadback, DatagramReadbackAdmission, DatagramReadbackValue, Domain,
+    EchoIgnore, Found, FrameKind, GroupSources, IcmpEntry, InboundSink, Interface, Lookup,
+    LookupContext, LookupDone, LookupError, Network, NetworkPolicy, NewLink, NewLinkKind,
+    OptionAdmission, PolicyDirection, PortEntry, Publication, PublishedDatagram, QueuedError,
+    RecvMsg, Room, SctpAssocEntry, SctpEndpoint, SctpOps, SendMsg, Shutdown, Socket, SocketKind,
+    StreamState, TcpOptionPolicy, VsockInboundSink, VsockPublication,
 };
 pub use errors::DatagramErrors;
 pub use icmp::IcmpSocket;
