@@ -1053,30 +1053,25 @@ where
             .map_err(ExecError::CustomBinding)?;
         let instance = Instance::new(&mut store, module, &imports)?;
         let memory = match imported {
-            Some(memory) => memory,
-            None => match instance.exports.get_memory("memory") {
-                Ok(memory) => memory.clone(),
-                Err(_) if abi.permits_missing_memory() => {
-                    match instance.exports.iter().memories().next() {
-                        Some((_, memory)) => memory.clone(),
-                        None => {
-                            Memory::new(&mut store, wasmer::MemoryType::new(0, Some(0), false))?
-                        }
-                    }
-                }
-                Err(error) => return Err(error.into()),
-            },
+            Some(memory) => Some(memory),
+            None => abi.exported_memory(&instance)?,
         };
         // Decided from the module's own globals, before a fork child's copy replaces them.
-        let guarded = abi.guardable(&instance, &mut store.as_store_mut());
+        let guarded = memory.is_some() && abi.guardable(&instance, &mut store.as_store_mut());
         let main_stack = abi.main_stack(&instance, &mut store.as_store_mut());
-        let mut asyncify = asyncify::Asyncify::new(&instance, &mut store)?;
-        let layout = abi.image_layout(
-            &instance,
-            &memory,
-            &mut store.as_store_mut(),
-            asyncify.is_some(),
-        );
+        let mut asyncify = if memory.is_some() {
+            asyncify::Asyncify::new(&instance, &mut store)?
+        } else {
+            None
+        };
+        let layout = memory.as_ref().and_then(|memory| {
+            abi.image_layout(
+                &instance,
+                memory,
+                &mut store.as_store_mut(),
+                asyncify.is_some(),
+            )
+        });
         if let Some(bootstrap) = &bootstrap
             && (layout.as_ref() != bootstrap.layout.as_ref()
                 || main_stack != bootstrap.stack
@@ -1095,21 +1090,23 @@ where
             Arc::<memory::ReadOnly>::default()
         };
         // Before any guest code runs, and before the guard is protected: `MAP_FIXED` resets it.
-        let base = match fork {
-            Some(image) => {
+        let base = match (fork, &memory) {
+            (Some(image), Some(memory)) => {
                 let guard = if guarded { memory::LOW_GUARD } else { 0 };
-                copy_image(&mut store, &instance, &memory, image, (guard, &read_only))?;
+                copy_image(&mut store, &instance, memory, image, (guard, &read_only))?;
                 if let Some(asyncify) = &mut asyncify {
                     image.adopt(asyncify);
                 }
                 image.memory.base().cloned()
             }
-            None => base::freeze(&memory, &store).map_err(ExecError::Base)?,
+            (Some(_), None) => return Err(ExecError::Load(LoadError::Format(Errno::EINVAL))),
+            (None, Some(memory)) => base::freeze(memory, &store).map_err(ExecError::Base)?,
+            (None, None) => None,
         };
-        let low_guard = match guarded {
-            true => memory::protect_low(&memory, &store),
-            false => 0,
-        };
+        let low_guard = memory
+            .as_ref()
+            .filter(|_| guarded)
+            .map_or(0, |memory| memory::protect_low(memory, &store));
         if bootstrap
             .as_ref()
             .is_some_and(|early| early.guard != low_guard)
@@ -1125,16 +1122,18 @@ where
         handoff
             .retain_process(task, &*bound)
             .map_err(ExecError::CustomBinding)?;
-        let shared = memory.as_shared(&store);
-        if let Some(foreign) = memory::ForeignMemory::capture(
-            &memory,
-            &store,
-            shared.clone(),
-            low_guard,
-            read_only.clone(),
-            syscalls.page_access(task),
-            base.clone(),
-        ) {
+        let shared = memory.as_ref().and_then(|memory| memory.as_shared(&store));
+        if let Some(memory) = &memory
+            && let Some(foreign) = memory::ForeignMemory::capture(
+                memory,
+                &store,
+                shared.clone(),
+                low_guard,
+                read_only.clone(),
+                syscalls.page_access(task),
+                base.clone(),
+            )
+        {
             // Preserve the kernel's original mm attachment identity and lifetime.
             syscalls.attach_memory(task, Arc::new(foreign));
         }
@@ -1159,7 +1158,7 @@ where
         });
         let data = env.as_mut(&mut store);
         data.imports = imports.clone();
-        data.memory = Some(memory);
+        data.memory = memory.clone();
         data.low_guard = low_guard;
         data.main_stack = main_stack;
         data.layout = layout;
@@ -1170,14 +1169,13 @@ where
         data.threads = threads;
         data.proc.set_module(module);
         data.asyncify = asyncify;
-        let memory = env.as_ref(&store).memory().unwrap().clone();
-        if let Some(attachments) = &attachments {
+        if let (Some(attachments), Some(memory)) = (&attachments, &memory) {
             attachments
                 .configure(
                     module,
                     &mut wasmer::AsStoreMut::as_store_mut(&mut store),
                     &instance,
-                    &memory,
+                    memory,
                 )
                 .map_err(ExecError::CustomBinding)?;
         }
@@ -1270,13 +1268,10 @@ where
     let metadata = |env: &mut ExecEnv<S>, store: &mut wasmer::StoreMut<'_>| {
         (
             image_abi.main_stack(instance, store),
-            image_abi.image_layout(
-                instance,
-                env.memory().unwrap(),
-                store,
-                env.asyncify.is_some(),
-            ),
-            image_abi.guardable(instance, store),
+            env.memory().and_then(|memory| {
+                image_abi.image_layout(instance, memory, store, env.asyncify.is_some())
+            }),
+            env.memory().is_some() && image_abi.guardable(instance, store),
         )
     };
     let before = entry.with_store(metadata).await;
@@ -1618,7 +1613,10 @@ where
         // Still instantiating: nothing can be delivered yet. Nor while asyncify unwinds or
         // rewinds the stack: the checks were added after its instrumentation, so they run on
         // the way, and a handler called then would find the instance mid-rewind.
-        let ready = data.memory.is_some() && !data.asyncify.as_ref().is_some_and(|a| a.moving());
+        // A memoryless command is ready once bound. A loader may already have
+        // attached bootstrap memory while preparing an image.
+        let ready = (data.memory.is_some() || data.abi.is_some())
+            && !data.asyncify.as_ref().is_some_and(|a| a.moving());
         (data.syscalls.clone(), data.task, ready)
     };
     yield_now().await;

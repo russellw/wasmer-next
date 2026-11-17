@@ -7,8 +7,8 @@ use std::sync::{
 
 use wasixv2_syscalls::{Control, Errno, LocalFuture, SignalFrame, Syscalls, TaskId};
 use wasmer::{
-    AsyncFunctionEnvMut, Function, FunctionEnv, Imports, Instance, Module, RuntimeError, StoreMut,
-    Value,
+    AsyncFunctionEnvMut, Function, FunctionEnv, Imports, Instance, Memory, Module, RuntimeError,
+    StoreMut, Value,
 };
 use wasmparser::{Encoding, Parser, Payload};
 
@@ -81,8 +81,8 @@ impl<S: Syscalls + Control + Send + Sync + 'static> Abi<S> for PlainCommand {
         }))
     }
 
-    fn permits_missing_memory(&self) -> bool {
-        true
+    fn exported_memory(&self, instance: &Instance) -> Result<Option<Memory>, wasmer::ExportError> {
+        Ok(instance.exports.get_memory("memory").ok().cloned())
     }
 }
 

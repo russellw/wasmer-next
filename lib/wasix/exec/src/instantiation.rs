@@ -43,7 +43,8 @@ pub trait InstantiationHook<S>: Send + Sync + 'static {
 /// Owned state paired with one hook's preparation and one actual instance.
 pub trait InstanceAttachment: Send + 'static {
     /// Host-only setup after memory/ABI binding, before Wasm start and ABI entry
-    /// (including explicit initializers). Start traps still deactivate this attachment.
+    /// (including explicit initializers). This is skipped for commands without attached
+    /// memory. Deactivation still runs, including after start traps.
     /// Attachments must not retain an owning Store or StoreAsync, directly or through
     /// another resource: their Store already retains the prepared state.
     fn configure(

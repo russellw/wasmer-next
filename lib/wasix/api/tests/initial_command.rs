@@ -536,6 +536,43 @@ async fn plain_hook_imports_configure_memory_before_wasm_start() {
 }
 
 #[tokio::test]
+async fn plain_commands_skip_attachment_configuration_without_abi_memory() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            for (memory, start_body) in [
+                ("", ""),
+                (
+                    r#"(memory (export "other") 1 2)"#,
+                    "(if (i32.ne (memory.grow (i32.const 1)) (i32.const 1)) (then unreachable))",
+                ),
+            ] {
+                let events = Events::default();
+                let machine = Machine::builder()
+                    .plain_commands(true)
+                    .instantiation_hook(Arc::new(Hook {
+                        mode: Mode::Provide,
+                        events: events.clone(),
+                    }))
+                    .build();
+                let raw = format!(
+                    r#"(module
+                        (import "custom" "value" (func $value (result i32)))
+                        {memory}
+                        (func $start {start_body})
+                        (start $start)
+                        (func (export "_start") (result i32) call $value))"#
+                );
+                assert_eq!(compiled(machine, &raw).await, Ok(7));
+                assert_eq!(
+                    *events.lock().unwrap(),
+                    [("prepare", None), ("deactivate", None), ("drop", None)]
+                );
+            }
+        })
+        .await;
+}
+
+#[tokio::test]
 async fn plain_files_require_opt_in_and_a_declaration_for_every_import() {
     tokio::task::LocalSet::new()
         .run_until(async {

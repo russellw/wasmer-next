@@ -195,6 +195,7 @@ struct Points {
     futex_memory: Option<bool>,
     /// Whether memory 0 is 32-bit, so its growth goes through the grow hook.
     memory32: Option<bool>,
+    memory0_accessible: bool,
     imported_globals: u32,
     budget: Option<u32>,
     reflection: Reflection,
@@ -352,7 +353,10 @@ impl Points {
             _ => return None,
         };
         let offset = u32::try_from(memarg.offset).ok()?;
-        (memarg.target == MemArgTarget::Memory(0) && self.futex_memory == Some(true)).then(|| {
+        (memarg.target == MemArgTarget::Memory(0)
+            && self.memory0_accessible
+            && self.futex_memory == Some(true))
+        .then(|| {
             [
                 Instruction::I32Const(offset as i32),
                 Instruction::Call(self.hook() + at),
@@ -365,7 +369,8 @@ impl Points {
     /// below what the instance's ABI reserves.
     fn grow_call(&self, instruction: &Instruction<'_>) -> Option<Instruction<'static>> {
         let grow = matches!(instruction, Instruction::MemoryGrow(0));
-        (grow && self.memory32 == Some(true)).then(|| Instruction::Call(self.hook() + 4))
+        (grow && self.memory0_accessible && self.memory32 == Some(true))
+            .then(|| Instruction::Call(self.hook() + 4))
     }
 
     fn add_budget(&mut self, globals: &mut GlobalSection, index: u32) {
@@ -479,6 +484,7 @@ impl Reencode for Points {
             match import?.ty {
                 TypeRef::Func(_) | TypeRef::FuncExact(_) => funcs += 1,
                 TypeRef::Global(_) => globals += 1,
+                TypeRef::Memory(_) => self.memory0_accessible = true,
                 _ => {}
             }
         }
@@ -505,6 +511,13 @@ impl Reencode for Points {
         exports: &mut ExportSection,
         section: ExportSectionReader<'_>,
     ) -> Result<(), Error> {
+        // Exec can only service memory hooks for its imported memory or named export.
+        for export in section.clone() {
+            let export = export?;
+            self.memory0_accessible |= export.kind == wasmparser::ExternalKind::Memory
+                && export.index == 0
+                && export.name == "memory";
+        }
         utils::parse_export_section(self, exports, section)?;
         self.add_reflection_exports(exports)
     }
@@ -765,7 +778,7 @@ mod tests {
     fn memory_grow_becomes_a_call_of_the_grow_hook() {
         let wasm = wat::parse_str(
             r#"(module
-                (memory 1)
+                (memory (export "memory") 1)
                 (memory $other 1)
                 (func (export "f") (result i32)
                   (drop (memory.grow $other (i32.const 1)))

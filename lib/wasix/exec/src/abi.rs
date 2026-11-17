@@ -10,8 +10,8 @@ use wasixv2_syscalls::{
     UserSlice, UserSliceMut,
 };
 use wasmer::{
-    AsyncFunctionEnvMut, Function, FunctionEnv, Imports, Instance, Module, RuntimeError, Store,
-    StoreAsync, StoreMut, Value,
+    AsyncFunctionEnvMut, Function, FunctionEnv, Imports, Instance, Memory, Module, RuntimeError,
+    Store, StoreAsync, StoreMut, Value,
 };
 
 use crate::{ExecEnv, ExecError, LoadError, Loader, Preparation, asyncify};
@@ -106,10 +106,10 @@ where
         self.low_guard() && crate::memory::guardable(instance, store)
     }
 
-    /// Whether the runtime can attach a zero-page placeholder if the command has no
-    /// imported or exported memory.
-    fn permits_missing_memory(&self) -> bool {
-        false
+    /// Selects the exported process memory when there is no imported memory.
+    /// Returning `None` runs the instance without kernel memory or attachment configuration.
+    fn exported_memory(&self, instance: &Instance) -> Result<Option<Memory>, wasmer::ExportError> {
+        instance.exports.get_memory("memory").cloned().map(Some)
     }
 
     /// Whether the ABI's modules may get the low guard, the first 64 KiB of linear memory made
