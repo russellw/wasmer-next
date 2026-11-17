@@ -230,6 +230,16 @@ fn copy_file_to_root(root: &Path, source: &Path) -> io::Result<()> {
 }
 
 fn stage_dynamic_runtime(root: &Path, dynamic_dir: &Path, program: &Path) {
+    // GCC can name libraries under /usr/lib while glibc searches /lib. Preserve
+    // the host's merged-/usr aliases in this otherwise empty guest root.
+    for directory in ["lib", "lib64"] {
+        if let Ok(target) = fs::read_link(Path::new("/").join(directory)) {
+            let target = target.strip_prefix("/").unwrap_or(&target);
+            fs::create_dir_all(root.join(target)).expect("create runtime library directory");
+            std::os::unix::fs::symlink(target, root.join(directory))
+                .expect("preserve runtime library directory alias");
+        }
+    }
     let interpreter = elf_interpreter(program)
         .expect("read dynamic fixture ELF interpreter")
         .expect("dynamic fixture has PT_INTERP");
