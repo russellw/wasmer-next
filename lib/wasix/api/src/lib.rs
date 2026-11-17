@@ -81,7 +81,7 @@ pub use wasixv2_kernel::{
 };
 use wasixv2_kernel::{FilesystemType, FsParam, HostClock, Kernel, SyscallEntry, Timekeeper};
 pub use wasixv2_pages::{BudgetExceeded, MemoryBudget};
-use wasixv2_pages::{BudgetedPages, Provider, SharedPages};
+use wasixv2_pages::{Provider, SharedPages};
 use wasixv2_syscalls::{Layered, TaskId};
 use wasixv2_trace::Trace;
 use wasixv2_vfs::{Cred, Ctx, Errno, LookupFlags, MountFlags, Vfs};
@@ -145,15 +145,9 @@ fn stack(kernel: Kernel) -> Stack {
 #[derive(Clone, Default)]
 struct MemoryConfig {
     budget: Option<Arc<dyn MemoryBudget>>,
-    // File data is block-charged by MemFs. Bypass BudgetedHost to avoid charging twice.
-    pages_host: Option<Arc<dyn Host>>,
 }
 
 impl MemoryConfig {
-    fn pages(&self, host: &Arc<dyn Host>) -> Arc<dyn Provider> {
-        Arc::new(HostPages(self.pages_host.as_ref().unwrap_or(host).clone()))
-    }
-
     fn apply(&self, fs: MemFs) -> Result<MemFs, Errno> {
         match &self.budget {
             Some(budget) => fs.try_with_memory_budget(budget.clone()),
@@ -162,63 +156,11 @@ impl MemoryConfig {
     }
 }
 
-struct BudgetedHost {
-    host: Arc<dyn Host>,
-    budget: Arc<dyn MemoryBudget>,
-}
-
 /// Two executor views of one machine, like Linux's guest tasks and kernel threads
 /// (`kernel/kthread.c:kthread_create_on_node`), without a second timekeeper.
 struct TaskHost {
     host: Arc<dyn Host>,
     executor: Arc<dyn Executor>,
-}
-
-impl Host for BudgetedHost {
-    fn realtime(&self) -> std::time::Duration {
-        self.host.realtime()
-    }
-    fn monotonic(&self) -> std::time::Duration {
-        self.host.monotonic()
-    }
-    fn sleep(&self, duration: std::time::Duration) -> LocalFuture<'_, ()> {
-        self.host.sleep(duration)
-    }
-    fn sleep_until(&self, deadline: std::time::Duration) -> LocalFuture<'_, ()> {
-        self.host.sleep_until(deadline)
-    }
-    fn sleep_until_range(
-        &self,
-        deadline: std::time::Duration,
-        slack: std::time::Duration,
-    ) -> LocalFuture<'_, ()> {
-        self.host.sleep_until_range(deadline, slack)
-    }
-    fn thread_cpu_time(&self) -> Option<std::time::Duration> {
-        self.host.thread_cpu_time()
-    }
-    fn thread_cpu_clock(&self) -> Option<Arc<dyn wasixv2_host::ThreadCpuClock>> {
-        self.host.thread_cpu_clock()
-    }
-    fn random(&self, buf: &mut [u8]) {
-        self.host.random(buf);
-    }
-    fn executor(&self) -> &dyn Executor {
-        self.host.executor()
-    }
-    fn report(&self, message: &str) {
-        self.host.report(message);
-    }
-    fn shared_pages(&self, size: u64) -> io::Result<Arc<dyn SharedPages>> {
-        Ok(Arc::new(BudgetedPages::new(
-            size,
-            self.budget.clone(),
-            || self.host.shared_pages(size),
-        )?))
-    }
-    fn shared_pages_for_mapping(&self, size: u64) -> io::Result<Arc<dyn SharedPages>> {
-        self.host.shared_pages_for_mapping(size)
-    }
 }
 
 impl Host for TaskHost {
@@ -260,9 +202,6 @@ impl Host for TaskHost {
     }
     fn shared_pages(&self, size: u64) -> io::Result<Arc<dyn SharedPages>> {
         self.host.shared_pages(size)
-    }
-    fn shared_pages_for_mapping(&self, size: u64) -> io::Result<Arc<dyn SharedPages>> {
-        self.host.shared_pages_for_mapping(size)
     }
 }
 
@@ -662,14 +601,6 @@ impl MachineBuilder {
         // The machine's wall clock is its own: setting it leaves the embedder's alone.
         let memory = MemoryConfig {
             budget: memory_budget,
-            pages_host: Some(host.clone()),
-        };
-        let host = match &memory.budget {
-            Some(budget) => Arc::new(BudgetedHost {
-                host,
-                budget: budget.clone(),
-            }) as Arc<dyn Host>,
-            None => host,
         };
         let time = Timekeeper::new(host);
         let host: Arc<dyn Host> = time.clone();
@@ -1588,6 +1519,7 @@ fn boot(
     let host = &host;
     let network_policy = network.policy();
     let mut kernel = Kernel::with_timekeeper(time.clone(), root)
+        .with_memory_budget(memory.budget.clone())
         .with_binfmt(abis)
         .with_network(network.clone())
         .with_network_factory(move || {
@@ -2007,7 +1939,7 @@ fn shared_tmpfs(
         gid,
     ))?;
     if cfg!(any(target_os = "linux", target_os = "android")) {
-        return Ok(fs.with_shared_pages(memory.pages(host)));
+        return Ok(fs.with_shared_pages(Arc::new(HostPages(host.clone()))));
     }
     Ok(fs)
 }
@@ -2134,7 +2066,7 @@ impl Tmpfs {
             options.quotas,
         )?)?;
         if cfg!(any(target_os = "linux", target_os = "android")) {
-            fs = fs.with_shared_pages(self.memory.pages(&self.host));
+            fs = fs.with_shared_pages(Arc::new(HostPages(self.host.clone())));
         }
         let fs = Arc::new(fs);
         self.adopt(&fs);
@@ -2324,7 +2256,6 @@ pub fn default_root_with_memory_budget(
 ) -> io::Result<Arc<dyn Filesystem>> {
     let memory = MemoryConfig {
         budget: Some(budget),
-        pages_host: Some(host.clone()),
     };
     default_root_with_memory(host, resolv_conf, user, release, &memory)
 }

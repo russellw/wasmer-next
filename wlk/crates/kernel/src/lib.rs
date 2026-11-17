@@ -82,6 +82,7 @@ pub use watch_queue::WatchList;
 
 use std::{
     collections::HashMap,
+    io,
     ops::Range,
     sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard},
     time::Duration,
@@ -120,6 +121,7 @@ use wasixv2_abi::{
 };
 use wasixv2_host::Host;
 pub use wasixv2_host::{Console, Stdio, WindowSize};
+use wasixv2_pages::{BudgetedPages, MemoryBudget, SharedPages};
 use wasixv2_syscalls::{
     AtomicWait, AtomicWord, Binfmt, Caller, Control, CpuAccount, CpuTime, Errno, ExitMm, Fd,
     GroupCpu, GroupStop, GuestAction, Image, LocalFuture, MaybeFuture, PidView, SharedMapping,
@@ -161,6 +163,7 @@ pub struct Kernel {
     /// The machine's clocks: [`Kernel::time`] as a host, whose wall clock is the machine's.
     host: Arc<dyn Host>,
     time: Arc<Timekeeper>,
+    memory_budget: Option<Arc<dyn MemoryBudget>>,
     /// Shared with the process filesystems, which read it.
     state: Arc<TaskTable>,
     // ---- ns ----
@@ -446,6 +449,22 @@ impl Task {
 }
 
 impl Kernel {
+    /// Sets the budget for persistent shared objects (SysV segments and I/O rings).
+    /// Anonymous shared mappings are accounted for by the embedder's linear-memory policy.
+    pub fn with_memory_budget(mut self, budget: Option<Arc<dyn MemoryBudget>>) -> Self {
+        self.memory_budget = budget;
+        self
+    }
+
+    fn shared_object_pages(&self, size: u64) -> io::Result<Arc<dyn SharedPages>> {
+        match &self.memory_budget {
+            Some(budget) => Ok(Arc::new(BudgetedPages::new(size, budget.clone(), || {
+                self.host.shared_pages(size)
+            })?)),
+            None => self.host.shared_pages(size),
+        }
+    }
+
     /// A kernel whose root filesystem is `root`, with a wall clock of its own over `host`'s.
     /// Further filesystems are mounted through [`Kernel::vfs`].
     pub fn new(host: Arc<dyn Host>, root: Arc<dyn Filesystem>) -> Self {
@@ -527,6 +546,7 @@ impl Kernel {
             timers,
             host,
             time,
+            memory_budget: None,
             state,
             init_ns: Arc::new(ns::NsProxy::initial(
                 &init_user_ns,

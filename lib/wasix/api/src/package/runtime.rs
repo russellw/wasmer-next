@@ -147,10 +147,7 @@ impl RuntimePackages {
             shim: Arc::new(shim),
             limit: config.limit,
             owner,
-            memory: MemoryConfig {
-                budget: memory.budget.clone(),
-                pages_host: memory.pages_host.clone(),
-            },
+            memory: memory.clone(),
             host: host.clone(),
             state: Mutex::default(),
             #[cfg(feature = "wasix1")]

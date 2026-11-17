@@ -588,8 +588,7 @@ impl Kernel {
         let mmap_size = size.div_ceil(PAGE_SIZE) * PAGE_SIZE;
         let nr_events = ((mmap_size - RING_HEADER) / EVENT_SIZE) as u32;
         let pages = self
-            .host
-            .shared_pages(mmap_size)
+            .shared_object_pages(mmap_size)
             .map_err(|_| Errno::ENOMEM)?;
         let header = AioRing {
             id: !0,

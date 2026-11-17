@@ -872,13 +872,11 @@ impl Kernel {
         } else {
             (
                 RingMemory::Mapped(
-                    self.host
-                        .shared_pages(shape.rings_size)
+                    self.shared_object_pages(shape.rings_size)
                         .map_err(|_| Errno::ENOMEM)?,
                 ),
                 RingMemory::Mapped(
-                    self.host
-                        .shared_pages(shape.sqes_size)
+                    self.shared_object_pages(shape.sqes_size)
                         .map_err(|_| Errno::ENOMEM)?,
                 ),
             )

@@ -613,7 +613,7 @@ impl Kernel {
     /// Where a new segment of `pages` pages keeps its bytes: a host shared memory object
     /// (`shmem_kernel_file_setup`), or kernel memory where the host has none.
     fn segment_backing(&self, pages: u64) -> Result<Backing, Errno> {
-        match self.host.shared_pages(pages * PAGE_SIZE) {
+        match self.shared_object_pages(pages * PAGE_SIZE) {
             Ok(pages) => Ok(Backing::Host(pages)),
             Err(err) if err.kind() == io::ErrorKind::Unsupported => {
                 Ok(Backing::Heap(Mutex::default()))

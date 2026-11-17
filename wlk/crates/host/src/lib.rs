@@ -357,16 +357,6 @@ pub trait Host: Send + Sync {
         let _ = size;
         Err(io::ErrorKind::Unsupported.into())
     }
-
-    /// A fresh anonymous shared object created for a linear-memory mapping.
-    /// A host budget adapter may omit its object charge when the embedder already charges
-    /// linear memory. Kernel pins can retain these pages after the mapping/image is gone;
-    /// omitting the object charge requires an external backstop for that retained memory.
-    /// Persistent objects (SysV segments, rings) must use `shared_pages`. The default
-    /// preserves the host's ordinary shared-page allocation behavior.
-    fn shared_pages_for_mapping(&self, size: u64) -> io::Result<Arc<dyn SharedPages>> {
-        self.shared_pages(size)
-    }
 }
 
 /// The work that runs a guest thread: called on the thread it runs on, it returns the future

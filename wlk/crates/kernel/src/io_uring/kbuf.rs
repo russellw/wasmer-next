@@ -102,7 +102,7 @@ impl Kernel {
         }
         let size = (u64::from(reg.ring_entries) * 16).div_ceil(PAGE_SIZE) * PAGE_SIZE;
         let storage = if reg.flags & 1 != 0 {
-            Storage::Mapped(self.host.shared_pages(size).map_err(|_| Errno::ENOMEM)?)
+            Storage::Mapped(self.shared_object_pages(size).map_err(|_| Errno::ENOMEM)?)
         } else {
             if reg.ring_addr == 0 {
                 return Err(Errno::EFAULT.into());
