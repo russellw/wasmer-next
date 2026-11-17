@@ -353,10 +353,45 @@ pub(crate) async fn fd_fdstat_get<S: Syscalls + Control + 'static>(
     out: i32,
 ) -> Result<i32, RuntimeError> {
     shim::errno(&env, async |frame| {
-        let rights = crate::rights::record(frame, Fd(fd)).await?;
-        let mut stat = infer_fdstat(frame, Fd(fd)).await?;
-        stat.fs_rights_base = rights.base;
-        stat.fs_rights_inheriting = rights.inheriting;
+        let fd = Fd(fd);
+        let set = frame.bind_descriptors(&[fd])?;
+        let entry = set
+            .get(fd)
+            .filter(|entry| entry.present)
+            .ok_or(Errno::BADF)?;
+        // Legacy fdstat used the slot number for stdio, regardless of redirection.
+        let stat = match fd.0 {
+            0..=2 => {
+                let common = Rights::FD_DATASYNC
+                    | Rights::FD_SYNC
+                    | Rights::FD_ADVISE
+                    | Rights::FD_FILESTAT_GET
+                    | Rights::FD_FDSTAT_SET_FLAGS
+                    | Rights::POLL_FD_READWRITE;
+                let (access, flags) = if fd.0 == 0 {
+                    (Rights::FD_READ, Fdflags::empty())
+                } else {
+                    (Rights::FD_WRITE, Fdflags::APPEND)
+                };
+                Fdstat {
+                    fs_filetype: Filetype::CHARACTER_DEVICE,
+                    fs_flags: flags,
+                    fs_rights_base: common | access,
+                    fs_rights_inheriting: Rights::empty(),
+                }
+            }
+            _ => {
+                let rights = crate::rights::record(frame, fd).await?;
+                let mut stat = infer_fdstat(frame, fd).await?;
+                if entry.host_stdio {
+                    // Outside the stdio slots, v1 saw the stream's Kind::File.
+                    stat.fs_filetype = Filetype::REGULAR_FILE;
+                }
+                stat.fs_rights_base = rights.base;
+                stat.fs_rights_inheriting = rights.inheriting;
+                stat
+            }
+        };
         frame.write(out as u32, &stat).await
     })
     .await
@@ -432,9 +467,16 @@ async fn filestat_get<S: Syscalls + Control + 'static>(
     snapshot0: bool,
 ) -> Result<i32, RuntimeError> {
     shim::errno(&env, async |frame| {
-        crate::rights::require(frame, &[(wasixv2_abi::Fd(fd), Rights::FD_FILESTAT_GET)]).await?;
-        let st = fstat(frame, Fd(fd), FILESTAT_MASK).await?;
-        let filetype = fd_filetype(frame, Fd(fd), u32::from(st.stx_mode)).await?;
+        let fd = Fd(fd);
+        crate::rights::require(frame, &[(fd, Rights::FD_FILESTAT_GET)]).await?;
+        let set = frame.bind_descriptors(&[fd])?;
+        let st = fstat(frame, fd, FILESTAT_MASK).await?;
+        // Legacy filestat used the inode's type, which follows duplicates and redirects.
+        let filetype = if set.get(fd).is_some_and(|entry| entry.host_stdio) {
+            Filetype::CHARACTER_DEVICE
+        } else {
+            fd_filetype(frame, fd, u32::from(st.stx_mode)).await?
+        };
         write_filestat(frame, out, filestat(&st, filetype), snapshot0).await
     })
     .await

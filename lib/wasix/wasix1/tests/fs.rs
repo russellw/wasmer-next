@@ -780,6 +780,59 @@ fn renumber_and_preopens() {
     assert_eq!(run(&guest(PREVIEW1, data, body)).0, 0);
 }
 
+#[test]
+fn stdio_and_pipe_stat_types() {
+    let wat = r#"
+(module
+  (import "wasix_32v1" "fd_fdstat_get" (func $fdstat (param i32 i32) (result i32)))
+  (import "wasix_32v1" "fd_filestat_get" (func $filestat (param i32 i32) (result i32)))
+  (import "wasix_32v1" "fd_pipe" (func $pipe (param i32 i32) (result i32)))
+  (import "wasix_32v1" "fd_renumber" (func $renumber (param i32 i32) (result i32)))
+  (import "wasix_32v1" "proc_exit" (func $exit (param i32)))
+  (memory (export "memory") 1)
+  (func $eq (param $step i32) (param $a i32) (param $b i32)
+    (if (i32.ne (local.get $a) (local.get $b)) (then (call $exit (local.get $step)))))
+  (func $types (param $step i32) (param $fd i32) (param $fdtype i32) (param $filetype i32)
+    (call $eq (local.get $step) (call $fdstat (local.get $fd) (i32.const 32)) (i32.const 0))
+    (call $eq (local.get $step) (i32.load8_u (i32.const 32)) (local.get $fdtype))
+    (call $eq (local.get $step) (call $filestat (local.get $fd) (i32.const 64)) (i32.const 0))
+    (call $eq (local.get $step) (i32.load8_u (i32.const 80)) (local.get $filetype)))
+  (func $stdio (param $step i32) (param $fd i32) (param $flags i32) (param $rights i64)
+    (call $types (local.get $step) (local.get $fd) (i32.const 2) (i32.const 2))
+    (call $eq (local.get $step) (i32.load16_u (i32.const 34)) (local.get $flags))
+    (if (i64.ne (i64.load (i32.const 40)) (local.get $rights)) (then (call $exit (local.get $step))))
+    (if (i64.ne (i64.load (i32.const 48)) (i64.const 0)) (then (call $exit (local.get $step)))))
+  (func (export "_start")
+    ;; v1's default stdin rights and stdout/stderr rights, with APPEND on the outputs.
+    (call $stdio (i32.const 1) (i32.const 0) (i32.const 0) (i64.const 0x0820009b))
+    (call $stdio (i32.const 2) (i32.const 1) (i32.const 1) (i64.const 0x082000d9))
+    (call $stdio (i32.const 3) (i32.const 2) (i32.const 1) (i64.const 0x082000d9))
+    ;; Both ordinary pipe ends report UNKNOWN.
+    (call $eq (i32.const 4) (call $pipe (i32.const 16) (i32.const 20)) (i32.const 0))
+    (call $types (i32.const 5) (i32.load (i32.const 16)) (i32.const 0) (i32.const 0))
+    (call $types (i32.const 6) (i32.load (i32.const 20)) (i32.const 0) (i32.const 0))
+    ;; A stdout alias sees the inode's distinct fdstat and filestat types outside slot 1.
+    (call $eq (i32.const 7) (call $renumber (i32.const 1) (i32.const 10)) (i32.const 0))
+    (call $types (i32.const 8) (i32.const 10) (i32.const 4) (i32.const 2))
+    ;; Redirect stdout onto a pipe: fdstat follows the slot and filestat follows the pipe.
+    (call $eq (i32.const 9) (call $renumber (i32.load (i32.const 20)) (i32.const 1)) (i32.const 0))
+    (call $types (i32.const 10) (i32.const 1) (i32.const 2) (i32.const 0))
+    (call $eq (i32.const 11) (i32.load16_u (i32.const 34)) (i32.const 1))
+    (if (i64.ne (i64.load (i32.const 40)) (i64.const 0x082000d9)) (then (call $exit (i32.const 12))))
+    (if (i64.ne (i64.load (i32.const 48)) (i64.const 0)) (then (call $exit (i32.const 13))))
+    (call $types (i32.const 14) (i32.const 10) (i32.const 4) (i32.const 2))
+    (call $exit (i32.const 0))))
+"#;
+    // The native debug build needs a larger host stack for exec admission.
+    let status = std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || run(&wat::parse_str(wat).unwrap()).0)
+        .unwrap()
+        .join()
+        .unwrap();
+    assert_eq!(status, 0);
+}
+
 /// The `wasix_32v1` descriptor calls: pipes, dup, descriptor flags, `path_open2`, cwd.
 #[test]
 fn wasix_descriptor_calls() {

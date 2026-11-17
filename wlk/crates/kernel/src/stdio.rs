@@ -1,4 +1,5 @@
 use std::{
+    any::Any,
     collections::VecDeque,
     io,
     sync::{Arc, Mutex},
@@ -52,6 +53,14 @@ pub(crate) fn open_files(stdio: Stdio, pseudo: &Pseudo, owner: (u32, u32)) -> [O
             owner,
         ),
     ]
+}
+
+pub(crate) fn is_host_stdio(file: &OpenFile) -> bool {
+    let Backing::Stream(object, _) = &file.backing else {
+        return false;
+    };
+    let object: &dyn Any = object.as_ref();
+    object.is::<HostInput>() || object.is::<HostOutput>()
 }
 
 /// The host stream `file`, a pipe inode, belongs to, if it is one: opening it again shares the

@@ -765,11 +765,13 @@ mod tests {
                 wasixv2_syscalls::Descriptor {
                     fd: Fd(3),
                     present: true,
+                    host_stdio: false,
                     attachment: Some(root.clone()),
                 },
                 wasixv2_syscalls::Descriptor {
                     fd: Fd(4),
                     present: true,
+                    host_stdio: false,
                     attachment: Some(directory),
                 },
             ],

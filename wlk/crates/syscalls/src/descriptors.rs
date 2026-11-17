@@ -36,6 +36,8 @@ impl DescriptorAttachment {
 pub struct Descriptor {
     pub fd: Fd,
     pub present: bool,
+    /// The captured file is backed by a host-provided standard stream.
+    pub host_stdio: bool,
     pub attachment: Option<DescriptorAttachment>,
 }
 

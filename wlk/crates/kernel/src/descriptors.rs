@@ -34,6 +34,9 @@ pub(crate) fn capture(
         .map(|(&fd, slot)| Descriptor {
             fd,
             present: slot.is_some(),
+            host_stdio: slot
+                .as_ref()
+                .is_some_and(|slot| crate::stdio::is_host_stdio(&slot.file)),
             attachment: slot.as_ref().and_then(|slot| slot.attachment.clone()),
         })
         .collect();
