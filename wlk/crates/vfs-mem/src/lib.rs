@@ -29,7 +29,7 @@ use std::{
 
 use async_trait::async_trait;
 use wasixv2_abi::{Errno, FsInodeFlags};
-use wasixv2_pages::{Provider, SharedPages};
+use wasixv2_pages::{MemoryBudget, Provider, SharedPages};
 use wasixv2_vfs::{
     AllocMode, Attr, Clock, Cred, Device, DirEntry, DirSink, FS_APPEND_FL, FS_IMMUTABLE_FL,
     FS_NOATIME_FL, FS_NODUMP_FL, FileId, FileKattr, FileType, Filesystem, FsInfo, FsResult, Handle,
@@ -140,6 +140,7 @@ pub(crate) struct Space {
     max_inodes: AtomicU64,
     /// Inode space used, in bytes: [`INODE_SIZE`] per inode and extra link, plus xattrs.
     ispace: AtomicU64,
+    budget: OnceLock<Arc<dyn MemoryBudget>>,
 }
 
 impl Space {
@@ -149,6 +150,7 @@ impl Space {
             blocks: AtomicU64::new(0),
             max_inodes: AtomicU64::new(limits.max_inodes.unwrap_or(0)),
             ispace: AtomicU64::new(0),
+            budget: OnceLock::new(),
         }
     }
 
@@ -171,11 +173,22 @@ impl Space {
     }
 
     pub(crate) fn charge_blocks(&self, n: u64) -> FsResult<()> {
-        Self::charge(&self.blocks, self.max_blocks(), n)
+        let bytes = n.checked_mul(BLOCK).ok_or(Errno::ENOSPC)?;
+        Self::charge(&self.blocks, self.max_blocks(), n)?;
+        if let Some(budget) = self.budget.get()
+            && budget.charge(bytes).is_err()
+        {
+            self.blocks.fetch_sub(n, Ordering::Relaxed);
+            return Err(Errno::ENOSPC);
+        }
+        Ok(())
     }
 
     pub(crate) fn release_blocks(&self, n: u64) {
         self.blocks.fetch_sub(n, Ordering::Relaxed);
+        if let Some(budget) = self.budget.get() {
+            budget.release(n * BLOCK);
+        }
     }
 
     fn max_ispace(&self) -> Option<u64> {
@@ -183,11 +196,21 @@ impl Space {
     }
 
     fn charge_ispace(&self, bytes: u64) -> FsResult<()> {
-        Self::charge(&self.ispace, self.max_ispace(), bytes)
+        Self::charge(&self.ispace, self.max_ispace(), bytes)?;
+        if let Some(budget) = self.budget.get()
+            && budget.charge(bytes).is_err()
+        {
+            self.ispace.fetch_sub(bytes, Ordering::Relaxed);
+            return Err(Errno::ENOSPC);
+        }
+        Ok(())
     }
 
     fn release_ispace(&self, bytes: u64) {
         self.ispace.fetch_sub(bytes, Ordering::Relaxed);
+        if let Some(budget) = self.budget.get() {
+            budget.release(bytes);
+        }
     }
 
     /// `shmem_reserve_inode`: room for an inode, or for another link to one.
@@ -291,6 +314,30 @@ impl MemFs {
             space.max_inodes.store(inodes, Ordering::Relaxed);
         }
         Ok(())
+    }
+
+    /// Installs a budget before first use, including the already-created root inode.
+    /// Fails with `EBUSY` if any node was handed out or a budget was already installed,
+    /// and `ENOSPC` if the initial reservation is refused.
+    pub fn try_with_memory_budget(self, budget: Arc<dyn MemoryBudget>) -> FsResult<Self> {
+        if Arc::strong_count(&self.root) != 1
+            || self.shared.next_ino.load(Ordering::Relaxed) != 2
+            || self.shared.space.budget.get().is_some()
+        {
+            return Err(Errno::EBUSY);
+        }
+        let space = &self.shared.space;
+        let bytes = space.ispace.load(Ordering::Relaxed);
+        budget.charge(bytes).map_err(|_| Errno::ENOSPC)?;
+        assert!(space.budget.set(budget).is_ok());
+        Ok(self)
+    }
+
+    /// Installs a budget before first use. Panics on refusal; use
+    /// [`Self::try_with_memory_budget`] to handle a budget too small for the root inode.
+    pub fn with_memory_budget(self, budget: Arc<dyn MemoryBudget>) -> Self {
+        self.try_with_memory_budget(budget)
+            .expect("memory budget admits the root inode")
     }
 
     /// Keeps the data of regular files created from now on in shared memory objects from

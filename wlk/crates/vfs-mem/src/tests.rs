@@ -868,3 +868,146 @@ fn quotas_soft_limits_expire_reset_and_preserve_mount_limit_byte_precision() {
     assert_eq!(block_on(handle.write_at(&[0; 8192], 0)), Ok(8192));
     assert_eq!(fs.get(0, 1).unwrap().dqb_btime, 120);
 }
+
+#[derive(Default)]
+struct CountingBudget {
+    used: AtomicU64,
+    limit: AtomicU64,
+}
+
+impl CountingBudget {
+    fn new(limit: u64) -> Arc<Self> {
+        Arc::new(Self {
+            used: AtomicU64::new(0),
+            limit: AtomicU64::new(limit),
+        })
+    }
+    fn used(&self) -> u64 {
+        self.used.load(Ordering::Relaxed)
+    }
+}
+impl wasixv2_pages::MemoryBudget for CountingBudget {
+    fn charge(&self, bytes: u64) -> Result<(), wasixv2_pages::BudgetExceeded> {
+        self.used
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                n.checked_add(bytes)
+                    .filter(|&n| n <= self.limit.load(Ordering::Relaxed))
+            })
+            .map(drop)
+            .map_err(|_| wasixv2_pages::BudgetExceeded)
+    }
+    fn release(&self, bytes: u64) {
+        assert!(self.used.fetch_sub(bytes, Ordering::Relaxed) >= bytes);
+    }
+}
+
+#[test]
+fn memory_budget_refusal_short_write_truncate_punch_unlink_and_drop() {
+    let budget = CountingBudget::new(2 * INODE_SIZE + 2 * BLOCK);
+    let fs = fs().try_with_memory_budget(budget.clone()).unwrap();
+    assert_eq!(budget.used(), INODE_SIZE);
+    let root = fs.root();
+    let file = block_on(root.create(b"f", &new(NewKind::Regular))).unwrap();
+    let handle = block_on(file.open(OpenOptions::default())).unwrap();
+    assert_eq!(
+        block_on(handle.write_at(&[1; 3 * BLOCK as usize], 0)),
+        Ok(2 * BLOCK as usize)
+    );
+    assert_eq!(
+        block_on(handle.write_at(b"x", 2 * BLOCK)),
+        Err(Errno::ENOSPC)
+    );
+    assert_eq!(budget.used(), 2 * INODE_SIZE + 2 * BLOCK);
+    block_on(handle.allocate(AllocMode::PunchHole, 0, BLOCK)).unwrap();
+    assert_eq!(budget.used(), 2 * INODE_SIZE + BLOCK);
+    block_on(handle.set_size(0)).unwrap();
+    assert_eq!(budget.used(), 2 * INODE_SIZE);
+    block_on(handle.write_at(b"x", 0)).unwrap();
+    block_on(root.unlink(b"f")).unwrap();
+    assert_eq!(budget.used(), 2 * INODE_SIZE + BLOCK);
+    drop((file, handle));
+    assert_eq!(budget.used(), INODE_SIZE);
+    drop((root, fs));
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
+fn memory_budget_initial_refusal_and_local_limit_rollback() {
+    let budget = CountingBudget::new(INODE_SIZE - 1);
+    assert!(matches!(
+        fs().try_with_memory_budget(budget.clone()),
+        Err(Errno::ENOSPC)
+    ));
+    assert_eq!(budget.used(), 0);
+    budget.limit.store(3 * INODE_SIZE, Ordering::Relaxed);
+    let fs = fs().with_memory_budget(budget.clone());
+    let file = block_on(fs.root().create(b"f", &new(NewKind::Regular))).unwrap();
+    let handle = block_on(file.open(OpenOptions::default())).unwrap();
+    assert_eq!(block_on(handle.write_at(b"x", 0)), Err(Errno::ENOSPC));
+    assert_eq!(fs.shared.space.blocks.load(Ordering::Relaxed), 0);
+    assert_eq!(budget.used(), 2 * INODE_SIZE);
+    budget.limit.store(u64::MAX, Ordering::Relaxed);
+    block_on(handle.write_at(b"x", 0)).unwrap();
+    assert_eq!(budget.used(), 2 * INODE_SIZE + BLOCK);
+    drop((file, handle, fs));
+    assert_eq!(budget.used(), 0);
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn memory_budget_shared_mapping_is_eager_and_not_double_charged() {
+    struct Pages;
+    impl Provider for Pages {
+        fn shared_pages(&self, size: u64) -> io::Result<Arc<dyn SharedPages>> {
+            Ok(Arc::new(wasixv2_pages::Memfd::new(size)?))
+        }
+    }
+    let budget = CountingBudget::new(2 * INODE_SIZE + 3 * BLOCK);
+    let fs = fs()
+        .with_shared_pages(Arc::new(Pages))
+        .with_memory_budget(budget.clone());
+    let file = block_on(fs.root().create(b"f", &new(NewKind::Regular))).unwrap();
+    let handle = block_on(file.open(OpenOptions::default())).unwrap();
+    block_on(handle.write_at(b"x", 0)).unwrap();
+    assert_eq!(budget.used(), 2 * INODE_SIZE + BLOCK);
+    let mapping = file
+        .shared_pages(0..3 * BLOCK, &Cred::user(1, 1))
+        .unwrap()
+        .unwrap();
+    assert_eq!(budget.used(), 2 * INODE_SIZE + 3 * BLOCK);
+    assert!(matches!(
+        file.shared_pages(0..4 * BLOCK, &Cred::user(1, 1)),
+        Err(Errno::ENOSPC)
+    ));
+    block_on(handle.set_size(0)).unwrap();
+    assert_eq!(budget.used(), 2 * INODE_SIZE + 3 * BLOCK);
+    drop((handle, file, fs));
+    // The mapping retains its inode and reservation until the last reference dies.
+    assert_eq!(budget.used(), INODE_SIZE + 3 * BLOCK);
+    drop(mapping);
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
+fn memory_budget_metadata_and_local_limits_share_the_same_accounting() {
+    let budget = CountingBudget::new(u64::MAX);
+    let fs = limited(Limits { max_bytes: Some(BLOCK), max_inodes: Some(4) })
+        .with_memory_budget(budget.clone());
+    let root = fs.root();
+    let file = block_on(root.create(b"f", &new(NewKind::Regular))).unwrap();
+    block_on(root.link(b"link", &file)).unwrap();
+    assert_eq!(budget.used(), 3 * INODE_SIZE);
+    block_on(file.setxattr(b"user.a", b"value", XattrSet::Any)).unwrap();
+    let xattr = XATTR_OVERHEAD + 6 + 5;
+    assert_eq!(budget.used(), 3 * INODE_SIZE + xattr);
+    block_on(file.removexattr(b"user.a")).unwrap();
+    assert_eq!(budget.used(), 3 * INODE_SIZE);
+    block_on(root.unlink(b"link")).unwrap();
+    assert_eq!(budget.used(), 2 * INODE_SIZE);
+    let handle = block_on(file.open(OpenOptions::default())).unwrap();
+    block_on(handle.write_at(b"x", 0)).unwrap();
+    assert_eq!(block_on(handle.write_at(b"x", BLOCK)), Err(Errno::ENOSPC));
+    assert_eq!(budget.used(), 2 * INODE_SIZE + BLOCK);
+    drop((handle, file, root, fs));
+    assert_eq!(budget.used(), 0);
+}
