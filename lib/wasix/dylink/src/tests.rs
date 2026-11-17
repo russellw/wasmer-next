@@ -280,12 +280,15 @@ fn runtime_paths_unknown_sections_and_untrusted_helpers_are_retained() {
     string("$ORIGIN", &mut paths);
     string("/lib", &mut paths);
     section(5, &paths, &mut data);
+    let mut arch = Vec::new();
+    string("wasm32", &mut arch);
+    section(6, &arch, &mut data);
     section(99, &[1, 2, 3], &mut data);
     let mut wasm = wat::parse_str(include_str!("fixtures/initialization.wat")).unwrap();
     section(0, &data, &mut wasm);
     let m = Module::parse(&wasm).unwrap();
     assert_eq!(m.runtime_path(), ["$ORIGIN", "/lib"]);
-    assert_eq!(m.unknown_subsections(), [(99, vec![1, 2, 3])]);
+    assert_eq!(m.unknown_subsections(), [(6, arch), (99, vec![1, 2, 3])]);
     assert!(m.start().is_some());
     assert!(m.exports().contains_key("__wasm_init_tls"));
     let p = Plan::new(&[m], &[vec![]], 0, &[], BindingMode::Now).unwrap();

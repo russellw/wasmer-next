@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use wasm_encoder::Encode;
 use wasmparser::{
     BinaryReader, Dylink0SectionReader, Dylink0Subsection, ExternalKind, FuncType, GlobalType,
     MemoryType, Operator, Parser, Payload, SymbolFlags, TableType, TypeRef, ValType, Validator,
@@ -325,6 +326,7 @@ fn parse_dylink(bytes: &[u8], offset: u64) -> Result<Dylink, PlanError> {
             Dylink0Subsection::ExportInfo(_) => 3,
             Dylink0Subsection::ImportInfo(_) => 4,
             Dylink0Subsection::RuntimePath(_) => 5,
+            Dylink0Subsection::TargetArch(_) => 6,
             Dylink0Subsection::Unknown { ty, .. } => *ty,
         };
         if id <= 5 && !seen.insert(id) {
@@ -367,6 +369,12 @@ fn parse_dylink(bytes: &[u8], offset: u64) -> Result<Dylink, PlanError> {
                         return Err(PlanError::Metadata("duplicate export flags"));
                     }
                 }
+            }
+            Dylink0Subsection::TargetArch(arch) => {
+                // Retain this advisory subsection as opaque metadata, as before wasmparser 0.263.
+                let mut data = Vec::new();
+                arch.encode(&mut data);
+                unknown.push((6, data));
             }
             Dylink0Subsection::Unknown { ty, data, .. } => unknown.push((ty, data.to_vec())),
         }

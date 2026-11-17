@@ -10,7 +10,7 @@
 	url = https://repo.or.cz/libc-test.git
 [submodule "tests/wasixv2/upstream/libcap"]
 	path = tests/wasixv2/upstream/libcap
-	url = https://git.kernel.org/pub/scm/libs/libcap/libcap.git
+	url = https://kernel.googlesource.com/pub/scm/libs/libcap/libcap
 [submodule "tests/wasixv2/upstream/libaio"]
 	path = tests/wasixv2/upstream/libaio
 	url = https://pagure.io/libaio.git
