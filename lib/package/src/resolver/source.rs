@@ -38,7 +38,7 @@ pub trait Source: Sync + Debug {
                 })
                 .ok_or(QueryError::NoMatches {
                     query: pkg.clone(),
-                    archived_versions: Vec::new(),
+                    archived_versions: Box::default(),
                 }),
             _ => candidates
                 .into_iter()
@@ -69,7 +69,7 @@ pub enum QueryError {
     },
     NoMatches {
         query: PackageSource,
-        archived_versions: Vec<semver::Version>,
+        archived_versions: Box<[semver::Version]>,
     },
     Timeout {
         query: PackageSource,
@@ -112,7 +112,7 @@ impl Display for QueryError {
             Self::NoMatches {
                 query: _,
                 archived_versions,
-            } => match archived_versions.as_slice() {
+            } => match archived_versions.as_ref() {
                 [] => f.write_str(
                     "the package was found, but no published versions matched the constraint",
                 ),

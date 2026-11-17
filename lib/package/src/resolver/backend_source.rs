@@ -251,7 +251,7 @@ impl Source for BackendSource {
                     Ok(None) => {
                         return Err(QueryError::NoMatches {
                             query: package.clone(),
-                            archived_versions: Vec::new(),
+                            archived_versions: Box::default(),
                         });
                     }
                     Err(error) => {
@@ -379,7 +379,7 @@ fn matching_package_summaries(
     if summaries.is_empty() {
         Err(QueryError::NoMatches {
             query: query.clone(),
-            archived_versions,
+            archived_versions: archived_versions.into_boxed_slice(),
         })
     } else {
         Ok(summaries)

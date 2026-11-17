@@ -123,7 +123,7 @@ impl RunContext {
         let summary = self.source.latest(specifier).await.map_err(|error| {
             resolver::ResolveError::Registry {
                 package: specifier.clone(),
-                error,
+                error: Box::new(error),
             }
         })?;
         let root = self.load_container(&summary).await?;

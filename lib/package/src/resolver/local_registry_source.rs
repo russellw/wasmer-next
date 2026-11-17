@@ -65,7 +65,7 @@ impl LocalRegistrySource {
         if matches.is_empty() {
             return Err(QueryError::NoMatches {
                 query: query.clone(),
-                archived_versions: Vec::new(),
+                archived_versions: Box::default(),
             });
         }
 
