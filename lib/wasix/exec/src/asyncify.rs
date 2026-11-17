@@ -1264,18 +1264,22 @@ pub(crate) async fn restore<S: 'static>(
 ) -> RuntimeError {
     let saved = cx
         .with_entry(|env, _, _| {
-            let a = env.asyncify.as_ref()?;
-            let saved = a.saved.get(&id.generation)?;
-            (saved.id == id && id.level <= a.depth).then(|| saved.clone())
+            let Some(a) = env.asyncify.as_ref() else {
+                return Err(not_instrumented());
+            };
+            match a.saved.get(&id.generation) {
+                Some(saved) if saved.id == id && id.level <= a.depth => Ok(saved.clone()),
+                _ => Err(RuntimeError::new(format!(
+                    "restoring a stack that was not saved, or whose call returned: requested {id:?}, current level {}, retained {:?}",
+                    a.depth,
+                    a.saved.values().map(|saved| saved.id).collect::<Vec<_>>()
+                ))),
+            }
         })
         .await;
-    let saved = match saved {
-        Ok(saved) => saved,
-        Err(error) => return error,
-    };
     match saved {
-        Some(saved) => RuntimeError::user(Box::new(Restore { saved, val })),
-        None => RuntimeError::new("restoring a stack that was not saved, or whose call returned"),
+        Ok(Ok(saved)) => RuntimeError::user(Box::new(Restore { saved, val })),
+        Ok(Err(error)) | Err(error) => error,
     }
 }
 
