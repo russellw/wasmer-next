@@ -150,11 +150,6 @@ impl TestBuilder {
         self
     }
 
-    pub fn with_async_threads(mut self) -> Self {
-        self.spec.enable_async_threads = true;
-        self
-    }
-
     pub fn args<I: IntoIterator<Item = S>, S: AsRef<str>>(mut self, args: I) -> Self {
         let args = args.into_iter().map(|s| s.as_ref().to_string());
         self.spec.cli_args.extend(args);
@@ -460,18 +455,6 @@ fn test_snapshot_condvar() {
     assert_json_snapshot!(snapshot);
 }
 
-#[cfg_attr(any(target_os = "macos", target_os = "windows"), ignore)]
-#[test]
-fn test_snapshot_condvar_async() {
-    let snapshot = TestBuilder::new()
-        .with_name(function!())
-        .with_async_threads()
-        .run_wasm(include_bytes!(
-            "../../../../wasmer-test-files/integration/wasm/example-condvar.wasm"
-        ));
-    assert_json_snapshot!(snapshot);
-}
-
 // Test that the expected default directories are present.
 #[cfg_attr(target_os = "windows", ignore)]
 #[test]
@@ -517,18 +500,6 @@ fn test_snapshot_cowsay() {
 fn test_snapshot_epoll() {
     let snapshot = TestBuilder::new()
         .with_name(function!())
-        .run_wasm(include_bytes!(
-            "../../../../wasmer-test-files/integration/wasm/example-epoll.wasm"
-        ));
-    assert_json_snapshot!(snapshot);
-}
-
-#[cfg_attr(any(target_os = "macos", target_os = "windows"), ignore)]
-#[test]
-fn test_snapshot_epoll_async() {
-    let snapshot = TestBuilder::new()
-        .with_name(function!())
-        .with_async_threads()
         .run_wasm(include_bytes!(
             "../../../../wasmer-test-files/integration/wasm/example-epoll.wasm"
         ));
@@ -718,7 +689,6 @@ fn test_snapshot_web_server_epoll() {
 
     let builder = TestBuilder::new()
         .with_name(name)
-        .with_async_threads()
         .enable_network(true)
         .arg("--root")
         .arg("/dev")
@@ -748,7 +718,6 @@ fn test_snapshot_web_server_poll() {
 
     let builder = TestBuilder::new()
         .with_name(name)
-        .with_async_threads()
         .enable_network(true)
         .arg("--root")
         .arg("/dev")
@@ -771,22 +740,6 @@ fn test_snapshot_fork_and_exec() {
     let snapshot = TestBuilder::new()
         .with_name(function!())
         .use_coreutils()
-        .run_wasm(include_bytes!(
-            "../../../../wasmer-test-files/integration/wasm/example-execve.wasm"
-        ));
-    assert_json_snapshot!(snapshot);
-}
-
-// The ability to fork the current process and run a different image but retain
-// the existing open file handles (which is needed for stdin and stdout redirection)
-#[cfg(not(target_os = "windows"))]
-#[cfg_attr(any(target_os = "macos", target_os = "windows"), ignore)]
-#[test]
-fn test_snapshot_fork_and_exec_async() {
-    let snapshot = TestBuilder::new()
-        .with_name(function!())
-        .use_coreutils()
-        .with_async_threads()
         .run_wasm(include_bytes!(
             "../../../../wasmer-test-files/integration/wasm/example-execve.wasm"
         ));
@@ -820,20 +773,6 @@ fn test_snapshot_fork() {
     assert_json_snapshot!(snapshot);
 }
 
-// Simple fork example that is a crude multi-threading implementation - used by `dash`
-#[cfg_attr(any(target_os = "macos", target_os = "windows"), ignore)]
-#[test]
-fn test_snapshot_fork_async() {
-    let snapshot = TestBuilder::new()
-        .with_name(function!())
-        .use_coreutils()
-        .with_async_threads()
-        .run_wasm(include_bytes!(
-            "../../../../wasmer-test-files/integration/wasm/example-fork.wasm"
-        ));
-    assert_json_snapshot!(snapshot);
-}
-
 // Performs a longjmp of a stack that was recorded before the fork.
 // This test ensures that the stacks that have been recorded are preserved
 // after a fork.
@@ -843,22 +782,6 @@ fn test_snapshot_fork_async() {
 fn test_snapshot_longjump_fork() {
     let snapshot = TestBuilder::new()
         .with_name(function!())
-        .run_wasm(include_bytes!(
-            "../../../../wasmer-test-files/integration/wasm/example-fork-longjmp.wasm"
-        ));
-    assert_json_snapshot!(snapshot);
-}
-
-// Performs a longjmp of a stack that was recorded before the fork.
-// This test ensures that the stacks that have been recorded are preserved
-// after a fork.
-// The behavior is needed for `dash`
-#[cfg_attr(any(target_os = "macos", target_os = "windows"), ignore)]
-#[test]
-fn test_snapshot_longjump_fork_async() {
-    let snapshot = TestBuilder::new()
-        .with_name(function!())
-        .with_async_threads()
         .run_wasm(include_bytes!(
             "../../../../wasmer-test-files/integration/wasm/example-fork-longjmp.wasm"
         ));
@@ -915,20 +838,6 @@ fn test_snapshot_sleep() {
     assert_json_snapshot!(snapshot);
 }
 
-// full multi-threading with shared memory and shared compiled modules
-#[cfg(target_os = "linux")]
-#[cfg_attr(any(target_os = "macos", target_os = "windows"), ignore)]
-#[test]
-fn test_snapshot_sleep_async() {
-    let snapshot = TestBuilder::new()
-        .with_name(function!())
-        .with_async_threads()
-        .run_wasm(include_bytes!(
-            "../../../../wasmer-test-files/integration/wasm/example-sleep.wasm"
-        ));
-    assert_json_snapshot!(snapshot);
-}
-
 // Uses `posix_spawn` to launch a sub-process and wait on it to exit
 #[cfg_attr(target_os = "windows", ignore)]
 #[test]
@@ -936,21 +845,6 @@ fn test_snapshot_process_spawn() {
     let snapshot = TestBuilder::new()
         .with_name(function!())
         .use_coreutils()
-        .run_wasm(include_bytes!(
-            "../../../../wasmer-test-files/integration/wasm/example-spawn.wasm"
-        ));
-    assert_json_snapshot!(snapshot);
-}
-
-// Uses `posix_spawn` to launch a sub-process and wait on it to exit
-#[cfg(not(target_os = "windows"))]
-#[cfg_attr(any(target_os = "macos", target_os = "windows"), ignore)]
-#[test]
-fn test_snapshot_process_spawn_async() {
-    let snapshot = TestBuilder::new()
-        .with_name(function!())
-        .use_coreutils()
-        .with_async_threads()
         .run_wasm(include_bytes!(
             "../../../../wasmer-test-files/integration/wasm/example-spawn.wasm"
         ));
@@ -1005,38 +899,11 @@ fn test_snapshot_vfork() {
     assert_json_snapshot!(snapshot);
 }
 
-// Tests that lightweight forking that does not copy the memory but retains the
-// open file descriptors works correctly. Uses asynchronous threading
-#[cfg_attr(target_os = "windows", ignore)]
-#[test]
-fn test_snapshot_vfork_async() {
-    let snapshot = TestBuilder::new()
-        .with_name(function!())
-        .use_coreutils()
-        .with_async_threads()
-        .run_wasm(include_bytes!(
-            "../../../../wasmer-test-files/integration/wasm/example-vfork.wasm"
-        ));
-    assert_json_snapshot!(snapshot);
-}
-
 #[cfg_attr(target_os = "windows", ignore)]
 #[test]
 fn test_snapshot_signals() {
     let snapshot = TestBuilder::new()
         .with_name(function!())
-        .run_wasm(include_bytes!(
-            "../../../../wasmer-test-files/integration/wasm/example-signal.wasm"
-        ));
-    assert_json_snapshot!(snapshot);
-}
-
-#[cfg_attr(target_os = "windows", ignore)]
-#[test]
-fn test_snapshot_signals_async() {
-    let snapshot = TestBuilder::new()
-        .with_name(function!())
-        .with_async_threads()
         .run_wasm(include_bytes!(
             "../../../../wasmer-test-files/integration/wasm/example-signal.wasm"
         ));
@@ -1076,8 +943,9 @@ fn test_snapshot_dash_python() {
     let snapshot = TestBuilder::new()
         .with_name(function!())
         .use_coreutils()
+        .use_pkg("python/python@3.13.5")
         .include_static_package("python/python@3.13.5", WEBC_PYTHON)
-        .stdin_str("wasmer run python/python -- -c 'print(10)'")
+        .stdin_str("python -c 'print(10)'")
         .run_wasm(include_bytes!(
             "../../../../wasmer-test-files/integration/wasm/dash.wasm"
         ));
@@ -1181,8 +1049,9 @@ fn test_snapshot_bash_python() {
     let snapshot = TestBuilder::new()
         .with_name(function!())
         .use_coreutils()
+        .use_pkg("python/python@3.13.5")
         .include_static_package("python/python@3.13.5", WEBC_PYTHON)
-        .stdin_str("wasmer run python/python -- -c 'print(10)'\n")
+        .stdin_str("python -c 'print(10)'\n")
         .run_wasm(include_bytes!(
             "../../../../wasmer-test-files/integration/wasm/bash.wasm"
         ));

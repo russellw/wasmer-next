@@ -15,7 +15,7 @@ expression: snapshot
   },
   "result": {
     "Success": {
-      "stdout": "bin\ndev\netc\ntmp\n",
+      "stdout": "bin\ndev\netc\nhome\nlib\nproc\nroot\nrun\nsys\ntmp\nusr\nvar\n",
       "stderr": "",
       "exit_code": 0
     }

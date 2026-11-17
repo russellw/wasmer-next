@@ -7,7 +7,8 @@ expression: snapshot
   "spec": {
     "name": "snapshot::test_snapshot_bash_python",
     "use_packages": [
-      "wasmer/coreutils"
+      "wasmer/coreutils",
+      "python/python@3.13.5"
     ],
     "include_webcs": [
       {
@@ -15,14 +16,14 @@ expression: snapshot
       }
     ],
     "cli_args": [],
-    "stdin_hash": "1bd3d13d236b92e595564d9a19c36095",
+    "stdin_hash": "2146faa59fd97ad4f02ff493e0a5481a",
     "enable_threads": true,
     "enable_network": false
   },
   "result": {
     "Success": {
       "stdout": "10\n",
-      "stderr": "test.wasm-5.1# test.wasm-5.1# exit\n",
+      "stderr": "",
       "exit_code": 0
     }
   }

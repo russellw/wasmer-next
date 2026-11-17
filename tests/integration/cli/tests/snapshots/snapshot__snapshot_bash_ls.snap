@@ -17,8 +17,8 @@ expression: snapshot
   },
   "result": {
     "Success": {
-      "stdout": "bin  dev  etc  opt  tmp\t usr\n",
-      "stderr": "test.wasm-5.1# test.wasm-5.1# exit\n",
+      "stdout": "bin\ndev\netc\nhome\nlib\nopt\nproc\nroot\nrun\nsys\ntmp\nusr\nvar\n",
+      "stderr": "",
       "exit_code": 0
     }
   }
