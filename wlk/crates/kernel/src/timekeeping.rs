@@ -325,6 +325,10 @@ impl Host for Timekeeper {
     fn shared_pages(&self, size: u64) -> std::io::Result<Arc<dyn SharedPages>> {
         self.host.shared_pages(size)
     }
+
+    fn shared_pages_for_mapping(&self, size: u64) -> std::io::Result<Arc<dyn SharedPages>> {
+        self.host.shared_pages_for_mapping(size)
+    }
 }
 
 #[cfg(test)]

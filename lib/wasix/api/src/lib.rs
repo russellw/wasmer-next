@@ -208,6 +208,9 @@ impl Host for BudgetedHost {
             || self.host.shared_pages(size),
         )?))
     }
+    fn shared_pages_for_mapping(&self, size: u64) -> io::Result<Arc<dyn SharedPages>> {
+        self.host.shared_pages_for_mapping(size)
+    }
 }
 
 impl Host for TaskHost {
@@ -249,6 +252,9 @@ impl Host for TaskHost {
     }
     fn shared_pages(&self, size: u64) -> io::Result<Arc<dyn SharedPages>> {
         self.host.shared_pages(size)
+    }
+    fn shared_pages_for_mapping(&self, size: u64) -> io::Result<Arc<dyn SharedPages>> {
+        self.host.shared_pages_for_mapping(size)
     }
 }
 
@@ -562,7 +568,12 @@ impl MachineBuilder {
 
     /// Budgets the default root, `/tmp`, `/dev/shm`, `/dev`, memfd, guest tmpfs mounts and
     /// writable package/layer uppers (allocated 4 KiB blocks and inode/xattr space), plus
-    /// kernel anonymous shared memory, SysV shm, io_uring and AIO objects (object size).
+    /// kernel SysV shm, io_uring and AIO objects (object size).
+    /// Anonymous `MAP_SHARED` objects rely on the engine's linear-memory charge instead of
+    /// an object charge. Kernel pins can retain their pages beyond the originating image;
+    /// that retained memory needs an external backstop. SysV segments and rings remain
+    /// object-charged because they can outlive mappings; their mapped ranges also occupy
+    /// engine-charged memory.
     /// Engine linear memories and NAPI/V8 require their own accountants sharing this limit.
     /// Persistent volumes, package lowers and kernel heap bookkeeping are not charged.
     /// Embedder-supplied filesystems must opt in separately. Callbacks must obey the locking

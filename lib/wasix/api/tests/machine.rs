@@ -866,7 +866,10 @@ async fn machine_memory_budget_covers_memfd_and_anonymous_shared_objects() {
     let charges = budget.charges.lock().unwrap();
     assert!(charges.contains(&1024), "memfd inode: {charges:?}");
     assert!(charges.contains(&4096), "memfd block: {charges:?}");
-    assert!(charges.contains(&65536), "anonymous object: {charges:?}");
+    assert!(
+        !charges.contains(&65536),
+        "anonymous mapping is already engine-charged: {charges:?}"
+    );
     assert_eq!(budget.used(), 0);
 }
 
@@ -884,7 +887,7 @@ async fn machine_memory_budget_refusal_is_enospc_for_files_and_enomem_for_shared
     let wat = r#"(module
       (import "wasixv2" "openat" (func $open (param i32 i32 i32 i32) (result i32)))
       (import "wasixv2" "write" (func $write (param i32 i32 i32) (result i32)))
-      (import "wasixv2" "mmap" (func $mmap (param i32 i32 i32 i32 i32 i64) (result i32)))
+      (import "wasixv2" "shmget" (func $shmget (param i32 i32 i32) (result i32)))
       (import "wasixv2" "exit_group" (func $exit (param i32)))
       (memory (export "memory") 1)
       (data (i32.const 16) "/tmp/full\00")
@@ -893,7 +896,7 @@ async fn machine_memory_budget_refusal_is_enospc_for_files_and_enomem_for_shared
         (if (i32.lt_s (local.get $fd) (i32.const 0)) (then (call $exit (i32.const 1))))
         (if (i32.ne (call $write (local.get $fd) (i32.const 16) (i32.const 1)) (i32.const -28))
           (then (call $exit (i32.const 2))))
-        (if (i32.ne (call $mmap (i32.const 0) (i32.const 65536) (i32.const 3) (i32.const 0x21) (i32.const -1) (i64.const 0)) (i32.const -12))
+        (if (i32.ne (call $shmget (i32.const 0) (i32.const 65536) (i32.const 384)) (i32.const -12))
           (then (call $exit (i32.const 3))))
         (call $exit (i32.const 0))))"#;
     assert_eq!(run(machine, wat).await.0, 0);

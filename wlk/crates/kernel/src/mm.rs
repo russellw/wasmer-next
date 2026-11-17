@@ -2045,7 +2045,7 @@ impl Kernel {
     /// (`shmem_zero_setup`), or `None` from a host without shared memory objects: the mapping
     /// is then ordinary memory of the address space, which no other process sees.
     fn shared_anonymous(&self, pages: u64) -> Result<Option<Source>, Errno> {
-        match self.host.shared_pages(pages * PAGE_SIZE) {
+        match self.host.shared_pages_for_mapping(pages * PAGE_SIZE) {
             Ok(pages) => Ok(Some(Source::Mapped(Mapped {
                 file: None,
                 pages,
