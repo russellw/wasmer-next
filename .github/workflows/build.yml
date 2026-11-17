@@ -67,7 +67,7 @@ jobs:
             enable_napi_v8: true
           - build: macos-arm
             # TODO: re-enable custom runner: os: depot-macos-14
-            os: macos-14
+            os: macos-15
             target: aarch64-apple-darwin
             artifact_name: "wasmer-darwin-arm64"
             build_wasm: false

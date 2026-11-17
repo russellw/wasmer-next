@@ -509,7 +509,7 @@ jobs:
             supports_v8: false
           - build: macos-arm
             # TODO: re-enable custom runner: os: depot-macos-14
-            os: macos-14
+            os: macos-15
             target: aarch64-apple-darwin
             exe: ""
             llvm_url: "https://github.com/wasmerio/llvm-custom-builds/releases/download/23.x/llvm-darwin-aarch64.tar.zst"
@@ -798,7 +798,7 @@ jobs:
             llvm_url: "https://github.com/wasmerio/llvm-custom-builds/releases/download/23.x/llvm-linux-aarch64.tar.zst"
           - build: macos-arm
             # TODO: re-enable custom runner: os: depot-macos-14
-            os: macos-14
+            os: macos-15
             target: aarch64-apple-darwin
             exe: ""
             wasix_rust_toolchain: true

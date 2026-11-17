@@ -27,6 +27,7 @@ extend-exclude = [
   "**/CHANGELOG.md",
   # Imported upstream suites and vendored code
   "tests/wasixv2/upstream",
+  "guest/libc",
   "**/third-party",
   # external submodule
   "lib/napi",
