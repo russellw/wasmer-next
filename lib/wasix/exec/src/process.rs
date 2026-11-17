@@ -16,12 +16,12 @@ use std::{
     task::{Poll, Waker},
 };
 
-use wasixv2_abi::Signal;
+use wasixv2_abi::{Errno, Signal};
 use wasixv2_host::Host;
-use wasixv2_syscalls::{Control, GuestAction, Image, Resume, Syscalls, TaskId};
+use wasixv2_syscalls::{CommandEnd, Control, GuestAction, Image, Resume, Syscalls, TaskId};
 use wasmer::{AsyncFunctionEnvMut, Engine, Function, Module, RuntimeError, Store, Value};
 
-use crate::{Ended, ExecEnv, ExecError, abi::Abis, asyncify};
+use crate::{Ended, ExecEnv, ExecError, LoadError, abi::Abis, asyncify};
 
 /// Raised from an import to unwind the old image after `execve`, carrying the new one.
 #[derive(Debug, thiserror::Error)]
@@ -1002,41 +1002,58 @@ where
     let first = match waited {
         // Killed meanwhile: it ends as the kill says.
         Err(status) => Ok(Ended::Exited(status)),
-        Ok(()) => {
-            let Some(loaded) = crate::cancellation::execution(
-                cleanup.cancellation(),
-                abis.loader().load(&engine, &image),
-            )
-            .await
-            else {
-                return Err(ExecError::Dropped);
-            };
-            drop(image);
-            match loaded {
-                Ok((image_engine, module)) => {
-                    engine = image_engine;
-                    let store = Store::new(engine.clone());
-                    let run = crate::run_image(
-                        store,
-                        &module,
-                        syscalls.clone(),
-                        task,
-                        host.clone(),
-                        abis.clone(),
-                        cleanup.clone(),
-                    );
-                    let Some(ended) =
-                        crate::cancellation::execution(cleanup.cancellation(), run).await
-                    else {
-                        return Err(ExecError::Dropped);
-                    };
-                    ended
-                }
-                Err(err) => Err(ExecError::Load(err)),
-            }
-        }
+        Ok(()) => run_next(&mut engine, image, task, &syscalls, &host, &abis, &cleanup).await,
     };
     finish(engine, first, syscalls, task, host, abis, cleanup).await
+}
+
+/// Runs a committed image until exit or its next exec.
+async fn run_next<S>(
+    engine: &mut Engine,
+    image: Image,
+    task: TaskId,
+    syscalls: &Arc<S>,
+    host: &Arc<dyn Host>,
+    abis: &Arc<Abis<S>>,
+    cleanup: &crate::cleanup::RunCleanup,
+) -> Result<Ended, ExecError>
+where
+    S: Syscalls + Control + Send + Sync + 'static,
+{
+    use crate::cancellation::execution;
+
+    if image.is_command() {
+        let end = execution(cleanup.cancellation(), syscalls.run_command(task, image))
+            .await
+            .ok_or(ExecError::Dropped)?;
+        return match end {
+            CommandEnd::Exited(status) => Ok(Ended::Exited(status)),
+            CommandEnd::Exec(image) => Ok(Ended::Exec(image.into())),
+            CommandEnd::Unsupported => Err(ExecError::Load(LoadError::Format(Errno::ENOEXEC))),
+        };
+    }
+
+    let (image_engine, module) =
+        execution(cleanup.cancellation(), abis.loader().load(engine, &image))
+            .await
+            .ok_or(ExecError::Dropped)?
+            .map_err(ExecError::Load)?;
+    drop(image);
+    *engine = image_engine;
+    execution(
+        cleanup.cancellation(),
+        crate::run_image(
+            Store::new(engine.clone()),
+            &module,
+            syscalls.clone(),
+            task,
+            host.clone(),
+            abis.clone(),
+            cleanup.clone(),
+        ),
+    )
+    .await
+    .ok_or(ExecError::Dropped)?
 }
 
 /// A default/noop ABI preserves its predecessor's compat custody. A successor
@@ -1068,6 +1085,7 @@ where
 {
     let mut ended = match first {
         Ok(ended) => ended,
+        Err(ExecError::Dropped) => return Err(ExecError::Dropped),
         Err(err) => {
             fault(&*syscalls, task, Signal::SIGSEGV.0);
             syscalls.release(task);
@@ -1106,52 +1124,26 @@ where
         if let Err(status) = waited {
             break status;
         }
-        let Some(loaded) = crate::cancellation::execution(
-            cleanup.cancellation(),
-            abis.loader().load(&engine, &image),
+        ended = match run_next(
+            &mut engine,
+            image.image,
+            task,
+            &syscalls,
+            &host,
+            &abis,
+            &cleanup,
         )
         .await
-        else {
-            return Err(ExecError::Dropped);
-        };
-        drop(image);
-        ended = match loaded {
-            Ok((image_engine, module)) => {
-                engine = image_engine;
-                let store = Store::new(engine.clone());
-                let run = crate::run_image(
-                    store,
-                    &module,
-                    syscalls.clone(),
-                    task,
-                    host.clone(),
-                    abis.clone(),
-                    cleanup.clone(),
-                );
-                let Some(ended) = crate::cancellation::execution(cleanup.cancellation(), run).await
-                else {
-                    return Err(ExecError::Dropped);
-                };
-                ended.unwrap_or_else(|err| Ended::Fault {
-                    task,
-                    handoff: None,
-                    signal: Signal::SIGSEGV.0,
-                    killed: None,
-                    report: format!(
-                        "wasixv2: cannot start the image process {} loaded with execve, \
-                         killing it with SIGSEGV: {err}",
-                        task.0
-                    ),
-                })
-            }
-            // Past the point of no return, a binary that does not load is a SIGSEGV.
+        {
+            Ok(ended) => ended,
+            Err(ExecError::Dropped) => return Err(ExecError::Dropped),
             Err(err) => Ended::Fault {
                 task,
                 handoff: None,
                 signal: Signal::SIGSEGV.0,
                 killed: None,
                 report: format!(
-                    "wasixv2: process {} loaded a module with execve that does not compile, \
+                    "wasixv2: cannot start the image process {} loaded with execve, \
                      killing it with SIGSEGV: {err}",
                     task.0
                 ),
@@ -1170,7 +1162,7 @@ pub(crate) async fn finish_task<S: Control>(syscalls: &S, task: TaskId) {
 
 /// The image of a vfork child's `execve`.
 pub(crate) async fn run_new_image<S>(
-    engine: Engine,
+    mut engine: Engine,
     mut image: ExecImage,
     syscalls: Arc<S>,
     task: TaskId,
@@ -1188,28 +1180,27 @@ where
         syscalls.release(task);
         return Ok(status);
     }
-    let loaded = abis.loader().load(&engine, &image).await;
-    drop(image);
-    let (engine, module) = match loaded {
-        Ok(loaded) => loaded,
-        Err(err) => {
-            tracing::warn!(tid = task.0, %err, "execve loaded a module that does not compile");
+    // Preserve the public runner's panic result before Takeover reports it, while
+    // sharing this worker's cleanup scope instead of creating a nested runner.
+    let run = async {
+        let first = run_next(
+            &mut engine,
+            image.image,
+            task,
+            &syscalls,
+            &host,
+            &abis,
+            &cleanup,
+        )
+        .await;
+        if let Err(ExecError::Load(err)) = &first {
+            tracing::warn!(tid = task.0, %err, "cannot load the exec image");
             let status = fault(&*syscalls, task, Signal::SIGSEGV.0);
             syscalls.release(task);
             return Ok(status);
         }
+        finish(engine, first, syscalls.clone(), task, host, abis, cleanup).await
     };
-    // Preserve the public runner's panic result before Takeover reports it, while
-    // sharing this worker's cleanup scope instead of creating a nested runner.
-    let run = run(
-        Store::new(engine),
-        &module,
-        syscalls.clone(),
-        task,
-        host,
-        abis,
-        cleanup,
-    );
     crate::catch_panic(run)
         .await
         .unwrap_or_else(|panic| Err(crate::host_panicked(&*syscalls, task, panic)))
@@ -1800,6 +1791,20 @@ pub(super) mod tests {
             self.pending.lock().unwrap().get_mut(&task)?.pop_front()
         }
 
+        fn run_command(&self, task: TaskId, image: Image) -> LocalFuture<'_, CommandEnd> {
+            assert_eq!(task, PARENT);
+            Box::pin(async move {
+                match image
+                    .command_token()
+                    .and_then(|token| token.downcast_ref::<u8>())
+                {
+                    Some(0) => CommandEnd::Exec(Image::command(Arc::new(1u8))),
+                    Some(1) => CommandEnd::Exited(42),
+                    _ => CommandEnd::Unsupported,
+                }
+            })
+        }
+
         fn group_wait(&self, _: TaskId) -> LocalFuture<'_, ()> {
             match &self.group_wait_failure {
                 Some(probe) => Box::pin(GroupWaitFailure(probe.clone())),
@@ -1921,6 +1926,26 @@ pub(super) mod tests {
         fn spawn_blocking(&self, work: Box<dyn FnOnce() + Send>) -> LocalFuture<'static, ()> {
             Box::pin(async move { work() })
         }
+    }
+
+    #[test]
+    fn virtual_command_images_handoff_and_exit_without_loading_wasm() {
+        let control = Arc::new(Recorder::default());
+        let host: Arc<dyn Host> = Arc::new(NoThreads);
+        let cleanup =
+            crate::cleanup::RunCleanup::new(wasixv2_host::LoaderCleanup::new(host.clone()), false);
+        let status = futures::executor::block_on(run_exec(
+            Store::default().engine().clone(),
+            Image::command(Arc::new(0u8)),
+            control.clone(),
+            PARENT,
+            host,
+            Arc::new(Abis::new()),
+            cleanup,
+        ));
+        assert_eq!(status.unwrap(), 42);
+        assert!(control.faulted.lock().unwrap().is_empty());
+        assert_eq!(&*control.released.lock().unwrap(), &[PARENT]);
     }
 
     // Linux mm/mmap.c:do_brk_flags grows backing memory without requiring any host

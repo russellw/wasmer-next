@@ -1,4 +1,5 @@
 use std::{
+    any::Any,
     ops::Range,
     sync::{
         Arc,
@@ -298,6 +299,12 @@ pub trait Control:
         Box::pin(async { Ok(()) })
     }
 
+    /// Runs an exec-committed virtual command as `task`.
+    fn run_command(&self, task: TaskId, image: Image) -> LocalFuture<'_, CommandEnd> {
+        let _ = (task, image);
+        Box::pin(async { CommandEnd::Unsupported })
+    }
+
     /// Before the last task of a process is released: waits until the other tasks of its thread
     /// group are gone, as a zombie leader stays until its group is empty, so whoever waits for
     /// the process never sees it end while a thread still runs.
@@ -541,52 +548,93 @@ pub trait Binfmt: Send + Sync {
 /// a `#!` line) before it reads the rest.
 pub const BINPRM_BUF_SIZE: usize = 256;
 
-/// The contents of the executable file an `execve` loaded, for the execution layer to run.
-/// Cheap to clone: the bytes are shared.
+/// The end of a virtual command running as an exec-committed task.
+pub enum CommandEnd {
+    /// The group's exit status, including when killed.
+    Exited(i32),
+    /// The image the command exec'd in the same task.
+    Exec(Image),
+    /// This control cannot run the command image.
+    Unsupported,
+}
+
+/// The executable image an `execve` loaded. Cheap to clone.
 #[derive(Clone)]
-pub struct Image {
-    bytes: Arc<dyn AsRef<[u8]> + Send + Sync>,
-    /// Whether `bytes` are the file's contents as its filesystem keeps them, unchanging.
-    shared: bool,
+pub struct Image(ImageKind);
+
+#[derive(Clone)]
+enum ImageKind {
+    Bytes {
+        bytes: Arc<dyn AsRef<[u8]> + Send + Sync>,
+        shared: bool,
+    },
+    Command(Arc<dyn Any + Send + Sync>),
 }
 
 impl Image {
     /// An image read into memory of its own.
     pub fn copied(bytes: Vec<u8>) -> Self {
-        Self {
+        Self(ImageKind::Bytes {
             bytes: Arc::new(bytes),
             shared: false,
-        }
+        })
     }
 
     /// An image whose bytes its filesystem shares and never changes while anyone holds them,
     /// such as a file of a package volume.
     pub fn shared(bytes: Arc<dyn AsRef<[u8]> + Send + Sync>) -> Self {
-        Self {
+        Self(ImageKind::Bytes {
             bytes,
             shared: true,
+        })
+    }
+
+    /// A host command, identified by the kernel's opaque token.
+    pub fn command(token: Arc<dyn Any + Send + Sync>) -> Self {
+        Self(ImageKind::Command(token))
+    }
+
+    pub fn is_command(&self) -> bool {
+        matches!(self.0, ImageKind::Command(_))
+    }
+
+    pub fn command_token(&self) -> Option<&Arc<dyn Any + Send + Sync>> {
+        match &self.0 {
+            ImageKind::Command(token) => Some(token),
+            ImageKind::Bytes { .. } => None,
         }
     }
 
     pub fn bytes(&self) -> &[u8] {
-        (*self.bytes).as_ref()
+        match &self.0 {
+            ImageKind::Bytes { bytes, .. } => (**bytes).as_ref(),
+            ImageKind::Command(_) => &[],
+        }
     }
 
-    /// What tells these contents apart from any others without reading them, for a cache of
-    /// what was made of them: for shared bytes, their address and length, which name the same
-    /// bytes for as long as someone holds [`Image::keep_alive`]. `None` for a copy, which only
-    /// its bytes identify.
+    /// The address and length of shared file bytes while someone holds [`Image::keep_alive`].
+    /// Copied bytes and virtual commands have no cache identity.
     pub fn identity(&self) -> Option<ImageId> {
-        let bytes = self.bytes();
-        self.shared.then_some(ImageId {
-            addr: bytes.as_ptr() as usize,
-            len: bytes.len(),
-        })
+        if let ImageKind::Bytes {
+            bytes,
+            shared: true,
+        } = &self.0
+        {
+            let bytes = (**bytes).as_ref();
+            return Some(ImageId {
+                addr: bytes.as_ptr() as usize,
+                len: bytes.len(),
+            });
+        }
+        None
     }
 
     /// Holds the bytes, and so keeps [`Image::identity`] theirs alone.
     pub fn keep_alive(&self) -> Arc<dyn AsRef<[u8]> + Send + Sync> {
-        self.bytes.clone()
+        match &self.0 {
+            ImageKind::Bytes { bytes, .. } => bytes.clone(),
+            ImageKind::Command(_) => Arc::new([]),
+        }
     }
 }
 
@@ -594,7 +642,8 @@ impl std::fmt::Debug for Image {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Image")
             .field("len", &self.bytes().len())
-            .field("shared", &self.shared)
+            .field("shared", &self.identity().is_some())
+            .field("command", &self.is_command())
             .finish()
     }
 }

@@ -37,9 +37,9 @@ pub use caller::{
     AsTask, Caller, TaskId, WaitCompletion, WaitCompletionSlot, as_task, current_task,
 };
 pub use control::{
-    AtomicWait, AtomicWord, BINPRM_BUF_SIZE, Binfmt, Control, ExecutionFault, ExitMm, GroupStop,
-    GuestAction, Image, ImageId, PidView, Resume, SharedMapping, SharedMappings, SignalFrame,
-    ThreadCompletion, VforkParent, VforkWait, WorkFlag,
+    AtomicWait, AtomicWord, BINPRM_BUF_SIZE, Binfmt, CommandEnd, Control, ExecutionFault, ExitMm,
+    GroupStop, GuestAction, Image, ImageId, PidView, Resume, SharedMapping, SharedMappings,
+    SignalFrame, ThreadCompletion, VforkParent, VforkWait, WorkFlag,
 };
 pub use cputime::{CpuAccount, CpuBase, CpuTime, CpuTimes, Expiry, GroupCpu};
 pub use descriptors::{

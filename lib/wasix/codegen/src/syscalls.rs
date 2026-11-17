@@ -564,6 +564,10 @@ impl<L, S: crate::Control> crate::Control for Layered<L, S> {
         self.inner.exec_wait(task)
     }
 
+    fn run_command(&self, task: crate::TaskId, image: crate::Image) -> crate::LocalFuture<'_, crate::CommandEnd> {
+        self.inner.run_command(task, image)
+    }
+
     fn group_wait(&self, task: crate::TaskId) -> crate::LocalFuture<'_, ()> {
         self.inner.group_wait(task)
     }
