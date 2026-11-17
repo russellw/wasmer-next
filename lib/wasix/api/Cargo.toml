@@ -41,7 +41,9 @@ thiserror.workspace = true
 tracing.workspace = true
 wasmparser.workspace = true
 webc.workspace = true
-wasmer-package = { workspace = true, features = ["acquisition"], optional = true }
+wasmer-package = { workspace = true, features = [
+  "acquisition",
+], optional = true }
 wasmer-config = { workspace = true, optional = true }
 futures-util = { workspace = true, optional = true }
 async-trait.workspace = true
@@ -53,7 +55,11 @@ serde_json.workspace = true
 wat.workspace = true
 
 [target.'cfg(unix)'.dependencies]
-tokio = { workspace = true, optional = true, features = ["fs", "io-util", "sync"] }
+tokio = { workspace = true, optional = true, features = [
+  "fs",
+  "io-util",
+  "sync",
+] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 futures-util.workspace = true
@@ -74,7 +80,9 @@ wasmer = { workspace = true, default-features = false, features = [
 ] }
 
 [target.'cfg(target_os = "windows")'.dev-dependencies]
-wasmer = { workspace = true, default-features = false, features = ["v8-default"] }
+wasmer = { workspace = true, default-features = false, features = [
+  "v8-default",
+] }
 
 [features]
 resolved-packages = ["dep:wasmer-package", "dep:wasmer-config"]

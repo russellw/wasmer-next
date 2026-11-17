@@ -34,4 +34,7 @@ tokio-util = { version = "0.7.8", features = ["codec"] }
 tracing = "0.1"
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(docsrs)', 'cfg(feature, values("rkyv", "hyper", "tokio-tungstenite", "json", "messagepack", "cbor"))'] }
+unexpected_cfgs = { level = "warn", check-cfg = [
+  'cfg(docsrs)',
+  'cfg(feature, values("rkyv", "hyper", "tokio-tungstenite", "json", "messagepack", "cbor"))',
+] }

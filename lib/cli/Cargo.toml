@@ -38,7 +38,12 @@ default = [
 
 backend = []
 coredump = ["wasm-coredump-builder"]
-sys = ["compiler", "dep:wasmer-vm", "wasixv2/sys", "wasmer-cache/module-cache-sys"]
+sys = [
+  "compiler",
+  "dep:wasmer-vm",
+  "wasixv2/sys",
+  "wasmer-cache/module-cache-sys",
+]
 v8 = ["backend", "wasmer/v8", "wasixv2/sys"]
 # Enable V8 and explicitly select it as the default backend.
 v8-default = ["v8", "wasmer/v8-default"]
@@ -76,27 +81,20 @@ static-artifact-load = [
   "wasmer/static-artifact-load",
   "wasmer-compiler/static-artifact-load",
 ]
-singlepass = [
-  "wasmer-compiler-singlepass",
-  "compiler",
-  "wasmer/singlepass",
-]
-cranelift = [
-  "wasmer-compiler-cranelift",
-  "compiler",
-  "wasmer/cranelift",
-]
-llvm = [
-  "wasmer-compiler-llvm",
-  "compiler",
-  "wasmer/llvm",
-]
+singlepass = ["wasmer-compiler-singlepass", "compiler", "wasmer/singlepass"]
+cranelift = ["wasmer-compiler-cranelift", "compiler", "wasmer/cranelift"]
+llvm = ["wasmer-compiler-llvm", "compiler", "wasmer/llvm"]
 disable-all-logging = [
   "tracing/release_max_level_off",
   "tracing/max_level_off",
   "log/release_max_level_off",
 ]
-headless = ["dep:wasmer-vm", "wasmer/sys", "wasixv2/sys", "wasmer-cache/module-cache-sys"]
+headless = [
+  "dep:wasmer-vm",
+  "wasmer/sys",
+  "wasixv2/sys",
+  "wasmer-cache/module-cache-sys",
+]
 headless-minimal = ["headless", "disable-all-logging"]
 telemetry = []
 
@@ -122,9 +120,16 @@ wasmer-compiler = { workspace = true, default-features = true, features = [
 wasmer-compiler-cranelift = { workspace = true, optional = true }
 wasmer-compiler-singlepass = { workspace = true, optional = true }
 wasmer-compiler-llvm = { workspace = true, optional = true }
-wasmer-package = { workspace = true, features = ["authoring", "acquisition-thread", "http-client"] }
+wasmer-package = { workspace = true, features = [
+  "authoring",
+  "acquisition-thread",
+  "http-client",
+] }
 wasmer-vm = { workspace = true, optional = true }
-wasmer-cache = { path = "../cache", version = "=7.5.0", default-features = false, features = ["module-cache", "module-cache-filesystem"] }
+wasmer-cache = { path = "../cache", version = "=7.5.0", default-features = false, features = [
+  "module-cache",
+  "module-cache-filesystem",
+] }
 wasmer-wast = { workspace = true, optional = true }
 wasmer-types = { workspace = true, default-features = true, features = [
   "enable-serde",
@@ -144,7 +149,9 @@ wasixv2 = { path = "../wasix/api", default-features = false, features = [
 webc.workspace = true
 wasmer-backend-api = { version = "=0.705.0", path = "../backend-api" }
 wasmer-package-sdk = { version = "=7.5.0", path = "../package-sdk" }
-wasmer-config = { version = "0.705.0", path = "../config", features = ["network-rules"] }
+wasmer-config = { version = "0.705.0", path = "../config", features = [
+  "network-rules",
+] }
 
 shared-buffer = { workspace = true, optional = true }
 rkyv = { workspace = true, optional = true }

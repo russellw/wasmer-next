@@ -17,4 +17,3 @@ wasixv2-wait = { path = "../wait" }
 bincode = { workspace = true, features = ["serde"] }
 serde = { workspace = true, features = ["derive"] }
 futures-util.workspace = true
-

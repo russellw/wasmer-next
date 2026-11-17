@@ -1,0 +1,7 @@
+# Submodules retain the formatting policy of their source repositories.
+exclude = [
+  "lib/napi/**",
+  "tests/wasixv2/upstream/**",
+  "wasmer-test-files/**",
+  "**/third-party/**",
+]

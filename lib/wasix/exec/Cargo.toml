@@ -42,15 +42,24 @@ wat.workspace = true
 wasm-bindgen-test.workspace = true
 
 [target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "windows")))'.dev-dependencies]
-wasmer = { workspace = true, default-features = false, features = ["cranelift"] }
+wasmer = { workspace = true, default-features = false, features = [
+  "cranelift",
+] }
 
 [target.'cfg(target_os = "windows")'.dev-dependencies]
-wasmer = { workspace = true, default-features = false, features = ["v8-default"] }
+wasmer = { workspace = true, default-features = false, features = [
+  "v8-default",
+] }
 
 [features]
 default = ["sys"]
 sys = ["wasmer/sys", "wasmer/headless"]
-js = ["wasmer/js-default", "wasixv2-host/browser", "dep:js-sys", "dep:wasm-bindgen"]
+js = [
+  "wasmer/js-default",
+  "wasixv2-host/browser",
+  "dep:js-sys",
+  "dep:wasm-bindgen",
+]
 
 # Source-built threaded regression artifact; never enabled by embedders.
 browser-memory-test = ["js", "wasixv2-host/browser", "dep:wat"]

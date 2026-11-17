@@ -34,7 +34,11 @@ wasixv2-vfs-mem = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test.workspace = true
-wasixv2 = { path = "../api", default-features = false, features = ["js", "web", "wasix1"] }
+wasixv2 = { path = "../api", default-features = false, features = [
+  "js",
+  "web",
+  "wasix1",
+] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 # Layout conformance only; never a runtime dependency.
@@ -48,9 +52,23 @@ wasmer = { workspace = true, default-features = false, features = [
 ] }
 
 [target.'cfg(target_os = "windows")'.dev-dependencies]
-wasmer = { workspace = true, default-features = false, features = ["v8-default"] }
+wasmer = { workspace = true, default-features = false, features = [
+  "v8-default",
+] }
 
 [features]
 default = ["sys"]
-sys = ["wasmer/sys", "wasmer/headless", "wasixv2-exec/sys", "wasixv2-dylink/sys"]
-js = ["wasmer/js-default", "wasixv2-exec/js", "wasixv2-dylink/js", "dep:serde", "dep:serde_json", "dep:wasm-bindgen"]
+sys = [
+  "wasmer/sys",
+  "wasmer/headless",
+  "wasixv2-exec/sys",
+  "wasixv2-dylink/sys",
+]
+js = [
+  "wasmer/js-default",
+  "wasixv2-exec/js",
+  "wasixv2-dylink/js",
+  "dep:serde",
+  "dep:serde_json",
+  "dep:wasm-bindgen",
+]

@@ -22,7 +22,11 @@ wasmer-compiler-llvm = { workspace = true, optional = true }
 wasmer-compiler-singlepass = { workspace = true, optional = true }
 wasmer-middlewares = { workspace = true, optional = true }
 wasmer-types = { workspace = true, default-features = true }
-wasixv2 = { path = "lib/wasix/api", default-features = false, features = ["sys", "tokio", "wasix1"], optional = true }
+wasixv2 = { path = "lib/wasix/api", default-features = false, features = [
+  "sys",
+  "tokio",
+  "wasix1",
+], optional = true }
 
 # Third party dependencies
 crossbeam-queue.workspace = true
@@ -476,4 +480,3 @@ required-features = ["tokio", "backend", "wasi", "wat"]
 name = "wasi-pipes"
 path = "examples/wasi_pipes.rs"
 required-features = ["tokio", "backend", "wasi", "wat"]
-

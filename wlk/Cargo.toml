@@ -56,7 +56,10 @@ wasm-bindgen = "0.2.120"
 wasm-bindgen-futures = "0.4.70"
 wasm-bindgen-test = "0.3.70"
 web-time = "1.1"
-webc = { version = "=12.0.1", default-features = false, features = ["v2", "v3"] }
+webc = { version = "=12.0.1", default-features = false, features = [
+  "v2",
+  "v3",
+] }
 
 [patch.crates-io]
 shared-buffer = { path = "third-party/shared-buffer" }

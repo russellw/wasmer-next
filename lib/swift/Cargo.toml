@@ -14,7 +14,9 @@ name = "wasmer_swift"
 [dependencies]
 anyhow.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread"], default-features = false }
+tokio = { workspace = true, features = [
+  "rt-multi-thread",
+], default-features = false }
 uniffi.workspace = true
 wasmer = { workspace = true, default-features = false, features = [
   "cranelift",
@@ -29,7 +31,11 @@ wasixv2 = { path = "../wasix/api", default-features = false, features = [
 ] }
 wasmer-config.workspace = true
 webc.workspace = true
-wasmer-package = { workspace = true, features = ["acquisition-thread", "http-client", "authoring"] }
+wasmer-package = { workspace = true, features = [
+  "acquisition-thread",
+  "http-client",
+  "authoring",
+] }
 
 
 [dev-dependencies]

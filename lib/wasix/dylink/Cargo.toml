@@ -32,8 +32,26 @@ js-sys.workspace = true
 
 [features]
 default = ["sys"]
-sys = ["dep:tracing", "dep:wasmer-types", "dep:wasixv2-abi", "dep:wasixv2-syscalls", "dep:wasixv2-host", "wasmer/sys", "wasmer/headless", "wasixv2-exec/sys"]
-js = ["dep:tracing", "dep:wasmer-types", "dep:wasixv2-abi", "dep:wasixv2-syscalls", "dep:wasixv2-host", "wasmer/js-default", "wasmer/js-serializable-module", "wasixv2-exec/js"]
+sys = [
+  "dep:tracing",
+  "dep:wasmer-types",
+  "dep:wasixv2-abi",
+  "dep:wasixv2-syscalls",
+  "dep:wasixv2-host",
+  "wasmer/sys",
+  "wasmer/headless",
+  "wasixv2-exec/sys",
+]
+js = [
+  "dep:tracing",
+  "dep:wasmer-types",
+  "dep:wasixv2-abi",
+  "dep:wasixv2-syscalls",
+  "dep:wasixv2-host",
+  "wasmer/js-default",
+  "wasmer/js-serializable-module",
+  "wasixv2-exec/js",
+]
 
 # Explicit opt-in keeps planner-only tests independent of native compiler crates.
 engine-tests = ["sys", "wasmer/cranelift"]
