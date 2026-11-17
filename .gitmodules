@@ -17,4 +17,4 @@
 [submodule "lib/napi"]
 	path = lib/napi
 	url = https://github.com/wasmerio/napi.git
-	branch = next
+	branch = edge-wasixv2

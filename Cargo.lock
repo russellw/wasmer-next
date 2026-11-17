@@ -7358,6 +7358,7 @@ dependencies = [
  "enum-iterator",
  "js-sys",
  "offset-allocator",
+ "parking_lot 0.12.5",
  "serde",
  "serde_json",
  "sha2",
