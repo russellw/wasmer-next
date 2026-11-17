@@ -7,10 +7,10 @@ authors = ["Wasmer Engineering Team <engineering@wasmer.io>"]
 edition = "2024"
 homepage = "https://wasmer.io/"
 license = "MIT"
-repository = "https://github.com/wasix-org/wasixv2-abi"
+repository = "https://github.com/wasmerio/wasmer-next"
 rust-version = "1.96"
 
-# Also a member of wasmer's workspace, where this is mounted at lib/wasixv2/codegen. Dependency
+# Also a member of wasmer's workspace, where this is mounted at lib/wasix/codegen. Dependency
 # requirements match wasmer's, so that workspace resolves them without changes.
 [dependencies]
 anyhow = "1.0"

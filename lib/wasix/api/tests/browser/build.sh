@@ -6,7 +6,7 @@ export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/target/b8-browser}"
 export WASIX_BROWSER_PACKAGE=wasixv2
 export WASIX_BROWSER_EXAMPLE=browser-facade
 export WASIX_BROWSER_FEATURES=browser,wasix1
-host_root="$(python3 scripts/wlk-source.py host)"
+host_root="wlk/crates/host"
 WASIX_BROWSER_WORKSPACE="$PWD" bash "$host_root/tests/browser/build.sh"
 out="$CARGO_TARGET_DIR/browser"
 mkdir -p "$out/memory"

@@ -3,13 +3,9 @@
 //!
 //! Set `WASIXV2_CODEGEN_BLESS=1` to regenerate them.
 
-use std::{
-    path::{Path, PathBuf},
-    process::Command,
-};
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use std::sync::OnceLock;
 use wasixv2_codegen::{
     Target, generate_abi, generate_exec, generate_syscalls, rust::source_from_header,
 };
@@ -22,45 +18,14 @@ fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..")
 }
 
-fn kernel_root() -> &'static Path {
-    static ROOT: OnceLock<PathBuf> = OnceLock::new();
-    ROOT.get_or_init(|| {
-        if let Some(path) = std::env::var_os("WLK_ROOT") {
-            return PathBuf::from(path);
-        }
-        let output = Command::new(env!("CARGO"))
-            .args(["metadata", "--locked", "--format-version", "1"])
-            .current_dir(repo_root())
-            .output()
-            .expect("read locked dependency metadata");
-        assert!(
-            output.status.success(),
-            "cargo metadata failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let metadata: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        let package = metadata["packages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|package| package["name"] == "wasixv2-abi")
-            .expect("WLK ABI dependency");
-        PathBuf::from(package["manifest_path"].as_str().unwrap())
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .to_path_buf()
-    })
-    .as_path()
-}
-
 fn generated_path(path: &str) -> PathBuf {
     for name in ["abi", "syscalls"] {
         if let Some(suffix) = path.strip_prefix(&format!("lib/wasix/{name}/")) {
-            return kernel_root().join("crates").join(name).join(suffix);
+            return repo_root()
+                .join("wlk")
+                .join("crates")
+                .join(name)
+                .join(suffix);
         }
     }
     repo_root().join(path)
@@ -81,12 +46,6 @@ fn check_generated(
     let source = source_from_header(&current).expect("generated header names its source");
     let fresh = generate(&root.join(source), source, Target::WASM32).unwrap();
     if bless() {
-        if path != EXEC_RS {
-            assert!(
-                std::env::var_os("WLK_ROOT").is_some(),
-                "set WLK_ROOT to a writable WLK checkout before blessing kernel outputs; never edit Cargo git cache"
-            );
-        }
         std::fs::write(generated_path(path), &fresh).unwrap();
         return;
     }

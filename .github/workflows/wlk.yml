@@ -21,6 +21,15 @@ jobs:
       - uses: actions/checkout@v4
         with:
           sparse-checkout: wlk
+      - name: Cache sealed WLK workspace
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            wlk/target
+          key: wlk-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('wlk/Cargo.lock', 'wlk/rust-toolchain.toml') }}
+          restore-keys: |
+            wlk-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.96 --profile minimal --component rustfmt --component clippy --target wasm32-unknown-unknown
       - name: Format
@@ -55,6 +64,15 @@ jobs:
       - uses: actions/checkout@v4
         with:
           sparse-checkout: wlk
+      - name: Cache sealed WLK workspace
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            wlk/target
+          key: wlk-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('wlk/Cargo.lock', 'wlk/rust-toolchain.toml') }}
+          restore-keys: |
+            wlk-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.96 --profile minimal --component clippy
       - name: Terminal lease regressions
@@ -69,6 +87,15 @@ jobs:
       - uses: actions/checkout@v4
         with:
           sparse-checkout: wlk
+      - name: Cache sealed WLK workspace
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            wlk/target
+          key: wlk-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('wlk/Cargo.lock', 'wlk/rust-toolchain.toml') }}
+          restore-keys: |
+            wlk-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
       - name: Install pinned Rust toolchain and wasm target
         run: rustup toolchain install 1.96 --profile minimal --target wasm32-unknown-unknown
       - name: Check browser host
@@ -83,6 +110,15 @@ jobs:
       - uses: actions/checkout@v4
         with:
           sparse-checkout: wlk
+      - name: Cache sealed WLK workspace
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            wlk/target
+          key: wlk-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('wlk/Cargo.lock', 'wlk/rust-toolchain.toml') }}
+          restore-keys: |
+            wlk-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.96 --profile minimal
       - uses: taiki-e/install-action@cargo-audit

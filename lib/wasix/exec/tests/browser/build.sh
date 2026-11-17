@@ -2,7 +2,7 @@
 # Threaded debug artifact: same std/TLS/limits contract as the B2 host harness.
 set -euo pipefail
 cd "$(dirname "$0")/../../../../.."
-host_root="$(python3 scripts/wlk-source.py host)"
+host_root="wlk/crates/host"
 export CARGO_INCREMENTAL=0
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/target/b3b-browser}"
 nightly=nightly-2026-08-08

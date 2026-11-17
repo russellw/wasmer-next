@@ -111,6 +111,9 @@ print(
     + ")"
 )
 for root, dirs, files in os.walk("."):
+    # WLK owns its versions in an excluded workspace.
+    if root == ".":
+        dirs[:] = [directory for directory in dirs if directory != "wlk"]
     path = root.split(os.sep)
     # print((len(path) - 1) * '---', os.path.basename(root))
     for file in files:

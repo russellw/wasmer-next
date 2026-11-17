@@ -20,6 +20,9 @@ class AreaTests(unittest.TestCase):
     def test_area_fanout(self):
         for path, expected in [
             ("wlk/crates/kernel/src/lib.rs", {"integration", "product"}),
+            ("wlk/crates/abi/src/generated.rs", {"integration", "product"}),
+            ("wlk/crates/syscalls/src/generated.rs", {"integration", "product"}),
+            ("lib/wasix/codegen/wit/types.wit", {"integration", "product"}),
             ("lib/wasix/api/src/lib.rs", {"integration", "product"}),
             ("lib/napi/src/lib.rs", {"integration", "product"}),
             ("lib/sdk/native/src/lib.rs", {"integration", "product"}),

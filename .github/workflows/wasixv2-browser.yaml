@@ -120,7 +120,7 @@ jobs:
       - name: Install B2's pinned nightly and matching bindgen CLI
         shell: bash
         run: |
-          host_root="$(python3 scripts/wlk-source.py host)"
+          host_root="wlk/crates/host"
           test -f "$host_root/tests/browser/build.sh"
           rustup toolchain install nightly-2026-08-08 --profile minimal --component rust-src --target wasm32-unknown-unknown
           version=$(sed -n '/^name = "wasm-bindgen"$/{n;s/version = "\(.*\)"/\1/p;}' Cargo.lock)
@@ -133,7 +133,7 @@ jobs:
           cache-targets: "false"
       - name: Link and inspect B2's debug runtime artifact
         run: |
-          host_root="$(python3 scripts/wlk-source.py host)"
+          host_root="wlk/crates/host"
           bash "$host_root/tests/browser/build.sh" > browser-build.log 2>&1
       - name: Reuse B2 smoke through Playwright
         working-directory: tests/wasixv2/browser

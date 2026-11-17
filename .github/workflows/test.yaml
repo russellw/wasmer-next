@@ -1045,6 +1045,8 @@ jobs:
           toolchain: ${{ steps.toolchain.outputs.rust_toolchain }}
       - run: sudo apt-get update && sudo apt-get install -y libclang-dev cmake ninja-build
       - run: cargo check --workspace --locked
+      - name: Check canonical WASIX Rust bindings
+        run: cargo test --locked -p wasixv2-exec --test generated
       - run: cargo build --locked -p wasmer-napi --features cli
   ci_success:
     name: Tests CI
