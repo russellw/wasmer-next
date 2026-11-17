@@ -39,7 +39,7 @@ default = [
 backend = []
 coredump = ["wasm-coredump-builder"]
 sys = ["compiler", "dep:wasmer-vm", "wasixv2/sys", "wasmer-cache/module-cache-sys"]
-v8 = ["backend", "wasmer/v8"]
+v8 = ["backend", "wasmer/v8", "wasixv2/sys"]
 # Enable V8 and explicitly select it as the default backend.
 v8-default = ["v8", "wasmer/v8-default"]
 wast = ["wasmer-wast"]

@@ -1756,7 +1756,7 @@ pub(super) fn receive_packet(
             msg.msg_iov = &mut iov;
             msg.msg_iovlen = 1;
             msg.msg_control = control.as_mut_ptr().cast();
-            msg.msg_controllen = std::mem::size_of_val(&control);
+            msg.msg_controllen = std::mem::size_of_val(&control) as _;
             let n = libc::recvmsg(
                 socket.as_raw_fd(),
                 &mut msg,
