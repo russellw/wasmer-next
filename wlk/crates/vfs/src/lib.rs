@@ -125,6 +125,11 @@ impl Vfs {
         })
     }
 
+    /// Drops cached negative dentries for a superblock after a live filesystem append.
+    pub fn invalidate_negative(&self, _sb: &Superblock) {
+        // The dcache currently retains positive entries only.
+    }
+
     /// The initial mount namespace.
     pub fn namespace(&self) -> &Arc<MntNs> {
         &self.ns

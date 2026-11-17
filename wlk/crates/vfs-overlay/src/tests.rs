@@ -1105,3 +1105,180 @@ fn root_upper_changes_survive_overlay_reconstruction() {
     assert_eq!(read(&lookup(&lower_root, b"copy").unwrap()), b"lower");
     assert!(lookup(&lower_root, b"gone").is_ok());
 }
+
+#[test]
+fn live_append_refreshes_cached_directories_without_changing_inodes_or_cookies() {
+    let upper = mem();
+    let upper_dir = mkdir(&upper.root(), b"d");
+    write(&upper_dir, b"old", b"upper");
+    let (fs, append) = OverlayFs::new_appendable(Some(upper.clone()), Vec::new());
+    let root = fs.root();
+    let dir = lookup(&root, b"d").unwrap();
+    let handle = block_on(dir.open(OpenOptions::default())).unwrap();
+    let mut first = Names(Vec::new(), 1);
+    block_on(handle.readdir(0, &mut first)).unwrap();
+    assert_eq!(first.0[0].0, b"old");
+    let ino = dir.ino();
+
+    let lower = mem();
+    let lower_dir = mkdir(&lower.root(), b"d");
+    write(&lower_dir, b"old", b"shadowed");
+    write(&lower_dir, b"new", b"tail");
+    block_on(append.append_lower(lower)).unwrap();
+
+    let mut remaining = Names(Vec::new(), usize::MAX);
+    block_on(handle.readdir(first.0[0].2, &mut remaining)).unwrap();
+    assert!(remaining.0.is_empty(), "the open stream keeps its snapshot");
+    block_on(handle.readdir(0, &mut remaining)).unwrap();
+    assert_eq!(remaining.0.len(), 2, "rewind refreshes the stream");
+    assert_eq!(read(&lookup(&dir, b"new").unwrap()), b"tail");
+    assert_eq!(read(&lookup(&dir, b"old").unwrap()), b"upper");
+    assert_eq!(lookup(&upper_dir, b"new").err(), Some(Errno::ENOENT));
+    assert_eq!(block_on(dir.getattr()).unwrap().ino, ino);
+    drop(handle);
+    drop(dir);
+    assert_eq!(lookup(&root, b"d").unwrap().ino(), ino);
+    let root_handle = block_on(root.open(OpenOptions::default())).unwrap();
+    let mut parents = Names(Vec::new(), usize::MAX);
+    block_on(root_handle.readdir(0, &mut parents)).unwrap();
+    assert_eq!(
+        (parents.0[0].0.as_slice(), parents.0[0].1),
+        (b"d".as_slice(), ino)
+    );
+}
+
+#[test]
+fn live_append_honors_whiteouts_and_opaque_and_nondirectory_barriers() {
+    let upper = mem();
+    let lower = mem();
+    let barrier = mem();
+    let merge = mkdir(&lower.root(), b"merged");
+    mkdir(&lower.root(), b"opaque");
+    mkdir(&lower.root(), b"stopped");
+    write(&merge, b"whiteout", b"base");
+    write(&barrier.root(), b"stopped", b"non-directory barrier");
+
+    let (fs, append) = OverlayFs::new_appendable(Some(upper), vec![lower, barrier]);
+    let root = fs.root();
+    let merge = lookup(&root, b"merged").unwrap();
+    let stopped = lookup(&root, b"stopped").unwrap();
+    block_on(merge.unlink(b"whiteout")).unwrap();
+    write(&merge, b"upper-only", b"previous upper");
+    block_on(merge.unlink(b"upper-only")).unwrap();
+    block_on(root.rmdir(b"opaque")).unwrap();
+    let opaque = mkdir(&root, b"opaque");
+
+    let lower = mem();
+    let tail = mkdir(&lower.root(), b"merged");
+    write(&tail, b"upper-only", b"new package");
+    write(&tail, b"whiteout", b"still hidden");
+    for name in [b"opaque".as_slice(), b"stopped"] {
+        write(&mkdir(&lower.root(), name), b"hidden", b"barrier");
+    }
+    block_on(append.append_lower(lower)).unwrap();
+
+    assert_eq!(lookup(&merge, b"whiteout").err(), Some(Errno::ENOENT));
+    assert_eq!(
+        read(&lookup(&merge, b"upper-only").unwrap()),
+        b"new package"
+    );
+    for dir in [opaque, stopped] {
+        assert_eq!(lookup(&dir, b"hidden").err(), Some(Errno::ENOENT));
+        assert!(list(&dir).is_empty());
+    }
+}
+
+#[test]
+fn live_append_serializes_with_rename_and_rmdir() {
+    use std::task::Context;
+
+    for rename in [false, true] {
+        for append_first in [false, true] {
+            let upper = mem();
+            mkdir(&upper.root(), b"old");
+            let (fs, append) = OverlayFs::new_appendable(Some(upper), Vec::new());
+            let root = fs.root();
+            let old = lookup(&root, b"old").unwrap();
+            let lower = mem();
+            write(&mkdir(&lower.root(), b"old"), b"new", b"tail");
+            if rename {
+                write(&mkdir(&lower.root(), b"moved"), b"new", b"target");
+            }
+
+            let outcome = block_on(async {
+                let node = root.as_any().downcast_ref::<OverlayNode>().unwrap();
+                let guard = node.shared.write_lock.lock().await;
+                let mut mutating = Box::pin(async {
+                    if rename {
+                        root.rename(b"old", &root, b"moved", RenameMode::Replace)
+                            .await
+                    } else {
+                        root.rmdir(b"old").await
+                    }
+                });
+                let mut appending = Box::pin(append.append_lower(lower));
+                let mut cx = Context::from_waker(std::task::Waker::noop());
+                assert!(appending.as_mut().poll(&mut cx).is_pending());
+                assert!(mutating.as_mut().poll(&mut cx).is_pending());
+                drop(guard);
+                if append_first {
+                    appending.await.unwrap();
+                    mutating.await
+                } else {
+                    let outcome = mutating.await;
+                    appending.await.unwrap();
+                    outcome
+                }
+            });
+            if append_first {
+                assert_eq!(
+                    outcome,
+                    Err(if rename {
+                        Errno::EXDEV
+                    } else {
+                        Errno::ENOTEMPTY
+                    })
+                );
+                assert_eq!(read(&lookup(&old, b"new").unwrap()), b"tail");
+            } else {
+                outcome.unwrap();
+                let supplied = lookup(&root, b"old").unwrap();
+                assert_ne!(old.ino(), supplied.ino());
+                assert_eq!(read(&lookup(&supplied, b"new").unwrap()), b"tail");
+                if rename {
+                    assert_eq!(lookup(&root, b"moved").unwrap().ino(), old.ino());
+                    assert_eq!(read(&lookup(&old, b"new").unwrap()), b"target");
+                } else {
+                    assert_eq!(lookup(&old, b"new").err(), Some(Errno::ENOENT));
+                    assert!(list(&old).is_empty());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn live_append_respects_prefixes_and_layer_capacity() {
+    let (fs, append) = OverlayFs::new_appendable(Some(mem()), Vec::new());
+    let lower = mem();
+    write(&lower.root(), b"file", b"hello");
+    let prefixed = PrefixFs::new(b"some/place", lower).unwrap();
+    block_on(append.append_lower(prefixed)).unwrap();
+    let some = lookup(&fs.root(), b"some").unwrap();
+    let place = lookup(&some, b"place").unwrap();
+    let file = lookup(&place, b"file").unwrap();
+    assert_eq!(read(&file), b"hello");
+    assert_ne!(place.ino(), some.ino());
+    assert_ne!(file.ino(), place.ino());
+
+    for _ in 1..MAX_LOWERS {
+        block_on(append.append_lower(mem())).unwrap();
+    }
+    assert_eq!(append.lower_count(), MAX_LOWERS);
+    assert_eq!(block_on(append.append_lower(mem())), Err(Errno::ENOSPC));
+    drop(file);
+    drop(place);
+    drop(some);
+    drop(fs);
+    assert_eq!(block_on(append.append_lower(mem())), Err(Errno::ESTALE));
+}

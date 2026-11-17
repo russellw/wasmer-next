@@ -27,7 +27,7 @@ use std::{
     any::Any,
     collections::{HashMap, HashSet},
     sync::{
-        Arc, Mutex, Weak,
+        Arc, Mutex, RwLock, Weak,
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
 };
@@ -40,6 +40,9 @@ use wasixv2_vfs::{
     Handle, LookupEntry, NewKind, NewNode, Node, OpenOptions, RenameMode, SeekHole, SetAttr,
     SharedContents, StatFs, TimeSet, XattrSet,
 };
+
+mod prefix;
+pub use prefix::PrefixFs;
 
 /// `OVERLAYFS_SUPER_MAGIC`.
 pub const OVERLAYFS_SUPER_MAGIC: u32 = 0x794c_7630;
@@ -79,6 +82,24 @@ impl OverlayFs {
         upper: Option<Arc<dyn Filesystem>>,
         lowers: Vec<Arc<dyn Filesystem>>,
     ) -> Arc<dyn Filesystem> {
+        Self::stack(upper, lowers, false)
+    }
+
+    /// Stacks the existing layers and returns a handle to append live lower layers.
+    pub fn new_appendable(
+        upper: Option<Arc<dyn Filesystem>>,
+        lowers: Vec<Arc<dyn Filesystem>>,
+    ) -> (Arc<dyn Filesystem>, OverlayAppender) {
+        let fs = Self::stack(upper, lowers, true);
+        let appender = OverlayAppender(Arc::downgrade(&fs.shared));
+        (fs, appender)
+    }
+
+    fn stack(
+        upper: Option<Arc<dyn Filesystem>>,
+        lowers: Vec<Arc<dyn Filesystem>>,
+        appendable: bool,
+    ) -> Arc<Self> {
         assert!(
             upper.is_some() || !lowers.is_empty(),
             "an overlay needs a layer"
@@ -86,7 +107,9 @@ impl OverlayFs {
         assert!(lowers.len() <= MAX_LOWERS, "too many lower layers");
         let shared = Arc::new(Shared {
             upper,
-            lowers,
+            base_lowers: lowers.len(),
+            appendable,
+            lowers: RwLock::new(lowers.into()),
             nodes: Mutex::default(),
             origins: Mutex::default(),
             overflow: Mutex::default(),
@@ -101,7 +124,7 @@ impl OverlayFs {
             xwhiteouts: true,
         });
         let lowers: Vec<Real> = shared
-            .lowers
+            .lowers()
             .iter()
             .enumerate()
             .map(|(i, fs)| Real {
@@ -123,6 +146,8 @@ impl OverlayFs {
                 name: Vec::new(),
                 key: None,
                 unlinked: false,
+                layers_seen: lowers_seen(&shared),
+                blocked: false,
             }),
             copy_lock: AsyncMutex::new(()),
             protattr: AtomicU32::new(0),
@@ -131,11 +156,50 @@ impl OverlayFs {
         Arc::new(Self { shared, root })
     }
 
-    fn top(&self) -> &Arc<dyn Filesystem> {
+    fn top(&self) -> Arc<dyn Filesystem> {
         self.shared
             .upper
-            .as_ref()
-            .unwrap_or_else(|| &self.shared.lowers[0])
+            .clone()
+            .unwrap_or_else(|| self.shared.lowers()[0].clone())
+    }
+}
+
+/// A weak handle to the appendable part of an overlay.
+#[derive(Clone)]
+pub struct OverlayAppender(Weak<Shared>);
+
+impl OverlayAppender {
+    /// Adds a layer below existing names and barriers (including whiteouts).
+    /// A mounted overlay's new lower must have stable names.
+    pub async fn append_lower(&self, lower: Arc<dyn Filesystem>) -> FsResult<()> {
+        let shared = self.0.upgrade().ok_or(Errno::ESTALE)?;
+        if !lower.info().stable {
+            return Err(Errno::EINVAL);
+        }
+        let root = lower.root();
+        if root.file_type() != FileType::Directory {
+            return Err(Errno::ENOTDIR);
+        }
+        if root
+            .as_any()
+            .downcast_ref::<OverlayNode>()
+            .is_some_and(|node| Arc::ptr_eq(&node.shared, &shared))
+        {
+            return Err(Errno::EINVAL);
+        }
+        let _guard = shared.write_lock.lock().await;
+        let mut lowers = shared.lowers.write().unwrap();
+        if lowers.len() == MAX_LOWERS {
+            return Err(Errno::ENOSPC);
+        }
+        *lowers = lowers.iter().cloned().chain([lower]).collect();
+        Ok(())
+    }
+
+    pub fn lower_count(&self) -> usize {
+        self.0
+            .upgrade()
+            .map_or(0, |shared| shared.lowers.read().unwrap().len())
     }
 }
 
@@ -146,7 +210,8 @@ impl Filesystem for OverlayFs {
     }
 
     fn info(&self) -> FsInfo {
-        let layers = || self.shared.upper.iter().chain(&self.shared.lowers);
+        let lowers = self.shared.lowers();
+        let layers = || self.shared.upper.iter().chain(lowers.iter());
         FsInfo {
             name: "overlay",
             magic: OVERLAYFS_SUPER_MAGIC,
@@ -181,7 +246,9 @@ impl Filesystem for OverlayFs {
 
 struct Shared {
     upper: Option<Arc<dyn Filesystem>>,
-    lowers: Vec<Arc<dyn Filesystem>>,
+    lowers: RwLock<Arc<[Arc<dyn Filesystem>]>>,
+    base_lowers: usize,
+    appendable: bool,
     /// Live overlay objects, so every name resolving to one object shares its copy-up state.
     nodes: Mutex<HashMap<Key, Weak<OverlayNode>>>,
     /// Upper inode number → overlay inode number of objects copied up from a lower layer, so
@@ -206,6 +273,10 @@ enum Key {
 }
 
 impl Shared {
+    fn lowers(&self) -> Arc<[Arc<dyn Filesystem>]> {
+        self.lowers.read().unwrap().clone()
+    }
+
     /// A unique overlay inode number for real inode `ino` of `layer`.
     fn xino(&self, layer: u8, ino: u64) -> u64 {
         if ino < 1 << LAYER_SHIFT {
@@ -226,7 +297,12 @@ impl Shared {
             if let Some(&ino) = self.origins.lock().unwrap().get(&top.node.ino()) {
                 return ino;
             }
-            if let Some(lower) = found.get(1) {
+            // A tail never changes the number of a directory already supplied by the
+            // upper. Copy-up of a tail-only directory keeps its origin through the map above.
+            if let Some(lower) = found
+                .get(1)
+                .filter(|lower| usize::from(lower.layer) <= self.base_lowers)
+            {
                 return self.xino(lower.layer, lower.node.ino());
             }
         }
@@ -241,11 +317,11 @@ impl Shared {
     /// The overlay object for `found`, reached as `name` in `parent`.
     async fn node(
         &self,
-        found: Vec<Real>,
+        found: Found,
         parent: &Arc<OverlayNode>,
         name: &[u8],
     ) -> FsResult<Arc<OverlayNode>> {
-        let top = &found[0];
+        let top = &found.reals[0];
         let key = match top.layer {
             UPPER => Key::Upper(top.node.ino()),
             _ => Key::Lower(parent.ino, name.to_vec()),
@@ -255,6 +331,7 @@ impl Shared {
         if let Some(node) = existing
             && node.real().ino() == top.node.ino()
         {
+            node.refresh().await?;
             return Ok(node);
         }
         // Lower hard links are separate overlay objects (`index=off`) that diverge on copy-up,
@@ -265,13 +342,15 @@ impl Shared {
             && top.node.getattr().await?.nlink > 1;
         let shared = parent.shared.clone();
         let file_type = top.node.file_type();
-        let mut found = found.into_iter();
+        let Found { reals, blocked } = found;
+        let mut found = reals.into_iter();
         let upper = found.next().unwrap();
         let (upper, lowers): (Option<Real>, Vec<Real>) = match upper.layer {
             UPPER => (Some(upper), found.collect()),
             _ => (None, std::iter::once(upper).chain(found).collect()),
         };
         let all: Vec<Real> = upper.iter().chain(&lowers).cloned().collect();
+        let layers_seen = lowers_seen(self);
         let node = Arc::new_cyclic(|this| OverlayNode {
             ino: match aliased {
                 true => self.fresh_ino(),
@@ -287,6 +366,8 @@ impl Shared {
                 name: name.to_vec(),
                 key: Some(key.clone()),
                 unlinked: false,
+                layers_seen,
+                blocked,
             }),
             copy_lock: AsyncMutex::new(()),
             protattr: AtomicU32::new(0),
@@ -360,8 +441,37 @@ struct State {
     parent: Option<Arc<OverlayNode>>,
     name: Vec<u8>,
     key: Option<Key>,
-    /// A lower non-directory whose name was removed: its copy-up stays unnamed.
+    /// An object whose name was removed. Copy-up stays unnamed and refresh stops.
     unlinked: bool,
+    /// Number of lower layers considered when merging this directory.
+    layers_seen: u16,
+    /// Whiteout, opaque directory, or non-directory at this name stops further merging.
+    blocked: bool,
+}
+
+fn lowers_seen(shared: &Shared) -> u16 {
+    shared.lowers.read().unwrap().len() as u16
+}
+
+#[derive(Default)]
+struct Found {
+    reals: Vec<Real>,
+    blocked: bool,
+}
+
+impl std::ops::Deref for Found {
+    type Target = [Real];
+
+    fn deref(&self) -> &Self::Target {
+        &self.reals
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum LowerName {
+    Missing,
+    Whiteout,
+    Present,
 }
 
 impl Drop for OverlayNode {
@@ -463,54 +573,146 @@ impl OverlayNode {
         attr
     }
 
-    /// Resolves `name` across the layers of this directory (`ovl_lookup`); empty if absent.
-    async fn find(&self, name: &[u8]) -> FsResult<Vec<Real>> {
-        let mut found: Vec<Real> = Vec::new();
+    /// Incorporates unseen tails, starting with the first stale ancestor. The appendable
+    /// overlay's write lock serializes refresh with directory moves and removals.
+    async fn refresh(&self) -> FsResult<()> {
+        if !self.shared.appendable || !self.is_dir() {
+            return Ok(());
+        }
+        let count = lowers_seen(&self.shared);
+        let mut chain = Vec::new();
+        let mut current = self.arc();
+        loop {
+            let parent = {
+                let state = current.state.lock().unwrap();
+                if state.layers_seen == count || state.blocked || state.unlinked {
+                    break;
+                }
+                state.parent.clone()
+            };
+            chain.push(current);
+            let Some(parent) = parent else { break };
+            current = parent;
+        }
+        for dir in chain.into_iter().rev() {
+            dir.refresh_from_parent(count).await?;
+        }
+        Ok(())
+    }
+
+    async fn refresh_from_parent(&self, count: u16) -> FsResult<()> {
+        let (seen, parent, name) = {
+            let state = self.state.lock().unwrap();
+            (state.layers_seen, state.parent.clone(), state.name.clone())
+        };
+        let mut found = Found::default();
+        match parent {
+            Some(parent) => {
+                let unseen = {
+                    let state = parent.state.lock().unwrap();
+                    let first = state
+                        .lowers
+                        .partition_point(|real| u16::from(real.layer) <= seen);
+                    state.lowers[first..].to_vec()
+                };
+                for real in unseen {
+                    if Self::find_in(real, &name, true, &mut found).await? {
+                        break;
+                    }
+                }
+            }
+            None => {
+                let lowers = self.shared.lowers();
+                found
+                    .reals
+                    .extend(
+                        lowers
+                            .iter()
+                            .enumerate()
+                            .skip(usize::from(seen))
+                            .map(|(i, fs)| Real {
+                                layer: i as u8 + 1,
+                                node: fs.root(),
+                                xwhiteouts: true,
+                            }),
+                    );
+            }
+        }
+        let mut state = self.state.lock().unwrap();
+        state.lowers.extend(found.reals);
+        state.layers_seen = count;
+        state.blocked = found.blocked;
+        Ok(())
+    }
+
+    /// Resolves `name` across the layers of this directory (`ovl_lookup`).
+    async fn find(&self, name: &[u8]) -> FsResult<Found> {
+        self.refresh().await?;
+        let mut found = Found::default();
         for dir in self.layers() {
-            let child = match pinned_entry(&dir.node, name).await {
-                Ok(child) => child,
-                Err(Errno::ENOENT | Errno::ENAMETOOLONG) => continue,
-                Err(err) => return Err(err),
-            };
-            if is_whiteout(&child, dir.xwhiteouts).await? {
-                break;
-            }
-            let is_dir = child.file_type() == FileType::Directory;
-            if !found.is_empty() && !is_dir {
-                break;
-            }
-            let (opaque, xwhiteouts) = match is_dir {
-                true => dir_flags(&child).await?,
-                false => (false, false),
-            };
-            found.push(Real {
-                layer: dir.layer,
-                node: child,
-                xwhiteouts,
-            });
-            if !is_dir || opaque {
+            let merging = !found.is_empty();
+            if Self::find_in(dir, name, merging, &mut found).await? {
                 break;
             }
         }
         Ok(found)
     }
 
-    /// Whether a lower layer of this directory has `name`, so removing it needs a whiteout.
-    async fn lower_positive(&self, name: &[u8]) -> FsResult<bool> {
+    /// Looks up a name in one layer; returns whether it bars any subsequent layers.
+    async fn find_in(dir: Real, name: &[u8], merging: bool, found: &mut Found) -> FsResult<bool> {
+        let child = match pinned_entry(&dir.node, name).await {
+            Ok(child) => child,
+            Err(Errno::ENOENT | Errno::ENAMETOOLONG) => return Ok(false),
+            Err(err) => return Err(err),
+        };
+        let is_dir = child.file_type() == FileType::Directory;
+        if is_whiteout(&child, dir.xwhiteouts).await? || (merging && !is_dir) {
+            found.blocked = true;
+            return Ok(true);
+        }
+        let (opaque, xwhiteouts) = if is_dir {
+            dir_flags(&child).await?
+        } else {
+            (false, false)
+        };
+        found.reals.push(Real {
+            layer: dir.layer,
+            node: child,
+            xwhiteouts,
+        });
+        found.blocked = !is_dir || opaque;
+        Ok(found.blocked)
+    }
+
+    /// How existing lower layers resolve `name`, including barriers at that name.
+    async fn lower_name(&self, name: &[u8]) -> FsResult<LowerName> {
         let lowers = self.state.lock().unwrap().lowers.clone();
         for dir in lowers {
             match pinned_entry(&dir.node, name).await {
-                Ok(child) => return Ok(!is_whiteout(&child, dir.xwhiteouts).await?),
+                Ok(child) => {
+                    return Ok(if is_whiteout(&child, dir.xwhiteouts).await? {
+                        LowerName::Whiteout
+                    } else {
+                        LowerName::Present
+                    });
+                }
                 Err(Errno::ENOENT | Errno::ENAMETOOLONG) => {}
                 Err(err) => return Err(err),
             }
         }
-        Ok(false)
+        Ok(LowerName::Missing)
+    }
+
+    /// Removing a name needs a whiteout when it would expose an existing lower entry.
+    /// An upper-only deletion leaves the name available to later appends.
+    async fn needs_whiteout(&self, name: &[u8]) -> FsResult<bool> {
+        Ok(self.lower_name(name).await? == LowerName::Present)
     }
 
     /// The merged listing (`ovl_dir_read_merged`): upper entries shadow lower ones, whiteouts
     /// hide names below them.
     async fn merged_entries(&self) -> FsResult<Vec<Entry>> {
+        self.refresh().await?;
         let layers = self.layers();
         let mut seen = HashSet::new();
         let mut out = Vec::new();
@@ -864,10 +1066,15 @@ impl OverlayNode {
         self.arc().copy_up().await
     }
 
-    fn moved(&self, parent: &Arc<OverlayNode>, name: &[u8]) {
+    fn moved(&self, parent: &Arc<OverlayNode>, name: &[u8], blocked: bool) {
         let mut state = self.state.lock().unwrap();
         state.parent = Some(parent.clone());
         state.name = name.to_vec();
+        state.blocked = blocked;
+    }
+
+    fn removed_directory(&self) {
+        self.state.lock().unwrap().unlinked = true;
     }
 
     /// Adds `name` in the upper directory, over a whiteout if there is one, and opens it with
@@ -880,7 +1087,8 @@ impl OverlayNode {
     ) -> FsResult<(Arc<OverlayNode>, Option<Box<dyn Handle>>)> {
         self.check_dir()?;
         let _guard = self.shared.write_lock.lock().await;
-        if !self.find(name).await?.is_empty() {
+        let previous = self.find(name).await?;
+        if !previous.is_empty() {
             return Err(Errno::EEXIST);
         }
         let upper = self.arc().copy_up().await?;
@@ -914,11 +1122,14 @@ impl OverlayNode {
                 return Err(err);
             }
         };
-        let found = vec![Real {
-            layer: UPPER,
-            node: child,
-            xwhiteouts: false,
-        }];
+        let found = Found {
+            reals: vec![Real {
+                layer: UPPER,
+                node: child,
+                xwhiteouts: false,
+            }],
+            blocked: previous.blocked || over_whiteout,
+        };
         let node = self.shared.node(found, &self.arc(), name).await?;
         Ok((node, handle))
     }
@@ -940,6 +1151,10 @@ impl Node for OverlayNode {
 
     async fn getattr(&self) -> FsResult<Attr> {
         self.load_protattr().await?;
+        if self.shared.appendable && self.is_dir() {
+            let _guard = self.shared.write_lock.lock().await;
+            self.refresh().await?;
+        }
         let attr = self.real().getattr().await?;
         Ok(self.fix_attr(attr))
     }
@@ -952,6 +1167,11 @@ impl Node for OverlayNode {
 
     async fn lookup(&self, name: &[u8]) -> FsResult<Arc<dyn Node>> {
         self.check_dir()?;
+        let _guard = if self.shared.appendable {
+            Some(self.shared.write_lock.lock().await)
+        } else {
+            None
+        };
         let found = self.find(name).await?;
         if found.is_empty() {
             return Err(Errno::ENOENT);
@@ -987,11 +1207,14 @@ impl Node for OverlayNode {
         let _guard = self.shared.write_lock.lock().await;
         let upper = self.arc().copy_up().await?;
         let (child, handle) = upper.create_unnamed(new, options).await?;
-        let found = vec![Real {
-            layer: UPPER,
-            node: child,
-            xwhiteouts: false,
-        }];
+        let found = Found {
+            reals: vec![Real {
+                layer: UPPER,
+                node: child,
+                xwhiteouts: false,
+            }],
+            blocked: true,
+        };
         let node = self.shared.node(found, &self.arc(), b"").await?;
         Ok((node.clone(), FileHandle::upper(node, options, handle)))
     }
@@ -1023,7 +1246,7 @@ impl Node for OverlayNode {
         if top.node.file_type() == FileType::Directory {
             return Err(Errno::EISDIR);
         }
-        let positive = self.lower_positive(name).await?;
+        let positive = self.needs_whiteout(name).await?;
         let upper = self.arc().copy_up().await?;
         match (top.layer == UPPER, positive) {
             (true, true) => {
@@ -1055,13 +1278,15 @@ impl Node for OverlayNode {
         if !child.merged_entries().await?.is_empty() {
             return Err(Errno::ENOTEMPTY);
         }
-        let positive = self.lower_positive(name).await?;
+        let positive = self.needs_whiteout(name).await?;
         let upper = self.arc().copy_up().await?;
         if !in_upper {
-            return match positive {
-                true => self.make_whiteout(&upper, name).await,
-                false => Ok(()),
-            };
+            if positive {
+                self.make_whiteout(&upper, name).await?;
+            }
+            child.removed_directory();
+            self.shared.lower_unlinked(self, name);
+            return Ok(());
         }
         // The whiteout, which can fail to be made, exists before anything is removed.
         let temp = match positive {
@@ -1078,6 +1303,7 @@ impl Node for OverlayNode {
             }
             return Err(err);
         }
+        child.removed_directory();
         let child_upper = child.upper_node().expect("in the upper layer");
         self.shared.forget_if_gone(&child_upper).await;
         if let Some(temp) = temp {
@@ -1133,8 +1359,10 @@ impl Node for OverlayNode {
             }
         }
         // Resolve lower presence before copy-up or whiteout cleanup can change upper.
-        let source_positive = old_parent.lower_positive(name).await?;
-        let target_positive = new_parent.lower_positive(new_name).await?;
+        let source_lower = old_parent.lower_name(name).await?;
+        let target_lower = new_parent.lower_name(new_name).await?;
+        let source_positive = source_lower == LowerName::Present;
+        let target_positive = target_lower == LowerName::Present;
         let source_upper = source.copy_up().await?;
         let old_upper = old_parent.copy_up().await?;
         let new_upper = new_parent.copy_up().await?;
@@ -1142,6 +1370,18 @@ impl Node for OverlayNode {
             (Some(target), RenameMode::Exchange) => Some(target.copy_up().await?),
             (Some(target), _) => target.upper_node(),
             (None, _) => None,
+        };
+        let source_opaque =
+            self.shared.appendable && source.is_dir() && dir_flags(&source_upper).await?.0;
+        let other_opaque = if self.shared.appendable
+            && mode == RenameMode::Exchange
+            && target.as_ref().is_some_and(|node| node.is_dir())
+        {
+            dir_flags(target_upper.as_ref().expect("copied up"))
+                .await?
+                .0
+        } else {
+            false
         };
         match &target {
             None => {
@@ -1172,11 +1412,20 @@ impl Node for OverlayNode {
 
         if mode == RenameMode::Exchange {
             let target = target.as_ref().expect("checked above");
-            target.moved(&old_parent, name);
+            target.moved(
+                &old_parent,
+                name,
+                other_opaque || source_lower != LowerName::Missing,
+            );
             if target.is_dir() && source_positive {
                 set_overlay_xattr(target_upper.as_ref().expect("copied up"), OPAQUE, b"y").await?;
             }
         } else {
+            if let Some(target) = &target
+                && target.is_dir()
+            {
+                target.removed_directory();
+            }
             if let Some(replaced) = &target_upper {
                 self.shared.forget_if_gone(replaced).await;
             }
@@ -1184,7 +1433,11 @@ impl Node for OverlayNode {
                 old_parent.install_whiteout(&old_upper, &temp, name).await?;
             }
         }
-        source.moved(&new_parent, new_name);
+        source.moved(
+            &new_parent,
+            new_name,
+            source_opaque || target_lower != LowerName::Missing,
+        );
         if source.is_dir() && target_positive {
             set_overlay_xattr(&source_upper, OPAQUE, b"y").await?;
         }
@@ -1574,6 +1827,11 @@ impl Handle for DirHandle {
         let entries = match cached {
             Some(entries) if cookie != 0 => entries,
             _ => {
+                let _guard = if self.node.shared.appendable {
+                    Some(self.node.shared.write_lock.lock().await)
+                } else {
+                    None
+                };
                 let entries = Arc::new(self.node.merged_entries().await?);
                 *self.snapshot.lock().unwrap() = Some(entries.clone());
                 entries
