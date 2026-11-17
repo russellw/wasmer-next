@@ -1,4 +1,10 @@
 //! Per-image EH/PIC loader. Shared state contains plans/source, never store-local functions.
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+mod cache;
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+pub use cache::{DylinkCache, DylinkCacheConfig, DylinkCacheStats};
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+pub use policy::compose_with_cache;
 mod closures;
 mod forward;
 mod graph;
@@ -98,6 +104,57 @@ impl Drop for Servicing<'_> {
 
 /// Register before Wasixv2. Only explicitly source-prepared EH/PIC images opt in.
 pub struct Native;
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+impl Native {
+    /// Register the native dynamic ABI with an embedder-owned cache.
+    pub fn with_cache<S: Syscalls + Control + Send + Sync + 'static>(
+        cache: Arc<DylinkCache>,
+    ) -> impl Abi<S> {
+        CachedNative(cache)
+    }
+}
+
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+struct CachedNative(Arc<DylinkCache>);
+
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+impl<S: Syscalls + Control + Send + Sync + 'static> Abi<S> for CachedNative {
+    fn name(&self) -> &'static str {
+        <Native as Abi<S>>::name(&Native)
+    }
+    fn matches(&self, module: &Module) -> bool {
+        <Native as Abi<S>>::matches(&Native, module)
+    }
+    fn matches_image(&self, image: &[u8]) -> bool {
+        <Native as Abi<S>>::matches_image(&Native, image)
+    }
+    fn for_image(&self, module: &Module) -> Option<Arc<dyn Abi<S>>> {
+        compose_with_cache(
+            module,
+            Arc::new(Wasixv2),
+            Arc::new(policy::NativePolicy),
+            self.0.clone(),
+        )
+    }
+    fn imports(
+        &self,
+        store: &mut StoreMut<'_>,
+        env: &FunctionEnv<ExecEnv<S>>,
+        module: &Module,
+    ) -> Imports {
+        Native.imports(store, env, module)
+    }
+    fn bind(
+        &self,
+        instance: &Instance,
+        store: &mut StoreMut<'_>,
+        task: TaskId,
+        role: Role,
+    ) -> std::result::Result<Arc<dyn AbiInstance<S>>, ExecError> {
+        Native.bind(instance, store, task, role)
+    }
+}
+
 impl<S: Syscalls + Control + Send + Sync + 'static> Abi<S> for Native {
     fn name(&self) -> &'static str {
         "wasixv2-dylink"
@@ -164,6 +221,8 @@ pub(crate) fn verify_compiled_source(module: &Module) -> Result<Vec<u8>> {
 type ArtifactKey = (wasmer_types::ModuleHash, Vec<(u32, u32)>, String, String);
 struct Root {
     policy: Arc<dyn LoadPolicy>,
+    #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+    cache: Option<Arc<DylinkCache>>,
     declarations: OnceLock<Option<wasixv2_exec::ImportDeclarations>>,
     owner: Arc<()>,
     artifacts: Mutex<BTreeMap<ArtifactKey, Arc<crate::artifact::PreparedArtifact>>>,
@@ -208,11 +267,21 @@ impl Work {
 impl Root {
     #[cfg(test)]
     fn new(source: Vec<u8>) -> Arc<Self> {
-        Self::with_policy(source, Arc::new(policy::NativePolicy))
+        let policy = Arc::new(policy::NativePolicy);
+        Self::from_main(
+            Library::with_policy(source, None, policy.as_ref()),
+            policy,
+            #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+            None,
+        )
     }
-    fn with_policy(source: Vec<u8>, policy: Arc<dyn LoadPolicy>) -> Arc<Self> {
+    fn from_main(
+        main: Result<Library>,
+        policy: Arc<dyn LoadPolicy>,
+        #[cfg(all(feature = "sys", not(target_arch = "wasm32")))] cache: Option<Arc<DylinkCache>>,
+    ) -> Arc<Self> {
         let parsed = (|| -> Result<(Graph, u32)> {
-            let mut main = Library::with_policy(source, None, policy.as_ref())?;
+            let mut main = main?;
             let stack = main
                 .metadata
                 .exports()
@@ -261,6 +330,8 @@ impl Root {
         };
         Arc::new(Self {
             policy,
+            #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+            cache,
             declarations: OnceLock::new(),
             owner: Arc::new(()),
             artifacts: Mutex::default(),
@@ -302,18 +373,71 @@ impl Root {
             );
             let artifact = match artifacts.entry(key) {
                 std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
-                std::collections::btree_map::Entry::Vacant(entry) => entry.insert(Arc::new(
-                    crate::artifact::PreparedArtifact::compile_main_tls(
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+                    let shared = self.cache.as_deref().filter(|_| engine.is_sys());
+                    let artifact = self.prepare_side_code(
                         engine,
-                        library.initialization.clone(),
+                        library,
                         &main_tls,
-                    )?,
-                )),
+                        #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+                        shared,
+                    )?;
+                    entry.insert(artifact)
+                }
             };
             library.prepared = Some(artifact.clone());
         }
         Ok(())
     }
+    fn prepare_side_code(
+        &self,
+        engine: &wasmer::Engine,
+        library: &Library,
+        main_tls: &BTreeMap<u32, u32>,
+        #[cfg(all(feature = "sys", not(target_arch = "wasm32")))] cache: Option<&DylinkCache>,
+    ) -> Result<Arc<crate::artifact::PreparedArtifact>> {
+        use crate::artifact::PreparedArtifact;
+
+        #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+        if let Some(cache) = cache {
+            return cache.prepare_code(engine, library, main_tls);
+        }
+        Ok(Arc::new(PreparedArtifact::compile_main_tls(
+            engine,
+            library.initialization.clone(),
+            main_tls,
+        )?))
+    }
+
+    fn open_library(
+        &self,
+        image: wasixv2_syscalls::LibraryImage,
+        path: Vec<u8>,
+        request: &[u8],
+        _engine: wasmer::EngineId,
+    ) -> Result<Library> {
+        #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+        let prepared = self
+            .cache
+            .as_deref()
+            .map(|cache| cache.prepare_library(&image.image, _engine, self.policy.as_ref()))
+            .transpose()?;
+        #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+        let mut library = match prepared {
+            Some(library) => library,
+            None => Library::with_policy(image.image.bytes().to_vec(), None, self.policy.as_ref())?,
+        };
+        #[cfg(not(all(feature = "sys", not(target_arch = "wasm32"))))]
+        let mut library =
+            Library::with_policy(image.image.bytes().to_vec(), None, self.policy.as_ref())?;
+        library.identity = Some(image.identity);
+        library.backing = Some(image.image);
+        library.path = path;
+        library.request = request.to_vec();
+        Ok(library)
+    }
+
     fn attach_cleanup(&self, scope: &Arc<wasixv2_host::LoaderCleanup>) {
         let mut scopes = lock(&self.cleanup);
         scopes.retain(|scope| scope.strong_count() != 0);

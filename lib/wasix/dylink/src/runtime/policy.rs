@@ -120,8 +120,48 @@ pub fn compose<S: Syscalls + Control + Send + Sync + 'static>(
     base: Arc<dyn Abi<S>>,
     policy: Arc<dyn LoadPolicy>,
 ) -> Option<Arc<dyn Abi<S>>> {
+    compose_root(
+        module,
+        base,
+        policy,
+        #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+        None,
+    )
+}
+
+/// Compose the ABI with a shared cache for native modules.
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+pub fn compose_with_cache<S: Syscalls + Control + Send + Sync + 'static>(
+    module: &Module,
+    base: Arc<dyn Abi<S>>,
+    policy: Arc<dyn LoadPolicy>,
+    cache: Arc<DylinkCache>,
+) -> Option<Arc<dyn Abi<S>>> {
+    compose_root(module, base, policy, Some(cache))
+}
+
+fn compose_root<S: Syscalls + Control + Send + Sync + 'static>(
+    module: &Module,
+    base: Arc<dyn Abi<S>>,
+    policy: Arc<dyn LoadPolicy>,
+    #[cfg(all(feature = "sys", not(target_arch = "wasm32")))] cache: Option<Arc<DylinkCache>>,
+) -> Option<Arc<dyn Abi<S>>> {
+    #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+    if let Some(cache) = cache.filter(|cache| cache.enabled())
+        && let Some(compiled) = module.sys_artifact()
+    {
+        let main = cache.verified_main(compiled, module, policy.as_ref())?;
+        let root = Root::from_main(main, policy, Some(cache));
+        return Some(Arc::new(Image { root, base }));
+    }
     let source = module.custom_sections(SOURCE_SECTION).next()?.to_vec();
-    let root = Root::with_policy(source, policy);
+    let main = Library::with_policy(source, None, policy.as_ref());
+    let root = Root::from_main(
+        main,
+        policy,
+        #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+        None,
+    );
     if let Err(error) = verify_compiled_source(module) {
         let _ = root.error.set(error.to_string());
     }

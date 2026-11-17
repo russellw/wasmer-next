@@ -12,6 +12,8 @@ mod artifact;
 mod image;
 #[cfg(any(feature = "sys", feature = "js"))]
 mod runtime;
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+pub use runtime::{DylinkCache, DylinkCacheConfig, DylinkCacheStats, compose_with_cache};
 #[cfg(any(feature = "sys", feature = "js"))]
 pub use runtime::{LoadPolicy, Native, compose};
 #[cfg(any(feature = "sys", feature = "js"))]

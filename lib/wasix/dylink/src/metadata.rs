@@ -42,6 +42,8 @@ pub struct Export {
 #[derive(Clone, Debug)]
 pub struct Module {
     pub(crate) memory: wasmparser::MemInfo,
+    #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+    pub(crate) memory_types: Vec<MemoryType>,
     pub(crate) needed: Vec<String>,
     runtime_path: Vec<String>,
     pub(crate) imports: Vec<Import>,
@@ -250,6 +252,8 @@ impl Module {
         }
         Ok(Self {
             memory,
+            #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+            memory_types: memories,
             needed,
             runtime_path,
             imports,
@@ -259,6 +263,56 @@ impl Module {
             omitted_weak_imports: import_flags,
             start,
         })
+    }
+
+    #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+    pub(crate) fn retained_bytes(&self) -> usize {
+        let signature = |ty: &FuncType| {
+            std::mem::size_of_val(ty.params()) + std::mem::size_of_val(ty.results())
+        };
+        let external = |ty: &ExternType| match ty {
+            ExternType::Function(ty) | ExternType::Tag(ty) => signature(ty),
+            _ => 0,
+        };
+        let strings = |strings: &Vec<String>| {
+            strings.capacity() * size_of::<String>()
+                + strings.iter().map(String::capacity).sum::<usize>()
+        };
+        size_of::<Self>()
+            + self.memory_types.capacity() * size_of::<MemoryType>()
+            + strings(&self.needed)
+            + strings(&self.runtime_path)
+            + self.imports.capacity() * size_of::<Import>()
+            + self
+                .imports
+                .iter()
+                .map(|item| item.name.capacity() + item.module.capacity() + external(&item.ty))
+                .sum::<usize>()
+            + self.functions.capacity() * size_of::<FuncType>()
+            + self.functions.iter().map(signature).sum::<usize>()
+            + self
+                .exports
+                .iter()
+                .map(|(key, item)| {
+                    // Charge a B-tree node per entry as a conservative allocation bound.
+                    12 * size_of::<(String, Export, usize)>() + key.capacity() + external(&item.ty)
+                })
+                .sum::<usize>()
+            + self.unknown.capacity() * size_of::<(u8, Vec<u8>)>()
+            + self
+                .unknown
+                .iter()
+                .map(|(_, bytes)| bytes.capacity())
+                .sum::<usize>()
+            + self
+                .omitted_weak_imports
+                .keys()
+                .map(|(module, name)| {
+                    12 * size_of::<(String, String, SymbolFlags, usize)>()
+                        + module.capacity()
+                        + name.capacity()
+                })
+                .sum::<usize>()
     }
 
     pub fn omitted_weak_imports(&self) -> &BTreeMap<(String, String), SymbolFlags> {

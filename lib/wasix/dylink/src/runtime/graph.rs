@@ -17,7 +17,7 @@ pub(super) struct LazyFunction {
 #[derive(Clone)]
 pub(super) struct Library {
     pub source: Arc<Vec<u8>>,
-    pub metadata: Module,
+    pub metadata: Arc<Module>,
     pub initialization: Arc<Initialization>,
     pub code_hash: wasmer_types::ModuleHash,
     pub prepared: Option<Arc<crate::artifact::PreparedArtifact>>,
@@ -35,16 +35,32 @@ pub(super) struct Library {
     pub tls_align: u32,
 }
 impl Library {
+    #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+    pub fn retained_bytes(&self) -> usize {
+        size_of::<Self>()
+            + self.source.capacity()
+            + self.metadata.retained_bytes()
+            + self.initialization.retained_bytes()
+    }
+
     pub fn with_policy(
         source: Vec<u8>,
         identity: Option<(u64, u64)>,
         policy: &dyn super::LoadPolicy,
     ) -> Result<Self> {
+        Self::with_visibility(source, identity, policy.honor_export_visibility())
+    }
+
+    pub fn with_visibility(
+        source: Vec<u8>,
+        identity: Option<(u64, u64)>,
+        honor_visibility: bool,
+    ) -> Result<Self> {
         let mut library = Self::new(source, identity)?;
-        if !policy.honor_export_visibility() {
+        if !honor_visibility {
             // v1's InstanceGroupState::resolve_exported_symbol searched actual
             // Wasm exports regardless of these flags. Retain TLS/absolute metadata.
-            for export in library.metadata.exports.values_mut() {
+            for export in Arc::make_mut(&mut library.metadata).exports.values_mut() {
                 export
                     .flags
                     .remove(SymbolFlags::VISIBILITY_HIDDEN | SymbolFlags::BINDING_LOCAL);
@@ -83,7 +99,7 @@ impl Library {
         }
         Ok(Self {
             source: Arc::new(source),
-            metadata,
+            metadata: Arc::new(metadata),
             initialization,
             code_hash,
             prepared: None,
@@ -174,7 +190,7 @@ impl Graph {
             &self
                 .libraries
                 .iter()
-                .map(|lib| lib.metadata.clone())
+                .map(|lib| (*lib.metadata).clone())
                 .collect::<Vec<_>>(),
             &self
                 .libraries
@@ -263,7 +279,7 @@ impl Graph {
         let modules = self
             .libraries
             .iter()
-            .map(|lib| lib.metadata.clone())
+            .map(|lib| (*lib.metadata).clone())
             .collect::<Vec<_>>();
         let dependencies = self
             .libraries
@@ -1068,7 +1084,8 @@ mod tests {
         let slot = graph.libraries[2].slots[&0];
         assert_eq!(graph.function_definition(1, 0).unwrap(), (2, 0));
         assert_eq!(graph.symbol(1, "f", &[0; 3]).unwrap(), slot);
-        graph.libraries[2].metadata.functions[0] = wasmparser::FuncType::new([], []);
+        Arc::make_mut(&mut graph.libraries[2].metadata).functions[0] =
+            wasmparser::FuncType::new([], []);
         assert!(
             graph
                 .function_definition(1, 0)

@@ -63,6 +63,8 @@ use std::{
 pub use shared_buffer::OwnedBuffer;
 #[cfg(any(feature = "sys", feature = "js"))]
 pub use wasixv2_dylink::{Compile, load};
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+pub use wasixv2_dylink::{DylinkCache, DylinkCacheConfig, DylinkCacheStats};
 use wasixv2_exec::{Abis, Wasixv2};
 #[cfg(not(any(feature = "sys", feature = "js")))]
 pub use wasixv2_exec::{Compile, load};
@@ -308,6 +310,8 @@ pub struct MachineBuilder {
     max_guest_tasks: Option<usize>,
     /// The embedder's loader; the ABIs' own default otherwise.
     loader: Option<Arc<dyn Loader>>,
+    #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+    dylink_cache: Option<Arc<DylinkCache>>,
     instantiation_hooks: Vec<Arc<dyn InstantiationHook<Stack>>>,
     #[cfg(feature = "resolved-packages")]
     runtime_package_config: RuntimePackageConfig,
@@ -361,6 +365,8 @@ impl MachineBuilder {
             init: true,
             max_guest_tasks: None,
             loader: None,
+            #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+            dylink_cache: None,
             instantiation_hooks: Vec::new(),
             #[cfg(feature = "resolved-packages")]
             runtime_package_config: RuntimePackageConfig::default(),
@@ -538,6 +544,14 @@ impl MachineBuilder {
         self
     }
 
+    /// Reuses native dynamic-module preparation across machines sharing this cache.
+    /// This also applies when the machine uses a custom [`Loader`] for its main module.
+    #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+    pub fn dylink_cache(mut self, cache: Arc<DylinkCache>) -> Self {
+        self.dylink_cache = Some(cache);
+        self
+    }
+
     /// Gives the machine the host's terminal as its console, a terminal device (`/dev/hvc0`)
     /// whose line discipline is the kernel's: `console` is the host's side of it, in raw mode.
     /// Each program the machine starts has the descriptors `fds` names of 0, 1 and 2 open on
@@ -605,6 +619,8 @@ impl MachineBuilder {
             init,
             max_guest_tasks,
             loader,
+            #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+            dylink_cache,
             instantiation_hooks,
             #[cfg(feature = "resolved-packages")]
             runtime_package_config,
@@ -660,9 +676,17 @@ impl MachineBuilder {
             )?,
         };
         #[cfg(feature = "wasix1")]
-        let wasix1 = Wasix1Commands::new(http_provider, wasix1_limits, wasix1_initial_command);
+        let wasix1 = Wasix1Commands::new(
+            http_provider,
+            wasix1_limits,
+            wasix1_initial_command,
+            #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+            dylink_cache.clone(),
+        );
         let mut configured_abis = abis(
             loader,
+            #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+            dylink_cache,
             #[cfg(feature = "js")]
             js_async_mode,
             #[cfg(feature = "wasix1")]
@@ -1666,11 +1690,18 @@ impl Wasix1Commands {
         http_provider: Option<Arc<dyn wasix1_http::HttpProvider>>,
         limits: wasixv2_wasix1::Limits,
         initial_command_entry: bool,
+        #[cfg(all(feature = "sys", not(target_arch = "wasm32")))] dylink_cache: Option<
+            Arc<DylinkCache>,
+        >,
     ) -> Self {
         let files = Arc::default();
         let mut abi = wasixv2_wasix1::Wasix1::with_commands(Arc::clone(&files)).with_limits(limits);
         if initial_command_entry {
             abi = abi.with_initial_command_entry();
+        }
+        #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+        if let Some(cache) = dylink_cache {
+            abi = abi.with_dylink_cache(cache);
         }
         if let Some(provider) = http_provider {
             abi = abi.with_http_provider(provider);
@@ -1687,6 +1718,9 @@ impl Wasix1Commands {
 /// `loader`, or [`Compile`].
 fn abis(
     loader: Option<Arc<dyn Loader>>,
+    #[cfg(all(feature = "sys", not(target_arch = "wasm32")))] dylink_cache: Option<
+        Arc<DylinkCache>,
+    >,
     #[cfg(feature = "js")] js_async_mode: wasmer::js::AsyncMode,
     #[cfg(feature = "wasix1")] wasix1: &Wasix1Commands,
 ) -> Abis<Stack> {
@@ -1701,6 +1735,13 @@ fn abis(
         if loader.is_none() {
             abis.set_loader(Arc::new(Compile));
         }
+        #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+        if let Some(cache) = dylink_cache {
+            abis.push(Arc::new(wasixv2_dylink::Native::with_cache::<Stack>(cache)));
+        } else {
+            abis.push(Arc::new(wasixv2_dylink::Native));
+        }
+        #[cfg(not(all(feature = "sys", not(target_arch = "wasm32"))))]
         abis.push(Arc::new(wasixv2_dylink::Native));
     }
     abis.push(Arc::new(Wasixv2));
@@ -2886,6 +2927,78 @@ mod tests {
                 &error.downcast_ref::<OriginalError>().unwrap().0,
                 &probe.error
             ));
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        #[tokio::test]
+        async fn dylink_cache_reuses_preparation_across_machines_and_isolates_engines() {
+            let engine = Engine::default();
+            let other_engine = wasmer::sys::EngineBuilder::new(wasmer::sys::Cranelift::default())
+                .set_features(Some(wasmer::sys::Features::all()))
+                .engine()
+                .into();
+            let main = pic(
+                r#"(module
+                    (import "env" "memory" (memory 1 65536 shared))
+                    (import "env" "__indirect_function_table" (table 3 funcref))
+                    (import "env" "side_value" (func $side (result i32)))
+                    (import "wasixv2" "exit_group" (func $exit (param i32)))
+                    (global (export "__stack_pointer") (mut i32) (i32.const 131072))
+                    (export "__indirect_function_table" (table 0))
+                    (func (export "_start") call $side call $exit))"#,
+                &["side.so"],
+            );
+            let one = load(&engine, &main).unwrap();
+            let two = load(&other_engine, &main).unwrap();
+            let side = pic(
+                r#"(module
+                    (import "env" "memory" (memory 1 65536 shared))
+                    (func (export "side_value") (result i32) i32.const 17))"#,
+                &[],
+            );
+            let layer = Layer(Arc::new(
+                PackageFs::from_files([("side.so".into(), OwnedBuffer::from_bytes(side))], 0, 0)
+                    .unwrap(),
+            ));
+            let shared = Arc::new(DylinkCache::new(DylinkCacheConfig {
+                max_bytes: 8 * 1024 * 1024,
+                ..DylinkCacheConfig::default()
+            }));
+            let disabled = Arc::new(DylinkCache::new(DylinkCacheConfig::default()));
+            let run = async |cache: Option<Arc<DylinkCache>>, engine: &Engine, module: &Module| {
+                let mut builder = Machine::builder();
+                if let Some(cache) = cache {
+                    builder = builder.dylink_cache(cache);
+                }
+                let machine = builder.build();
+                machine.mount_layer("/lib", &layer, false).await.unwrap();
+                let status = machine
+                    .run_module(
+                        engine,
+                        module,
+                        ProcessConfig {
+                            args: Vec::new(),
+                            env: Vec::new(),
+                            stdio: Stdio::from_fns(|_| {}, |_| {}),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                machine.shutdown().await;
+                assert_eq!(status, 17);
+            };
+            run(None, &engine, &one).await;
+            run(Some(disabled.clone()), &engine, &one).await;
+            assert_eq!(disabled.stats(), DylinkCacheStats::default());
+            run(Some(shared.clone()), &engine, &one).await;
+            let cold = shared.stats();
+            assert_eq!((cold.hits, cold.misses, cold.entries), (0, 3, 3));
+            run(Some(shared.clone()), &engine, &one).await;
+            let warm = shared.stats();
+            assert_eq!((warm.hits, warm.misses), (3, 3));
+            run(Some(shared.clone()), &other_engine, &two).await;
+            let different = shared.stats();
+            assert_eq!((different.hits, different.misses), (3, 6));
         }
 
         #[tokio::test]

@@ -84,6 +84,38 @@ impl Initialization {
         &self.original
     }
 
+    #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+    pub(crate) fn retained_bytes(&self) -> usize {
+        let program = |program: &Program| program.ops.capacity() * size_of::<Op>();
+        size_of::<Self>()
+            + (self.first.capacity() + self.peer.capacity()) * size_of::<Program>()
+            + self
+                .first
+                .iter()
+                .chain(&self.peer)
+                .chain(&self.tls)
+                .chain(&self.tls_reloc)
+                .map(program)
+                .sum::<usize>()
+            + self.segments.capacity() * size_of::<Vec<u8>>()
+            + self.segments.iter().map(Vec::capacity).sum::<usize>()
+            + self.original.capacity()
+            + self.dropped.len() * 12 * size_of::<(u32, usize)>()
+            + self.aliases.capacity() * size_of::<(String, wasmparser::ExternalKind, u32)>()
+            + self
+                .aliases
+                .iter()
+                .map(|(name, _, _)| name.capacity())
+                .sum::<usize>()
+            + self.active_data.capacity() * size_of::<(Address, u32)>()
+            + self.active_elements.capacity() * size_of::<(Address, Vec<Option<u32>>)>()
+            + self
+                .active_elements
+                .iter()
+                .map(|(_, indices)| indices.capacity() * size_of::<Option<u32>>())
+                .sum::<usize>()
+    }
+
     /// Extracts start, data relocations and optional TLS initialization. Only a finite
     /// straight-line helper graph and the exact lld shared-PIC once template are accepted.
     /// Helpers may not call imports or constructors, branch/loop, read memory, grow tables

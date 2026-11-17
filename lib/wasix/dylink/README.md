@@ -70,6 +70,29 @@ imports, tables, globals and TLS; required effect/range/identity checks remain.
 The image releases cache ownership at logical retirement, while live engine
 instances retain their normal code ownership.
 
+Native embedders can opt into reuse across loader roots by passing the same
+`Arc<DylinkCache>` to `wasixv2::MachineBuilder::dylink_cache`. The default
+disables cross-root reuse, as does a zero byte budget. This works with custom
+loaders that reuse the same compiled main artifact. Verification is keyed by
+that artifact's identity. Side-file parsing uses live shared image identities
+or a SHA-256 content key for copied files. Side code adds the concrete
+engine identity, memory styles and verified main TLS offsets to its source key. The
+side instrumenter uses one fixed preemption profile.
+
+The byte and optional entry limits evict least-recently-used entries. An
+optional time-to-idle evicts entries on a host thread even without further
+access. Identical preparations in flight share their result. `stats()`
+reports cumulative hits (including joined preparations), misses and evictions,
+plus the current charged bytes and entry count.
+
+The cache holds only weak references to package byte owners. It charges its
+own parsed source and plan allocations and the engine's measured compiled
+artifact heap. Native archives also charge their backing bytes. The cache
+does not own a Store or Engine. Active roots may continue using artifacts
+after eviction, and the engine's executable mappings retain their existing
+engine-managed lifetime. Dependency lookup, memory reservations, stack/TLS,
+table placement and relocation still run for each root.
+
 The browser JS profile uses the same EH/PIC NOW and direct-function LAZY loader.
 Existing B2 envelopes transport compiled Modules into future/idle realms; a cold realm
 uses Wasmer's existing retained-source compile-once/cache fallback. No compilation

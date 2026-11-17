@@ -192,12 +192,13 @@ impl<S: Syscalls + Control + Send + Sync + 'static> Image<S> {
         if let Some(error) = self.root.error.get() {
             return Err(load_error(error));
         }
-        let (syscalls, task, cleanup) = cx
-            .with_store(|data, _| {
+        let (syscalls, task, cleanup, engine) = cx
+            .with_store(|data, store| {
                 (
                     data.syscalls().clone(),
                     data.task(),
                     data.loader_cleanup().cloned(),
+                    store.engine().id(),
                 )
             })
             .await;
@@ -290,7 +291,11 @@ impl<S: Syscalls + Control + Send + Sync + 'static> Image<S> {
                 &*syscalls,
                 &caller,
                 &graph,
-                &StartupPolicy::for_loader(&current, self.root.policy.clone()),
+                (
+                    &StartupPolicy::for_loader(&current, self.root.policy.clone()),
+                    &self.root,
+                    engine,
+                ),
             )
             .await
             .map_err(load_error)?;
@@ -447,7 +452,7 @@ fn weak_main_fixups(base: &Imports, graph: &mut Graph) -> Result<()> {
     let modules = graph
         .libraries
         .iter()
-        .map(|lib| lib.metadata.clone())
+        .map(|lib| (*lib.metadata).clone())
         .collect::<Vec<_>>();
     let dependencies = graph
         .libraries
@@ -495,8 +500,9 @@ async fn collect<S: wasixv2_syscalls::LoaderControl>(
     syscalls: &S,
     caller: &Caller<'_>,
     old: &Graph,
-    policy: &StartupPolicy,
+    context: (&StartupPolicy, &Root, wasmer::EngineId),
 ) -> Result<Graph> {
+    let (policy, _, _) = context;
     let mut graph = old.clone();
     async fn open<S: wasixv2_syscalls::LoaderControl>(
         syscalls: &S,
@@ -505,7 +511,7 @@ async fn collect<S: wasixv2_syscalls::LoaderControl>(
         name: &[u8],
         runtime: &[String],
         origin: &[u8],
-        policy: &StartupPolicy,
+        (policy, root, engine): (&StartupPolicy, &Root, wasmer::EngineId),
     ) -> Result<usize> {
         let loader = &*policy.loader;
         if loader.reuse_by_name()
@@ -530,12 +536,8 @@ async fn collect<S: wasixv2_syscalls::LoaderControl>(
         {
             return Ok(index);
         }
-        let mut lib =
-            Library::with_policy(image.image.bytes().to_vec(), Some(image.identity), loader)?;
-        lib.backing = Some(image.image);
-        lib.path = path;
-        lib.request = name.to_vec();
-        graph.libraries.push(lib);
+        let library = root.open_library(image, path, name, engine)?;
+        graph.libraries.push(library);
         Ok(graph.libraries.len() - 1)
     }
     let mut preloads = Vec::new();
@@ -548,7 +550,7 @@ async fn collect<S: wasixv2_syscalls::LoaderControl>(
                 name,
                 &[],
                 b"./main.wasm",
-                policy,
+                context,
             )
             .await?,
         );
@@ -573,7 +575,7 @@ async fn collect<S: wasixv2_syscalls::LoaderControl>(
                 name.as_bytes(),
                 &runtime,
                 &origin,
-                policy,
+                context,
             )
             .await?;
             graph.libraries[index].dependencies.push(dependency);
@@ -1032,7 +1034,12 @@ mod tests {
             search: Some(b"/lib".to_vec()),
             preloads: vec![b"preload.so".to_vec()],
         };
-        let mut future = Box::pin(collect(&files, &caller, &old, &policy));
+        let mut future = Box::pin(collect(
+            &files,
+            &caller,
+            &old,
+            (&policy, &root, wasmer::Engine::default().id()),
+        ));
         let graph = match future
             .as_mut()
             .poll(&mut Context::from_waker(Waker::noop()))

@@ -281,7 +281,7 @@ impl<S: Syscalls + Control + Send + Sync + 'static> StoreImage<S> {
             .map_err(|_| Errno::EFAULT)?;
         let old = self.root.graph();
         let (mut graph, requested) =
-            match collect(env, caller, &old, &name, &search, flags, &*self.root.policy).await {
+            match collect(env, caller, &old, &name, &search, flags, &self.root).await {
                 Ok(value) => value,
                 Err(error) => {
                     if !env
@@ -523,9 +523,12 @@ async fn collect<S: Syscalls + Control + Send + Sync + 'static>(
     name: &[u8],
     search: &[u8],
     flags: DlFlags,
-    policy: &dyn LoadPolicy,
+    root: &Root,
 ) -> Result<(Graph, usize)> {
-    let syscalls = env.read().await.data().syscalls().clone();
+    let policy = root.policy.as_ref();
+    let (syscalls, engine) = Context::Import(env)
+        .with(|data, store| (data.syscalls().clone(), store.engine().id()))
+        .await;
     let mut graph = old.clone();
     if name.is_empty() {
         return Ok((graph, 0));
@@ -555,11 +558,7 @@ async fn collect<S: Syscalls + Control + Send + Sync + 'static>(
         if flags.contains(DlFlags::RTLD_NOLOAD) {
             return Err(failure("RTLD_NOLOAD library is not loaded"));
         }
-        let mut library =
-            Library::with_policy(image.image.bytes().to_vec(), Some(image.identity), policy)?;
-        library.backing = Some(image.image.clone());
-        library.path = path;
-        library.request = name.to_vec();
+        let library = root.open_library(image, path, name, engine)?;
         graph.libraries.push(library);
         graph.libraries.len() - 1
     };
@@ -600,14 +599,7 @@ async fn collect<S: Syscalls + Control + Send + Sync + 'static>(
             {
                 index
             } else {
-                let mut library = Library::with_policy(
-                    image.image.bytes().to_vec(),
-                    Some(image.identity),
-                    policy,
-                )?;
-                library.backing = Some(image.image.clone());
-                library.path = path;
-                library.request = name.as_bytes().to_vec();
+                let library = root.open_library(image, path, name.as_bytes(), engine)?;
                 graph.libraries.push(library);
                 graph.libraries.len() - 1
             };

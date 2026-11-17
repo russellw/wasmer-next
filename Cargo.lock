@@ -3173,6 +3173,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "loupe"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4de4e09ccbef442225e81339e930ed93dc339d4f1b2eaf479f89590ebeb9bf13"
+dependencies = [
+ "indexmap",
+ "loupe-derive",
+ "rustversion",
+]
+
+[[package]]
+name = "loupe-derive"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ca8362a975c18ea799abfcb1902140370acd73d239f8c2f74d6e2c5f6a30929f"
+dependencies = [
+ "quote",
+ "syn 1.0.109",
+]
+
+[[package]]
 name = "lru-slab"
 version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6460,6 +6481,7 @@ name = "wasixv2-dylink"
 version = "0.0.0"
 dependencies = [
  "js-sys",
+ "loupe",
  "thiserror 2.0.21",
  "tracing",
  "wasixv2-abi",
@@ -6469,7 +6491,9 @@ dependencies = [
  "wasm-bindgen-test",
  "wasm-encoder 0.263.0",
  "wasmer",
+ "wasmer-compiler",
  "wasmer-types",
+ "wasmer-vm",
  "wasmparser 0.263.0",
  "wat",
 ]
@@ -7183,6 +7207,7 @@ dependencies = [
  "leb128",
  "libc",
  "libwild",
+ "loupe",
  "macho-unwind-info",
  "memmap2",
  "more-asserts",
@@ -7527,6 +7552,7 @@ dependencies = [
  "hex",
  "indexmap",
  "itertools 0.15.0",
+ "loupe",
  "more-asserts",
  "num_enum",
  "rkyv",
@@ -7555,6 +7581,7 @@ dependencies = [
  "itertools 0.15.0",
  "libc",
  "libunwind",
+ "loupe",
  "mach2",
  "more-asserts",
  "parking_lot 0.13.0",

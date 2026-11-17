@@ -79,6 +79,8 @@ pub struct Wasix1 {
     http: Option<Arc<dyn http::HttpProvider>>,
     limits: Limits,
     initial_command_entry: bool,
+    #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+    dylink_cache: Option<Arc<wasixv2_dylink::DylinkCache>>,
 }
 
 impl Wasix1 {
@@ -96,6 +98,8 @@ impl Wasix1 {
             http: None,
             limits: Limits::default(),
             initial_command_entry: false,
+            #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+            dylink_cache: None,
         }
     }
 
@@ -105,6 +109,13 @@ impl Wasix1 {
     /// admit import-free files through the kernel's exec image format check.
     pub fn with_initial_command_entry(mut self) -> Self {
         self.initial_command_entry = true;
+        self
+    }
+
+    /// Shares preparation of dynamic modules with other opt-in machines.
+    #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+    pub fn with_dylink_cache(mut self, cache: Arc<wasixv2_dylink::DylinkCache>) -> Self {
+        self.dylink_cache = Some(cache);
         self
     }
 
@@ -161,6 +172,15 @@ where
 
     fn for_image(&self, module: &Module) -> Option<Arc<dyn Abi<S>>> {
         <Self as Abi<S>>::matches(self, module).then_some(())?;
+        #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+        if let Some(cache) = &self.dylink_cache {
+            return wasixv2_dylink::compose_with_cache(
+                module,
+                Arc::new(self.clone()),
+                Arc::new(calls::dynamic::Policy),
+                cache.clone(),
+            );
+        }
         wasixv2_dylink::compose(
             module,
             Arc::new(self.clone()),
