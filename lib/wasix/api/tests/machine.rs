@@ -899,3 +899,39 @@ async fn machine_memory_budget_refusal_is_enospc_for_files_and_enomem_for_shared
     assert_eq!(run(machine, wat).await.0, 0);
     assert_eq!(budget.used(), 0);
 }
+
+#[test]
+fn embedder_default_root_can_share_the_machine_budget_before_population() {
+    let host: Arc<dyn wasixv2::Host> = Arc::new(wasixv2::TokioHost::default());
+    let budget = MemoryBudget::new(u64::MAX);
+    let root = wasixv2::default_root_with_memory_budget(
+        &host,
+        "",
+        &Credentials::default(),
+        Uname::default().release(),
+        budget.clone(),
+    )
+    .unwrap();
+    assert!(budget.used() > 1024);
+    let machine = wasixv2::MachineBuilder::new(host.clone())
+        .root(root)
+        .memory_budget(budget.clone())
+        .try_build()
+        .unwrap();
+    drop(machine);
+    assert_eq!(budget.used(), 0);
+    budget
+        .limit
+        .store(1024, std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        wasixv2::default_root_with_memory_budget(
+            &host,
+            "",
+            &Credentials::default(),
+            Uname::default().release(),
+            budget.clone(),
+        )
+        .is_err()
+    );
+    assert_eq!(budget.used(), 0);
+}

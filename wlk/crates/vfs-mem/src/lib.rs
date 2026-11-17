@@ -317,6 +317,7 @@ impl MemFs {
     }
 
     /// Installs a budget before first use, including the already-created root inode.
+    /// Callbacks must obey the locking and lifetime contract of [`MemoryBudget`].
     /// Fails with `EBUSY` if any node was handed out or a budget was already installed,
     /// and `ENOSPC` if the initial reservation is refused.
     pub fn try_with_memory_budget(self, budget: Arc<dyn MemoryBudget>) -> FsResult<Self> {

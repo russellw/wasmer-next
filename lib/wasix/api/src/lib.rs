@@ -142,6 +142,10 @@ struct MemoryConfig {
 }
 
 impl MemoryConfig {
+    fn pages(&self, host: &Arc<dyn Host>) -> Arc<dyn Provider> {
+        Arc::new(HostPages(self.pages_host.as_ref().unwrap_or(host).clone()))
+    }
+
     fn apply(&self, fs: MemFs) -> Result<MemFs, Errno> {
         match &self.budget {
             Some(budget) => fs.try_with_memory_budget(budget.clone()),
@@ -499,6 +503,10 @@ impl MachineBuilder {
     /// asynchronously, such as host directories, go under it with
     /// [`Machine::mount_root_lower_host_dir`].
     ///
+    /// This does not install the machine budget on `root`: embedder-supplied memory
+    /// filesystems must already carry it (see [`MemFs::try_with_memory_budget`] and
+    /// [`default_root_with_memory_budget`]).
+    ///
     /// [`build`]: MachineBuilder::build
     pub fn root(mut self, root: Arc<dyn Filesystem>) -> Self {
         self.root = Some(root);
@@ -557,7 +565,9 @@ impl MachineBuilder {
     /// kernel anonymous shared memory, SysV shm, io_uring and AIO objects (object size).
     /// Engine linear memories and NAPI/V8 require their own accountants sharing this limit.
     /// Persistent volumes, package lowers and kernel heap bookkeeping are not charged.
-    /// Embedder-supplied filesystems must opt in separately. Use `try_build` for refusal.
+    /// Embedder-supplied filesystems must opt in separately. Callbacks must obey the locking
+    /// and lifetime contract of [`MemoryBudget`]. Use `try_build` for refusal.
+    /// Hosts without shared-page support can fall back to unbudgeted heap SysV backing.
     pub fn memory_budget(mut self, budget: Arc<dyn MemoryBudget>) -> Self {
         self.memory_budget = Some(budget);
         self
@@ -569,6 +579,7 @@ impl MachineBuilder {
     }
 
     /// Boots the machine, returning allocation and filesystem budget refusals to the caller.
+    /// On refusal, returns `Err` and releases all reservations held by partially built state.
     pub fn try_build(self) -> io::Result<Machine> {
         let Self {
             host,
@@ -1901,9 +1912,7 @@ fn shared_tmpfs(
         gid,
     ))?;
     if cfg!(any(target_os = "linux", target_os = "android")) {
-        return Ok(fs.with_shared_pages(Arc::new(HostPages(
-            memory.pages_host.as_ref().unwrap_or(host).clone(),
-        ))));
+        return Ok(fs.with_shared_pages(memory.pages(host)));
     }
     Ok(fs)
 }
@@ -2030,13 +2039,7 @@ impl Tmpfs {
             options.quotas,
         )?)?;
         if cfg!(any(target_os = "linux", target_os = "android")) {
-            fs = fs.with_shared_pages(Arc::new(HostPages(
-                self.memory
-                    .pages_host
-                    .as_ref()
-                    .unwrap_or(&self.host)
-                    .clone(),
-            )));
+            fs = fs.with_shared_pages(self.memory.pages(&self.host));
         }
         let fs = Arc::new(fs);
         self.adopt(&fs);
@@ -2211,6 +2214,24 @@ pub fn default_root(
 ) -> Arc<dyn Filesystem> {
     default_root_with_memory(host, resolv_conf, user, release, &MemoryConfig::default())
         .expect("a new memory filesystem takes the default layout")
+}
+
+/// The default skeleton charged to `budget` before population. For callers supplying their
+/// own root to [`MachineBuilder::root`]; use the same budget on the builder for kernel mounts.
+/// Returns `ENOSPC` on refusal and releases the partially built filesystem's reservations.
+/// Callbacks must obey [`MemoryBudget`]'s locking and lifetime contract.
+pub fn default_root_with_memory_budget(
+    host: &Arc<dyn Host>,
+    resolv_conf: &str,
+    user: &Credentials,
+    release: &str,
+    budget: Arc<dyn MemoryBudget>,
+) -> io::Result<Arc<dyn Filesystem>> {
+    let memory = MemoryConfig {
+        budget: Some(budget),
+        pages_host: Some(host.clone()),
+    };
+    default_root_with_memory(host, resolv_conf, user, release, &memory)
 }
 
 fn default_root_with_memory(

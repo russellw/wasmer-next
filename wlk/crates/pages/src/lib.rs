@@ -113,8 +113,26 @@ pub fn new_id() -> u64 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
-/// A machine's memory reservation policy. Refused charges must leave the budget unchanged.
-/// Callbacks must not block or re-enter filesystem/kernel operations: callers may hold locks.
+/// A machine's memory reservation policy.
+///
+/// Both callbacks run synchronously on arbitrary threads, including executor tasks and `Drop`
+/// implementations. Memory-filesystem locks (nodes and directories) and kernel locks (memory
+/// mappings, IPC and fd tables) may be held. Implementations must not directly or indirectly:
+///
+/// - call `Machine`, kernel, filesystem or [`SharedPages`] APIs;
+/// - block, await, or wait for anything that might wait on the machine (including blocking
+///   channel sends, `block_on`, or joining a thread);
+/// - drop the last reference to anything that owns machine objects.
+///
+/// To react to a refusal, record it and wake another thread or task without blocking.
+/// A refused [`charge`](Self::charge) must leave the budget unchanged. In total,
+/// [`release`](Self::release) returns exactly the bytes successful charges reserved. Calls
+/// are not paired: one release can cover many per-block charges. A successful charge may be
+/// released immediately when a later quota check or backing allocation fails.
+///
+/// Objects retain the budget through an `Arc`. Releases can arrive after the machine has
+/// been dropped, if an embedder still holds a filesystem or shared object. Keep any state
+/// used by the callbacks alive until every charged object is gone.
 pub trait MemoryBudget: Send + Sync {
     fn charge(&self, bytes: u64) -> Result<(), BudgetExceeded>;
     fn release(&self, bytes: u64);

@@ -597,7 +597,8 @@ impl Mapping {
             && let Some(pages) = file
                 .inode()?
                 .node()
-                .shared_pages(mapped.offset..mapped.offset + self.len, cred)?
+                .shared_pages(mapped.offset..mapped.offset + self.len, cred)
+                .map_err(super::file_mapping_errno)?
         {
             mapped.pages = pages;
         }

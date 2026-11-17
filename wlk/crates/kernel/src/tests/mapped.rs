@@ -1245,6 +1245,20 @@ fn fixed_mmap_range_overflow_precedes_tmpfs_capacity() {
             fd,
             0
         ))),
-        Errno::ENOSPC,
+        Errno::ENOMEM,
     );
+    let at = map_file(&kernel, &caller, fd, PAGE, RW);
+    memory.put(at, b"kept");
+    assert_eq!(
+        errno(block_on(kernel.mremap(
+            &caller,
+            at,
+            PAGE,
+            2 * PAGE,
+            MremapFlags::MREMAP_MAYMOVE,
+            0
+        ))),
+        Errno::ENOMEM,
+    );
+    assert_eq!(memory.get(at, 4), b"kept");
 }

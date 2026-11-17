@@ -3673,7 +3673,8 @@ fn check_file_mapping(
     // that is, so the host never faults where Linux would raise SIGBUS: the pages read zero.
     if let Some(pages) = inode
         .node()
-        .shared_pages(offset..offset + pages * PAGE_SIZE, cred)?
+        .shared_pages(offset..offset + pages * PAGE_SIZE, cred)
+        .map_err(file_mapping_errno)?
     {
         return Ok(Some(Source::Mapped(Mapped {
             file: Some(file.clone()),
@@ -3686,6 +3687,16 @@ fn check_file_mapping(
     }
     let shared = Shared::new(Object::File(file.clone()), offset, writable, writer);
     Ok(Some(Source::Shared(shared)))
+}
+
+/// Eager file-page reservation substitutes for a fault: mmap reports memory exhaustion,
+/// while ordinary file writes keep the filesystem's ENOSPC.
+fn file_mapping_errno(errno: Errno) -> Errno {
+    if errno == Errno::ENOSPC {
+        Errno::ENOMEM
+    } else {
+        errno
+    }
 }
 
 #[cfg(test)]
