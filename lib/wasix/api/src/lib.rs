@@ -433,6 +433,7 @@ impl MachineBuilder {
     /// original import-free initial module. Defaults to false; file execution
     /// and guest execve format admission remain unchanged. The embedder must
     /// check the original command before preparation injects runtime imports.
+    /// Mutually exclusive with [`Self::plain_commands`].
     #[cfg(feature = "wasix1")]
     pub fn wasix1_initial_command(mut self, enabled: bool) -> Self {
         self.wasix1_initial_command = enabled;
@@ -442,7 +443,7 @@ impl MachineBuilder {
     /// Allows compiled commands, files and guest execve targets whose imports are all
     /// declared by registered instantiation hooks. This fallback ABI defaults to off.
     /// It runs `_start` and accepts a void return (exit 0) or an i32 exit status.
-    /// When enabled, it supersedes the WASIX v1 initial-command opt-in.
+    /// Mutually exclusive with the WASIX v1 initial-command opt-in.
     pub fn plain_commands(mut self, enabled: bool) -> Self {
         self.plain_commands = enabled;
         self
@@ -615,6 +616,8 @@ impl MachineBuilder {
 
     /// Boots the machine, returning allocation and filesystem budget refusals to the caller.
     /// On refusal, returns `Err` and releases all reservations held by partially built state.
+    /// Enabling both plain commands and the WASIX v1 initial-command ABI returns
+    /// [`io::ErrorKind::InvalidInput`].
     pub fn try_build(self) -> io::Result<Machine> {
         let Self {
             host,
@@ -647,6 +650,13 @@ impl MachineBuilder {
             #[cfg(all(feature = "host-network", unix))]
             vsock,
         } = self;
+        #[cfg(feature = "wasix1")]
+        if wasix1_initial_command && plain_commands {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "plain_commands and wasix1_initial_command are mutually exclusive",
+            ));
+        }
         let owner = (user.uid(), user.gid());
         // The machine's wall clock is its own: setting it leaves the embedder's alone.
         let memory = MemoryConfig {
@@ -684,11 +694,7 @@ impl MachineBuilder {
             )?,
         };
         #[cfg(feature = "wasix1")]
-        let wasix1 = Wasix1Commands::new(
-            http_provider,
-            wasix1_limits,
-            wasix1_initial_command && !plain_commands,
-        );
+        let wasix1 = Wasix1Commands::new(http_provider, wasix1_limits, wasix1_initial_command);
         let mut configured_abis = abis(
             loader,
             #[cfg(feature = "js")]

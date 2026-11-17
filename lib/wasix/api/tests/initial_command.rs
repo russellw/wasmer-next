@@ -343,6 +343,17 @@ async fn initial_entry_opt_in_preserves_normal_v1_and_v2_abi_selection() {
     }).await;
 }
 
+#[test]
+fn command_opt_ins_are_mutually_exclusive() {
+    let error = Machine::builder()
+        .wasix1_initial_command(true)
+        .plain_commands(true)
+        .try_build()
+        .err()
+        .expect("both command ABIs were accepted");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+}
+
 #[tokio::test]
 async fn plain_files_and_execve_return_the_command_status() {
     tokio::task::LocalSet::new()
