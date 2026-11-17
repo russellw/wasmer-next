@@ -79,6 +79,19 @@ impl Terminal {
 
     /// The terminal's settings now.
     fn termios(&self) -> libc::termios {
+        #[cfg(target_os = "macos")]
+        {
+            // Like WLK's empty-PTY observer, complete XNU's deferred canonical
+            // reinput before comparing every termios field. Input is consumed
+            // by the guest before these fixtures take another snapshot.
+            let mut available: libc::c_int = -1;
+            // SAFETY: the live test PTY writes an int through this pointer.
+            assert_eq!(
+                unsafe { libc::ioctl(self.slave.as_raw_fd(), libc::FIONREAD, &mut available) },
+                0
+            );
+            assert_eq!(available, 0, "termios snapshots require an empty test PTY");
+        }
         let mut termios = std::mem::MaybeUninit::<libc::termios>::zeroed();
         // SAFETY: `tcgetattr` fills kernel fields; trailing control slots are already zero.
         assert_eq!(

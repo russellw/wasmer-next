@@ -313,6 +313,18 @@ mod tests {
         }
     }
     fn settings(fd: libc::c_int) -> libc::termios {
+        #[cfg(target_os = "macos")]
+        {
+            // Match WLK's empty-PTY observer: XNU completes deferred canonical
+            // reinput on FIONREAD before we compare the full termios snapshot.
+            let mut available: libc::c_int = -1;
+            // SAFETY: the live test PTY writes an int through this pointer.
+            assert_eq!(
+                unsafe { libc::ioctl(fd, libc::FIONREAD, &mut available) },
+                0
+            );
+            assert_eq!(available, 0, "termios snapshots require an empty test PTY");
+        }
         let mut settings = std::mem::MaybeUninit::<libc::termios>::zeroed();
         // SAFETY: tcgetattr fills kernel fields; fields absent from its layout are already zero.
         assert_eq!(unsafe { libc::tcgetattr(fd, settings.as_mut_ptr()) }, 0);
