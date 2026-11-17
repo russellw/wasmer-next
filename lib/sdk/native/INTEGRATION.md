@@ -48,9 +48,10 @@ run. Persistent artifact bytes use the existing versioned cache directories.
 
 Only WEBC v3 is supported. Journaling is excluded and configured guest CPU
 parallelism is deferred. Browser/Node/macOS are held. Canonical opt-in legacy
-append offsets and native endpoint policy use the reviewed WLK main API. All 21
-WLK packages have one Git-main identity at
-`8ec0fc67017353513321617103f85739b07556b9`; no development path overrides remain.
+append offsets and native endpoint policy use the reviewed WLK main API. All WLK
+packages now come from the sealed local `wlk/` workspace. Historical validation
+below used `8ec0fc67017353513321617103f85739b07556b9`; that is provenance, not a
+current Git dependency pin.
 Initial native commands with no imports use a private, default-off WASI entry
 profile. The SDK checks the selected original command atom, compiles it through
 the same NativeLoader/cache and uses the facade's common admitted module path.

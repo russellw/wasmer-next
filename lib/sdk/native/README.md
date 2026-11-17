@@ -47,7 +47,7 @@ and completion delivered promptly. Keep callbacks short.
 
 ## Use the crate
 
-This native SDK is maintained in the private `wasmer-next` workspace and is
+This native SDK is maintained in the public `wasmer-next` workspace and is
 not published to crates.io. Depend on its source by path:
 
 ```toml
@@ -56,7 +56,7 @@ wasmer-sdk = { path = "../wasmer-next/lib/sdk/native" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
-The workspace lockfile pins the shared WLK dependency. See [INTEGRATION.md](INTEGRATION.md)
+The SDK uses the shared local WLK path dependencies at `wlk/`. See [INTEGRATION.md](INTEGRATION.md)
 for the port's validation and remaining work. Package archives must be WebC v3.
 
 ## Load or create a package from Wasm

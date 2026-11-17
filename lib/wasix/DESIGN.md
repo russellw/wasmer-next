@@ -101,7 +101,7 @@ A syscall runs as: imported function → decode arguments → method on a trait 
 5. **Everything is generated from one table.**
    - From one syscall table, written in the component model's WIT format, codegen produces the wasm import shims, the decoders, the `Syscalls` trait and a `Syscall` request enum.
    - It also produces a `Layered<L, S>` adapter that forwards every method by default.
-   - The table and the generator live in their own repository, [wasixv2-abi](https://github.com/wasix-org/wasixv2-abi), which wasmer mounts as a submodule at `lib/wasix/codegen` and libc2 at `wasixv2/abi`. Each consumer commits the code it generates.
+   - The table and canonical generator are tracked at `lib/wasix/codegen`. Generated kernel bindings live in `wlk/crates/{abi,syscalls}`, import shims in `lib/wasix/exec`, and C glue in `guest/libc`. ABI changes update these outputs together; downstream libc2 consumers need a matching revision.
 
 ```rust
 // generated

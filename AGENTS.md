@@ -91,7 +91,7 @@ suites and this repository's other submodules.
 
 | Repository | Here | Holds |
 | ---------- | ---- | ----- |
-| [wasixv2-abi](https://github.com/wasix-org/wasixv2-abi) | `lib/wasix/codegen` | The ABI (annotated WIT) and `wasixv2-codegen` |
+| This repository | `lib/wasix/codegen` (tracked source) | The canonical ABI (annotated WIT) and `wasixv2-codegen` |
 | [libc2](https://github.com/wasix-org/libc2) | `guest/libc` (tracked source) | The musl-based libc and sysroots |
 
 ### Crate tests
@@ -101,10 +101,10 @@ cargo test -p wasixv2 -p wasixv2-abi -p wasixv2-kernel -p wasixv2-codegen  # and
 ```
 
 These are plain Rust: the kernel's unit tests, the facade's WAT tests, and
-`lib/wasix/abi/tests/generated.rs`, which checks that the generated
-crates match the ABI at the pinned submodule commit. After an ABI or
+`lib/wasix/exec/tests/generated.rs`, which checks that the generated
+kernel and exec crates match the owned canonical WIT. After an ABI or
 generator change, regenerate with
-`WASIXV2_CODEGEN_BLESS=1 cargo test -p wasixv2-abi --test generated`.
+`WASIXV2_CODEGEN_BLESS=1 cargo test -p wasixv2-exec --test generated`.
 
 ### The test suite
 
@@ -145,7 +145,8 @@ not run the suite yet.
 - The legacy implementation and its fixtures are removed. Keep v1 adapter/product
   compatibility tests here; never copy legacy fixtures into `tests/wasixv2/`.
 - ABI changes land here in one commit: canonical WIT/generator, kernel, import
-  shim, libc C glue and wrappers, and tests. Regenerate libc with
+  shim, libc C glue and wrappers, and tests. Downstream libc2 consumers need
+  the matching ABI revision. Regenerate libc with
   `WASIXV2_LIBC_BLESS=1 cargo test -p wasixv2-codegen --test guest_libc --locked`.
 
 ## Personal execution preferences

@@ -215,25 +215,18 @@ package/
 > You can generate the C-API for a specific compiler and engine with:
 > `make build-capi-{ENGINE}`
 
-## Private WLK dependency
+## Local WASIX kernel
 
-The WASIX kernel is fetched from private `https://github.com/wasmerio/wlk`, branch
-`main`, at the revision in `Cargo.lock`. GitHub credentials need Contents-read access
-to that repository. For local development, `gh auth login` then `gh auth setup-git`
-configures Git; Cargo uses the Git CLI. CI must provide an organization-approved
-read token (for example `WLK_READ_TOKEN`) to its Git credential helper. A Wasmer
-repository `GITHUB_TOKEN` alone cannot read a different private repository. Do not
-make WLK public to work around missing credentials.
+WLK is tracked at `wlk/` as a sealed, engine-independent workspace. Its toolchain,
+lockfile, formatting, Clippy and tests remain separate from the product workspace.
+Root consumers use path dependencies; no WLK credentials, Git pin or `WLK_ROOT`
+override is needed. Browser assets live in `wlk/crates/host`.
 
-Run `cargo check --locked -p wasixv2 -p wasixv2-exec -p wasixv2-wasix1` for the
-Wasmer integration. WLK owns its independent check, Clippy, nextest and audit CI.
-`python3 scripts/wlk-source.py host` locates assets in the locked dependency
-checkout; `WLK_ROOT=/path/to/wlk` can select developer assets explicitly.
-
-For coordinated source edits, use explicit local `[patch."https://github.com/wasmerio/wlk"]`
-overrides for every affected core package; remove those overrides before committing
-and regenerate the lockfile against the pushed WLK source. Never mix two source
-identities for the same kernel types.
+Run `cargo check --locked -p wasixv2 -p wasixv2-exec -p wasixv2-wasix1` for
+integration. Check or regenerate the kernel and exec bindings from the owned WIT
+with `cargo test -p wasixv2-exec --test generated` and
+`WASIXV2_CODEGEN_BLESS=1` when blessing. Commit ABI, kernel, import-shim and guest
+libc outputs together; see [TEST.md](TEST.md).
 
 ## Native executor shutdown
 
@@ -248,9 +241,9 @@ the host discards every executor job and every owner-thread driver.
 
 ## Extracted engine
 
-The engine is a private Git dependency, locked by Cargo.lock; Rust 1.99 and
+The engine is a public Git dependency, locked by Cargo.lock; Rust 1.99 and
 LLVM 23 are required. Engine implementation tests run in wasmer-runtime. See
-[RUNTIME-EXTRACTION.md](RUNTIME-EXTRACTION.md) for private fetch credentials,
+[RUNTIME-EXTRACTION.md](RUNTIME-EXTRACTION.md) for fetch configuration,
 CI setup, GitHub App owner prerequisites and coordinated engine patches. CI
 uses `CROSS_DEPENDENCY_GITHUB_APP_CLIENT_ID` and
 `CROSS_DEPENDENCY_GITHUB_APP_PRIVATE_KEY` to mint a Contents-read token for

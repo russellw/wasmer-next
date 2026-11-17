@@ -1,6 +1,6 @@
 # Wasmer Lightweight Kernel (WLK)
 
-This private repository contains the engine-independent WASIX kernel, syscall interfaces, host services, and filesystem/network drivers used by Wasmer. The Rust package names and public APIs are kept stable across the repository extraction. Wasmer runtime integration remains in the main Wasmer repository.
+This sealed workspace in `wasmerio/wasmer-next` contains the engine-independent WASIX kernel, syscall interfaces, host services, and filesystem/network drivers used by Wasmer. The Rust package names and public APIs are kept stable across the extraction and subsequent local import. Wasmer runtime integration remains in the main Wasmer repository.
 
 ## Workspace
 
@@ -69,4 +69,6 @@ cargo check -p wasixv2-host --features browser --target wasm32-unknown-unknown -
 
 The repository CI runs formatting, native check and lint, Rust and browser protocol tests, a dependency-boundary check, security audit, and supported wasm32 checks. The browser worker/TLS integration recipe requires its pinned nightly, Rust source, Node, Chromium, and a matching `wasm-bindgen` CLI; see [the host browser test guide](crates/host/tests/browser/README.md).
 
-This repository is private and is consumed from Wasmer at a pinned Git revision. The crates are currently workspace packages and are not independently published.
+Wasmer consumes these local crates by path. This workspace keeps its own toolchain,
+Cargo.lock and CI, and may not depend on engine crates. Its crates are
+`publish = false`; the containing repository is public.

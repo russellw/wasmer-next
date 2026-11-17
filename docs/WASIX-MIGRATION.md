@@ -20,4 +20,4 @@ selects Machine for supported v1 and preview1 imports.
 
 WASIX64, proc_snapshot and existing CLI/C API limitations are recorded in
 lib/wasix/TODO.md. Removal does not claim new compatibility or a passing suite.
-Engine ownership and private fetch setup are in RUNTIME-EXTRACTION.md.
+Engine ownership and runtime fetch setup are in RUNTIME-EXTRACTION.md.

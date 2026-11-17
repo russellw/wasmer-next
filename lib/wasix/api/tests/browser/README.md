@@ -132,7 +132,7 @@ export WASM_BINDGEN=/path/to/wasm-bindgen-matching-Cargo.lock
 bash lib/wasix/api/tests/browser/build.sh
 npm ci --prefix tests/wasixv2/browser
 node --test lib/wasix/api/tests/browser/*.test.mjs \
-  "$(python3 scripts/wlk-source.py host)/tests/browser/protocol.test.mjs"
+  "wlk/crates/host/tests/browser/protocol.test.mjs"
 CHROME=/usr/bin/google-chrome node lib/wasix/api/tests/browser/lifecycle.mjs \
   "$CARGO_TARGET_DIR/browser"
 node tests/wasixv2/browser/run.mjs --manifest /source-built/export/manifest.json \
@@ -166,6 +166,10 @@ Local recipes default to shared-machine CPUs 4-7; `WASIX_BROWSER_CPUS` overrides
 the affinity without changing Cargo or runtime flags. The cold runner installs
 native build prerequisites including lld and rsync
 (Linux `Makefile:headers_install` uses rsync for the pinned UAPI headers).
+
+The owned libc is now tracked at `guest/libc`. The older browser producer recipe
+still fetches the external `wasix-org/libc2` source described below; that fetch
+and its separate credentials remain until the producer is migrated.
 
 `wasix-org/libc2` is private. Set the Actions secret `WASIXV2_TOOLCHAIN_TOKEN`
 to a credential with **Contents: read** access to that repository (and any other

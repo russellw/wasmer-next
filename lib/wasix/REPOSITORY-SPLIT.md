@@ -1,5 +1,6 @@
 > Ownership update (2026-11-16): WLK extraction has been reversed into the
-> sealed local wlk/ workspace; the engine now lives in wasmerio/wasmer-runtime.
+> sealed local wlk/ workspace so ABI, kernel and consumer changes can be reviewed
+> atomically. The engine lives in public wasmerio/wasmer-runtime.
 > Legacy runtime/support crates are removed. The body records the historical
 > split design, not the current dependency layout.
 

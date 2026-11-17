@@ -17,7 +17,8 @@
     },
     "abi": {
       "revision": "c2c28b95e0c403b224f9cf83fa0e6d56a5a2f3a0",
-      "repository": "https://github.com/wasix-org/wasixv2-abi"
+      "repository": "https://github.com/wasix-org/wasixv2-abi",
+      "source_ownership": "tracked source: lib/wasix/codegen; repository/revision above record historical provenance"
     },
     "tests": {
       "revision": "c2795a1d22e3d00e373c2b3cb31cc1bf57b4de07",
@@ -105,11 +106,11 @@
     }
   ],
   "kernel_extraction": {
-    "repository": "https://github.com/wasmerio/wlk",
-    "private": true,
+    "repository": "https://github.com/wasmerio/wasmer-next",
+    "private": false,
     "branch": "main",
-    "revision": "see Cargo.lock",
-    "layout": "crates/*",
+    "revision": "containing Wasmer commit",
+    "layout": "wlk/crates/*",
     "kept_in_wasmer": [
       "api",
       "exec",
@@ -117,6 +118,7 @@
       "wasix1",
       "codegen"
     ],
-    "note": "integration_code_revision records the pre-extraction stopped-work baseline; unfinished parity branches remain separate"
+    "note": "Extraction reversed into the sealed local workspace on 2026-11-17; integration_code_revision and unfinished branches retain historical provenance.",
+    "historical_repository": "https://github.com/wasmerio/wlk"
   }
 }

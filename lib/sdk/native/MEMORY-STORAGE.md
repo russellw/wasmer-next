@@ -1,5 +1,8 @@
 # Private memory storage boundary
 
+WLK is now local at `wlk/`. The revision references below record historical
+validation evidence; current dependencies use paths in this checkout.
+
 `memory.rs` owns the complete implementation behind `Directory`. Its only
 constructor creates a `wasixv2_vfs_mem::MemFs`, a private `Vfs`, `Cred::user(1, 1)`
 and a private `SystemTimeClock`. Explicit `Limits::UNLIMITED` preserves the old

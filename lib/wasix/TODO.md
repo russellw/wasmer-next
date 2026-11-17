@@ -1,16 +1,16 @@
 # WASIX compatibility TODO
 
-Active delivery: 2026-11-05. Integration target: private
+Active delivery: 2026-11-05. Integration target: public
 [`wasmerio/wasmer-next`, `main`](https://github.com/wasmerio/wasmer-next/tree/main).
 The previous stopped-work snapshot is preserved below. **Full supported v1 parity is not complete.**
 This tree was renamed from `lib/wasixv2` to `lib/wasix`; crate names remain unchanged.
-The old runtime remains in `lib/wasix-legacy` until its consumers have working replacements.
+The old runtime/support stack has been removed; v1 guests use the v2 adapter.
 
 ## Active unification work
 
-All new source is published only to private `wasmerio/wasmer-next` and
-`wasmerio/wlk`. The CLI and embedding consumers must use v2 before legacy
-runtime/support crates are removed. Keep `wasixv2-wasix1`, the v1 guest adapter
+Current source is owned in public `wasmerio/wasmer-next`: the sealed kernel is
+local at `wlk/`, the canonical generator at `lib/wasix/codegen`, and libc at
+`guest/libc`. The engine is in public `wasmerio/wasmer-runtime`. Keep `wasixv2-wasix1`, the v1 guest adapter
 on the v2 kernel. Original fixtures and behavior evidence remain removal gates.
 
 | Stream | Required result |
@@ -59,10 +59,10 @@ browser validation remain open.
 
 ### Current unfinished source handoffs
 
-These private branches preserve ongoing work. Their component results do not
+These source branches preserve ongoing work. Their component results do not
 establish full parity or an integrated release result.
 
-| Work | Private source | Remaining gate |
+| Work | Source | Remaining gate |
 | --- | --- | --- |
 | Contexts/closures | Native foundation integrated as `6e9876f90e3`, WLK `fc3b2b99821` | Reviewed native custody, startup/cancellation, owned generator and base preparation are integrated. Composed check, canonical equality (3), preparation (3), contexts (3) and cancellation (6) pass. Nonmain `posix_spawn` is now integrated with exact child cancellation/reaping and replacement-safe transfer: custody (3), published child (2), spawn (7), two original C consumers and the combined CLI/Swift check pass. Native original consumers are 27/29, with two tracked conservative-cacheability differences; browser remains separate. |
 | Native C API | [Reviewed consumer source](https://github.com/wasmerio/wasmer-next/tree/wasixv2/parity-capi-final-native-union), final composition with all 21 WLK dependencies at published `5d9102ccd0e70c82c0c8724d67c1618be8fa8b05` | Configuration/routing (17), host-thread attachment (4), foreign handoff/retirement (10), public Pending-Detached cancellation (1), and shared/private memory-selection proofs (4) pass. The `d2037d0` component adds nine passing caller-Drop/cleanup-panic/continuation/reentrant-wake and legal outer-Store cleanup tests; these runtime results precede the final Darwin-source/pin composition, whose selected Exec/C API all-target strict Clippy passes at `dd4081e0`. Earlier kernel retirement receipts remain 11 focused proofs and 78 affected io_uring tests. Last-Store destruction under an active foreign current-thread executor remains mandatory open, alongside broader fork/affinity, opaque-panic and V8 gates. No full native parity or final legacy-retirement claim. |
@@ -92,8 +92,8 @@ the entire Linux syscall surface is not required. Preserve original consumer tes
 compilation, model tests and feature flags alone do not establish compatibility.
 
 The stopped-parity baseline is `2854c34dc590c5e832ba727036317af9e42d659f`.
-The current branch additionally extracts the engine-independent core to private WLK,
-selected from `main` at the exact revision in `Cargo.lock`. The baseline combines
+The engine-independent core is now tracked locally at `wlk/`; its sealed
+workspace is selected by path, not by a Git lockfile revision. The baseline combines
 the delivered parity work, native NAPI frame/GC repair and directory migration. The unfinished branches below are **not merged**
 into that snapshot. Existing focused component evidence and offline locked Cargo
 metadata passed; no fresh whole-snapshot release/browser/full-suite validation was
@@ -102,9 +102,9 @@ performed for this stop checkpoint. Source revisions are in [SNAPSHOT.json](SNAP
 | Repository | Source snapshot | Role |
 | --- | --- | --- |
 | [Wasmer](https://github.com/wasmerio/wasmer/tree/feat/wasixv2) | `feat/wasixv2`, code `2854c34dc59` | Integration target, not a parity GO |
-| [WLK](https://github.com/wasmerio/wlk/tree/main) | `main`, exact source in `Cargo.lock` | 21 engine-independent crates; private repository |
+| [WLK](../../wlk) | tracked `wlk/` source | Sealed engine-independent workspace |
 | [NAPI](https://github.com/wasmerio/napi/tree/wasix/parity-unified) | `bdc247406e9cecd46888ce648a62d51ed2732378` | Native GC repair + relocated legacy dependency paths |
-| [ABI/generator](https://github.com/wasix-org/wasixv2-abi/tree/c2c28b95e0c403b224f9cf83fa0e6d56a5a2f3a0) | `c2c28b95e0c403b224f9cf83fa0e6d56a5a2f3a0` | Canonical integration source |
+| [ABI/generator](codegen) | tracked `lib/wasix/codegen` source | Canonical integration source; historical revision in PROVENANCE.md |
 | [Guest tests](https://github.com/wasix-org/wasixv2-tests/tree/c2795a1d22e3d00e373c2b3cb31cc1bf57b4de07) | `c2795a1d22e3d00e373c2b3cb31cc1bf57b4de07` | Test source with runtime-path migration |
 | [libc2](https://github.com/wasix-org/libc2/tree/snapshot/wasixv2-20261105) | `ce830d6e`, branch `snapshot/wasixv2-20261105` | Dynamic libc source based on `feaf3753`, ABI/test pins aligned; excludes unfinished context wrappers |
 | [wasixcc](https://github.com/wasix-org/wasixcc/tree/snapshot/wasixv2-20261105) | `29aba5dee92f`, branch `snapshot/wasixv2-20261105` | Source PIC table-argument correction |
@@ -289,13 +289,12 @@ Additional reference-lifetime test draft:
 - Record/replay, dedicated embedder-policy implementation, paused memory-accounting
   redesign and host-enforced page-protection/userfaultfd extensions remain future/design
   work beyond delivered per-feature controls; no blanket implementation claim.
-- Pure kernel repository extraction is implemented in private `wasmerio/wlk` with
-  21 crates under `crates/`. Wasmer keeps api/exec/dylink/wasix1 and canonical codegen;
-  git dependencies select WLK `main` with an exact lockfile revision. Maintain the
-  generation/reference integration tests here and kernel CI there. Private-repository
-  credentials are required for downstream CI. Further planner extraction, publication
-  and stable cross-engine API commitments remain separate decisions. This does not
-  close the outstanding compatibility work above.
+- The kernel extraction has been reversed into the sealed `wlk/` workspace.
+  Kernel, canonical WIT/generator, import shims and guest libc outputs now change
+  together here. Root integration uses path dependencies, while WLK retains its
+  own toolchain, lockfile and CI. Publication and stable cross-engine API contracts
+  remain separate decisions and do not close the compatibility work above.
+
 
 Deferred source is preserved in
 [runtime `wasixv2/parity-wasix64`](https://github.com/wasmerio/wasmer/tree/wasixv2/parity-wasix64)

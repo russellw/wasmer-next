@@ -1,18 +1,17 @@
 # Product runtime dependency
 
-The engine is maintained in private `wasmerio/wasmer-runtime`, branch `next`.
+The engine is maintained in public `wasmerio/wasmer-runtime`, branch `next`.
 The root Cargo.lock pins the reviewed revision; all engine packages must use the
 same Git source identity. Rust 1.99 and LLVM 23 are required by that engine.
 
-For HTTPS access, configure `gh auth login` and `gh auth setup-git`. Cargo uses
-Git CLI fetching through .cargo/config.toml. CI jobs resolving Cargo dependencies
-mint a GitHub App installation token with Contents-read access to wasmer-runtime
-(see owner prerequisites below). WLK is now local under wlk/. A token scoped only
-to this repository cannot fetch the private engine. Containers need the same
-credential setup inside them.
+Both wasmer-next and wasmer-runtime are public as of 2026-11-17. Anonymous HTTPS
+can fetch the engine. CI deliberately retains its per-job GitHub App installation
+token and setup action, including container credential forwarding; current
+workflows still require the configured app secrets. This also supports any
+remaining restricted fetches. WLK is tracked locally at `wlk/`.
 
-V8's Linux provider is a separate private wasmer-next asset (726693826). Its
-automatic download needs GH_TOKEN/GITHUB_TOKEN with read access here; that is
+V8's Linux provider is a public wasmer-next asset (726693826). Its
+current build script requires GH_TOKEN/GITHUB_TOKEN for automatic download; that is
 separate from runtime Git access. Alternatively provide an absolute
 WASMER_V8_ARTIFACT_DIR with lib/libv8.a (Windows: lib/v8.lib), verified against
 the runtime's provider/header ABI. The override is authoritative. See the
@@ -27,15 +26,15 @@ the same Git source. Never mix engine type identities.
 
 Engine unit/WAST/Miri/backend tests and V8 production belong in wasmer-runtime.
 This repository retains CLI/C API/NAPI/SDK/Swift and WASIX v2 integration tests.
-Private-engine release and public registry distribution policy is out of scope.
+Engine release and public registry distribution policy is out of scope.
 
 ## CI setup and ownership
 
-Owner prerequisites:
+Owner prerequisites for the retained authenticated CI configuration:
 
 - Create or reuse the cross-dependency GitHub App and grant it repository
   **Contents: read-only** permission.
-- Install the app on the **wasmerio** organization with access to the private
+- Install the app on the **wasmerio** organization with access to the public
   **wasmer-runtime** repository; approve any pending installation/permission
   request. No access to this product repository or public wasmerio/napi is needed.
 - Generate an app private key. Set Actions secrets
@@ -80,7 +79,7 @@ be refreshed after this product revision is reachable from its main Git source.
 Root NAPI builds use the root lock and do not require that future standalone lock.
 
 The existing modified flake.nix was explicitly excluded from this work. Its
-LLVM 22/Nix toolchain selection and private dependency vendoring need a separate
+LLVM 22/Nix toolchain selection and Git dependency vendoring need a separate
 coordinated update before claiming Nix builds work against the new engine.
 The untracked docs/MERGE.md remains untouched; its Phase C engine-area guidance
 is superseded by the integration/product selector in .github/ci-changes.py.

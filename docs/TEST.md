@@ -15,7 +15,7 @@ make check-wasixv2-wasm
 
 Engine unit, WAST, backend, Miri, benchmark and fuzz tests now belong in
 wasmerio/wasmer-runtime. Its tests/ignores.txt belongs to that engine suite;
-do not add engine ignores to this product repository. Private dependency setup
+do not add engine ignores to this product repository. Runtime fetch setup
 is documented in [RUNTIME-EXTRACTION.md](RUNTIME-EXTRACTION.md).
 
 ## Kernel and guest tests

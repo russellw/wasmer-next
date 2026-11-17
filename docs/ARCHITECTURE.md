@@ -15,7 +15,7 @@ engine integration. The root Cargo.toml lists its members.
 | tests/integration, tests/wasixv2 | Product and guest integration suites |
 
 The engine (API, VM, compilers, types, derive, middlewares, WAST/compiler tests
-and fuzzing) lives in private wasmerio/wasmer-runtime, branch next. All engine
+and fuzzing) lives in public wasmerio/wasmer-runtime, branch next. All engine
 packages use one Git source; Cargo.lock pins its revision. See
 [RUNTIME-EXTRACTION.md](RUNTIME-EXTRACTION.md) for credentials and development.
 

@@ -1,6 +1,6 @@
 # Producer source ownership
 
-This directory is owned source in private `wasmerio/wasmer-next`. Its six
+This directory is owned source in public `wasmerio/wasmer-next`. Its six
 `include/wasix/*.h` files and two wrapper implementations originate from
 [`wasix-org/libc2` commit
 `71ccfb3879d9eae8984f917219d703c70e285789`](https://github.com/wasix-org/libc2/commit/71ccfb3879d9eae8984f917219d703c70e285789):
