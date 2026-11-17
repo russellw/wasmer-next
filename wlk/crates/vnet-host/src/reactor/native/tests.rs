@@ -1075,8 +1075,9 @@ fn receive_install_budget_failure_is_authoritative_and_flood_cannot_starve_fd_cl
     assert_eq!(complete(lease.wait_ready()), Err(Errno::EBUSY));
     assert_eq!(receiver.ready_count.load(Ordering::SeqCst), 0);
     assert!(receiver.packets.lock().unwrap().is_empty());
-    assert_eq!(*receiver.errors.lock().unwrap(), [Errno::EBUSY]);
+    // wait_ready reports the failure before the synchronous failed callback finishes.
     complete(lease.close()).unwrap();
+    assert_eq!(*receiver.errors.lock().unwrap(), [Errno::EBUSY]);
     closed(udp.close());
     let rebound = std::net::UdpSocket::bind(address).unwrap();
     drop(rebound);
