@@ -870,48 +870,6 @@ impl Kernel {
         self.init == Some(process.pid)
     }
 
-    /// Reads an already-open, readable regular file without changing its position.
-    /// The byte limit applies to the actual image as well as its reported size.
-    pub async fn read_guest_regular_file(
-        &self,
-        task: TaskId,
-        fd: Fd,
-        limit: usize,
-    ) -> Result<wasixv2_syscalls::Image, Errno> {
-        let files = self
-            .state
-            .read_or_recover()
-            .tasks
-            .get(&task)
-            .ok_or(Errno::ESRCH)?
-            .files
-            .clone();
-        let file = files.lock_or_recover().get(fd).ok_or(Errno::EBADF)?;
-        let file::Backing::Inode(file) = &file.backing else {
-            return Err(Errno::EINVAL);
-        };
-        if !file.readable || file.path_only {
-            return Err(Errno::EBADF);
-        }
-        if file.file_type() != wasixv2_vfs::FileType::Regular {
-            return Err(Errno::EINVAL);
-        }
-        let size = self.vfs.stat(&file.path).await?.size;
-        if size > limit as u64 {
-            return Err(Errno::EFBIG);
-        }
-        let image = process::read_image(file, size)
-            .await
-            .map_err(|err| match err {
-                wasixv2_syscalls::SysErr::Errno(errno) => errno,
-                _ => Errno::EIO,
-            })?;
-        if image.bytes().len() > limit {
-            return Err(Errno::EFBIG);
-        }
-        Ok(image)
-    }
-
     fn file(&self, task: TaskId, fd: Fd) -> Result<Arc<OpenFile>, Errno> {
         let file = self.files(task).lock_or_recover().get(fd);
         file.ok_or(Errno::EBADF)

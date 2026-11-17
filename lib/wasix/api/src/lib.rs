@@ -26,11 +26,16 @@ pub use package::{
 };
 
 #[cfg(feature = "resolved-packages")]
-pub use package::runtime::{
-    InstalledRuntimePackage, RuntimeCommandDefaults, RuntimePackage, RuntimePackageResolver,
+pub use package::runtime::InstalledRuntimePackage;
+#[cfg(feature = "resolved-packages")]
+pub use package::wasmer_command::{
+    RuntimeCommandDefaults, RuntimePackage, RuntimePackageResolver, WasmerCommandConfig,
 };
 #[cfg(feature = "resolved-packages")]
-use package::runtime::{RuntimePackageConfig, RuntimePackages};
+use package::{
+    runtime::RuntimePackages,
+    wasmer_command::{RuntimePackageConfig, WasmerCommand},
+};
 
 mod directory;
 pub use directory::{DirectoryEntry, populate_directory};
@@ -669,16 +674,6 @@ impl MachineBuilder {
         if plain_commands {
             configured_abis.push_plain_command();
         }
-        #[cfg(feature = "resolved-packages")]
-        let runtime_packages = RuntimePackages::configure(
-            runtime_package_config,
-            &mut configured_abis,
-            &memory,
-            &host,
-            owner,
-            #[cfg(feature = "wasix1")]
-            wasix1.files.clone(),
-        )?;
         let abis = Arc::new(configured_abis);
         let mut registry = Commands::builder();
         let mut command_paths = Vec::with_capacity(commands.len());
@@ -686,14 +681,37 @@ impl MachineBuilder {
             registry.register_spec(&path, spec).map_err(errno_to_io)?;
             command_paths.push(path);
         }
+        #[cfg(feature = "resolved-packages")]
+        let runtime_packages = runtime_package_config
+            .finish()
+            .map(|config| {
+                let packages = RuntimePackages::new(
+                    config.limit,
+                    &memory,
+                    &host,
+                    owner,
+                    #[cfg(feature = "wasix1")]
+                    wasix1.files.clone(),
+                );
+                let command = Arc::new(WasmerCommand {
+                    resolver: config.resolver,
+                    allow_local: config.allow_local,
+                    budget: memory.budget.clone(),
+                    packages: packages.clone(),
+                });
+                for path in config.paths {
+                    registry
+                        .register(&path, command.clone())
+                        .map_err(errno_to_io)?;
+                    command_paths.push(path);
+                }
+                Ok::<_, io::Error>(packages)
+            })
+            .transpose()?;
         let commands = registry.build();
         let mut lowers = Vec::new();
         if !commands.is_empty() {
             lowers.push(commands.filesystem());
-        }
-        #[cfg(feature = "resolved-packages")]
-        if let Some(packages) = &runtime_packages {
-            lowers.push(packages.shim.clone());
         }
         let boot_root = if lowers.is_empty() {
             root.clone()
@@ -928,19 +946,12 @@ impl Machine {
     }
 
     fn command_lowers(&self) -> usize {
-        let commands = usize::from(!self.commands.is_empty());
-        #[cfg(feature = "resolved-packages")]
-        let commands = commands + usize::from(self.runtime_packages.is_some());
-        commands
+        usize::from(!self.commands.is_empty())
     }
 
     async fn reboot_root(&mut self) -> io::Result<()> {
         let mut lowers = self.root_lowers.clone();
         lowers.extend(self.skeleton.iter().cloned());
-        #[cfg(feature = "resolved-packages")]
-        if let Some(packages) = &self.runtime_packages {
-            lowers.insert(0, packages.shim.clone());
-        }
         if !self.commands.is_empty() {
             lowers.insert(0, self.commands.filesystem());
         }

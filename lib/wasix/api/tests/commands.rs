@@ -1123,7 +1123,7 @@ mod runtime_packages {
 "#;
 
     #[tokio::test]
-    async fn shim_imports_live_aliases_and_scoped_volumes_with_a_cap() {
+    async fn wasmer_imports_live_aliases_and_scoped_volumes_with_a_cap() {
         local(async {
             let resolver = Arc::new(Resolver(layout().await, AtomicUsize::new(0)));
             let mut machine = Machine::builder()
@@ -1178,7 +1178,7 @@ mod runtime_packages {
                 );
             }
             let (status, _) = run_file(&machine, "/bin/wasmer", &["wasmer", "run", "test/b"]).await;
-            assert_eq!(status.unwrap(), 126);
+            assert_eq!(status.unwrap(), 1);
             assert_eq!(
                 machine
                     .install_runtime_package(&resolver.package(2))
@@ -1257,7 +1257,7 @@ mod runtime_packages {
     }
 
     #[tokio::test]
-    async fn shim_checks_guest_files_before_registry() {
+    async fn wasmer_checks_guest_files_before_registry() {
         local(async {
             let resolver = Arc::new(Resolver(layout().await, AtomicUsize::new(0)));
             let mut machine = Machine::builder()
@@ -1294,6 +1294,43 @@ mod runtime_packages {
             assert_eq!(status.unwrap(), 0);
             assert_eq!(output, "package-echo first\npackage");
             assert_eq!(resolver.1.load(Ordering::Relaxed), 0);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn wasmer_custom_registration_enforces_source_policy() {
+        local(async {
+            let resolver = Arc::new(Resolver(layout().await, AtomicUsize::new(0)));
+            let mut machine = Machine::builder()
+                .wasmer_command(wasixv2::WasmerCommandConfig {
+                    resolver: resolver.clone(),
+                    limit: 1,
+                    allow_local: false,
+                    paths: vec!["/usr/bin/guest-wasmer".into()],
+                })
+                .build();
+            machine
+                .install_commands(commands(&[("local.wasm", &echo("local"))]))
+                .await
+                .unwrap();
+            let path = "/usr/bin/guest-wasmer";
+            let (status, help) = run_file(&machine, path, &["wasmer", "--help"]).await;
+            assert_eq!(status.unwrap(), 0);
+            assert!(help.starts_with("Usage: wasmer run"));
+            let (status, version) = run_file(&machine, path, &["wasmer", "--version"]).await;
+            assert_eq!(status.unwrap(), 0);
+            assert_eq!(version, format!("wasmer {}\n", wasmer_types::VERSION));
+            for (args, code) in [
+                (&["wasmer", "run"][..], 2),
+                (&["wasmer", "run", "https://example.invalid/package"][..], 2),
+                (&["wasmer", "run", "/bin/local.wasm"][..], 126),
+                (&["wasmer", "run", "test/missing"][..], 127),
+            ] {
+                let (status, _) = run_file(&machine, path, args).await;
+                assert_eq!(status.unwrap(), code);
+            }
+            assert_eq!(resolver.1.load(Ordering::Relaxed), 1);
         })
         .await;
     }

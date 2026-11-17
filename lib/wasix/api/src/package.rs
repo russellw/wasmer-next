@@ -2,6 +2,8 @@
 //! to the embedder; execution remains ordinary VFS exec (`fs/exec.c:kernel_execve`).
 #[cfg(feature = "resolved-packages")]
 pub(crate) mod runtime;
+#[cfg(feature = "resolved-packages")]
+pub(crate) mod wasmer_command;
 
 use crate::{Filesystem, Layer, Machine, OwnedBuffer};
 #[cfg(feature = "resolved-packages")]
