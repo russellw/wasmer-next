@@ -476,7 +476,7 @@ impl MachineBuilder {
     ///
     /// This does not install the machine budget on `root`: embedder-supplied memory
     /// filesystems must already carry it (see [`MemFs::try_with_memory_budget`] and
-    /// [`default_root_with_memory_budget`]).
+    /// [`default_root`]).
     ///
     /// [`build`]: MachineBuilder::build
     pub fn root(mut self, root: Arc<dyn Filesystem>) -> Self {
@@ -551,7 +551,7 @@ impl MachineBuilder {
 
     pub fn build(self) -> Machine {
         self.try_build()
-            .expect("machine memory budget admits its initial filesystems")
+            .expect("machine configuration and memory budget allow boot")
     }
 
     /// Boots the machine, returning allocation and filesystem budget refusals to the caller.
@@ -617,12 +617,12 @@ impl MachineBuilder {
         let network = network.unwrap_or_else(|| default_network(dns, network_policy));
         let root = match root {
             Some(root) => root,
-            None => default_root_with_memory(
+            None => default_root(
                 &host,
                 &network.resolv_conf(),
                 &user,
                 uname.release(),
-                &memory,
+                memory.budget.clone(),
             )?,
         };
         #[cfg(feature = "wasix1")]
@@ -2233,44 +2233,23 @@ impl Provider for HostPages {
 /// modules whose interfaces it implements (`veth`, `dummy`, ...), and `modules.dep` is empty,
 /// since nothing is loadable. Programs that check for a driver, as LTP's
 /// `tst_require_drivers` does, look there.
+///
+/// With `budget`, charges the skeleton before population and returns `ENOSPC` on refusal,
+/// releasing the partially built filesystem's reservations. When supplying this root to
+/// [`MachineBuilder::root`], set the same budget on the builder for kernel mounts.
+/// Callbacks must obey [`MemoryBudget`]'s locking and lifetime contract.
 pub fn default_root(
     host: &Arc<dyn Host>,
     resolv_conf: &str,
     user: &Credentials,
     release: &str,
-) -> Arc<dyn Filesystem> {
-    default_root_with_memory(host, resolv_conf, user, release, &MemoryConfig::default())
-        .expect("a new memory filesystem takes the default layout")
-}
-
-/// The default skeleton charged to `budget` before population. For callers supplying their
-/// own root to [`MachineBuilder::root`]; use the same budget on the builder for kernel mounts.
-/// Returns `ENOSPC` on refusal and releases the partially built filesystem's reservations.
-/// Callbacks must obey [`MemoryBudget`]'s locking and lifetime contract.
-pub fn default_root_with_memory_budget(
-    host: &Arc<dyn Host>,
-    resolv_conf: &str,
-    user: &Credentials,
-    release: &str,
-    budget: Arc<dyn MemoryBudget>,
+    budget: Option<Arc<dyn MemoryBudget>>,
 ) -> io::Result<Arc<dyn Filesystem>> {
-    let memory = MemoryConfig {
-        budget: Some(budget),
-    };
-    default_root_with_memory(host, resolv_conf, user, release, &memory)
-}
-
-fn default_root_with_memory(
-    host: &Arc<dyn Host>,
-    resolv_conf: &str,
-    user: &Credentials,
-    release: &str,
-    memory: &MemoryConfig,
-) -> io::Result<Arc<dyn Filesystem>> {
+    let memory = MemoryConfig { budget };
     let (uid, gid) = (user.uid(), user.gid());
     // mm/shmem.c shmem_mmap_prepare: root tmpfs files share their pages across fork too.
     let root: Arc<dyn Filesystem> =
-        Arc::new(shared_tmpfs(host, 0o755, uid, gid, memory).map_err(errno_to_io)?);
+        Arc::new(shared_tmpfs(host, 0o755, uid, gid, &memory).map_err(errno_to_io)?);
     let vfs = Vfs::new(root.clone());
     let cred = Cred::root();
     let top = vfs.root();

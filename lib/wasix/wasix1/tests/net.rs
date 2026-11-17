@@ -552,7 +552,9 @@ fn resolve_without_name_servers_fails_fast() {
     let no_resolv_conf = || {
         let host: Arc<dyn wasixv2::Host> = Arc::new(wasixv2::TokioHost::default());
         let release = wasixv2::Uname::LINUX_RELEASE;
-        let root = wasixv2::default_root(&host, "", &wasixv2::Credentials::default(), release);
+        let root =
+            wasixv2::default_root(&host, "", &wasixv2::Credentials::default(), release, None)
+                .unwrap();
         Machine::with_root(host, root)
     };
     let started = std::time::Instant::now();
