@@ -106,6 +106,12 @@ where
         self.low_guard() && crate::memory::guardable(instance, store)
     }
 
+    /// Whether the runtime can attach a zero-page placeholder if the command has no
+    /// imported or exported memory.
+    fn permits_missing_memory(&self) -> bool {
+        false
+    }
+
     /// Whether the ABI's modules may get the low guard, the first 64 KiB of linear memory made
     /// inaccessible when the module's layout keeps nothing there (see [`crate::memory`]). Only
     /// an ABI whose libc never touches those addresses says yes; no by default.
@@ -146,6 +152,11 @@ pub trait ExecProcessLease: Send + Sync + 'static {}
 
 /// The per-instance half of an [`Abi`]: entry points and the guest-visible interruptions.
 pub trait AbiInstance<S: 'static>: Send + Sync {
+    /// Whether the runtime can start threads or fork children of this image.
+    fn supports_process_creation(&self) -> bool {
+        true
+    }
+
     /// Acquires the exact process registration before entry, or moves an already
     /// held vfork child's registration. `process` is its leader, never a thread ID.
     fn retain_exec_process(
@@ -538,6 +549,14 @@ where
     pub fn push_instantiation_hook(&mut self, hook: Arc<dyn crate::InstantiationHook<S>>) {
         self.owning_thread |= hook.requires_owning_thread();
         self.hooks.push(hook);
+    }
+
+    /// Registers the fallback ABI for commands whose original imports are all declared
+    /// by the registered hooks. Call after registering all other ABIs and hooks.
+    pub fn push_plain_command(&mut self) {
+        self.push(Arc::new(crate::plain::PlainCommand(
+            crate::ImportDeclarations::new(&self.hooks),
+        )));
     }
 
     /// Whether any registered binding requires an owning thread, including

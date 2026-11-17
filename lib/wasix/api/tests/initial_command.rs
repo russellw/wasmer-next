@@ -1,4 +1,4 @@
-//! Initial compiled commands use the ordinary ABI, hook and admitted-run machinery.
+//! Initial compiled commands and plain command files use the ordinary exec and hook machinery.
 #![cfg(all(
     feature = "sys",
     feature = "tokio",
@@ -68,6 +68,7 @@ type Events = Arc<Mutex<Vec<(&'static str, Option<u32>)>>>;
 #[derive(Clone, Copy)]
 enum Mode {
     Track,
+    Provide,
     Deny,
     Replace,
     ReplaceWrongType,
@@ -81,6 +82,11 @@ struct Attachment {
     memory: Option<Memory>,
 }
 impl InstantiationHook<MachineSyscalls> for Hook {
+    fn provides_import(&self, namespace: &str, name: &str) -> bool {
+        matches!(self.mode, Mode::Provide)
+            && matches!((namespace, name), ("custom", "value") | ("env", "memory"))
+    }
+
     fn prepare_imports(
         &self,
         _: &Module,
@@ -100,6 +106,11 @@ impl InstantiationHook<MachineSyscalls> for Hook {
                 };
                 imports.define("wasixv2-exec", "preempt", replacement);
             }
+            Mode::Provide => imports.define(
+                "custom",
+                "value",
+                Function::new_typed(store, || -> i32 { 7 }),
+            ),
             Mode::Track => (),
         }
         Ok(Some(Box::new(Attachment {
@@ -111,12 +122,14 @@ impl InstantiationHook<MachineSyscalls> for Hook {
 impl InstanceAttachment for Attachment {
     fn configure(
         &mut self,
-        _: &Module,
+        module: &Module,
         store: &mut StoreMut<'_>,
         instance: &Instance,
         memory: &Memory,
     ) -> Result<(), RuntimeError> {
-        assert_eq!(instance.exports.get_memory("memory").unwrap(), memory);
+        if module.imports().memories().next().is_none() {
+            assert_eq!(instance.exports.get_memory("memory").unwrap(), memory);
+        }
         memory.view(&*store).write(0, &41u32.to_le_bytes()).unwrap();
         self.memory = Some(memory.clone());
         self.events.lock().unwrap().push(("configure", Some(41)));
@@ -328,4 +341,154 @@ async fn initial_entry_opt_in_preserves_normal_v1_and_v2_abi_selection() {
             assert_eq!(compiled(Machine::builder().wasix1_initial_command(true).build(), source).await, Ok(expected));
         }
     }).await;
+}
+
+#[tokio::test]
+async fn plain_files_and_execve_return_the_command_status() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut machine = Machine::builder().plain_commands(true).build();
+            let raw = r#"(module (func (export "_start") (result i32) i32.const 23))"#;
+            let trap = r#"(module (func (export "_start") unreachable))"#;
+            machine
+                .install_commands([("raw", raw), ("exec", EXEC_RAW), ("trap", trap)].map(
+                    |(name, wat)| (name.into(), OwnedBuffer::from(wat::parse_str(wat).unwrap())),
+                ))
+                .await
+                .unwrap();
+            let stdout = Arc::new(Capture::default());
+            for (path, expected) in [("/bin/raw", 23), ("/bin/exec", 23), ("/bin/trap", 132)] {
+                let status = machine
+                    .run_file(&Engine::default(), path, config(stdout.clone()))
+                    .await
+                    .unwrap();
+                assert_eq!(status, expected, "{path}");
+            }
+            assert!(
+                stdout.0.lock().unwrap().is_empty(),
+                "execve replaced its caller"
+            );
+            machine.shutdown().await;
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn plain_hook_imports_configure_memory_before_wasm_start() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            for memory in [
+                r#"(memory (export "memory") 1)"#,
+                r#"(import "env" "memory" (memory 1 2 shared))"#,
+            ] {
+                let events = Events::default();
+                let mut machine = Machine::builder()
+                    .plain_commands(true)
+                    .instantiation_hook(Arc::new(Hook {
+                        mode: Mode::Provide,
+                        events: events.clone(),
+                    }))
+                    .build();
+                let raw = format!(
+                    r#"(module
+                    (import "custom" "value" (func $value (result i32)))
+                    {memory}
+                    (func $start
+                        (if (i32.ne (i32.load (i32.const 0)) (i32.const 41)) (then unreachable))
+                        (i32.store (i32.const 0) (i32.const 42)))
+                    (start $start)
+                    (func (export "_start") (result i32) call $value))"#
+                );
+                machine
+                    .install_commands([(
+                        "raw".into(),
+                        OwnedBuffer::from(wat::parse_str(raw).unwrap()),
+                    )])
+                    .await
+                    .unwrap();
+                let status = machine
+                    .run_file(
+                        &Engine::default(),
+                        "/bin/raw",
+                        config(Arc::new(Capture::default())),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(status, 7);
+                assert_eq!(
+                    *events.lock().unwrap(),
+                    [
+                        ("prepare", None),
+                        ("configure", Some(41)),
+                        ("deactivate", Some(42)),
+                        ("drop", None),
+                    ]
+                );
+                machine.shutdown().await;
+            }
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn plain_files_require_opt_in_and_a_declaration_for_every_import() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            for (enabled, source) in [
+                (false, RAW),
+                (false, r#"(module (import "custom" "value" (func (result i32))) (func (export "_start")))"#),
+                (true, r#"(module (import "custom" "value" (func (result i32))) (import "custom" "missing" (func)) (func (export "_start")))"#),
+            ] {
+                let events = Events::default();
+                let mut machine = Machine::builder()
+                    .plain_commands(enabled)
+                    .instantiation_hook(Arc::new(Hook {
+                        mode: Mode::Provide,
+                        events: events.clone(),
+                    }))
+                    .build();
+                machine
+                    .install_commands([("raw".into(), OwnedBuffer::from(wat::parse_str(source).unwrap()))])
+                    .await
+                    .unwrap();
+                let error = machine
+                    .run_file(&Engine::default(), "/bin/raw", config(Arc::new(Capture::default())))
+                    .await
+                    .unwrap_err();
+                assert!(matches!(error, wasixv2::RunError::Execve { ref err, .. } if err.raw_os_error() == Some(8)), "{error}");
+                assert!(events.lock().unwrap().is_empty());
+                machine.shutdown().await;
+            }
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn plain_commands_preserve_native_wasixv2_selection() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut machine = Machine::builder().plain_commands(true).build();
+            let raw = r#"(module
+                (import "wasixv2" "exit_group" (func $exit (param i32)))
+                (memory (export "memory") 1)
+                (func (export "_start") (call $exit (i32.const 24)) unreachable))"#;
+            machine
+                .install_commands([(
+                    "native".into(),
+                    OwnedBuffer::from(wat::parse_str(raw).unwrap()),
+                )])
+                .await
+                .unwrap();
+            let status = machine
+                .run_file(
+                    &Engine::default(),
+                    "/bin/native",
+                    config(Arc::new(Capture::default())),
+                )
+                .await
+                .unwrap();
+            assert_eq!(status, 24);
+            machine.shutdown().await;
+        })
+        .await;
 }

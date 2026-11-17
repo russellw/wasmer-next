@@ -348,6 +348,7 @@ pub struct MachineBuilder {
     /// The embedder's loader; the ABIs' own default otherwise.
     loader: Option<Arc<dyn Loader>>,
     instantiation_hooks: Vec<Arc<dyn InstantiationHook<Stack>>>,
+    plain_commands: bool,
     #[cfg(feature = "js")]
     js_async_mode: wasmer::js::AsyncMode,
     #[cfg(feature = "wasix1")]
@@ -397,6 +398,7 @@ impl MachineBuilder {
             max_guest_tasks: None,
             loader: None,
             instantiation_hooks: Vec::new(),
+            plain_commands: false,
             #[cfg(feature = "js")]
             js_async_mode: wasmer::js::AsyncMode::Blocking,
             #[cfg(feature = "wasix1")]
@@ -421,6 +423,15 @@ impl MachineBuilder {
     #[cfg(feature = "wasix1")]
     pub fn wasix1_initial_command(mut self, enabled: bool) -> Self {
         self.wasix1_initial_command = enabled;
+        self
+    }
+
+    /// Allows compiled commands, files and guest execve targets whose imports are all
+    /// declared by registered instantiation hooks. This fallback ABI defaults to off.
+    /// It runs `_start` and accepts a void return (exit 0) or an i32 exit status.
+    /// When enabled, it supersedes the WASIX v1 initial-command opt-in.
+    pub fn plain_commands(mut self, enabled: bool) -> Self {
+        self.plain_commands = enabled;
         self
     }
 
@@ -605,6 +616,7 @@ impl MachineBuilder {
             max_guest_tasks,
             loader,
             instantiation_hooks,
+            plain_commands,
             #[cfg(feature = "js")]
             js_async_mode,
             #[cfg(feature = "wasix1")]
@@ -657,7 +669,11 @@ impl MachineBuilder {
             )?,
         };
         #[cfg(feature = "wasix1")]
-        let wasix1 = Wasix1Commands::new(http_provider, wasix1_limits, wasix1_initial_command);
+        let wasix1 = Wasix1Commands::new(
+            http_provider,
+            wasix1_limits,
+            wasix1_initial_command && !plain_commands,
+        );
         let mut configured_abis = abis(
             loader,
             #[cfg(feature = "js")]
@@ -667,6 +683,9 @@ impl MachineBuilder {
         );
         for hook in instantiation_hooks {
             configured_abis.push_instantiation_hook(hook);
+        }
+        if plain_commands {
+            configured_abis.push_plain_command();
         }
         let abis = Arc::new(configured_abis);
         let kernel = boot(

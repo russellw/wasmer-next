@@ -147,10 +147,9 @@ where
             module_flavor(module),
             Some(V1Flavor::Wasm32 | V1Flavor::HttpClient)
         ) || (self.initial_command_entry
-            && module.imports().all(|import| {
-                import.module() == "wasixv2-exec"
-                    && matches!(import.ty(), wasmer::ExternType::Function(_))
-            }))
+            && module
+                .imports()
+                .all(|import| wasixv2_exec::is_command_runtime_import(&import)))
     }
 
     fn matches_image(&self, image: &[u8]) -> bool {

@@ -24,6 +24,7 @@ mod memory;
 mod memory_image;
 #[cfg(all(target_os = "linux", feature = "sys"))]
 mod pagemap;
+mod plain;
 mod preempt;
 #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
 pub use cancellation::OwnedEntryWaiter;
@@ -73,6 +74,7 @@ pub use loader::{Compile, LoadError, Loader};
 pub use memory::GuestMemory;
 #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
 pub use memory::poll_native_host_reservation;
+pub use plain::is_command_runtime_import;
 pub use preempt::InstrumentError;
 pub use preparation::Preparation;
 pub use process::VFORK_RETURN;
@@ -275,10 +277,17 @@ impl<S> ExecEnv<S> {
     }
 
     /// The task the instance runs as; it changes when vfork switches the instance.
-    pub fn process_fork_allowed(&self) -> bool {
-        self.contexts
-            .upgrade()
-            .is_none_or(|group| group.current() == 0)
+    pub fn process_fork_allowed(&self) -> bool
+    where
+        S: 'static,
+    {
+        self.abi
+            .as_ref()
+            .is_none_or(|abi| abi.supports_process_creation())
+            && self
+                .contexts
+                .upgrade()
+                .is_none_or(|group| group.current() == 0)
     }
 
     pub fn task(&self) -> TaskId {
@@ -1036,7 +1045,18 @@ where
         let instance = Instance::new(&mut store, module, &imports)?;
         let memory = match imported {
             Some(memory) => memory,
-            None => instance.exports.get_memory("memory")?.clone(),
+            None => match instance.exports.get_memory("memory") {
+                Ok(memory) => memory.clone(),
+                Err(_) if abi.permits_missing_memory() => {
+                    match instance.exports.iter().memories().next() {
+                        Some((_, memory)) => memory.clone(),
+                        None => {
+                            Memory::new(&mut store, wasmer::MemoryType::new(0, Some(0), false))?
+                        }
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            },
         };
         // Decided from the module's own globals, before a fork child's copy replaces them.
         let guarded = abi.guardable(&instance, &mut store.as_store_mut());
@@ -1110,7 +1130,8 @@ where
             syscalls.attach_memory(task, Arc::new(foreign));
         }
         // ---- thr ----
-        let threads = shared.map(|shared| {
+        let thread_memory = shared.filter(|_| bound.supports_process_creation());
+        let threads = thread_memory.map(|shared| {
             let protected = (low_guard, read_only.clone(), base.clone());
             let image = thread::Image::new(
                 store.engine().clone(),

@@ -22,9 +22,9 @@ pub trait InstantiationHook<S>: Send + Sync + 'static {
         false
     }
 
-    /// Declares host imports that a dynamic linker may otherwise treat as missing
-    /// guest symbols. This pure declaration must stay fixed for the image lifetime;
-    /// it neither constructs a value nor overrides infrastructure or a guest definition.
+    /// Declares host imports for plain command admission and dynamic linking.
+    /// This pure declaration stays fixed for the image lifetime and leaves
+    /// infrastructure imports and guest definitions intact.
     fn provides_import(&self, _namespace: &str, _name: &str) -> bool {
         false
     }
@@ -148,7 +148,7 @@ impl<S: 'static> Declaration for Declared<S> {
     }
 }
 impl ImportDeclarations {
-    fn new<S: 'static>(hooks: &[Arc<dyn InstantiationHook<S>>]) -> Self {
+    pub(crate) fn new<S: 'static>(hooks: &[Arc<dyn InstantiationHook<S>>]) -> Self {
         Self {
             identities: Arc::new(
                 hooks
