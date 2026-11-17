@@ -27,6 +27,8 @@ runs:
         install -m 600 /dev/null "$token_file"
         printf '%s' "$PRIVATE_DEPS_TOKEN" > "$token_file"
 
+        # Checkout's temporary trust config does not reach container shell steps.
+        git config --global --add safe.directory "$GITHUB_WORKSPACE"
         git config --global credential.useHttpPath true
         for u in \
           "https://github.com/wasmerio/wasmer-runtime" \
