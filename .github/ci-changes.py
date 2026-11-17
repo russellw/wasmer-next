@@ -125,9 +125,14 @@ def outputs(areas):
                 "command": 'cargo test --release --locked --target "$TARGET" '
                 "-p wasixv2 -p wasixv2-exec -p wasixv2-dylink "
                 "-p wasixv2-wasix1 -p wasixv2-codegen "
-                "-p wasmer-sdk -p wasmer-c-api-imports "
+                "-p wasmer-sdk "
                 "-p wasmer-package -p wasmer-package-sdk "
-                "-p wasmer-backend-api -p wasmer-config -p wasmer-cache",
+                "-p wasmer-backend-api -p wasmer-config -p wasmer-cache && "
+                'case "$TARGET" in *windows*) imports_backend=v8-default;; '
+                '*) imports_backend=sys-default;; esac && '
+                'cargo test --release --locked --target "$TARGET" '
+                "-p wasmer-c-api-imports --no-default-features "
+                '--features "wat,$imports_backend,wasixv2"',
             }
         ] + [stage for stage in TEST_MATRIX if stage["make"] != "test-all"])
         if product else [],

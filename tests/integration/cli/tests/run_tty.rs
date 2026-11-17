@@ -41,15 +41,15 @@ fn winsize(rows: u16) -> libc::winsize {
 impl Terminal {
     fn open() -> Self {
         let (mut master, mut slave) = (0, 0);
-        let size = winsize(ROWS);
+        let mut size = winsize(ROWS);
         // SAFETY: `openpty` fills both descriptors when it succeeds.
         let ret = unsafe {
             libc::openpty(
                 &mut master,
                 &mut slave,
                 std::ptr::null_mut(),
-                std::ptr::null(),
-                &size,
+                std::ptr::null_mut(),
+                &mut size,
             )
         };
         assert_eq!(ret, 0, "openpty: {}", std::io::Error::last_os_error());
@@ -107,7 +107,7 @@ impl Terminal {
         // SAFETY: async-signal-safe calls between fork and exec.
         unsafe {
             command.pre_exec(|| {
-                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
+                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(())

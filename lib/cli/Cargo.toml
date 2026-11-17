@@ -114,6 +114,7 @@ tokio-subscriber = ["dep:console-subscriber", "tokio/tracing"]
 
 wasmer = { workspace = true, default-features = false, features = [
   "headless",
+  "wat",
 ] }
 wasmer-compiler = { workspace = true, default-features = true, features = [
   "compiler",

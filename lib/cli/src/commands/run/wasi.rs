@@ -280,44 +280,6 @@ impl Wasi {
         Ok((have_current_dir, mapped_dirs))
     }
 
-    /// The runtime `wasmer run` resolves, downloads and compiles packages with: the registry
-    /// and local sources, the package cache and the compiled-module cache.
-    pub(super) fn prepare_context(
-        &self,
-        engine: Engine,
-        env: &WasmerEnv,
-        executor: tokio::runtime::Runtime,
-        preferred_webc_version: webc::Version,
-        compiler_debug_dir_used: bool,
-        progress: indicatif::ProgressBar,
-        quiet_mode: bool,
-    ) -> Result<RunContext> {
-        let client = Arc::new(ReqwestHttpClient::default());
-        let package_loader = self
-            .prepare_package_loader(env, client.clone())
-            .context("Unable to prepare the package loader")?;
-        let source = self.prepare_source(env, client, preferred_webc_version)?;
-        let module_cache: Arc<dyn ModuleCache + Send + Sync> =
-            if !self.disable_cache && !compiler_debug_dir_used {
-                let cache = SharedCache::default().with_fallback(FileSystemCache::new(
-                    env.cache_dir().join("compiled"),
-                    executor.handle().clone(),
-                ));
-                Arc::new(cache)
-            } else {
-                Arc::new(SharedCache::default())
-            };
-        Ok(RunContext::new(
-            executor,
-            engine,
-            source,
-            package_loader,
-            module_cache,
-            progress,
-            quiet_mode,
-        ))
-    }
-
     fn prepare_package_loader(
         &self,
         env: &WasmerEnv,
@@ -439,6 +401,48 @@ fn tokens_by_authority(env: &WasmerEnv) -> Result<HashMap<String, String>> {
     tokens.extend(frontend_tokens);
 
     Ok(tokens)
+}
+
+impl super::Run {
+    /// The runtime `wasmer run` resolves, downloads and compiles packages with: the registry
+    /// and local sources, the package cache and the compiled-module cache.
+    pub(super) fn prepare_context(
+        &self,
+        engine: Engine,
+        executor: tokio::runtime::Runtime,
+        preferred_webc_version: webc::Version,
+        progress: indicatif::ProgressBar,
+        quiet_mode: bool,
+    ) -> Result<RunContext> {
+        let env = &self.env;
+        let client = Arc::new(ReqwestHttpClient::default());
+        let package_loader = self
+            .wasi
+            .prepare_package_loader(env, client.clone())
+            .context("Unable to prepare the package loader")?;
+        let source = self
+            .wasi
+            .prepare_source(env, client, preferred_webc_version)?;
+        let module_cache: Arc<dyn ModuleCache + Send + Sync> =
+            if !self.wasi.disable_cache && self.rt.compiler_debug_dir.is_none() {
+                let cache = SharedCache::default().with_fallback(FileSystemCache::new(
+                    env.cache_dir().join("compiled"),
+                    executor.handle().clone(),
+                ));
+                Arc::new(cache)
+            } else {
+                Arc::new(SharedCache::default())
+            };
+        Ok(RunContext::new(
+            executor,
+            engine,
+            source,
+            package_loader,
+            module_cache,
+            progress,
+            quiet_mode,
+        ))
+    }
 }
 
 #[cfg(test)]

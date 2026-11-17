@@ -932,14 +932,15 @@ impl Node for HostNode {
         self.at(name, move |dir, name| {
             // SAFETY: plain syscall on NUL-terminated names.
             cvt(unsafe {
-                libc::renameat2(
+                libc::syscall(
+                    libc::SYS_renameat2,
                     dir,
                     name.as_ptr(),
                     new_dir.as_raw_fd(),
                     new_name.as_ptr(),
                     flags,
                 )
-            })
+            } as libc::c_int)
             .map(drop)
         })
         .await

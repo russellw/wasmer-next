@@ -41,9 +41,14 @@ wasixv2 = { path = "../api", default-features = false, features = ["js", "web", 
 wasmer-wasix-types = { path = "../../wasi-types" }
 wasixv2 = { path = "../api" }
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+
+[target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "windows")))'.dev-dependencies]
 wasmer = { workspace = true, default-features = false, features = [
   "cranelift",
 ] }
+
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+wasmer = { workspace = true, default-features = false, features = ["v8-default"] }
 
 [features]
 default = ["sys"]

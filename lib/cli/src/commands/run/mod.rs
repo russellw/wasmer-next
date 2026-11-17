@@ -139,12 +139,10 @@ impl Run {
             wasmer_vm::set_stack_size(stack_size);
         }
 
-        let runtime = self.wasi.prepare_context(
+        let runtime = self.prepare_context(
             engine.clone(),
-            &self.env,
             runtime,
             preferred_webc_version,
-            self.rt.compiler_debug_dir.is_some(),
             pb.clone(),
             output.is_quiet_or_no_tty(),
         )?;

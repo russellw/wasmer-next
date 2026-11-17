@@ -38,11 +38,14 @@ futures.workspace = true
 wasmprinter.workspace = true
 wat.workspace = true
 
-[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-wasmer = { workspace = true, default-features = false, features = ["cranelift"] }
-
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test.workspace = true
+
+[target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "windows")))'.dev-dependencies]
+wasmer = { workspace = true, default-features = false, features = ["cranelift"] }
+
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+wasmer = { workspace = true, default-features = false, features = ["v8-default"] }
 
 [features]
 default = ["sys"]

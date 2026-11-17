@@ -62,14 +62,19 @@ wasix1-net-reference = { path = "tests/support/classic-reference" }
 wasixv2-vnet-web = { workspace = true }
 wasixv2-wait = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
-wasmer = { workspace = true, default-features = false, features = [
-  "cranelift",
-] }
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test.workspace = true
 wasm-bindgen-futures.workspace = true
 js-sys.workspace = true
+
+[target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "windows")))'.dev-dependencies]
+wasmer = { workspace = true, default-features = false, features = [
+  "cranelift",
+] }
+
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+wasmer = { workspace = true, default-features = false, features = ["v8-default"] }
 
 [features]
 resolved-packages = ["dep:wasmer-package", "dep:wasmer-config"]

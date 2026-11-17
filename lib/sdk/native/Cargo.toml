@@ -10,7 +10,7 @@ publish = false
 
 [features]
 default = ["sys"]
-sys = ["wasmer/cranelift", "wasixv2/sys", "wasixv2/tokio", "wasixv2/host-network", "wasixv2/wasix1"]
+sys = ["wasmer/sys", "wasixv2/sys", "wasixv2/tokio", "wasixv2/host-network", "wasixv2/wasix1"]
 napi-v8 = ["sys", "dep:wasmer-napi", "wasmer-napi/wasix"]
 
 [dependencies]
@@ -45,6 +45,13 @@ wasixv2-wait.workspace = true
 webc = { version = "=12.0.1", default-features = false, features = ["v3"] }
 wasmparser.workspace = true
 wasmer-napi = { path = "../../napi", optional = true, default-features = false }
+
+# Match the engine backends supported on each native host.
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+wasmer = { workspace = true, default-features = false, features = ["cranelift"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+wasmer = { workspace = true, default-features = false, features = ["v8-default"] }
 
 [dev-dependencies]
 serde_json.workspace = true

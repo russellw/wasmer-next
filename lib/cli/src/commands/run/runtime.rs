@@ -20,10 +20,7 @@ use wasmer_config::{
 };
 use wasmer_package::{
     loader::{LoadedPackage, PackageDownloader},
-    resolver::{
-        self, PackageInfo, PackageSummary, QueryError, Resolution, ResolvedFileSystemMapping,
-        Source,
-    },
+    resolver::{self, PackageInfo, PackageSummary, QueryError, Resolution, Source},
 };
 use webc::Container;
 
@@ -61,9 +58,7 @@ pub(super) struct RunContext {
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct PackageTree {
-    pub containers: HashMap<PackageId, Container>,
     pub files: HashMap<PackageId, PathBuf>,
-    pub filesystem: Vec<ResolvedFileSystemMapping>,
     pub root: Option<PackageId>,
     pub root_is_local_dir: bool,
 }
@@ -79,7 +74,7 @@ impl RunContext {
     pub fn new(
         executor: tokio::runtime::Runtime,
         engine: Engine,
-        source: impl Source + Send + Sync + 'static,
+        source: impl Source + Send + 'static,
         downloader: PackageDownloader,
         module_cache: Arc<dyn ModuleCache + Send + Sync>,
         progress: ProgressBar,
@@ -189,13 +184,11 @@ impl RunContext {
         let package = LoadedPackage::from_containers(resolution, containers)?;
         let files = self.files.lock().unwrap();
         let tree = PackageTree {
-            containers: package.containers.clone(),
             files: files
                 .iter()
                 .filter(|(id, _)| package.containers.contains_key(*id))
                 .map(|(id, path)| (id.clone(), path.clone()))
                 .collect(),
-            filesystem: package.resolution.package.filesystem.clone(),
             root: Some(package.resolution.package.root_package.clone()),
             root_is_local_dir: local,
         };

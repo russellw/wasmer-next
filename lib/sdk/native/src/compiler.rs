@@ -6,10 +6,9 @@ use std::{
     sync::{Arc, Mutex},
 };
 use wasixv2::{Image, ImageId, LoadError, Loader, LocalFuture};
-use wasmer::{
-    Engine, Module,
-    sys::{Cranelift, EngineBuilder},
-};
+#[cfg(not(target_os = "windows"))]
+use wasmer::sys::{Cranelift, EngineBuilder};
+use wasmer::{Engine, Module};
 use wasmer_cache::module_cache::{
     FileSystemCache, ModuleCache, ModuleHash, SharedCache, load_module,
 };
@@ -55,12 +54,18 @@ impl CompilationOwner {
         if let Some((_, engine)) = engines.iter().find(|(existing, _)| existing == &features) {
             return Ok(engine.clone());
         }
+        #[cfg(not(target_os = "windows"))]
         let mut engine = EngineBuilder::new(Cranelift::default())
             .set_features(Some(features.clone()))
             .engine();
-        #[cfg(feature = "napi-v8")]
+        #[cfg(all(feature = "napi-v8", not(target_os = "windows")))]
         engine.set_tunables(wasmer_napi::budgeted_tunables(self.context.budget()));
+        #[cfg(not(target_os = "windows"))]
         let engine: Engine = engine.into();
+        #[cfg(target_os = "windows")]
+        let engine: Engine = wasmer::v8::V8::new().into();
+        #[cfg(all(feature = "napi-v8", target_os = "windows"))]
+        anyhow::bail!("N-API memory budgets require a native sys compiler backend");
         engines.push((features, engine.clone()));
         Ok(engine)
     }
