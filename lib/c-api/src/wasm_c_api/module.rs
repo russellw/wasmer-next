@@ -465,9 +465,9 @@ pub unsafe extern "C" fn wasm_module_deserialize(
             Module::deserialize(store, bytes.as_slice())
         })));
 
-    Some(unsafe {
-        NonNull::new_unchecked(Box::into_raw(Box::new(wasm_module_t { inner: module })))
-    })
+    Some(Box::into_non_null(Box::new(wasm_module_t {
+        inner: module,
+    })))
 }
 
 /// Serializes a module into a binary representation that the

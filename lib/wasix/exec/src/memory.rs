@@ -27,7 +27,7 @@
 //! with `SIGSEGV`, and [`ReadOnly`] keeps [`write`] out of it. Every other range stays
 //! read-write whatever the guest asked for, as wasm enforces no page protection of its own.
 
-#[cfg(all(unix, feature = "sys"))]
+#[cfg(all(feature = "sys", any(unix, test)))]
 use std::sync::RwLockWriteGuard;
 use std::{
     ops::Range,
@@ -268,7 +268,7 @@ impl ReadOnly {
         self.0.read().unwrap_or_else(PoisonError::into_inner)
     }
 
-    #[cfg(all(unix, feature = "sys"))]
+    #[cfg(all(feature = "sys", any(unix, test)))]
     fn ranges_mut(&self) -> RwLockWriteGuard<'_, Vec<Range<u64>>> {
         self.0.write().unwrap_or_else(PoisonError::into_inner)
     }
