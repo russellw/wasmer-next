@@ -39,8 +39,10 @@ slots with element segments and imported function aliases. `deferred_checks`
 records that reconciliation, host import checking and unknown global values.
 
 `Initialization::parse` validates finite helper bodies and the exact supported lld
-shared-memory once template, then produces fresh-range-checked host writes, scalar
-global updates and element placements. It never executes wasm; helper names alone
+shared-memory once templates (including the v1 block/local.tee prologue and its
+finite relocation prefix), then produces fresh-range-checked host writes, scalar global updates and element placements.
+Relocation helpers share a 1,024-local aggregate bound and support wasm32 wrapping
+offset addition and subtraction. It never executes wasm; helper names alone
 confer no trust. It rejects imported calls, constructors, recursion, loops and writes
 to imported globals. The no-auto-start rewrite makes active data empty passive
 segments and active elements declared while preserving segment indices. Private

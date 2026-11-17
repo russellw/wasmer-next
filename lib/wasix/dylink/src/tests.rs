@@ -574,6 +574,105 @@ fn shared_once_template_is_lifted_without_atomic_wait_or_peer_reinitialization()
 }
 
 #[test]
+fn legacy_once_template_preserves_bounds_and_peer_semantics() {
+    let fixture = include_str!("fixtures/once-initialization-v1.wat");
+    let init = crate::Initialization::parse(&bytes(fixture, [16, 0, 0, 0], &[], &[], &[])).unwrap();
+    let first = init
+        .effects([(0, 128)].into(), &reservation(128..144), None)
+        .unwrap();
+    assert_eq!(first.writes[0].address, 128);
+    assert_eq!(first.writes[0].bytes, b"test");
+    assert_eq!(first.writes[1].address, 136);
+    assert_eq!(first.writes[1].bytes, 2u32.to_le_bytes());
+    assert!(
+        init.effects([(0, 128)].into(), &reservation(128..136), None)
+            .is_err()
+    );
+    assert!(
+        init.effects([(0, 128)].into(), &reservation(256..272), Some(256))
+            .unwrap()
+            .writes
+            .is_empty()
+    );
+    assert_eq!(
+        init.dropped_segments().iter().copied().collect::<Vec<_>>(),
+        [0]
+    );
+    for (from, to) in [
+        ("br_table 0 1 2", "br_table 0 2 2"),
+        ("local.tee 0", "local.tee 1"),
+        (
+            "i32.const 2 i32.atomic.store",
+            "i32.const 1 i32.atomic.store",
+        ),
+        (
+            "i32.const 4 memory.init $data",
+            "i32.const 4 memory.init $data loop br 0 end",
+        ),
+    ] {
+        let bad = fixture.replace(from, to);
+        assert!(crate::Initialization::parse(&bytes(&bad, [16, 0, 0, 0], &[], &[], &[])).is_err());
+    }
+}
+
+#[test]
+fn legacy_once_prefix_is_validated_and_applies_to_every_store() {
+    let fixture = include_str!("fixtures/once-initialization-v1.wat")
+        .replace(
+            "(memory 1 1 shared)",
+            "(memory 1 1 shared) (global $reloc (mut i32) (i32.const 0))",
+        )
+        .replace(
+            "    block block block",
+            "    global.get $base i32.const -4 i32.sub global.set $reloc\n    block block block",
+        );
+    let init =
+        crate::Initialization::parse(&bytes(&fixture, [16, 0, 0, 0], &[], &[], &[])).unwrap();
+    for tls in [None, Some(256)] {
+        let effects = init
+            .effects([(0, 128)].into(), &reservation(128..272), tls)
+            .unwrap();
+        assert_eq!(effects.globals[&1], 132);
+        assert_eq!(effects.writes.is_empty(), tls.is_some());
+    }
+    let bad = fixture.replace("global.set $reloc", "global.set $reloc loop br 0 end");
+    assert!(crate::Initialization::parse(&bytes(&bad, [16, 0, 0, 0], &[], &[], &[])).is_err());
+}
+
+#[test]
+fn relocation_locals_use_the_aggregate_bound() {
+    // Optimized v1 lld emits hundreds of cached address locals in Python's
+    // __wasm_apply_data_relocs, rather than only the two once-helper locals.
+    let fixture = |count: usize| {
+        format!(
+            r#"(module
+      (memory 1)
+      (func (export "__wasm_apply_data_relocs") (local {})
+        i32.const 128 local.tee 0 local.set {}
+        local.get {} i32.const -4 i32.sub i32.const 42 i32.store))"#,
+            "i32 ".repeat(count),
+            count - 1,
+            count - 1
+        )
+    };
+    let init = crate::Initialization::parse(&bytes(&fixture(1024), [0; 4], &[], &[], &[])).unwrap();
+    let effects = init
+        .effects(Default::default(), &reservation(132..136), None)
+        .unwrap();
+    assert_eq!(effects.writes[0].address, 132);
+    assert_eq!(effects.writes[0].bytes, 42u32.to_le_bytes());
+    assert!(
+        init.effects(Default::default(), &reservation(133..137), None)
+            .is_err()
+    );
+    assert!(crate::Initialization::parse(&bytes(&fixture(1025), [0; 4], &[], &[], &[])).is_err());
+    let nested = fixture(1024)
+        .replace("(memory 1)", "(memory 1) (func $helper (local i32))")
+        .replace("i32.const 128", "call $helper i32.const 128");
+    assert!(crate::Initialization::parse(&bytes(&nested, [0; 4], &[], &[], &[])).is_err());
+}
+
+#[test]
 fn sanitized_instantiation_has_no_start_or_active_shared_writes() {
     let wasm = bytes(
         r#"(module
