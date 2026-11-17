@@ -896,8 +896,9 @@ lint-packages: RUSTFLAGS += -D dead-code -D nonstandard-style -D unused-imports 
 lint-packages:
 	RUSTFLAGS="${RUSTFLAGS}" cargo clippy --all --examples --exclude wasmer-cli --exclude wasmer-swift --locked -- -D clippy::all
 	RUSTFLAGS="${RUSTFLAGS}" cargo clippy --manifest-path lib/cli/Cargo.toml --locked $(compiler_features) -- -D clippy::all
+# The imported kernel and standalone guest suite retain their own C source style.
 lint-clang-format:
-	find . \( -path './lib/napi' -o -path './lib/wild' -o -path './target' \) -prune -o -type f \( -name '*.c' -o -name '*.cpp' \) -exec clang-format --dry-run --color -Werror {} +
+	find . \( -path './lib/napi' -o -path './lib/wild' -o -path './target' -o -path './wlk' -o -path './tests/wasixv2' \) -prune -o -type f \( -name '*.c' -o -name '*.cpp' \) -exec clang-format --dry-run --color -Werror {} +
 lint-yamlfmt:
 	yamlfmt -lint .github
 lint-taplo:

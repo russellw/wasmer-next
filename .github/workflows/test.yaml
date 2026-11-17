@@ -16,6 +16,7 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 env:
+  GH_TOKEN: ${{ github.token }}
   RUST_BACKTRACE: 1
   NEXTEST_PROFILE: "ci"
   RUSTUP_WINDOWS_PATH_ADD_BIN: 1
@@ -722,6 +723,10 @@ jobs:
         if: matrix.build-what.key == 'check'
         shell: bash
         run: ${{ matrix.build-what.build-cmd }}
+        env:
+          TARGET: ${{ matrix.metadata.target }}
+          TARGET_DIR: target/${{ matrix.metadata.target }}/release
+          CARGO_TARGET: ${{ matrix.metadata.target }}
       - name: Lint C-API
         shell: bash
         if: ${{ matrix.build-what.key == 'capi' && !(matrix.metadata.build == 'linux-musl'  || matrix.metadata.build == 'windows-gnu') }}
