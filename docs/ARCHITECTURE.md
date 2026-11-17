@@ -30,7 +30,9 @@ remain independent; root integration consumes them by path. No WLK crate may
 depend on an engine crate. Its sparse-checkout CI enforces the boundary.
 Canonical generator checks remain in lib/wasix/exec/tests/generated.rs.
 
-Submodules are wasmer-test-files, NAPI's QuickJS, and the upstream suites at
-tests/wasixv2/upstream/{ltp,libc-test,libcap,libaio}. The v2 suite itself is tracked
-source. Initialize submodules before builds. NAPI remains local for now; its
-provenance is in lib/napi/SOURCE.md and comparison in NAPI-UPSTREAM-DIFF.md.
+Submodules are wasmer-test-files, lib/napi (wasmerio/napi, branch next), and the
+upstream suites at tests/wasixv2/upstream/{ltp,libc-test,libcap,libaio}. NAPI owns
+its nested QuickJS submodule. The v2 suite itself is tracked source. Initialize
+with `git submodule update --init --recursive` before builds. NAPI retains its
+WASIX v2 adaptations and path dependencies on this workspace; see
+[NAPI-UPSTREAM-DIFF.md](NAPI-UPSTREAM-DIFF.md).

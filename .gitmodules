@@ -1,9 +1,6 @@
 [submodule "wasmer-test-files"]
 	path = wasmer-test-files
 	url = https://github.com/wasmerio/wasmer-test-files.git
-[submodule "lib/napi/quickjs/deps/quickjs"]
-	path = lib/napi/quickjs/deps/quickjs
-	url = https://github.com/wasmerio/quickjs.git
 [submodule "tests/wasixv2/upstream/ltp"]
 	path = tests/wasixv2/upstream/ltp
 	url = https://github.com/wasix-org/ltp.git
@@ -17,3 +14,7 @@
 [submodule "tests/wasixv2/upstream/libaio"]
 	path = tests/wasixv2/upstream/libaio
 	url = https://pagure.io/libaio.git
+[submodule "lib/napi"]
+	path = lib/napi
+	url = https://github.com/wasmerio/napi.git
+	branch = next

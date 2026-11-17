@@ -50,7 +50,7 @@ jobs:
           repository: ${{ github.repository }}
           ref: ${{ inputs.candidate_ref }}
           path: candidate
-          submodules: false
+          submodules: recursive
           persist-credentials: false
       - name: Configure private runtime access
         uses: ./candidate/.github/actions/setup-runtime

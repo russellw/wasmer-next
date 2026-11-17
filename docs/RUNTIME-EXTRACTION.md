@@ -79,6 +79,6 @@ checks. The changed area-selector tests are retained for CI, not claimed passed.
 Existing backend/platform restrictions, V8 concurrency limitations and guest-suite
 setup gaps still apply. No public-registry distribution policy is established.
 
-NAPI stays local: [NAPI-UPSTREAM-DIFF.md](NAPI-UPSTREAM-DIFF.md) records its
-comparison with runtime's unchanged upstream submodule. Replacing it is a later
-port, not part of this extraction.
+NAPI is mounted at lib/napi from wasmerio/napi, branch next, preserving the
+product's WASIX v2 adaptations rather than reverting to runtime's upstream pin.
+See [NAPI-UPSTREAM-DIFF.md](NAPI-UPSTREAM-DIFF.md).

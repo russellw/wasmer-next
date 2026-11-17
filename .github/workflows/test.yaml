@@ -70,7 +70,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          submodules: true
+          submodules: recursive
       - name: Configure private runtime access
         uses: ./.github/actions/setup-runtime
         with:
@@ -87,7 +87,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          submodules: true
+          submodules: recursive
       - name: Configure private runtime access
         uses: ./.github/actions/setup-runtime
         with:
@@ -180,7 +180,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          submodules: true
+          submodules: recursive
       - name: Configure private runtime access
         uses: ./.github/actions/setup-runtime
         with:
@@ -207,7 +207,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          submodules: true
+          submodules: recursive
       - name: Configure private runtime access
         uses: ./.github/actions/setup-runtime
         with:
@@ -228,7 +228,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          submodules: true
+          submodules: recursive
       - name: Configure private runtime access
         uses: ./.github/actions/setup-runtime
         with:
@@ -280,7 +280,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          submodules: true
+          submodules: recursive
       #- uses: ./.github/actions/load_toolchain
       #  id: load_toolchain
       #- uses: dtolnay/rust-toolchain@stable
@@ -398,7 +398,7 @@ jobs:
           apk add git bash openssh-client
       - uses: actions/checkout@v6
         with:
-          submodules: true
+          submodules: recursive
       - name: Configure private runtime access
         uses: ./.github/actions/setup-runtime
         with:
@@ -652,7 +652,7 @@ jobs:
           apk add git bash openssh-client
       - uses: actions/checkout@v6
         with:
-          submodules: true
+          submodules: recursive
       - name: Configure private runtime access
         uses: ./.github/actions/setup-runtime
         with:
@@ -806,7 +806,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          submodules: true
+          submodules: recursive
       - uses: ./.github/actions/setup-runtime
         with:
           ssh-key: ${{ secrets.RUNTIME_CI_READ_SSH_KEY }}
