@@ -40,7 +40,8 @@ jobs:
   build:
     name: ${{ matrix.build }}
     if: github.event_name != 'pull_request' || startsWith(github.head_ref, 'release-')
-    runs-on: ${{ matrix.build == 'linux-x64' && (github.event_name == 'pull_request' && 'aux-pub-16cpu-amd64' || 'aux-pub-trusted-16cpu-amd64') || matrix.build == 'linux-arm64' && (github.event_name == 'pull_request' && 'aux-pub-16cpu-arm64' || 'aux-pub-trusted-16cpu-arm64') || matrix.os }}
+    # TODO: re-enable custom runner: runs-on: ${{ matrix.build == 'linux-x64' && (github.event_name == 'pull_request' && 'aux-pub-16cpu-amd64' || 'aux-pub-trusted-16cpu-amd64') || matrix.build == 'linux-arm64' && (github.event_name == 'pull_request' && 'aux-pub-16cpu-arm64' || 'aux-pub-trusted-16cpu-arm64') || matrix.os }}
+    runs-on: ${{ matrix.os }}
     needs: setup
     strategy:
       fail-fast: false
@@ -65,7 +66,8 @@ jobs:
             enable_v8: true
             enable_napi_v8: true
           - build: macos-arm
-            os: depot-macos-14
+            # TODO: re-enable custom runner: os: depot-macos-14
+            os: macos-14
             target: aarch64-apple-darwin
             artifact_name: "wasmer-darwin-arm64"
             build_wasm: false
@@ -295,7 +297,8 @@ jobs:
   windows_gnu:
     name: windows-gnu
     if: github.event_name != 'pull_request' || startsWith(github.head_ref, 'release-')
-    runs-on: ${{ github.event_name == 'pull_request' && 'aux-pub-16cpu-amd64' || 'aux-pub-trusted-16cpu-amd64' }}
+    # TODO: re-enable custom runner: runs-on: ${{ github.event_name == 'pull_request' && 'aux-pub-16cpu-amd64' || 'aux-pub-trusted-16cpu-amd64' }}
+    runs-on: ubuntu-22.04
     steps:
       - name: Check cross-dependency app credentials
         shell: bash
@@ -401,7 +404,8 @@ jobs:
   linux-riscv64:
     name: linux-riscv64
     if: github.event_name != 'pull_request' || startsWith(github.head_ref, 'release-')
-    runs-on: ${{ github.event_name == 'pull_request' && 'aux-pub-16cpu-amd64' || 'aux-pub-trusted-16cpu-amd64' }}
+    # TODO: re-enable custom runner: runs-on: ${{ github.event_name == 'pull_request' && 'aux-pub-16cpu-amd64' || 'aux-pub-trusted-16cpu-amd64' }}
+    runs-on: ubuntu-22.04
     steps:
       - name: Check cross-dependency app credentials
         shell: bash

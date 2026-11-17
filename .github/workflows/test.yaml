@@ -46,7 +46,8 @@ jobs:
         run: python3 .github/ci-changes.py
   setup:
     name: Set up
-    runs-on: ${{ github.event_name == 'pull_request' && 'aux-pub-16cpu-amd64' || 'aux-pub-trusted-16cpu-amd64' }}
+    # TODO: re-enable custom runner: runs-on: ${{ github.event_name == 'pull_request' && 'aux-pub-16cpu-amd64' || 'aux-pub-trusted-16cpu-amd64' }}
+    runs-on: ubuntu-22.04
     outputs:
       VERSION: ${{ steps.setup.outputs.VERSION }}
       DOING_RELEASE: ${{ steps.setup.outputs.DOING_RELEASE }}
@@ -104,7 +105,8 @@ jobs:
     needs: changes
     if: ${{ needs.changes.outputs.code == 'true' }}
     name: Code lint
-    runs-on: ${{ github.event_name == 'pull_request' && 'aux-pub-16cpu-amd64' || 'aux-pub-trusted-16cpu-amd64' }}
+    # TODO: re-enable custom runner: runs-on: ${{ github.event_name == 'pull_request' && 'aux-pub-16cpu-amd64' || 'aux-pub-trusted-16cpu-amd64' }}
+    runs-on: ubuntu-22.04
     steps:
       - name: Check cross-dependency app credentials
         shell: bash
@@ -211,7 +213,8 @@ jobs:
     needs: changes
     if: ${{ needs.changes.outputs.integration == 'true' }}
     name: WASIX v2 wasm check (${{ matrix.component }})
-    runs-on: ${{ github.event_name == 'pull_request' && 'aux-pub-16cpu-amd64' || 'aux-pub-trusted-16cpu-amd64' }}
+    # TODO: re-enable custom runner: runs-on: ${{ github.event_name == 'pull_request' && 'aux-pub-16cpu-amd64' || 'aux-pub-trusted-16cpu-amd64' }}
+    runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
@@ -266,7 +269,8 @@ jobs:
     needs: changes
     if: ${{ needs.changes.outputs.code == 'true' }}
     name: cargo-deny
-    runs-on: ${{ github.event_name == 'pull_request' && 'aux-pub-16cpu-amd64' || 'aux-pub-trusted-16cpu-amd64' }}
+    # TODO: re-enable custom runner: runs-on: ${{ github.event_name == 'pull_request' && 'aux-pub-16cpu-amd64' || 'aux-pub-trusted-16cpu-amd64' }}
+    runs-on: ubuntu-22.04
     steps:
       - name: Check cross-dependency app credentials
         shell: bash
@@ -308,7 +312,8 @@ jobs:
     needs: changes
     if: ${{ needs.changes.outputs.code == 'true' }}
     name: Build docs.rs
-    runs-on: ${{ github.event_name == 'pull_request' && 'aux-pub-16cpu-amd64' || 'aux-pub-trusted-16cpu-amd64' }}
+    # TODO: re-enable custom runner: runs-on: ${{ github.event_name == 'pull_request' && 'aux-pub-16cpu-amd64' || 'aux-pub-trusted-16cpu-amd64' }}
+    runs-on: ubuntu-22.04
     steps:
       - name: Check cross-dependency app credentials
         shell: bash
@@ -371,7 +376,8 @@ jobs:
     needs: changes
     if: ${{ needs.changes.outputs.product == 'true' }}
     name: ${{ matrix.build-what.name }} - linux-riscv64
-    runs-on: ${{ github.event_name == 'pull_request' && 'aux-pub-16cpu-amd64' || 'aux-pub-trusted-16cpu-amd64' }}
+    # TODO: re-enable custom runner: runs-on: ${{ github.event_name == 'pull_request' && 'aux-pub-16cpu-amd64' || 'aux-pub-trusted-16cpu-amd64' }}
+    runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
@@ -461,7 +467,8 @@ jobs:
     needs: [setup, changes]
     if: ${{ needs.changes.outputs.product == 'true' }}
     name: ${{ matrix.build-what.name }} - ${{ matrix.metadata.build }}
-    runs-on: ${{ (matrix.metadata.build == 'linux-x64' || matrix.metadata.build == 'linux-musl' || matrix.metadata.build == 'windows-gnu') && (github.event_name == 'pull_request' && 'aux-pub-16cpu-amd64' || 'aux-pub-trusted-16cpu-amd64') || matrix.metadata.build == 'linux-arm64' && (github.event_name == 'pull_request' && 'aux-pub-16cpu-arm64' || 'aux-pub-trusted-16cpu-arm64') || matrix.metadata.os }}
+    # TODO: re-enable custom runner: runs-on: ${{ (matrix.metadata.build == 'linux-x64' || matrix.metadata.build == 'linux-musl' || matrix.metadata.build == 'windows-gnu') && (github.event_name == 'pull_request' && 'aux-pub-16cpu-amd64' || 'aux-pub-trusted-16cpu-amd64') || matrix.metadata.build == 'linux-arm64' && (github.event_name == 'pull_request' && 'aux-pub-16cpu-arm64' || 'aux-pub-trusted-16cpu-arm64') || matrix.metadata.os }}
+    runs-on: ${{ matrix.metadata.os }}
     strategy:
       fail-fast: false
       matrix:
@@ -482,7 +489,8 @@ jobs:
             llvm_url: "https://github.com/wasmerio/llvm-custom-builds/releases/download/23.x/llvm-linux-aarch64.tar.zst"
             supports_v8: false
           - build: macos-arm
-            os: depot-macos-14
+            # TODO: re-enable custom runner: os: depot-macos-14
+            os: macos-14
             target: aarch64-apple-darwin
             exe: ""
             llvm_url: "https://github.com/wasmerio/llvm-custom-builds/releases/download/23.x/llvm-darwin-aarch64.tar.zst"
@@ -739,7 +747,8 @@ jobs:
     needs: [setup, changes]
     if: ${{ needs.changes.outputs.product == 'true' }}
     name: ${{ matrix.stage.description }} - ${{ matrix.metadata.build }}
-    runs-on: ${{ (matrix.metadata.build == 'linux-x64' || matrix.metadata.build == 'linux-musl') && (github.event_name == 'pull_request' && 'aux-pub-16cpu-amd64' || 'aux-pub-trusted-16cpu-amd64') || matrix.metadata.build == 'linux-arm64' && (github.event_name == 'pull_request' && 'aux-pub-16cpu-arm64' || 'aux-pub-trusted-16cpu-arm64') || matrix.metadata.os }}
+    # TODO: re-enable custom runner: runs-on: ${{ (matrix.metadata.build == 'linux-x64' || matrix.metadata.build == 'linux-musl') && (github.event_name == 'pull_request' && 'aux-pub-16cpu-amd64' || 'aux-pub-trusted-16cpu-amd64') || matrix.metadata.build == 'linux-arm64' && (github.event_name == 'pull_request' && 'aux-pub-16cpu-arm64' || 'aux-pub-trusted-16cpu-arm64') || matrix.metadata.os }}
+    runs-on: ${{ matrix.metadata.os }}
     strategy:
       fail-fast: false
       matrix:
@@ -765,7 +774,8 @@ jobs:
             wasix_rust_toolchain: true
             llvm_url: "https://github.com/wasmerio/llvm-custom-builds/releases/download/23.x/llvm-linux-aarch64.tar.zst"
           - build: macos-arm
-            os: depot-macos-14
+            # TODO: re-enable custom runner: os: depot-macos-14
+            os: macos-14
             target: aarch64-apple-darwin
             exe: ""
             wasix_rust_toolchain: true
@@ -1013,7 +1023,8 @@ jobs:
       - run: cargo build --locked -p wasmer-napi --features cli
   ci_success:
     name: Tests CI
-    runs-on: ${{ github.event_name == 'pull_request' && 'aux-pub-16cpu-amd64' || 'aux-pub-trusted-16cpu-amd64' }}
+    # TODO: re-enable custom runner: runs-on: ${{ github.event_name == 'pull_request' && 'aux-pub-16cpu-amd64' || 'aux-pub-trusted-16cpu-amd64' }}
+    runs-on: ubuntu-22.04
     needs:
       - changes
       - setup
