@@ -2,8 +2,8 @@
 use super::*;
 use wasm_encoder::{
     BlockType, Catch, CodeSection, EntityType, ExportKind, ExportSection, FunctionSection,
-    GlobalType, ImportSection, Instruction, MemArg, MemoryType, RefType, TableType, TypeSection,
-    ValType,
+    GlobalType, ImportSection, Instruction, MemArg, MemArgTarget, MemoryType, RefType, TableType,
+    TypeSection, ValType,
 };
 
 const BATCH: u32 = 100;
@@ -122,7 +122,8 @@ fn memarg(offset: u64) -> MemArg {
     MemArg {
         offset,
         align: 0,
-        memory_index: 0,
+        target: MemArgTarget::Memory(0),
+        ordering: None,
     }
 }
 fn store_value(ty: u8, offset: u64) -> Instruction<'static> {

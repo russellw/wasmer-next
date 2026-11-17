@@ -5,7 +5,9 @@ use std::{
     ops::Range,
 };
 
-use wasmparser::{DataKind, FunctionBody, Operator, Parser, Payload, TypeRef, ValType};
+use wasmparser::{
+    DataKind, FunctionBody, MemArgTarget, Operator, Parser, Payload, TypeRef, ValType,
+};
 
 use crate::{Module, PlanError};
 
@@ -817,8 +819,12 @@ impl Compile<'_> {
                 }
                 Operator::I32Add => Op::Add32,
                 Operator::I64Add => Op::Add64,
-                Operator::I32Store { memarg } if memarg.memory == 0 => Op::Store(4, memarg.offset),
-                Operator::I64Store { memarg } if memarg.memory == 0 => Op::Store(8, memarg.offset),
+                Operator::I32Store { memarg } if memarg.target == MemArgTarget::Memory(0) => {
+                    Op::Store(4, memarg.offset)
+                }
+                Operator::I64Store { memarg } if memarg.target == MemArgTarget::Memory(0) => {
+                    Op::Store(8, memarg.offset)
+                }
                 Operator::MemoryInit { data_index, mem: 0 } => Op::Copy(data_index),
                 Operator::MemoryFill { mem: 0 } => Op::Fill,
                 Operator::DataDrop { data_index } => Op::DropData(data_index),
@@ -868,7 +874,7 @@ fn once_body<'a>(ops: &[Operator<'a>], first: bool) -> Result<Vec<Operator<'a>>,
         || !matches!(ops[7], Operator::LocalGet { local_index: 0 })
         || !matches!(ops[8], Operator::I32Const { value: 0 })
         || !matches!(ops[9], Operator::I32Const { value: 1 })
-        || !matches!(ops[10], Operator::I32AtomicRmwCmpxchg { memarg } if memarg.memory == 0 && memarg.offset == 0 && memarg.align == 2)
+        || !matches!(ops[10], Operator::I32AtomicRmwCmpxchg { memarg } if memarg.target == MemArgTarget::Memory(0) && memarg.offset == 0 && memarg.align == 2)
         || !matches!(ops.get(12), Some(Operator::End))
     {
         return Err(invalid());
@@ -892,17 +898,17 @@ fn once_body<'a>(ops: &[Operator<'a>], first: bool) -> Result<Vec<Operator<'a>>,
     }
     let pattern = matches!(tail[0], Operator::LocalGet { local_index: 0 })
         && matches!(tail[1], Operator::I32Const { value: 2 })
-        && matches!(tail[2], Operator::I32AtomicStore { memarg } if memarg.memory == 0 && memarg.offset == 0 && memarg.align == 2)
+        && matches!(tail[2], Operator::I32AtomicStore { memarg } if memarg.target == MemArgTarget::Memory(0) && memarg.offset == 0 && memarg.align == 2)
         && matches!(tail[3], Operator::LocalGet { local_index: 0 })
         && matches!(tail[4], Operator::I32Const { value: -1 })
-        && matches!(tail[5], Operator::MemoryAtomicNotify { memarg } if memarg.memory == 0 && memarg.offset == 0 && memarg.align == 2)
+        && matches!(tail[5], Operator::MemoryAtomicNotify { memarg } if memarg.target == MemArgTarget::Memory(0) && memarg.offset == 0 && memarg.align == 2)
         && matches!(tail[6], Operator::Drop)
         && matches!(tail[7], Operator::Br { relative_depth: 1 })
         && matches!(tail[8], Operator::End)
         && matches!(tail[9], Operator::LocalGet { local_index: 0 })
         && matches!(tail[10], Operator::I32Const { value: 1 })
         && matches!(tail[11], Operator::I64Const { value: -1 })
-        && matches!(tail[12], Operator::MemoryAtomicWait32 { memarg } if memarg.memory == 0 && memarg.offset == 0 && memarg.align == 2)
+        && matches!(tail[12], Operator::MemoryAtomicWait32 { memarg } if memarg.target == MemArgTarget::Memory(0) && memarg.offset == 0 && memarg.align == 2)
         && matches!(tail[13], Operator::Drop)
         && matches!(tail[14], Operator::End);
     if !pattern
@@ -931,7 +937,8 @@ fn once_body<'a>(ops: &[Operator<'a>], first: bool) -> Result<Vec<Operator<'a>>,
                     align: 2,
                     max_align: 2,
                     offset: 0,
-                    memory: 0,
+                    target: MemArgTarget::Memory(0),
+                    ordering: None,
                 },
             },
         ]);
