@@ -160,9 +160,16 @@ pub(crate) async fn path_open2<S: Syscalls + Control + 'static>(
         frame.install_descriptors(vec![
             crate::rights::Record::new(base, inheriting).attachment(),
         ])?;
+        // v1 grants existing-file truncation only when the resulting fd can write.
+        let backing_oflags =
+            if !oflags_v1.contains(Oflags::CREAT) && !base.contains(Rights::FD_WRITE) {
+                oflags_v1 & !Oflags::TRUNC
+            } else {
+                oflags_v1
+            };
         let flags = open_how(
             Lookupflags(dirflags as u32),
-            Oflags(oflags as u16),
+            backing_oflags,
             base,
             Fdflags(fdflags as u16),
             Fdflagsext(fdflagsext as u16),

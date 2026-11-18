@@ -314,6 +314,47 @@ fn descriptor_rights_reduce_independently_and_deny_path_effects_before_creation(
 }
 
 #[test]
+fn path_open_trunc_requires_delegated_write() {
+    use wasixv2_wasix1::abi::fs::Rights;
+
+    let read = Rights::FD_READ.0;
+    let write = Rights::FD_WRITE.0;
+    let dir = (Rights::PATH_OPEN | Rights::PATH_FILESTAT_SET_SIZE).0;
+    let data = r#"
+  (import "wasix_32v1" "path_open2" (func $path_open2 (param i32 i32 i32 i32 i32 i64 i64 i32 i32 i32) (result i32)))
+  (data (i32.const 1024) "dir")
+  (data (i32.const 1032) "file")
+  (data (i32.const 1040) "keep")
+  (data (i32.const 1060) "dir/file")
+"#;
+    let body = format!(
+        r#"
+    (call $ok (i32.const 1) (call $path_create_directory (i32.const 3) (i32.const 1024) (i32.const 3)))
+    (call $ok (i32.const 2) (call $path_open (i32.const 3) (i32.const 1) (i32.const 1024) (i32.const 3) (i32.const 2) (i64.const {dir}) (i64.const {both}) (i32.const 0) (i32.const 16)))
+    (call $ok (i32.const 3) (call $path_open (i32.const 3) (i32.const 1) (i32.const 1024) (i32.const 3) (i32.const 2) (i64.const {dir}) (i64.const {read}) (i32.const 0) (i32.const 20)))
+    (call $ok (i32.const 4) (call $path_open (i32.const 3) (i32.const 1) (i32.const 1060) (i32.const 8) (i32.const 1) (i64.const {write}) (i64.const 0) (i32.const 0) (i32.const 24)))
+    (call $iov (i32.const 1040) (i32.const 4))
+    (call $ok (i32.const 5) (call $fd_write (i32.load (i32.const 24)) (i32.const 0) (i32.const 1) (i32.const 28)))
+    (call $eq (i32.const 6) (i32.load (i32.const 28)) (i32.const 4))
+    (call $ok (i32.const 7) (call $fd_close (i32.load (i32.const 24))))
+
+    (call $ok (i32.const 8) (call $path_open (i32.load (i32.const 20)) (i32.const 1) (i32.const 1032) (i32.const 4) (i32.const 8) (i64.const {read}) (i64.const 0) (i32.const 0) (i32.const 24)))
+    (call $iov (i32.const 80) (i32.const 4))
+    (call $ok (i32.const 9) (call $fd_read (i32.load (i32.const 24)) (i32.const 0) (i32.const 1) (i32.const 28)))
+    (call $eq (i32.const 10) (i32.load (i32.const 28)) (i32.const 4))
+    (call $eq (i32.const 11) (i32.load (i32.const 80)) (i32.load (i32.const 1040)))
+
+    ;; TRUNC implies write when the parent delegates it, even for requested read rights.
+    (call $ok (i32.const 12) (call $path_open2 (i32.load (i32.const 16)) (i32.const 1) (i32.const 1032) (i32.const 4) (i32.const 8) (i64.const {read}) (i64.const 0) (i32.const 0) (i32.const 0) (i32.const 24)))
+    (call $ok (i32.const 13) (call $fd_read (i32.load (i32.const 24)) (i32.const 0) (i32.const 1) (i32.const 28)))
+    (call $eq (i32.const 14) (i32.load (i32.const 28)) (i32.const 0))
+"#,
+        both = read | write,
+    );
+    assert_eq!(run(&guest("wasix_32v1", data, &body)).0, 0);
+}
+
+#[test]
 fn descriptor_concurrent_guest_reductions_cannot_restore_each_others_removed_rights() {
     use wasixv2_wasix1::abi::fs::Rights;
     let read = Rights::FD_READ.0;
