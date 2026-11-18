@@ -943,10 +943,11 @@ impl Machine {
         {
             return Err(io::Error::other("too many layers stacked under the root"));
         }
-        for Layer(lower) in layers {
-            self.root_lowers.insert(0, lower);
-        }
-        self.reboot_root().await?;
+        let mut lowers = self.root_lowers.clone();
+        lowers.splice(0..0, layers.into_iter().rev().map(|Layer(lower)| lower));
+        self.reboot_root(&lowers, &self.root_upper.clone(), self.skeleton.clone())
+            .await?;
+        self.root_lowers = lowers;
         Ok(())
     }
 
@@ -964,14 +965,19 @@ impl Machine {
         if *self.in_use.get_mut() {
             return Err(errno_to_io(Errno::EBUSY));
         }
-        if self.skeleton.is_none() {
-            if self.root_lowers.len() + self.command_lowers() == MAX_LOWERS {
-                return Err(io::Error::other("too many layers stacked under the root"));
+        let skeleton = match &self.skeleton {
+            Some(skeleton) => skeleton.clone(),
+            None => {
+                if self.root_lowers.len() + self.command_lowers() == MAX_LOWERS {
+                    return Err(io::Error::other("too many layers stacked under the root"));
+                }
+                self.root_upper.clone()
             }
-            self.skeleton = Some(self.root_upper.clone());
-        }
+        };
+        self.reboot_root(&self.root_lowers.clone(), &upper, Some(skeleton.clone()))
+            .await?;
+        self.skeleton = Some(skeleton);
         self.root_upper = upper;
-        self.reboot_root().await?;
         Ok(())
     }
 
@@ -993,14 +999,19 @@ impl Machine {
         usize::from(!self.commands.is_empty())
     }
 
-    async fn reboot_root(&mut self) -> io::Result<()> {
-        let mut lowers = self.root_lowers.clone();
-        lowers.extend(self.skeleton.iter().cloned());
+    async fn reboot_root(
+        &mut self,
+        root_lowers: &[Arc<dyn Filesystem>],
+        upper: &Arc<dyn Filesystem>,
+        skeleton: Option<Arc<dyn Filesystem>>,
+    ) -> io::Result<()> {
+        let mut lowers = root_lowers.to_vec();
+        lowers.extend(skeleton);
         if !self.commands.is_empty() {
             lowers.insert(0, self.commands.filesystem());
         }
         let root = boot_overlay(
-            self.root_upper.clone(),
+            upper.clone(),
             lowers,
             #[cfg(feature = "resolved-packages")]
             self.runtime_packages.as_deref(),
