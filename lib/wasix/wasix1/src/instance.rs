@@ -744,8 +744,8 @@ mod tests {
         let owner = wasi.host_process(task);
         let other_owner = owner.clone();
         let state = owner.current_state().unwrap();
-        let attached_a = owner.attach::<()>(&a, &mut store.as_store_mut());
-        let attached_b = owner.attach::<()>(&b, &mut store.as_store_mut());
+        let attached_a = owner.attach::<wasixv2_kernel::Kernel>(&a, &mut store.as_store_mut());
+        let attached_b = owner.attach::<wasixv2_kernel::Kernel>(&b, &mut store.as_store_mut());
         let selected_a = attached_a
             .as_any()
             .downcast_ref::<Wasix1Instance>()
