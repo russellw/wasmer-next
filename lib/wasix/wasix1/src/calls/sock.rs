@@ -340,7 +340,7 @@ pub(crate) async fn sock_listen<S: Syscalls + Control + 'static>(
     .await
 }
 
-/// `connect`; a `CONNECT_TIMEOUT` the guest set bounds a blocking connect.
+/// `connect`; blocking TCP uses the v1 default unless the guest set `CONNECT_TIMEOUT`.
 pub(crate) async fn sock_connect<S: Syscalls + Control + 'static>(
     env: Env<S>,
     fd: i32,

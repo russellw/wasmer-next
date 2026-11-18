@@ -473,6 +473,104 @@ fn compat_timeouts() {
     assert_eq!(run(&data, body).0, 0);
 }
 
+/// A pending connection gets v1's default deadline unless the guest set a timeout
+/// or opened a nonblocking socket. Observe the actual timespec and finish the wait at once.
+#[cfg(not(target_arch = "wasm32"))]
+#[tokio::test]
+async fn blocking_tcp_connect_uses_the_legacy_timeout() {
+    use wasixv2_abi::{Errno, GuestPtr, KernelTimespec};
+    use wasixv2_kernel::{Dispatch, HostClock, Kernel, SyscallEntry};
+    use wasixv2_syscalls::{
+        Caller, Layer, Layered, MaybeFuture, SysResult, Syscall, SyscallRet, read_value,
+    };
+
+    #[derive(Default)]
+    struct PendingConnect {
+        timeouts: Mutex<Vec<(i64, i64)>>,
+    }
+
+    impl Layer<Kernel> for PendingConnect {
+        fn call<'a>(
+            &'a self,
+            caller: &'a Caller<'_>,
+            call: Syscall,
+            next: &'a Kernel,
+        ) -> MaybeFuture<'a, SysResult<SyscallRet>> {
+            match call {
+                Syscall::Connect { .. } => MaybeFuture::Ready(Err(Errno::EINPROGRESS.into())),
+                Syscall::PpollTime64 { nfds, tsp, .. } => {
+                    MaybeFuture::Future(Box::pin(async move {
+                        assert_eq!(nfds, 1);
+                        let time: KernelTimespec =
+                            read_value(caller.memory(), GuestPtr::new(tsp.addr())).await?;
+                        self.timeouts
+                            .lock()
+                            .unwrap()
+                            .push((time.tv_sec, time.tv_nsec));
+                        Ok(SyscallRet::PpollTime64(0))
+                    }))
+                }
+                _ => Dispatch.call(caller, call, next),
+            }
+        }
+    }
+
+    let host: Arc<dyn wasixv2::Host> = Arc::new(wasixv2::TokioHost::default());
+    let root = Arc::new(wasixv2_vfs_mem::MemFs::new(
+        Arc::new(HostClock(host.clone())),
+        0o777,
+        1,
+        1,
+    ));
+    let mut abis = wasixv2_exec::Abis::new();
+    abis.push(Arc::new(wasixv2_wasix1::Wasix1::new()));
+    let abis = Arc::new(abis);
+    let network = wasixv2::Net::new(wasixv2::NetConfig::default(), None);
+    let kernel = Kernel::new(host.clone(), root)
+        .with_binfmt(abis.clone())
+        .with_network(network);
+    let task = kernel
+        .spawn(ProcessConfig {
+            args: vec!["connect-timeout".into()],
+            env: vec![],
+            stdio: Stdio::from_fns(|_| {}, |_| {}),
+        })
+        .unwrap();
+    let syscalls = Arc::new(Layered::new(
+        SyscallEntry(PendingConnect::default()),
+        kernel,
+    ));
+
+    let data = format!(
+        r#"{LOOPBACK_ADDR}
+        ;; option_timestamp at 1000: Some(10 ms)
+        (data (i32.const 1000) "\01\00\00\00\00\00\00\00\80\96\98\00\00\00\00\00")"#
+    );
+    let body = r#"
+    ;; Implicit and explicit timeouts both report TIMEDOUT (73).
+    (call $ok (call $sock_open (i32.const 1) (i32.const 1) (i32.const 0) (i32.const 0)) (i32.const 1))
+    (call $assert (i32.eq (call $sock_connect (i32.load (i32.const 0)) (i32.const 1024)) (i32.const 73)) (i32.const 2))
+    (call $ok (call $sock_open (i32.const 1) (i32.const 1) (i32.const 6) (i32.const 4)) (i32.const 3))
+    (call $ok (call $set_time (i32.load (i32.const 4)) (i32.const 21) (i32.const 1000)) (i32.const 4))
+    (call $assert (i32.eq (call $sock_connect (i32.load (i32.const 4)) (i32.const 1024)) (i32.const 73)) (i32.const 5))
+    ;; SOCK_NONBLOCK keeps returning INPROGRESS (26).
+    (call $ok (call $sock_open (i32.const 1) (i32.const 0x4001) (i32.const 6) (i32.const 8)) (i32.const 6))
+    (call $assert (i32.eq (call $sock_connect (i32.load (i32.const 8)) (i32.const 1024)) (i32.const 26)) (i32.const 7))
+    "#;
+    let store = wasmer::Store::default();
+    let module = wasixv2_exec::load(store.engine(), &guest(&data, body)).unwrap();
+    assert_eq!(
+        wasixv2_exec::run_with_abis(store, &module, syscalls.clone(), task, host, abis)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        *syscalls.layer.0.timeouts.lock().unwrap(),
+        [(30, 0), (0, 10_000_000)]
+    );
+}
+
 /// The compat timeouts belong to the socket under its number: a copy (`dup`) has them, a number
 /// that is closed or renumbered onto forgets them.
 #[test]

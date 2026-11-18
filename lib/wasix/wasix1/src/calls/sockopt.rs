@@ -3,15 +3,16 @@
 //! Each v1 [`Sockoption`] has one kind (flag, size or time, matching the call that takes it)
 //! and maps to a Linux option, except `CONNECT_TIMEOUT` and `ACCEPT_TIMEOUT`, which Linux does
 //! not have: the compat layer keeps them per socket and applies them in `sock_connect` and
-//! `sock_accept`.
+//! `sock_accept`. Blocking TCP connects default to 30 seconds, as in v1.
 
 use crate::abi::fs::Rights;
 
 use std::{collections::HashMap, sync::Mutex, time::Duration};
 
 use wasixv2_abi::{
-    ConstSockaddrPtr, FcntlCmd, Fd, GuestPtrMut, IpOption, Ipv6Option, KernelSockTimeval, Linger,
-    OpenFlags, PollEvents, SocketLevel, SocketOption, SocketType, TcpOption,
+    ConstSockaddrPtr, FcntlCmd, Fd, GuestPtrMut, IpOption, IpProtocol, Ipv6Option,
+    KernelSockTimeval, Linger, OpenFlags, PollEvents, SocketLevel, SocketOption, SocketType,
+    TcpOption,
 };
 use wasixv2_syscalls::{Control, SysErr, Syscalls};
 use wasmer::RuntimeError;
@@ -196,16 +197,28 @@ async fn status_flags<S: Syscalls + Control + 'static>(
     Ok(OpenFlags(flags as u32))
 }
 
-/// The `CONNECT_TIMEOUT` of a blocking socket.
+/// The `CONNECT_TIMEOUT` of a blocking socket, falling back to the v1 TCP default.
 pub(crate) async fn connect_timeout<S: Syscalls + Control + 'static>(
     frame: &Frame<'_, S>,
     fd: Fd,
 ) -> V1Result<Option<Duration>> {
-    let Some(timeout) = timeout(frame, fd, Wait::Connect).await? else {
+    if status_flags(frame, fd)
+        .await?
+        .contains(OpenFlags::O_NONBLOCK)
+    {
         return Ok(None);
-    };
-    let flags = status_flags(frame, fd).await?;
-    Ok((!flags.contains(OpenFlags::O_NONBLOCK)).then_some(timeout))
+    }
+    if let Some(timeout) = timeout(frame, fd, Wait::Connect).await? {
+        return Ok(Some(timeout));
+    }
+    let protocol = int_option(
+        frame,
+        fd,
+        SocketLevel::SOL_SOCKET,
+        SocketOption::SO_PROTOCOL.0,
+    )
+    .await?;
+    Ok((protocol == IpProtocol::IPPROTO_TCP.0).then_some(Duration::from_secs(30)))
 }
 
 /// A blocking `connect` that gives up with `TIMEDOUT` after `timeout`: the socket is made
