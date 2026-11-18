@@ -18,13 +18,18 @@ pub(crate) async fn proc_exit<S: Syscalls + Control + 'static>(
     .await
 }
 
-/// `exit` of the calling thread.
+/// v1 ignores the supplied status and ends the process when its leader exits.
 pub(crate) async fn thread_exit<S: Syscalls + Control + 'static>(
     env: Env<S>,
-    code: i32,
+    _code: i32,
 ) -> Result<(), RuntimeError> {
     shim::void(&env, "thread_exit", async |frame| {
-        frame.syscalls.exit(&frame.caller(), code).await?;
+        let caller = frame.caller();
+        if frame.task == frame.process() {
+            frame.syscalls.exit_group(&caller, 0).await?;
+        } else {
+            frame.syscalls.exit(&caller, 0).await?;
+        }
         Ok(())
     })
     .await

@@ -592,8 +592,8 @@ fn atomic_waits() {
     assert_eq!(status(ATOMIC_WAITS), 0);
 }
 
-/// A thread blocked in `memory.atomic.wait32` ends with its group: by `proc_exit2`, and by a
-/// signal whose default action kills the process.
+/// A thread blocked in `memory.atomic.wait32` ends with its group: by `proc_exit2`, by the
+/// leader's `thread_exit`, or by a signal whose default action kills the process.
 #[test]
 fn the_group_ends_threads_blocked_in_atomic_waits() {
     let wat = |end: &str| {
@@ -603,6 +603,7 @@ fn the_group_ends_threads_blocked_in_atomic_waits() {
       (import "env" "memory" (memory 1 1 shared))
       (import "wasix_32v1" "thread_spawn_v2" (func $spawn (param i32 i32) (result i32)))
       (import "wasi_snapshot_preview1" "proc_raise" (func $raise (param i32) (result i32)))
+      (import "wasix_32v1" "thread_exit" (func $thread_exit (param i32)))
       (import "wasix_32v1" "proc_exit2" (func $exit (param i32)))
       (func (export "wasi_thread_start") (param $tid i32) (param $arg i32)
         (i32.atomic.store (i32.const 200) (i32.const 1))
@@ -619,9 +620,34 @@ fn the_group_ends_threads_blocked_in_atomic_waits() {
         )
     };
     assert_eq!(status(&wat("(call $exit (i32.const 7))")), 7);
+    assert_eq!(status(&wat("(call $thread_exit (i32.const 7))")), 0);
     assert_eq!(
         status(&wat("(drop (call $raise (i32.const 15)))")),
         128 + 15
+    );
+}
+
+#[test]
+fn thread_exit_from_a_worker_leaves_the_group_running() {
+    assert_eq!(
+        status(
+            r#"
+(module
+  (import "env" "memory" (memory 1 1 shared))
+  (import "wasix_32v1" "thread_spawn_v2" (func $spawn (param i32 i32) (result i32)))
+  (import "wasix_32v1" "thread_join" (func $join (param i32) (result i32)))
+  (import "wasix_32v1" "thread_exit" (func $thread_exit (param i32)))
+  (import "wasix_32v1" "proc_exit2" (func $exit (param i32)))
+  (func (export "wasi_thread_start") (param i32 i32)
+    (call $thread_exit (i32.const 7))
+    (call $exit (i32.const 1)))
+  (func (export "_start")
+    (if (call $spawn (i32.const 100) (i32.const 104)) (then (call $exit (i32.const 2))))
+    (if (call $join (i32.load (i32.const 104))) (then (call $exit (i32.const 3))))
+    (call $exit (i32.const 42))))
+"#
+        ),
+        42
     );
 }
 
