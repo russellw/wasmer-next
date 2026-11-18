@@ -668,7 +668,9 @@ where
             .await;
         let phase = phase.load(std::sync::atomic::Ordering::Relaxed);
         let ended = match (phase, result) {
-            (0, Err(error)) => Err(wasmer::InstantiationError::Start(error).into()),
+            (0, Err(error)) if !crate::start_ended(&error) => {
+                Err(wasmer::InstantiationError::Start(error).into())
+            }
             (1, Err(error)) => Err(ExecError::Load(crate::LoadError::other(error))),
             (_, result) => Ok(crate::ended(
                 entry.cx(),

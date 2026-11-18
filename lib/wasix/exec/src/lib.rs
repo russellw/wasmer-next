@@ -344,6 +344,10 @@ pub fn thread_exit_status(error: &RuntimeError) -> Option<i32> {
     error.downcast_ref::<Exited>().map(|exit| exit.0)
 }
 
+fn start_ended(error: &RuntimeError) -> bool {
+    thread_exit_status(error).is_some() || error.clone().to_trap() == Some(TrapCode::HostInterrupt)
+}
+
 /// Compiles `wasm` for [`run`], with the preemption points that let a busy guest notice signals
 /// and the exit of its thread group, and atomic waits that a signal interrupts. A module they
 /// cannot be added to still has its start deferred, with a warning; [`is_preemptible`] tells.
@@ -1443,7 +1447,9 @@ impl<S: Syscalls + Control + Send + Sync + 'static> Ready<S> {
         };
         let phase = phase.load(std::sync::atomic::Ordering::Relaxed);
         let ended = match (phase, result) {
-            (0, Err(error)) => Err(wasmer::InstantiationError::Start(error).into()),
+            (0, Err(error)) if !start_ended(&error) => {
+                Err(wasmer::InstantiationError::Start(error).into())
+            }
             (phase, result) => {
                 let origin = if phase == 2 {
                     ErrorOrigin::GuestInvocation

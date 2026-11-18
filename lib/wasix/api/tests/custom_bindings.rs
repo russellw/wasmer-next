@@ -1062,11 +1062,12 @@ fn start_config() -> ProcessConfig {
 async fn start_imports_use_configured_memory_and_retained_protected_leases() {
     tokio::task::LocalSet::new()
         .run_until(async {
-            for (tail, shared) in [
-                ("", true),
-                ("", false),
-                ("unreachable", true),
-                ("unreachable", false),
+            for (tail, shared, status) in [
+                ("", true, Some(0)),
+                ("", false, Some(0)),
+                ("i32.const 5 call $exit", true, Some(5)),
+                ("unreachable", true, None),
+                ("unreachable", false, None),
             ] {
                 let probe = Arc::new(StartProbe::default());
                 let machine = Machine::builder()
@@ -1078,8 +1079,8 @@ async fn start_imports_use_configured_memory_and_retained_protected_leases() {
                 let result = machine
                     .run_process(&start_guest_memory(tail, "", shared), start_config())
                     .await;
-                if tail.is_empty() {
-                    assert_eq!(result.unwrap(), 0);
+                if let Some(status) = status {
+                    assert_eq!(result.unwrap(), status);
                 } else {
                     assert!(result.unwrap_err().to_string().contains("unreachable"));
                 }
@@ -1119,6 +1120,33 @@ async fn canceling_start_retires_its_original_attachment_and_pin() {
                 assert!(probe.lease.lock().unwrap().is_none());
                 assert_eq!(probe.events.lock().unwrap().last().unwrap().0, "deactivate");
             }
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn killed_looping_start_reports_the_signal_status() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let probe = Arc::new(StartProbe::default());
+            let machine = Machine::builder()
+                .instantiation_hook(Arc::new(StartHook {
+                    probe: probe.clone(),
+                    pending: false,
+                }))
+                .build();
+            let guest = start_guest("(loop br 0)");
+            let run = machine.run_process(&guest, start_config());
+            let kill = async {
+                probe.entered.notified().await;
+                machine.signal(wasixv2_abi::Signal::SIGKILL.0).unwrap();
+            };
+            let (status, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::join!(run, kill)
+            })
+            .await
+            .unwrap();
+            assert_eq!(status.unwrap(), 137);
         })
         .await;
 }
