@@ -60,6 +60,9 @@ pub fn needs_preparation(bytes: &[u8]) -> Result<bool, PlanError> {
 /// Whether a raw dylink image lacks a command or reactor entry export.
 /// A Wasm start section can initialize a shared library and does not count.
 pub fn is_side_only(bytes: &[u8]) -> Result<bool, PlanError> {
+    if !Parser::is_core_wasm(bytes) {
+        return Ok(false);
+    }
     let profile = profile(bytes)?;
     Ok(profile.dynamic && !profile.prepared && !profile.entry)
 }

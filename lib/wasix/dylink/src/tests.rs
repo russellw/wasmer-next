@@ -904,6 +904,24 @@ fn compilation_source_preparation_selects_supported_raw_dynamic_mains() {
 }
 
 #[test]
+fn side_only_classification_requires_a_core_module_without_an_entry() {
+    let component =
+        wat::parse_str(r#"(component (core module (@custom "dylink.0" "\01\04\00\00\00\00")))"#)
+            .unwrap();
+    assert!(!crate::is_side_only(&component).unwrap());
+    for entry in ["_start", "_initialize"] {
+        let source = bytes(
+            &format!(r#"(module (func (export "{entry}")))"#),
+            [0; 4],
+            &[],
+            &[],
+            &[],
+        );
+        assert!(!crate::is_side_only(&source).unwrap());
+    }
+}
+
+#[test]
 fn dynamic_main_source_preparation_is_explicit_and_non_executing() {
     let static_image = wat::parse_str("(module (func $init) (start $init))").unwrap();
     assert_eq!(crate::prepare_image(&static_image).unwrap(), static_image);
