@@ -1314,7 +1314,7 @@ impl Machine {
         // A new root would boot a kernel the signaller does not reach.
         self.in_use.store(true, Ordering::Relaxed);
         Signaller {
-            syscalls: self.syscalls.clone(),
+            syscalls: Arc::downgrade(&self.syscalls),
             running: self.running.clone(),
         }
     }
@@ -1574,10 +1574,11 @@ impl Machine {
 pub struct Layer(Arc<dyn Filesystem>);
 
 /// Sends signals to the processes a [`Machine`] runs, from any thread; see
-/// [`Machine::signaller`].
+/// [`Machine::signaller`]. It does not keep the machine's kernel alive: once the machine and
+/// its processes are gone, so are the kernel's own threads, and signalling does nothing.
 #[derive(Clone)]
 pub struct Signaller {
-    syscalls: Arc<Stack>,
+    syscalls: Weak<Stack>,
     running: Arc<Mutex<Vec<TaskId>>>,
 }
 
@@ -1602,7 +1603,10 @@ impl Signaller {
     /// of the groups ignores it, so the kernel discarded it, as when no process runs. A
     /// pending signal is taken once [`Signaller::foreground_pending`] says so.
     pub fn signal_foreground(&self, sig: i32) -> io::Result<bool> {
-        let kernel = &self.syscalls.inner;
+        let Some(syscalls) = self.syscalls.upgrade() else {
+            return check_signal(sig).map(|()| false);
+        };
+        let kernel = &syscalls.inner;
         if kernel.has_console() {
             return match kernel.console_signal(wasixv2_abi::Signal(sig)) {
                 Ok(pending) => Ok(pending),
@@ -1622,29 +1626,34 @@ impl Signaller {
     /// Whether a `sig` sent with [`Signaller::signal_foreground`] is still pending, not yet
     /// taken by any process of those groups.
     pub fn foreground_pending(&self, sig: i32) -> bool {
-        let kernel = &self.syscalls.inner;
+        let Some(syscalls) = self.syscalls.upgrade() else {
+            return false;
+        };
+        let kernel = &syscalls.inner;
         if kernel.has_console() {
             return kernel.console_signal_pending(wasixv2_abi::Signal(sig));
         }
         let running = self.running.lock().unwrap().clone();
-        running.into_iter().any(|task| {
-            self.syscalls
-                .inner
-                .process_group_pending(task, wasixv2_abi::Signal(sig))
-        })
+        running
+            .into_iter()
+            .any(|task| kernel.process_group_pending(task, wasixv2_abi::Signal(sig)))
     }
 
     /// The host's terminal changed its size to `size`: the console's foreground process
     /// group gets SIGWINCH. Nothing without a console.
     pub fn console_resize(&self, size: WindowSize) {
-        self.syscalls.inner.console_resize(size);
+        if let Some(syscalls) = self.syscalls.upgrade() {
+            syscalls.inner.console_resize(size);
+        }
     }
 
     /// The host's terminal went away: the console hangs up, as a terminal whose line drops.
     /// The leader of the session it controls gets SIGHUP and SIGCONT, and the files open on
     /// it end. Nothing without a console.
     pub fn console_hangup(&self) {
-        self.syscalls.inner.console_hangup();
+        if let Some(syscalls) = self.syscalls.upgrade() {
+            syscalls.inner.console_hangup();
+        }
     }
 
     fn each(
@@ -1652,18 +1661,27 @@ impl Signaller {
         sig: i32,
         mut send: impl FnMut(&Kernel, TaskId, wasixv2_abi::Signal) -> Result<(), Errno>,
     ) -> io::Result<()> {
-        if !(1..=64).contains(&sig) {
-            return Err(errno_to_io(Errno::EINVAL));
-        }
+        check_signal(sig)?;
+        let Some(syscalls) = self.syscalls.upgrade() else {
+            return Ok(());
+        };
         let running = self.running.lock().unwrap().clone();
         for task in running {
-            match send(&self.syscalls.inner, task, wasixv2_abi::Signal(sig)) {
+            match send(&syscalls.inner, task, wasixv2_abi::Signal(sig)) {
                 // It exited meanwhile.
                 Ok(()) | Err(Errno::ESRCH) => {}
                 Err(errno) => return Err(errno_to_io(errno)),
             }
         }
         Ok(())
+    }
+}
+
+fn check_signal(sig: i32) -> io::Result<()> {
+    if (1..=64).contains(&sig) {
+        Ok(())
+    } else {
+        Err(errno_to_io(Errno::EINVAL))
     }
 }
 

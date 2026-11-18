@@ -1032,3 +1032,117 @@ async fn memory_budget_survives_root_upper_and_layer_reboots() {
     drop(machine);
     assert_eq!(budget.used(), 0);
 }
+
+/// Arms `ITIMER_REAL` for 100 s, which starts the kernel's timer driver, and exits with
+/// `setitimer`'s result.
+const ITIMER_WAT: &str = r#"
+  (module
+    (import "wasixv2" "setitimer" (func $setitimer (param i32 i32 i32) (result i32)))
+    (import "wasixv2" "exit_group" (func $exit_group (param i32)))
+    (memory (export "memory") 1)
+    ;; struct __kernel_old_itimerval: it_interval 0, it_value 100 s.
+    (data (i32.const 16) "\00\00\00\00\00\00\00\00\64\00\00\00\00\00\00\00")
+    (func (export "_start")
+      (call $exit_group (call $setitimer (i32.const 0) (i32.const 16) (i32.const 0)))))
+"#;
+
+/// A host whose threads, the kernel's drivers here, are counted while they run.
+struct DriverHost {
+    host: wasixv2::TokioHost,
+    running: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+struct Running(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+impl wasixv2::Host for DriverHost {
+    fn realtime(&self) -> std::time::Duration {
+        wasixv2::Host::realtime(&self.host)
+    }
+    fn monotonic(&self) -> std::time::Duration {
+        wasixv2::Host::monotonic(&self.host)
+    }
+    fn sleep(&self, duration: std::time::Duration) -> LocalFuture<'_, ()> {
+        wasixv2::Host::sleep(&self.host, duration)
+    }
+    fn sleep_until(&self, deadline: std::time::Duration) -> LocalFuture<'_, ()> {
+        wasixv2::Host::sleep_until(&self.host, deadline)
+    }
+    fn random(&self, buf: &mut [u8]) {
+        wasixv2::Host::random(&self.host, buf);
+    }
+    fn executor(&self) -> &dyn wasixv2::Executor {
+        self
+    }
+}
+
+impl wasixv2::Executor for DriverHost {
+    fn spawn_local(&self, future: LocalFuture<'static, ()>) {
+        wasixv2::Executor::spawn_local(&self.host, future);
+    }
+    fn spawn_blocking(&self, work: Box<dyn FnOnce() + Send>) -> LocalFuture<'static, ()> {
+        wasixv2::Executor::spawn_blocking(&self.host, work)
+    }
+    fn spawn_thread(&self, start: wasixv2::ThreadStart) -> io::Result<()> {
+        self.running
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let running = Running(self.running.clone());
+        wasixv2::Executor::spawn_thread(
+            &self.host,
+            Box::new(move || {
+                let run = start();
+                Box::pin(async move {
+                    let _running = running;
+                    run.await;
+                })
+            }),
+        )
+    }
+}
+
+/// A signaller does not keep a dropped machine's kernel alive, so the kernel's timer driver
+/// ends with the machine. An embedder that holds a signaller until its host threads end
+/// would otherwise wait for the driver forever.
+#[tokio::test]
+async fn a_signaller_does_not_keep_the_timer_driver_of_a_dropped_machine() {
+    let running = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let host = Arc::new(DriverHost {
+        host: wasixv2::TokioHost::default(),
+        running: running.clone(),
+    });
+    let machine = wasixv2::MachineBuilder::new(host)
+        .task_executor(Arc::new(wasixv2::TokioHost::default()))
+        .build();
+    let signaller = machine.signaller();
+    let stdio = Stdio {
+        stdin: Arc::new(EmptySource),
+        stdout: Arc::new(Capture::default()),
+        stderr: Arc::new(Capture::default()),
+    };
+    let wasm = wat::parse_str(ITIMER_WAT).unwrap();
+    let status = machine.run(&wasm, stdio).await.unwrap();
+    assert_eq!(status, 0, "setitimer succeeds");
+    assert_eq!(
+        running.load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "the armed timer started the driver"
+    );
+    machine.shutdown().await;
+    drop(machine);
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while running.load(std::sync::atomic::Ordering::Acquire) != 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the timer driver outlived its machine");
+    // Nothing runs any more: signalling the machine that is gone does nothing.
+    signaller.signal(15).unwrap();
+    assert!(!signaller.signal_foreground(15).unwrap());
+    signaller.console_hangup();
+}
