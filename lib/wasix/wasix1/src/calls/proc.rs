@@ -387,25 +387,45 @@ async fn package_command<S: Syscalls + Control + 'static>(
     Ok(frame.instance().commands().read().unwrap().get(id).cloned())
 }
 
-/// `exec` for the calls without a result: a failure ends the process.
+/// The old void imports require UTF-8 and terminate with the v1 errno on failure.
 async fn exec_or_exit<S: Syscalls + Control + 'static>(
     frame: &Frame<'_, S>,
-    command: &Command,
+    name: (i32, i32),
+    args: (i32, i32),
+    envs: (i32, i32),
 ) -> V1Result<()> {
-    match exec(frame, command).await {
-        Err(Error::Sys(SysErr::Restart | SysErr::RestartNoHand)) => {
-            Err(Error::Sys(SysErr::Restart))
-        }
-        Ok(()) => Ok(()),
-        Err(err) => {
-            tracing::debug!(?err, name = %String::from_utf8_lossy(&command.name), "proc_exec failed");
-            frame
-                .syscalls
-                .exit_group(&frame.caller(), EXEC_FAILED)
-                .await?;
-            Ok(())
-        }
+    let read = async |(ptr, len): (i32, i32)| -> V1Result<Vec<u8>> {
+        let bytes = read_bytes(frame, ptr as u32, len as u32)
+            .await
+            .map_err(|_| Errno::INVAL)?;
+        std::str::from_utf8(&bytes).map_err(|_| Errno::INVAL)?;
+        Ok(bytes)
+    };
+    let result = async {
+        let name = read(name).await?;
+        let args = split_args(&read(args).await?);
+        let env = if envs.0 == 0 {
+            None
+        } else {
+            Some(split_env(&read(envs).await?)?)
+        };
+        exec(frame, &Command::new(name, args, env, false, None)).await
     }
+    .await;
+    let errno = match result {
+        Ok(()) => return Ok(()),
+        Err(Error::V1(errno)) => errno,
+        Err(Error::Sys(SysErr::Errno(errno))) => Errno::from_linux(errno),
+        Err(Error::Sys(SysErr::Restart | SysErr::RestartNoHand)) => {
+            return Err(SysErr::Restart.into());
+        }
+        Err(err) => return Err(err),
+    };
+    frame
+        .syscalls
+        .exit_group(&frame.caller(), i32::from(errno.0))
+        .await?;
+    Ok(())
 }
 
 /// `proc_exec(name, args)`: never returns, except in a vfork parent.
@@ -417,16 +437,7 @@ pub(crate) async fn proc_exec<S: Syscalls + Control + 'static>(
     args_len: i32,
 ) -> Result<(), RuntimeError> {
     shim::void(&env, "proc_exec", async |frame| {
-        let command = command_from_lists(
-            frame,
-            (name, name_len),
-            (args, args_len),
-            (0, 0),
-            false,
-            (0, 0),
-        )
-        .await?;
-        exec_or_exit(frame, &command).await
+        exec_or_exit(frame, (name, name_len), (args, args_len), (0, 0)).await
     })
     .await
 }
@@ -442,16 +453,7 @@ pub(crate) async fn proc_exec2<S: Syscalls + Control + 'static>(
     envs_len: i32,
 ) -> Result<(), RuntimeError> {
     shim::void(&env, "proc_exec2", async |frame| {
-        let command = command_from_lists(
-            frame,
-            (name, name_len),
-            (args, args_len),
-            (envs, envs_len),
-            false,
-            (0, 0),
-        )
-        .await?;
-        exec_or_exit(frame, &command).await
+        exec_or_exit(frame, (name, name_len), (args, args_len), (envs, envs_len)).await
     })
     .await
 }

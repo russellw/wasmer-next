@@ -1463,6 +1463,50 @@ fn vfork_and_exec() {
     assert_eq!(stdout, b"child");
 }
 
+#[test]
+fn void_proc_exec_exits_with_the_v1_errno() {
+    let wat = |call: &str| {
+        format!(
+            r#"
+(module
+  (import "wasix_32v1" "proc_exec" (func $exec (param i32 i32 i32 i32)))
+  (import "wasix_32v1" "proc_exec2" (func $exec2 (param i32 i32 i32 i32 i32 i32)))
+  (import "wasi_snapshot_preview1" "proc_exit" (func $exit (param i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 100) "/missing.wasm")
+  (data (i32.const 120) "no-equals")
+  (data (i32.const 140) "\ff")
+  (func (export "_start")
+    {call}
+    (call $exit (i32.const 99))))
+"#
+        )
+    };
+    assert_eq!(
+        status(&wat(
+            "(call $exec (i32.const 100) (i32.const 13) (i32.const 0) (i32.const 0))"
+        )),
+        44
+    );
+    for (env, len, expected) in [(0, 0, 44), (120, 9, 28)] {
+        assert_eq!(
+            status(&wat(&format!(
+                "(call $exec2 (i32.const 100) (i32.const 13) (i32.const 0) (i32.const 0) \
+                 (i32.const {env}) (i32.const {len}))"
+            ))),
+            expected
+        );
+    }
+    for address in [140, 65536] {
+        assert_eq!(
+            status(&wat(&format!(
+                "(call $exec (i32.const {address}) (i32.const 1) (i32.const 0) (i32.const 0))"
+            ))),
+            28
+        );
+    }
+}
+
 /// Preparing a host namespace needs no guest memory. Its live descriptor metadata,
 /// rather than the original bootstrap fd list, survives the runner's actual exec handoff.
 #[test]
