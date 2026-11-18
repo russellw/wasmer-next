@@ -160,10 +160,10 @@ impl WasmerCommand {
         }
         let args: Vec<_> = args.map(<[u8]>::to_vec).collect();
         let package = match self.source(&cx, &target).await {
-            Ok(Source::Wasm) => {
-                let argv = std::iter::once(target.clone()).chain(args).collect();
+            Ok(Source::Wasm(file)) => {
+                let argv = std::iter::once(target).chain(args).collect();
                 let env = cx.env().to_vec();
-                return execute(cx, &target, argv, env).await;
+                return finish_exec(cx.exec_file(file.file(), argv, env).await, false).await;
             }
             Ok(Source::Package(package)) => package,
             Err(error) => return error.print(&cx).await,
@@ -241,7 +241,7 @@ impl WasmerCommand {
             .await
             .map_err(|_| CommandError::NOT_EXECUTABLE)?;
         if header[..size].starts_with(b"\0asm\x01\0\0\0") {
-            return Ok(Source::Wasm);
+            return Ok(Source::Wasm(file));
         }
         let bytes = ImageBytes::read(&file, self.budget.as_ref())
             .await
@@ -261,17 +261,8 @@ impl WasmerCommand {
 }
 
 enum Source {
-    Wasm,
+    Wasm(CommandFile),
     Package(RuntimePackage),
-}
-
-async fn execute(
-    cx: CommandContext<'_>,
-    path: &[u8],
-    args: Vec<Vec<u8>>,
-    env: Vec<Vec<u8>>,
-) -> CommandOutcome {
-    finish_exec(cx.exec(path, args, env).await, false).await
 }
 
 async fn finish_exec(
