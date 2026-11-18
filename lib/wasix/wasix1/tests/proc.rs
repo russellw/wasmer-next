@@ -912,6 +912,114 @@ fn spawn() {
     assert_eq!(std::fs::read(programs.0.join("out.txt")).unwrap(), b"child");
 }
 
+#[test]
+#[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+fn spawn_file_actions_preserve_preopens_rights_and_cloexec() {
+    use wasixv2::{DirectoryBootstrap, NamespaceBootstrap};
+    use wasixv2_wasix1::PreopenRights;
+    use wasmer::{Module, Store};
+
+    let child = r#"
+    (module
+      (import "wasi_snapshot_preview1" "fd_readdir" (func $readdir (param i32 i32 i32 i64 i32) (result i32)))
+      (import "wasi_snapshot_preview1" "fd_prestat_dir_name" (func $name (param i32 i32 i32) (result i32)))
+      (import "wasi_snapshot_preview1" "fd_fdstat_get" (func $stat (param i32 i32) (result i32)))
+      (import "wasi_snapshot_preview1" "proc_exit" (func $exit (param i32)))
+      (memory (export "memory") 1)
+      (func (export "_start")
+        (if (call $name (i32.const 4) (i32.const 0) (i32.const 4)) (then (call $exit (i32.const 11))))
+        (if (i32.ne (i32.load (i32.const 0)) (i32.const 0x7070612f)) (then (call $exit (i32.const 12))))
+        (if (call $readdir (i32.const 4) (i32.const 128) (i32.const 256) (i64.const 0) (i32.const 8))
+          (then (call $exit (i32.const 17))))
+        (if (call $stat (i32.const 40) (i32.const 16)) (then (call $exit (i32.const 13))))
+        (if (i64.ne (i64.load (i32.const 24)) (i64.const 2)) (then (call $exit (i32.const 14))))
+        (if (i64.ne (i64.load (i32.const 32)) (i64.const 2097152)) (then (call $exit (i32.const 15))))
+        (if (i32.ne (call $stat (i32.const 41) (i32.const 16)) (i32.const 8)) (then (call $exit (i32.const 16))))))
+    "#;
+    let parent = r#"
+    (module
+      (import "wasix_32v1" "proc_spawn2" (func $spawn
+        (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+      (import "wasix_32v1" "proc_join" (func $join (param i32 i32 i32) (result i32)))
+      (import "wasi_snapshot_preview1" "fd_prestat_get" (func $prestat (param i32 i32) (result i32)))
+      (import "wasi_snapshot_preview1" "fd_fdstat_get" (func $stat (param i32 i32) (result i32)))
+      (import "wasi_snapshot_preview1" "proc_exit" (func $exit (param i32)))
+      (memory (export "memory") 1)
+      (data (i32.const 1000) "/prog/child.wasm")
+      (data (i32.const 1032) "child\n")
+      ;; Four 56-byte actions: CLOSE fd 4, CLOSE absent fd 100, OPEN fd 40, OPEN CLOEXEC fd 41.
+      (data (i32.const 2004) "\04")
+      (data (i32.const 2060) "\64")
+      (func $open (param $op i32) (param $fd i32) (param $flags i32)
+        (i32.store8 (local.get $op) (i32.const 2))
+        (i32.store offset=4 (local.get $op) (local.get $fd))
+        (i32.store offset=12 (local.get $op) (i32.const 1000))
+        (i32.store offset=16 (local.get $op) (i32.const 16))
+        (i32.store offset=20 (local.get $op) (i32.const 1))
+        (i64.store offset=32 (local.get $op) (i64.const 2))
+        (i64.store offset=40 (local.get $op) (i64.const 2097152))
+        (i32.store16 offset=50 (local.get $op) (local.get $flags)))
+      (func (export "_start")
+        (call $open (i32.const 2112) (i32.const 40) (i32.const 0))
+        (call $open (i32.const 2168) (i32.const 41) (i32.const 1))
+        (if (call $spawn (i32.const 1000) (i32.const 16) (i32.const 1032) (i32.const 6)
+                         (i32.const 0) (i32.const 0) (i32.const 2000) (i32.const 4)
+                         (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)
+                         (i32.const 100))
+          (then (call $exit (i32.const 1))))
+        (i32.store8 (i32.const 200) (i32.const 1))
+        (i32.store (i32.const 204) (i32.load (i32.const 100)))
+        (if (call $join (i32.const 200) (i32.const 0) (i32.const 220)) (then (call $exit (i32.const 2))))
+        (if (i32.load16_u (i32.const 222)) (then (call $exit (i32.load16_u (i32.const 222)))))
+        (if (call $prestat (i32.const 4) (i32.const 16)) (then (call $exit (i32.const 3))))
+        (if (i32.ne (call $stat (i32.const 40) (i32.const 16)) (i32.const 8)) (then (call $exit (i32.const 4))))
+        (if (i32.ne (call $stat (i32.const 41) (i32.const 16)) (i32.const 8)) (then (call $exit (i32.const 5))))))
+    "#;
+    let programs = Programs::new("spawn-file-actions", &[("child.wasm", child)]);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    tokio::task::LocalSet::new().block_on(&runtime, async {
+        let machine = Arc::new(Machine::new());
+        let source = machine.capture_host_directory(&programs.0, false).unwrap();
+        let (mut process, boot) = machine
+            .start_embedding_with_namespace(
+                ProcessConfig {
+                    args: vec!["parent".into()],
+                    env: vec![],
+                    stdio: Stdio::from_fns(|_| {}, |_| {}),
+                },
+                NamespaceBootstrap {
+                    directories: vec![DirectoryBootstrap {
+                        source,
+                        lookup_name: Some(b"prog".to_vec()),
+                        attachment: Some(PreopenRights::ALL.named_attachment(b"/app").unwrap()),
+                    }],
+                    root_attachment: Some(PreopenRights::ALL.named_attachment(b"/").unwrap()),
+                    root_fallback: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(boot.descriptors[1].0, 4);
+        let store = Store::default();
+        let module = Module::new(&store, wat::parse_str(parent).unwrap()).unwrap();
+        let result = wasixv2_exec::run_with_abis(
+            store,
+            &module,
+            process.syscalls(),
+            process.task(),
+            process.host(),
+            process.abis(),
+        )
+        .await;
+        process.close();
+        machine.shutdown().await;
+        assert_eq!(result.unwrap(), 0);
+    });
+}
+
 /// Spawn retains the parent's context; neither its child nor a failed exec can
 /// turn a guest fork/vfork into a supported operation in that context.
 #[test]

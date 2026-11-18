@@ -34,8 +34,8 @@ use wasixv2_exec::{
     asyncify::import::{self, Resumed},
 };
 use wasixv2_syscalls::{
-    Control, Errno as LinuxErrno, ExecutionFault, SysErr, Syscalls, TaskId, UserMemory,
-    WaitCompletion, WaitCompletionSlot,
+    Control, DescriptorInstallations, Errno as LinuxErrno, ExecutionFault, SysErr, Syscalls,
+    TaskId, UserMemory, WaitCompletion, WaitCompletionSlot,
 };
 use wasmer::RuntimeError;
 
@@ -52,6 +52,7 @@ use crate::{
     errno::{Error, V1Result},
     instance::{Vfork, Wasix1Instance},
     process::{CommandDefaults, FileId, ProcState},
+    rights::Record,
     shim::{self, Done, Env, Frame},
 };
 
@@ -797,9 +798,25 @@ async fn file_action<S: Syscalls + Control + 'static>(
         Ok(frame.mem.alloc_cstr(&path)?)
     };
     match op.cmd {
-        // musl ignores a failed close.
         ProcSpawnFdOpName::CLOSE => {
-            let _ = frame.syscalls.close(&caller, fd).await;
+            let set = frame
+                .syscalls
+                .snapshot_descriptors(frame.task, &[fd])
+                .map_err(SysErr::from)?;
+            let protected = set
+                .get(fd)
+                .and_then(|entry| entry.attachment.as_ref())
+                .and_then(|attachment| attachment.downcast_ref::<Record>())
+                .is_some_and(|record| {
+                    record.preopen && record.legacy.as_ref().is_none_or(|object| !object.stdio)
+                });
+            if !protected {
+                // musl ignores a failed close.
+                let _ = frame
+                    .syscalls
+                    .close(&caller.with_descriptors(&set), fd)
+                    .await;
+            }
         }
         ProcSpawnFdOpName::DUP2 if op.src_fd == op.fd => {
             // dup2 onto itself keeps the descriptor across exec.
@@ -821,14 +838,25 @@ async fn file_action<S: Syscalls + Control + 'static>(
         ProcSpawnFdOpName::OPEN => {
             let path = path().await?;
             let at = Fd(AtFd::AT_FDCWD.0);
+            let flags = open_flags(op);
+            let record = Record::new(Rights(op.fs_rights_base), Rights(op.fs_rights_inheriting));
+            let plan = DescriptorInstallations::new(vec![record.attachment()]);
             let opened = frame
                 .syscalls
-                .openat(&caller, at, path, open_flags(op), 0o666)
+                .openat(
+                    &caller.with_descriptor_installations(&plan),
+                    at,
+                    path,
+                    flags,
+                    0o666,
+                )
                 .await?;
             if opened != fd {
+                let installed = plan.result(0).ok_or(Errno::IO)?;
+                let caller = frame.caller().with_descriptors(installed);
                 frame
                     .syscalls
-                    .dup3(&caller, opened, fd, OpenFlags(0))
+                    .dup3(&caller, opened, fd, flags & OpenFlags::O_CLOEXEC)
                     .await?;
                 frame.syscalls.close(&caller, opened).await?;
             }
