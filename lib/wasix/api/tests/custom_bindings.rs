@@ -18,10 +18,12 @@ use wasmer::{
 
 type Events = Arc<Mutex<Vec<(usize, &'static str)>>>;
 type ThreadEvents = Arc<Mutex<Vec<(&'static str, std::thread::ThreadId)>>>;
+type CleanupGate = Arc<Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>;
 #[derive(Clone)]
 struct ThreadProbe {
     events: ThreadEvents,
     barrier: Option<Arc<std::sync::Barrier>>,
+    cleanup_gate: Option<CleanupGate>,
 }
 impl ThreadProbe {
     fn record(&self, phase: &'static str) {
@@ -168,6 +170,14 @@ impl InstanceAttachment for Attachment {
             assert!(
                 scope
                     .submit(Box::new(move || Box::pin(async move {
+                        let gate = thread
+                            .cleanup_gate
+                            .as_ref()
+                            .and_then(|gate| gate.lock().unwrap().take());
+                        if let Some(gate) = gate {
+                            thread.record("cleanup waiting");
+                            let _ = gate.await;
+                        }
                         thread.record("cleanup");
                     })))
                     .is_ok()
@@ -643,6 +653,7 @@ async fn side_only_bindings_construct_and_retire_on_their_owning_thread() {
                     Some(ThreadProbe {
                         events: events.clone(),
                         barrier: None,
+                        cleanup_gate: None,
                     }),
                     file,
                 )
@@ -695,6 +706,7 @@ async fn admitted_side_bindings_keep_the_existing_owning_thread_lifecycle() {
                     Some(ThreadProbe {
                         events: events.clone(),
                         barrier: None,
+                        cleanup_gate: None,
                     }),
                     file,
                     true,
@@ -718,6 +730,82 @@ async fn admitted_side_bindings_keep_the_existing_owning_thread_lifecycle() {
         .await;
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn file_exit_status_is_available_before_loader_cleanup_drains() {
+    use std::{os::unix::fs::PermissionsExt, time::Duration};
+    use tokio::sync::oneshot;
+
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let programs = tempfile::tempdir().unwrap();
+            let path = programs.path().join("main.wasm");
+            let wasm = wat::parse_str(
+                r#"(module
+                    (import "custom" "value" (func $value (result i32)))
+                    (import "wasixv2" "exit_group" (func $exit (param i32)))
+                    (memory (export "memory") 1)
+                    (func (export "_start") call $value i32.const 41 i32.add call $exit))"#,
+            )
+            .unwrap();
+            std::fs::write(&path, wasm).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+            let events: ThreadEvents = Arc::default();
+            let (release, cleanup_gate) = oneshot::channel();
+            let machine = Machine::builder()
+                .instantiation_hook(Arc::new(Hook {
+                    next: AtomicUsize::new(1),
+                    events: Arc::default(),
+                    omit: false,
+                    thread: Some(ThreadProbe {
+                        events: events.clone(),
+                        barrier: None,
+                        cleanup_gate: Some(Arc::new(Mutex::new(Some(cleanup_gate)))),
+                    }),
+                }))
+                .build();
+            machine
+                .mount_host_dir("/prog", programs.path(), false)
+                .await
+                .unwrap();
+
+            let engine = wasmer::Engine::default();
+            let config = ProcessConfig {
+                args: vec![],
+                env: vec![],
+                stdio: Stdio::from_fns(|_| {}, |_| {}),
+            };
+            let (publish, exit) = oneshot::channel();
+            let exit_events = events.clone();
+            let mut run = std::pin::pin!(machine.run_file_with_exit_status(
+                &engine,
+                "/prog/main.wasm",
+                config,
+                move |status| {
+                    exit_events.lock().unwrap().push(("exit", std::thread::current().id()));
+                    let _ = publish.send(status);
+                },
+            ));
+
+            tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::select! {
+                    status = exit => assert_eq!(status.unwrap(), 42),
+                    result = &mut run => panic!("run completed before cleanup was released: {result:?}"),
+                }
+                assert!(futures_util::poll!(&mut run).is_pending());
+                release.send(()).unwrap();
+                assert_eq!(run.await.unwrap(), 42);
+            })
+            .await
+            .unwrap();
+            let events = events.lock().unwrap();
+            let phases: Vec<_> = events.iter().map(|(phase, _)| *phase).collect();
+            assert!(phases.ends_with(&["exit", "deactivate", "cleanup waiting", "cleanup"]));
+        })
+        .await;
+}
+
 #[tokio::test]
 async fn independent_binding_roots_use_distinct_owning_threads() {
     if !owning_thread_subprocess("independent_binding_roots_use_distinct_owning_threads") {
@@ -736,6 +824,7 @@ async fn independent_binding_roots_use_distinct_owning_threads() {
                     Some(ThreadProbe {
                         events: first.clone(),
                         barrier: Some(barrier.clone()),
+                        cleanup_gate: None,
                     }),
                     false
                 ),
@@ -746,6 +835,7 @@ async fn independent_binding_roots_use_distinct_owning_threads() {
                     Some(ThreadProbe {
                         events: second.clone(),
                         barrier: Some(barrier),
+                        cleanup_gate: None,
                     }),
                     false
                 ),

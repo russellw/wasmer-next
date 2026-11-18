@@ -514,6 +514,24 @@ pub async fn run_exec<S>(
 where
     S: Syscalls + Control + Send + Sync + 'static,
 {
+    run_exec_with_exit_status(engine, image, syscalls, task, host, abis, None).await
+}
+
+/// Like [`run_exec`], with a callback for the process's exit status before cleanup drains.
+/// Startup errors are returned by the run itself.
+pub async fn run_exec_with_exit_status<S>(
+    engine: Engine,
+    image: Image,
+    syscalls: Arc<S>,
+    task: TaskId,
+    host: Arc<dyn Host>,
+    abis: Arc<Abis<S>>,
+    on_exit: Option<Box<dyn FnOnce(i32) + Send>>,
+) -> Result<i32, ExecError>
+where
+    S: Syscalls + Control + Send + Sync + 'static,
+{
+    let exit_status = on_exit.map(|notify| process::ExitStatus::new(task, notify));
     if abis.requires_owning_thread() {
         #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
         return cancellation::run_owned_entry(
@@ -523,6 +541,7 @@ where
             task,
             host,
             abis,
+            exit_status,
         )
         .await;
         #[cfg(not(all(feature = "sys", not(target_arch = "wasm32"))))]
@@ -531,27 +550,6 @@ where
             task,
             ExecError::OwningThreadUnsupported,
         ));
-    }
-    run_exec_profiled(engine, image, syscalls, task, host, abis, None).await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_exec_profiled<S>(
-    engine: Engine,
-    image: Image,
-    syscalls: Arc<S>,
-    task: TaskId,
-    host: Arc<dyn Host>,
-    abis: Arc<Abis<S>>,
-    profile: Option<thread::OwningThread>,
-) -> Result<i32, ExecError>
-where
-    S: Syscalls + Control + Send + Sync + 'static,
-{
-    if let Some(profile) = &profile {
-        profile
-            .authorize()
-            .map_err(|error| reject_profile(&*syscalls, task, error))?;
     }
     let cleanup = cleanup::RunCleanup::new(wasixv2_host::LoaderCleanup::new(host.clone()), {
         #[cfg(feature = "sys")]
@@ -562,7 +560,8 @@ where
         {
             false
         }
-    });
+    })
+    .with_exit_status(exit_status);
     let run = process::run_exec(
         engine,
         image,
@@ -572,20 +571,13 @@ where
         abis,
         cleanup.clone(),
     );
-    match profile {
-        Some(profile) => catch_panic(profile.run(&cleanup, run))
-            .await
-            .unwrap_or_else(|panic| Err(host_panicked(&*syscalls, task, panic))),
-        None => {
-            cleanup
-                .run(async move {
-                    catch_panic(run)
-                        .await
-                        .unwrap_or_else(|panic| Err(host_panicked(&*syscalls, task, panic)))
-                })
+    cleanup
+        .run(async move {
+            catch_panic(run)
                 .await
-        }
-    }
+                .unwrap_or_else(|panic| Err(host_panicked(&*syscalls, task, panic)))
+        })
+        .await
 }
 
 /// Constructs the initial Store inside the host's existing thread factory,
@@ -611,6 +603,7 @@ where
             task,
             host,
             abis,
+            None,
         )
         .await
     }
@@ -967,6 +960,8 @@ impl Drop for Binding {
 }
 
 struct Ready<S: Send + Sync + 'static> {
+    task: TaskId,
+    exit_status: Option<process::ExitStatus>,
     store: Option<Store>,
     invocations: instantiation::NativeInvocations,
     env: FunctionEnv<ExecEnv<S>>,
@@ -1008,7 +1003,8 @@ where
         .map(|gate| Binding::new(&*abi, gate, task))
         .transpose()
         .map_err(|e| ExecError::Load(LoadError::Format(e)))?;
-    let handoff = Arc::new(process::Handoff::default());
+    let exit_status = cleanup.exit_status().filter(|exit| exit.observes(task));
+    let handoff = Arc::new(process::Handoff::with_exit_status(exit_status.clone()));
     handoff.bind_cancellation(cleanup.cancellation());
     let env = embedding::environment(
         &mut store.as_store_mut(),
@@ -1211,6 +1207,8 @@ where
         }
     };
     Ok(Ready {
+        task,
+        exit_status,
         store: Some(store),
         invocations,
         env,
@@ -1446,7 +1444,7 @@ impl<S: Syscalls + Control + Send + Sync + 'static> Ready<S> {
             None => result,
         };
         let phase = phase.load(std::sync::atomic::Ordering::Relaxed);
-        let ended = match (phase, result) {
+        let mut ended = match (phase, result) {
             (0, Err(error)) if !start_ended(&error) => {
                 Err(wasmer::InstantiationError::Start(error).into())
             }
@@ -1459,6 +1457,36 @@ impl<S: Syscalls + Control + Send + Sync + 'static> Ready<S> {
                 Ok(ended(entry.cx(), result, on_return, Role::Process, origin).await)
             }
         };
+        // Image retirement can wait on the loader after the guest has closed its files.
+        if let Some(exit_status) = &self.exit_status {
+            let task = self.task;
+            match &ended {
+                Ok(Ended::Exited(status)) => exit_status.report(task, *status),
+                Ok(Ended::Fault {
+                    task: at,
+                    signal,
+                    killed,
+                    report,
+                    ..
+                }) if *at == task => {
+                    let (syscalls, host) = entry
+                        .with_store(|env, _| (env.syscalls.clone(), env.host.clone()))
+                        .await;
+                    let status = process::fault_in(
+                        &*syscalls,
+                        &*host,
+                        task,
+                        *at,
+                        (*signal, *killed),
+                        report,
+                    )
+                    .expect("the fault ended this process");
+                    exit_status.report(task, status);
+                    ended = Ok(Ended::Exited(status));
+                }
+                _ => {}
+            }
+        }
         if let Some(attachments) = &mut attachments {
             attachments.deactivate().await;
         }

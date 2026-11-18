@@ -69,7 +69,41 @@ pub(crate) struct Detached(pub(crate) Arc<Handoff>);
 /// shared by the instances of one process image: the process instance and its threads'. Only
 /// one run takes over from an image, as the image is dead to every thread once it did.
 #[derive(Default)]
-pub(crate) struct Handoff(Mutex<HandoffState>);
+pub(crate) struct Handoff(Mutex<HandoffState>, Option<ExitStatus>);
+
+/// A one-shot observer shared only by images of the same process.
+#[derive(Clone)]
+pub(crate) struct ExitStatus {
+    task: TaskId,
+    notify: Arc<Mutex<Option<ExitCallback>>>,
+}
+
+type ExitCallback = Box<dyn FnOnce(i32) + Send>;
+
+impl ExitStatus {
+    pub(crate) fn new(task: TaskId, notify: ExitCallback) -> Self {
+        Self {
+            task,
+            notify: Arc::new(Mutex::new(Some(notify))),
+        }
+    }
+
+    pub(crate) fn observes(&self, task: TaskId) -> bool {
+        task == self.task
+    }
+
+    pub(crate) fn report(&self, task: TaskId, status: i32) {
+        if !self.observes(task) {
+            return;
+        }
+        let notify = self.notify.lock().unwrap().take();
+        if let Some(notify) = notify
+            && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| notify(status))).is_err()
+        {
+            tracing::error!("process exit status observer panicked");
+        }
+    }
+}
 
 #[derive(Default)]
 struct HandoffState {
@@ -102,6 +136,14 @@ impl std::fmt::Debug for Handoff {
 }
 
 impl Handoff {
+    pub(crate) fn with_exit_status(exit_status: Option<ExitStatus>) -> Self {
+        Self(Mutex::default(), exit_status)
+    }
+
+    pub(crate) fn exit_status(&self) -> Option<ExitStatus> {
+        self.1.clone()
+    }
+
     #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
     pub(crate) fn install_takeover(
         &self,
@@ -696,12 +738,16 @@ where
             );
             let done = handoff.clone();
             let started = self.start(task, move |cleanup| {
+                let cleanup = cleanup.with_exit_status(done.exit_status());
                 let takeover = Takeover(done);
                 let run = run_new_image(engine, image, syscalls, task, host, abis, cleanup);
                 async move { takeover.report(run.await) }
             });
             // The process died of SIGSEGV, as one whose image cannot start does.
             if let Err(status) = started {
+                if let Some(exit_status) = handoff.exit_status() {
+                    exit_status.report(task, status);
+                }
                 handoff.complete(Ok(status));
             }
         }
@@ -1150,6 +1196,7 @@ where
             },
         };
     };
+    cleanup.report_exit(task, status);
     finish_task(&*syscalls, task).await;
     Ok(status)
 }
@@ -1176,8 +1223,8 @@ where
     let _process = image.lease.take();
     // `de_thread`: the old image is gone from every thread before the new one starts.
     if let Err(status) = syscalls.exec_wait(task).await {
-        syscalls.group_wait(task).await;
-        syscalls.release(task);
+        cleanup.report_exit(task, status);
+        finish_task(&*syscalls, task).await;
         return Ok(status);
     }
     // Preserve the public runner's panic result before Takeover reports it, while
@@ -1197,6 +1244,7 @@ where
             tracing::warn!(tid = task.0, %err, "cannot load the exec image");
             let status = fault(&*syscalls, task, Signal::SIGSEGV.0);
             syscalls.release(task);
+            cleanup.report_exit(task, status);
             return Ok(status);
         }
         finish(engine, first, syscalls.clone(), task, host, abis, cleanup).await

@@ -211,7 +211,11 @@ pub(super) async fn spawn_program(
                                 path,
                                 args,
                                 env,
-                            } => running.exec_file(&engine, task, &path, args, env).await,
+                            } => {
+                                running
+                                    .exec_file(&engine, task, &path, args, env, None)
+                                    .await
+                            }
                         }
                     };
                     admission.released();

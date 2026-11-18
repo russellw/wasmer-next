@@ -10,6 +10,7 @@ pub(crate) struct RunCleanup {
     shared: Arc<LoaderCleanup>,
     local: Option<LocalCleanupRunner>,
     cancellation: Option<crate::cancellation::Cancellation>,
+    exit_status: Option<crate::process::ExitStatus>,
     #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
     owner: Option<wasmer::sys::NativeCleanupOwner>,
 }
@@ -99,6 +100,7 @@ impl RunCleanup {
                 local,
                 owner,
                 cancellation: None,
+                exit_status: None,
             }
         }
         #[cfg(not(all(feature = "sys", not(target_arch = "wasm32"))))]
@@ -108,6 +110,7 @@ impl RunCleanup {
                 shared,
                 local: None,
                 cancellation: None,
+                exit_status: None,
             }
         }
     }
@@ -122,6 +125,24 @@ impl RunCleanup {
     pub(crate) fn cancellation(&self) -> Option<&crate::cancellation::Cancellation> {
         self.cancellation.as_ref()
     }
+    pub(crate) fn with_exit_status(
+        mut self,
+        exit_status: Option<crate::process::ExitStatus>,
+    ) -> Self {
+        self.exit_status = exit_status;
+        self
+    }
+
+    pub(crate) fn exit_status(&self) -> Option<crate::process::ExitStatus> {
+        self.exit_status.clone()
+    }
+
+    pub(crate) fn report_exit(&self, task: wasixv2_syscalls::TaskId, status: i32) {
+        if let Some(exit_status) = &self.exit_status {
+            exit_status.report(task, status);
+        }
+    }
+
     pub(crate) fn shared(&self) -> &Arc<LoaderCleanup> {
         &self.shared
     }

@@ -1377,11 +1377,37 @@ impl Machine {
         path: &str,
         config: ProcessConfig,
     ) -> Result<i32, RunError> {
+        self.run_file_inner(engine, path, config, None).await
+    }
+
+    /// Like [`Machine::run_file`], with an exit notification before loader cleanup drains.
+    /// The callback can run on the guest's executor and should return promptly. Keep driving
+    /// this future to await cleanup and console delivery. Startup errors are returned by
+    /// the future. If the initial exec never commits an image, only the future reports
+    /// its outcome.
+    pub async fn run_file_with_exit_status(
+        &self,
+        engine: &Engine,
+        path: &str,
+        config: ProcessConfig,
+        on_exit: impl FnOnce(i32) + Send + 'static,
+    ) -> Result<i32, RunError> {
+        self.run_file_inner(engine, path, config, Some(Box::new(on_exit)))
+            .await
+    }
+
+    async fn run_file_inner(
+        &self,
+        engine: &Engine,
+        path: &str,
+        config: ProcessConfig,
+        on_exit: Option<Box<dyn FnOnce(i32) + Send>>,
+    ) -> Result<i32, RunError> {
         self.check_thread_profile()?;
         let bytes = |strings: &[String]| strings.iter().map(|s| s.as_bytes().to_vec()).collect();
         let (args, env) = (bytes(&config.args), bytes(&config.env));
         let (task, running) = self.start(config).await?;
-        let status = self.exec_file(engine, task, path, args, env).await;
+        let status = self.exec_file(engine, task, path, args, env, on_exit).await;
         running.released();
         self.console_sent().await;
         status
@@ -1403,6 +1429,7 @@ impl Machine {
         path: &str,
         args: Vec<Vec<u8>>,
         env: Vec<Vec<u8>>,
+        on_exit: Option<Box<dyn FnOnce(i32) + Send>>,
     ) -> Result<i32, RunError> {
         let kernel = &self.syscalls.inner;
         let image = match kernel.exec(task, path.as_bytes(), args, env).await {
@@ -1421,13 +1448,14 @@ impl Machine {
             }
         };
         let (syscalls, abis) = (self.syscalls.clone(), self.abis.clone());
-        let run = wasixv2_exec::run_exec(
+        let run = wasixv2_exec::run_exec_with_exit_status(
             engine.clone(),
             image,
             syscalls,
             task,
             self.task_host.clone(),
             abis,
+            on_exit,
         );
         Ok(run.await?)
     }

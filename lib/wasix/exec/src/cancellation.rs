@@ -637,6 +637,7 @@ async fn committed_worker<S>(
     host: Arc<dyn Host>,
     abis: Arc<Abis<S>>,
     cancellation: Cancellation,
+    exit_status: Option<process::ExitStatus>,
 ) -> Result<i32, ExecError>
 where
     S: Syscalls + Control + Send + Sync + 'static,
@@ -658,7 +659,8 @@ where
         wasixv2_host::LoaderCleanup::new(host.clone()),
         engine.is_sys(),
     )
-    .with_cancellation(cancellation.clone());
+    .with_cancellation(cancellation.clone())
+    .with_exit_status(exit_status);
     let call = async {
         let run = async {
             cancellation
@@ -776,6 +778,7 @@ where
                         worker_host,
                         abis,
                         cancellation,
+                        worker_completion.exit_status(),
                     )
                     .await
                 }
@@ -861,6 +864,7 @@ pub(super) async fn run_owned_entry<S>(
     task: TaskId,
     host: Arc<dyn Host>,
     abis: Arc<Abis<S>>,
+    exit_status: Option<process::ExitStatus>,
 ) -> Result<i32, ExecError>
 where
     S: Syscalls + Control + Send + Sync + 'static,
@@ -887,7 +891,8 @@ where
                                 wasixv2_host::LoaderCleanup::new(worker_host.clone()),
                                 engine.is_sys(),
                             )
-                            .with_cancellation(cancellation.clone());
+                            .with_cancellation(cancellation.clone())
+                            .with_exit_status(exit_status);
                             let run = async {
                                 match entry {
                                     ThreadEntry::Module(module) => {
