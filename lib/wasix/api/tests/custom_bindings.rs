@@ -806,6 +806,66 @@ async fn file_exit_status_is_available_before_loader_cleanup_drains() {
         .await;
 }
 
+#[cfg(unix)]
+#[test]
+fn file_exit_status_is_available_before_stdio_closes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Debug builds need more stack for the inline guest's syscall futures.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            tokio::task::LocalSet::new().block_on(&runtime, async {
+                let programs = tempfile::tempdir().unwrap();
+                let path = programs.path().join("main.wasm");
+                let wasm = wat::parse_str(
+                    r#"(module
+                    (import "wasixv2" "exit_group" (func $exit (param i32)))
+                    (memory (export "memory") 1)
+                    (func (export "_start") i32.const 42 call $exit))"#,
+                )
+                .unwrap();
+                std::fs::write(&path, wasm).unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+                let machine = Machine::builder().build();
+                machine
+                    .mount_host_dir("/prog", programs.path(), false)
+                    .await
+                    .unwrap();
+
+                let stdio = Stdio::from_fns(|_| {}, |_| {});
+                let stdout = Arc::downgrade(&stdio.stdout);
+                let config = ProcessConfig {
+                    args: vec![],
+                    env: vec![],
+                    stdio,
+                };
+                let (publish, exit) = tokio::sync::oneshot::channel();
+                let status = machine
+                    .run_file_with_exit_status(
+                        &wasmer::Engine::default(),
+                        "/prog/main.wasm",
+                        config,
+                        move |status| {
+                            let _ = publish.send((status, stdout.strong_count() > 0));
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(status, 42);
+                assert_eq!(exit.await.unwrap(), (42, true));
+            });
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
 #[tokio::test]
 async fn independent_binding_roots_use_distinct_owning_threads() {
     if !owning_thread_subprocess("independent_binding_roots_use_distinct_owning_threads") {

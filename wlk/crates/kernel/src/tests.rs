@@ -244,6 +244,37 @@ fn exit_group_leaves_pending_exit_with_low_byte() {
 }
 
 #[test]
+fn group_exit_observer_runs_before_exit_files() {
+    for (fatal, expected) in [(false, 3), (true, 139)] {
+        let (kernel, task, _) = setup(b"");
+        let memory = FlatMemory::default();
+        let caller = Caller::new(task, &memory);
+        let files = Arc::downgrade(&kernel.state.read_or_recover().tasks[&task].files);
+        let observed = Arc::new(Mutex::new(None));
+        let record = observed.clone();
+        let observed_files = files.clone();
+        assert!(kernel.on_group_exit(
+            task,
+            Box::new(move |status| {
+                *record.lock().unwrap() = Some((status, observed_files.strong_count() > 0));
+            }),
+        ));
+
+        if fatal {
+            assert!(kernel.fault(task, Signal::SIGSEGV.0));
+            assert_eq!(*observed.lock().unwrap(), Some((expected, true)));
+            block_on(kernel.exit_mm(&caller));
+        } else {
+            assert_eq!(block_on(kernel.exit_group(&caller, 0x1_03)), Ok(()));
+        }
+
+        assert_eq!(*observed.lock().unwrap(), Some((expected, true)));
+        assert_eq!(files.strong_count(), 0);
+        assert!(!kernel.on_group_exit(task, Box::new(|_| {})));
+    }
+}
+
+#[test]
 fn startup_block_lays_out_argv_envp_and_auxv() {
     let (kernel, task, _) = spawn(b"", &["prog", "arg"], &["K=V"]);
     let memory = FlatMemory(RefCell::new(vec![0; 4096]));

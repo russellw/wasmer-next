@@ -1380,11 +1380,15 @@ impl Machine {
         self.run_file_inner(engine, path, config, None).await
     }
 
-    /// Like [`Machine::run_file`], with an exit notification before loader cleanup drains.
-    /// The callback can run on the guest's executor and should return promptly. Keep driving
-    /// this future to await cleanup and console delivery. Startup errors are returned by
-    /// the future. If the initial exec never commits an image, only the future reports
-    /// its outcome.
+    /// Like [`Machine::run_file`], with a one-shot exit notification. On `exit_group`,
+    /// the callback runs when the kernel decides the status, before closing descriptors.
+    /// It may run on the guest executor or on a host thread that causes the exit. Return
+    /// promptly and avoid calling into the machine synchronously from the callback.
+    ///
+    /// The exec layer can also report the status before loader cleanup as a fallback.
+    /// Keep driving the future to await cleanup and console delivery. If the initial
+    /// exec never commits an image, only the future reports the outcome. After commit,
+    /// the callback may still run if the future is dropped before the process exits.
     pub async fn run_file_with_exit_status(
         &self,
         engine: &Engine,
@@ -1447,6 +1451,17 @@ impl Machine {
                 });
             }
         };
+        let on_exit = on_exit.map(|notify| {
+            let slot = Arc::new(Mutex::new(Some(notify)));
+            let report = move |status| {
+                let notify = slot.lock().unwrap().take();
+                if let Some(notify) = notify {
+                    notify(status);
+                }
+            };
+            kernel.on_group_exit(task, Box::new(report.clone()));
+            Box::new(report) as Box<dyn FnOnce(i32) + Send>
+        });
         let (syscalls, abis) = (self.syscalls.clone(), self.abis.clone());
         let run = wasixv2_exec::run_exec_with_exit_status(
             engine.clone(),

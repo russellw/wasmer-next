@@ -670,6 +670,18 @@ impl Kernel {
         self.binfmt = binfmt;
     }
 
+    /// Registers a one-shot observer of the status when the task's thread group claims exit.
+    /// It replaces any previously registered observer. Returns false if the task is unknown
+    /// or the group has already claimed exit. The callback runs synchronously on the thread
+    /// claiming exit, before that path proceeds with group teardown.
+    pub fn on_group_exit(&self, task: TaskId, notify: Box<dyn FnOnce(i32) + Send>) -> bool {
+        let process = {
+            let state = self.state.read_or_recover();
+            state.tasks.get(&task).map(|task| task.process.clone())
+        };
+        process.is_some_and(|process| process.group.set_exit_observer(notify))
+    }
+
     /// The machine's VFS, for the embedder to mount filesystems.
     pub fn vfs(&self) -> &Arc<Vfs> {
         &self.vfs

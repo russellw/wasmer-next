@@ -73,6 +73,7 @@ struct GroupState {
     exec: Option<GroupExec>,
     /// The status of `exit_group`, or of the group's end when its last task called `exit`.
     exit: Option<i32>,
+    exit_observer: Option<Box<dyn FnOnce(i32) + Send>>,
     /// The status of the leader's own `exit`, which is the group's when it ends without an
     /// `exit_group` (`wait_task_zombie` reads the leader's `exit_code`).
     leader_exit: Option<i32>,
@@ -94,6 +95,17 @@ impl Group {
         let group = Self::default();
         group.state.lock_or_recover().live = 1;
         group
+    }
+
+    pub(crate) fn set_exit_observer(&self, notify: Box<dyn FnOnce(i32) + Send>) -> bool {
+        let mut state = self.state.lock_or_recover();
+        if state.exit.is_some() {
+            return false;
+        }
+        let previous = state.exit_observer.replace(notify);
+        drop(state);
+        drop(previous);
+        true
     }
 
     /// The group is exiting or exited.
@@ -578,14 +590,14 @@ impl Kernel {
         let Some(process) = state.tasks.get(&task).map(|task| task.process.clone()) else {
             return false;
         };
-        let (status, won) = {
+        let (status, won, observer) = {
             let mut group = process.group.state.lock_or_recover();
             match group.exit {
                 Some(_) if fatal.is_some() => return false,
-                Some(status) => (status, false),
+                Some(status) => (status, false, None),
                 None => {
                     group.exit = Some(status);
-                    (status, true)
+                    (status, true, group.exit_observer.take())
                 }
             }
         };
@@ -608,6 +620,11 @@ impl Kernel {
         }
         let signals = state.tasks[&task].signals.group().clone();
         drop(state);
+        if let Some(notify) = observer
+            && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| notify(status))).is_err()
+        {
+            tracing::error!("process exit status observer panicked");
+        }
         // `SIGNAL_GROUP_EXIT`: no task stops any more, and stopped ones go on to their exit.
         signals.cancel_stop(true);
         if others {
