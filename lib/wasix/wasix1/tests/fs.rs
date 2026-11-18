@@ -318,7 +318,7 @@ fn path_open_trunc_requires_delegated_write() {
 
     let read = Rights::FD_READ.0;
     let write = Rights::FD_WRITE.0;
-    let dir = (Rights::PATH_OPEN | Rights::PATH_FILESTAT_SET_SIZE).0;
+    let dir = (Rights::PATH_OPEN | Rights::PATH_CREATE_FILE | Rights::PATH_FILESTAT_SET_SIZE).0;
     let data = r#"
   (import "wasix_32v1" "path_open2" (func $path_open2 (param i32 i32 i32 i32 i32 i64 i64 i32 i32 i32) (result i32)))
   (data (i32.const 1024) "dir")
@@ -343,10 +343,17 @@ fn path_open_trunc_requires_delegated_write() {
     (call $eq (i32.const 10) (i32.load (i32.const 28)) (i32.const 4))
     (call $eq (i32.const 11) (i32.load (i32.const 80)) (i32.load (i32.const 1040)))
 
+    (call $ok (i32.const 12) (call $fd_close (i32.load (i32.const 24))))
+    ;; CREAT | TRUNC also preserves an existing file without delegated write.
+    (call $ok (i32.const 13) (call $path_open (i32.load (i32.const 20)) (i32.const 1) (i32.const 1032) (i32.const 4) (i32.const 9) (i64.const {read}) (i64.const 0) (i32.const 0) (i32.const 24)))
+    (call $ok (i32.const 14) (call $fd_read (i32.load (i32.const 24)) (i32.const 0) (i32.const 1) (i32.const 28)))
+    (call $eq (i32.const 15) (i32.load (i32.const 28)) (i32.const 4))
+    (call $eq (i32.const 16) (i32.load (i32.const 80)) (i32.load (i32.const 1040)))
+
     ;; TRUNC implies write when the parent delegates it, even for requested read rights.
-    (call $ok (i32.const 12) (call $path_open2 (i32.load (i32.const 16)) (i32.const 1) (i32.const 1032) (i32.const 4) (i32.const 8) (i64.const {read}) (i64.const 0) (i32.const 0) (i32.const 0) (i32.const 24)))
-    (call $ok (i32.const 13) (call $fd_read (i32.load (i32.const 24)) (i32.const 0) (i32.const 1) (i32.const 28)))
-    (call $eq (i32.const 14) (i32.load (i32.const 28)) (i32.const 0))
+    (call $ok (i32.const 17) (call $path_open2 (i32.load (i32.const 16)) (i32.const 1) (i32.const 1032) (i32.const 4) (i32.const 8) (i64.const {read}) (i64.const 0) (i32.const 0) (i32.const 0) (i32.const 24)))
+    (call $ok (i32.const 18) (call $fd_read (i32.load (i32.const 24)) (i32.const 0) (i32.const 1) (i32.const 28)))
+    (call $eq (i32.const 19) (i32.load (i32.const 28)) (i32.const 0))
 "#,
         both = read | write,
     );
