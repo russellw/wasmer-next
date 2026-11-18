@@ -903,6 +903,48 @@ async fn machine_memory_budget_refusal_is_enospc_for_files_and_enomem_for_shared
     assert_eq!(budget.used(), 0);
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[tokio::test]
+async fn sysv_shm_stays_charged_until_removed_and_detached() {
+    let budget = MemoryBudget::new(u64::MAX);
+    let machine = Machine::builder().memory_budget(budget.clone()).build();
+    let wasm = wat::parse_str(r#"(module
+      (import "wasixv2" "shmget" (func $get (param i32 i32 i32) (result i32)))
+      (import "wasixv2" "shmat" (func $attach (param i32 i32 i32) (result i32)))
+      (import "wasixv2" "shmctl" (func $ctl (param i32 i32 i32) (result i32)))
+      (import "wasixv2" "shmdt" (func $detach (param i32) (result i32)))
+      (import "wasixv2" "write" (func $write (param i32 i32 i32) (result i32)))
+      (import "wasixv2" "exit_group" (func $exit (param i32)))
+      (memory (export "memory") 1)
+      (func $sample (drop (call $write (i32.const 1) (i32.const 16) (i32.const 1))))
+      (func (export "_start") (local $id i32) (local $addr i32)
+        (call $sample)
+        (local.set $id (call $get (i32.const 0) (i32.const 65536) (i32.const 384)))
+        (if (i32.lt_s (local.get $id) (i32.const 0)) (then (call $exit (i32.const 1))))
+        (call $sample)
+        (local.set $addr (call $attach (local.get $id) (i32.const 0) (i32.const 0)))
+        (if (i32.lt_s (local.get $addr) (i32.const 0)) (then (call $exit (i32.const 2))))
+        (call $sample)
+        (if (call $ctl (local.get $id) (i32.const 0) (i32.const 0)) (then (call $exit (i32.const 3))))
+        (call $sample)
+        (if (call $detach (local.get $addr)) (then (call $exit (i32.const 4))))
+        (call $sample)
+        (call $exit (i32.const 0))))"#).unwrap();
+    let samples = Arc::new(Mutex::new(Vec::new()));
+    let stdio = Stdio::from_fns(
+        {
+            let (samples, budget) = (samples.clone(), budget.clone());
+            move |_| samples.lock().unwrap().push(budget.used())
+        },
+        |_| {},
+    );
+    assert_eq!(machine.run(&wasm, stdio).await.unwrap(), 0);
+    let samples = samples.lock().unwrap();
+    let start = samples[0];
+    let charged = start + 65536;
+    assert_eq!(*samples, [start, charged, charged, charged, start]);
+}
+
 #[test]
 fn embedder_default_root_can_share_the_machine_budget_before_population() {
     let host: Arc<dyn wasixv2::Host> = Arc::new(wasixv2::TokioHost::default());

@@ -782,8 +782,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn injected_root_layers_give_the_first_package_priority() {
-        async fn root_layout(files: &[(&str, &[u8])]) -> ResolvedLayout {
+    async fn injected_volumes_give_the_first_package_priority() {
+        async fn layout_at(path: &str, files: &[(&str, &[u8])]) -> ResolvedLayout {
             let volume = Directory::new(
                 files
                     .iter()
@@ -796,23 +796,29 @@ mod tests {
                     .collect(),
                 Timestamps::default(),
             );
-            let package = loaded(archive_at("/", volume)).await;
+            let package = loaded(archive_at(path, volume)).await;
             ResolvedLayout::new(&package, false, None).unwrap()
         }
 
-        let main = root_layout(&[("shared", b"main")]).await;
-        let first = root_layout(&[("shared", b"first"), ("dependency", b"first")]).await;
-        let second = root_layout(&[("shared", b"second"), ("dependency", b"second")]).await;
-        let layout = main.using([first, second]);
-        let mut machine = Machine::new();
-        crate::install_package_sources(
-            &mut machine,
-            &[super::super::PackageInstallSource::Resolved(&layout)],
-        )
-        .await
-        .unwrap();
-        assert_eq!(read(&machine, b"/shared").await, b"main");
-        assert_eq!(read(&machine, b"/dependency").await, b"first");
+        for path in ["/", "/data"] {
+            let main = layout_at("/", &[("shared", b"main")]).await;
+            let first = layout_at(path, &[("shared", b"first"), ("dependency", b"first")]).await;
+            let second = layout_at(path, &[("shared", b"second"), ("dependency", b"second")]).await;
+            let layout = main.using([first, second]);
+            let mut machine = Machine::new();
+            crate::install_package_sources(
+                &mut machine,
+                &[super::super::PackageInstallSource::Resolved(&layout)],
+            )
+            .await
+            .unwrap();
+            let prefix = path.trim_end_matches('/');
+            assert_eq!(read(&machine, b"/shared").await, b"main");
+            assert_eq!(
+                read(&machine, format!("{prefix}/dependency").as_bytes()).await,
+                b"first"
+            );
+        }
     }
 
     #[cfg(feature = "wasix1")]
