@@ -8,7 +8,7 @@ use std::{
 
 use futures_util::lock::Mutex as AsyncMutex;
 use wasixv2_abi::OpenFlags;
-use wasixv2_vfs::{Cred, Ctx, File, LookupFlags, Mount, OpenHow, Path, Superblock, Vfs};
+use wasixv2_vfs::{Cred, Ctx, File, FileType, LookupFlags, Mount, OpenHow, Path, Superblock, Vfs};
 use wasixv2_vfs_overlay::{OverlayAppender, PrefixFs};
 
 use super::wasmer_command::RuntimePackage;
@@ -22,7 +22,7 @@ pub struct ImportedRuntimePackage {
     pub identity: [u8; 32],
     pub entrypoint: String,
     pub entrypoint_visible: bool,
-    /// Mapping paths covered by mounts that do not accept new package layers.
+    /// Mapping paths blocked by existing non-directories or non-appendable mounts.
     pub hidden: Vec<String>,
 }
 
@@ -229,7 +229,15 @@ impl RuntimePackages {
         // its lowers from top to bottom.
         for volume in package.layout.volumes.iter().rev() {
             let parts = mapping_components(&volume.mount_path)?;
-            let (mount, rest) = covering_mount(vfs, &root, &parts).await?;
+            let (mount, rest) = match covering_mount(vfs, &root, &parts).await {
+                Ok(target) => target,
+                Err(Errno::ENOTDIR | Errno::ELOOP) => {
+                    tracing::warn!(path = %volume.mount_path, "runtime package mapping is hidden by an existing non-directory");
+                    hidden.push(volume.mount_path.clone());
+                    continue;
+                }
+                Err(error) => return Err(errno_to_io(error)),
+            };
             let Some(appender) = self.target(mount.sb()) else {
                 tracing::warn!(path = %volume.mount_path, "runtime package mapping is hidden by an existing mount");
                 hidden.push(volume.mount_path.clone());
@@ -354,7 +362,7 @@ async fn covering_mount<'a>(
     vfs: &Arc<Vfs>,
     root: &Path,
     parts: &'a [&'a [u8]],
-) -> io::Result<(Arc<Mount>, &'a [&'a [u8]])> {
+) -> Result<(Arc<Mount>, &'a [&'a [u8]]), Errno> {
     let cred = Cred::root();
     let cx = context(&cred, root);
     let mut cursor = root.clone();
@@ -373,11 +381,12 @@ async fn covering_mount<'a>(
             .await;
         let next = match next {
             Ok(next) => next,
-            Err(err) if matches!(err.errno(), Errno::ENOENT | Errno::ENOTDIR | Errno::ELOOP) => {
-                break;
-            }
-            Err(err) => return Err(errno_to_io(err.errno())),
+            Err(err) if err.errno() == Errno::ENOENT => break,
+            Err(err) => return Err(err.errno()),
         };
+        if next.dentry.file_type() != FileType::Directory {
+            return Err(Errno::ENOTDIR);
+        }
         if !Arc::ptr_eq(&cursor.mnt, &next.mnt) {
             suffix = &parts[i + 1..];
         }
