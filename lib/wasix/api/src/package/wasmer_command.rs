@@ -48,6 +48,8 @@ pub struct RuntimeCommandDefaults {
 }
 
 /// Enables the guest `wasmer` command at the selected paths.
+///
+/// A local `.wasm` file must have its executable bit set and be on an exec-allowed mount.
 pub struct WasmerCommandConfig {
     pub resolver: Arc<dyn RuntimePackageResolver>,
     pub limit: usize,
@@ -196,21 +198,25 @@ impl WasmerCommand {
 
     async fn source(&self, cx: &CommandContext<'_>, target: &[u8]) -> Result<Source, CommandError> {
         // Registry identifiers may include a namespace separator. Try an existing guest
-        // file first, then parse a registry identifier if the path is absent.
-        if !target.windows(3).any(|window| window == b"://") {
+        // regular file first, then parse an implicit target as a registry identifier.
+        let explicit = [b"/".as_slice(), b"./", b"../"]
+            .iter()
+            .any(|prefix| target.starts_with(prefix));
+        if explicit || !target.windows(3).any(|window| window == b"://") {
             match cx
                 .open(target, OpenFlags::O_RDONLY | OpenFlags::O_NONBLOCK)
                 .await
             {
-                Ok(file) => {
+                Ok(file) if file.file().file_type() == FileType::Regular => {
                     if !self.allow_local {
                         return Err(CommandError(126, b"wasmer: local files are disabled\n"));
                     }
                     return self.local(file).await;
                 }
-                Err(Errno::ENOENT | Errno::ENOTDIR) => {}
+                Ok(_) | Err(Errno::ENOENT | Errno::ENOTDIR) if !explicit => {}
+                Err(Errno::ENOENT) => return Err(CommandError::NOT_FOUND),
                 Err(Errno::ENAMETOOLONG) => return Err(CommandError::INVALID),
-                Err(_) => return Err(CommandError::NOT_EXECUTABLE),
+                Ok(_) | Err(_) => return Err(CommandError::NOT_EXECUTABLE),
             }
         }
         if target.len() > MAX_SPECIFIER {
@@ -230,9 +236,6 @@ impl WasmerCommand {
     }
 
     async fn local(&self, file: CommandFile) -> Result<Source, CommandError> {
-        if file.file().file_type() != FileType::Regular {
-            return Err(CommandError::NOT_EXECUTABLE);
-        }
         let mut header = [0; 8];
         let size = read_to_end(&file, &mut header)
             .await

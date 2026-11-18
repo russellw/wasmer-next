@@ -1583,6 +1583,35 @@ mod runtime_packages {
         .await;
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wasmer_falls_back_for_implicit_directories_but_checks_explicit_exec_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        local(async {
+            let upper = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(upper.path().join("test/a")).unwrap();
+            let wasm = upper.path().join("x.wasm");
+            std::fs::write(&wasm, echo("local")).unwrap();
+            std::fs::set_permissions(&wasm, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+            let resolver = Arc::new(Resolver(layout().await, AtomicUsize::new(0)));
+            let mut machine = Machine::builder()
+                .runtime_package_resolver(resolver.clone())
+                .build();
+            machine.set_root_upper_host_dir(upper.path()).await.unwrap();
+            let (status, output) =
+                run_file(&machine, "/bin/wasmer", &["wasmer", "run", "test/a"]).await;
+            assert_eq!(status.unwrap(), 0);
+            assert_eq!(output, "package-echo first\npackage");
+            let (status, _) =
+                run_file(&machine, "/bin/wasmer", &["wasmer", "run", "./x.wasm"]).await;
+            assert_eq!(status.unwrap(), 126);
+            assert_eq!(resolver.1.load(Ordering::Relaxed), 1);
+        })
+        .await;
+    }
+
     #[tokio::test]
     async fn wasmer_custom_registration_enforces_source_policy() {
         local(async {
