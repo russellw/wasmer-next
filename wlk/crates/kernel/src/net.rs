@@ -187,19 +187,20 @@ impl Kernel {
                 }
             }));
             let weak = Arc::downgrade(&socket);
-            let timers = self.timers.clone();
+            // Weak: a socket outliving the kernel must not keep its timer driver running.
+            let timers = self.timers.downgrade();
             let host = self.host.clone();
             let armed = Mutex::new(None);
             socket.set_connect_timer(Box::new(move |expiry| {
                 let mut armed = armed.lock_or_recover();
-                *armed = expiry.map(|(duration, attempt)| {
+                *armed = expiry.and_then(|(duration, attempt)| {
                     let weak = weak.clone();
-                    let timer = timers.timer(Box::new(move || {
+                    let timer = timers.upgrade()?.timer(Box::new(move || {
                         weak.upgrade()?.connect_expire(attempt);
                         None
                     }));
                     timer.start(host.monotonic() + duration);
-                    timer
+                    Some(timer)
                 });
             }));
         }

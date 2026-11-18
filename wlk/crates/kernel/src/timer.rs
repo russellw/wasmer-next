@@ -57,7 +57,21 @@ struct Entry {
     generation: u64,
 }
 
+/// [`Timers`] that do not keep the machine's timers, and so their driver, alive.
+#[derive(Clone)]
+pub(crate) struct WeakTimers(Weak<Shared>);
+
+impl WeakTimers {
+    pub(crate) fn upgrade(&self) -> Option<Timers> {
+        self.0.upgrade().map(|shared| Timers { shared })
+    }
+}
+
 impl Timers {
+    pub(crate) fn downgrade(&self) -> WeakTimers {
+        WeakTimers(Arc::downgrade(&self.shared))
+    }
+
     pub(crate) fn new(host: Arc<dyn Host>) -> Self {
         Self {
             shared: Arc::new(Shared {

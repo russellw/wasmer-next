@@ -970,6 +970,38 @@ fn ip_accept_at_the_descriptor_limit_keeps_the_connection_queued() {
     assert!(accept().is_ok());
 }
 
+/// A TCP socket's connect timer does not keep the machine's timers, whose driver runs on a
+/// host thread until they are gone, alive after the kernel: an embedder waits for that thread.
+#[test]
+fn a_connected_socket_does_not_keep_the_kernel_timers_alive() {
+    let net = wasixv2_vnet::Net::new(wasixv2_vnet::NetConfig::default(), None);
+    let host = Arc::new(super::ptimer::RealHost(std::time::Instant::now()));
+    let (kernel, task, memory) =
+        super::cred::machine_with_host(host, |kernel| kernel.with_network(net));
+    let caller = Caller::new(task, &memory);
+    let listener = socket(&kernel, &caller, STREAM);
+    sockaddr(&memory, 0x200, 6201);
+    assert_eq!(
+        block_on(kernel.bind(&caller, listener, GuestPtr::new(0x200), 16)),
+        Ok(0)
+    );
+    assert_eq!(block_on(kernel.listen(&caller, listener, 1)), Ok(0));
+    let client = socket(&kernel, &caller, STREAM);
+    // The connect armed its SYN_SENT timer, and so started the timer driver.
+    assert_eq!(
+        block_on(kernel.connect(&caller, client, GuestPtr::new(0x200), 16)),
+        Ok(0)
+    );
+    let file = kernel.files(task).lock_or_recover().get(client).unwrap();
+    let timers = kernel.timers.downgrade();
+    drop(kernel);
+    assert!(
+        timers.upgrade().is_none(),
+        "a socket kept the dropped kernel's timers"
+    );
+    drop(file);
+}
+
 #[test]
 fn blocking_connect_on_a_connecting_socket_waits_instead_of_ealready() {
     let net = wasixv2_vnet::Net::new(wasixv2_vnet::NetConfig::default(), None);
