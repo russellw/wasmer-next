@@ -31,7 +31,7 @@ use wasixv2_abi::{
     KernelTimespec, SaFlags, Sigaction, SigactionPtr, SigevNotify, Sigevent, SignalHandler,
     SigprocmaskHow, Sigset, SigsetPtr, TimerFlags, TimerId,
 };
-use wasixv2_syscalls::{Control, Syscalls};
+use wasixv2_syscalls::{Control, SysErr, Syscalls};
 use wasmer::RuntimeError;
 
 use crate::{
@@ -304,11 +304,17 @@ pub(crate) async fn thread_signal<S: Syscalls + Control + 'static>(
     shim::errno(&env, async |frame| {
         let pid = frame.pid().await?;
         let tid = if tid == LIBC_MAIN_THREAD { pid } else { tid };
-        frame
+        if tid <= 0 {
+            return Ok(());
+        }
+        match frame
             .syscalls
             .tgkill(&frame.caller(), pid, tid, linux(sig))
-            .await?;
-        Ok(())
+            .await
+        {
+            Ok(_) | Err(SysErr::Errno(wasixv2_abi::Errno::ESRCH)) => Ok(()),
+            Err(err) => Err(err.into()),
+        }
     })
     .await
 }

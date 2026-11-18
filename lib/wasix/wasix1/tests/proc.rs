@@ -213,6 +213,33 @@ fn fresh_thread_does_not_run_an_unregistered_signal_callback() {
 }
 
 #[test]
+fn thread_signal_ignores_missing_targets_and_accepts_the_leader_sentinel() {
+    assert_eq!(
+        status(
+            r#"
+(module
+  (import "wasix_32v1" "callback_signal" (func $callback (param i32 i32)))
+  (import "wasix_32v1" "thread_signal" (func $signal (param i32 i32) (result i32)))
+  (import "wasix_32v1" "proc_exit2" (func $exit (param i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 16) "__wasm_signal")
+  (func (export "__wasm_signal") (param $sig i32)
+    (i32.store (i32.const 100) (local.get $sig)))
+  (func (export "_start")
+    (call $callback (i32.const 16) (i32.const 13))
+    (if (call $signal (i32.const 0) (i32.const 10)) (then (call $exit (i32.const 1))))
+    (if (call $signal (i32.const -1) (i32.const 10)) (then (call $exit (i32.const 2))))
+    (if (call $signal (i32.const 1073741822) (i32.const 10)) (then (call $exit (i32.const 3))))
+    (if (i32.load (i32.const 100)) (then (call $exit (i32.const 4))))
+    (if (call $signal (i32.const 1073741823) (i32.const 10)) (then (call $exit (i32.const 5))))
+    (if (i32.ne (i32.load (i32.const 100)) (i32.const 10)) (then (call $exit (i32.const 6))))))
+"#
+        ),
+        0
+    );
+}
+
+#[test]
 fn process_signal_waits_for_the_registered_thread() {
     assert_eq!(
         status(
