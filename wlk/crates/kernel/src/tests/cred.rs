@@ -20,7 +20,13 @@ const UNCHANGED: u32 = u32::MAX;
 pub(super) fn machine_with(
     configure: impl FnOnce(Kernel) -> Kernel,
 ) -> (Kernel, TaskId, FlatMemory) {
-    let host: Arc<dyn Host> = Arc::new(TestHost);
+    machine_with_host(Arc::new(TestHost), configure)
+}
+
+pub(super) fn machine_with_host(
+    host: Arc<dyn Host>,
+    configure: impl FnOnce(Kernel) -> Kernel,
+) -> (Kernel, TaskId, FlatMemory) {
     let root = MemFs::new(Arc::new(HostClock(host.clone())), 0o755, 1, 1);
     let kernel = configure(Kernel::new(host, Arc::new(root)));
     let task = kernel

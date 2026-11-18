@@ -3474,6 +3474,64 @@ fn tcp_cork_timer_push_and_closed_peer_reset() {
     assert_eq!(c.output_len(), Ok(0));
 }
 
+#[test]
+fn tcp_syn_sent_expiry_reports_etimedout() {
+    let n = net();
+    let listener = tcp(&n);
+    let addr = a("127.0.0.1:19010");
+    listener.bind(addr, false).unwrap();
+    listener.listen(0).unwrap();
+
+    let first = tcp(&n);
+    first.connect(addr).unwrap();
+
+    let client = tcp(&n);
+    let armed = Arc::new(Mutex::new(Vec::new()));
+    let observed = armed.clone();
+    client.set_connect_timer(Box::new(move |expiry| {
+        observed.lock().unwrap().extend(expiry);
+    }));
+    assert_eq!(client.connect(addr), Err(Errno::EINPROGRESS));
+    assert_eq!(client.connect(addr), Err(Errno::EALREADY));
+    let (duration, attempt) = armed.lock().unwrap()[0];
+    assert_eq!(duration, Duration::from_secs(131));
+    assert_eq!(armed.lock().unwrap().len(), 1);
+
+    client.connect_expire(attempt);
+    assert!(
+        client
+            .poll(None)
+            .contains(PollMask::OUT | PollMask::ERR | PollMask::HUP)
+    );
+    assert_eq!(client.take_error(), Some(Errno::ETIMEDOUT));
+    assert_eq!(client.take_error(), None);
+
+    let retry = tcp(&n);
+    let observed = Arc::new(Mutex::new(None));
+    let armed_retry = observed.clone();
+    retry.set_connect_timer(Box::new(move |expiry| {
+        *armed_retry.lock().unwrap() = expiry;
+    }));
+    assert_eq!(retry.connect(addr), Err(Errno::EINPROGRESS));
+    let (_, old) = observed.lock().unwrap().unwrap();
+    retry.connect_expire(old);
+    assert_eq!(retry.connect(addr), Err(Errno::ETIMEDOUT));
+    assert_eq!(retry.connect(addr), Err(Errno::EINPROGRESS));
+    let (_, current) = observed.lock().unwrap().unwrap();
+    assert_ne!(current, old);
+    retry.connect_expire(old);
+    assert_eq!(retry.connect(addr), Err(Errno::EALREADY));
+
+    listener.accept().unwrap();
+    // Accept promotes the current attempt; the two timed-out entries must be skipped.
+    retry.connect_expire(current);
+    assert_eq!(retry.connect(addr), Err(Errno::EISCONN));
+    let child = listener.accept().unwrap().socket;
+    send(&*retry, b"connected").unwrap();
+    assert_eq!(recv(&*child, 64).unwrap(), b"connected");
+    assert_eq!(listener.accept().unwrap_err(), Errno::EAGAIN);
+}
+
 /// net/ipv6/ipv6_sockglue.c do_ipv6_setsockopt and datagram.c
 /// ip6_datagram_recv_common_ctl: RFC 2292 receive bits are independent of RFC 3542.
 #[test]

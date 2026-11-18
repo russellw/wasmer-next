@@ -973,7 +973,9 @@ fn ip_accept_at_the_descriptor_limit_keeps_the_connection_queued() {
 #[test]
 fn blocking_connect_on_a_connecting_socket_waits_instead_of_ealready() {
     let net = wasixv2_vnet::Net::new(wasixv2_vnet::NetConfig::default(), None);
-    let (kernel, task, memory) = super::cred::machine_with(|kernel| kernel.with_network(net));
+    let host = Arc::new(super::ptimer::RealHost(std::time::Instant::now()));
+    let (kernel, task, memory) =
+        super::cred::machine_with_host(host, |kernel| kernel.with_network(net));
     let caller = Caller::new(task, &memory);
     let listener = socket(&kernel, &caller, STREAM);
     sockaddr(&memory, 0x200, 6200);
@@ -990,12 +992,12 @@ fn blocking_connect_on_a_connecting_socket_waits_instead_of_ealready() {
         block_on(kernel.socket(&caller, AddressFamily::AF_INET, STREAM | 0x800, 0)).unwrap();
     assert_eq!(errno(connect(second)), Errno::EINPROGRESS);
     assert_eq!(errno(connect(second)), Errno::EALREADY);
-    // Blocking again, as a connect restarted after a signal is: it waits (here until its
-    // SO_SNDTIMEO, which the test host ends at once) rather than failing with EALREADY.
+    // Blocking again, as a connect restarted after a signal is: it waits until its
+    // SO_SNDTIMEO rather than failing with EALREADY.
     let setfl = block_on(kernel.fcntl64(&caller, second, wasixv2_abi::FcntlCmd::F_SETFL, 0));
     assert_eq!(setfl, Ok(0));
-    put(&memory, 0x400, &1i64.to_le_bytes());
-    put(&memory, 0x408, &0i64.to_le_bytes());
+    put(&memory, 0x400, &0i64.to_le_bytes());
+    put(&memory, 0x408, &1_000i64.to_le_bytes());
     let timeo = block_on(kernel.setsockopt(
         &caller,
         second,

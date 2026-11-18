@@ -695,6 +695,9 @@ pub trait DatagramReadbackAdmission: Pollable {
     fn complete_result(&self) -> Option<Result<DatagramReadbackValue, Errno>>;
 }
 
+/// Arms a TCP SYN_SENT deadline with the attempt ID, or cancels it with `None`.
+pub type ConnectTimer = Box<dyn Fn(Option<(Duration, u64)>) + Send + Sync>;
+
 pub trait Socket: Pollable {
     /// Kernel timer hook for TCP's 200 ms cork ceiling (TCP_RTO_MIN).
     /// Like the existing synchronous setter, option commit may call this hook
@@ -704,6 +707,16 @@ pub trait Socket: Pollable {
     }
     /// Push partial TCP segments when the cork timer expires.
     fn cork_expire(&self) {}
+
+    /// Arms a SYN_SENT timer for this attempt, or cancels it. The hook can run under the
+    /// socket lock, so it must be bounded and must not reenter the socket.
+    fn set_connect_timer(&self, arm: ConnectTimer) {
+        let _ = arm;
+    }
+    /// Fails this attempt with ETIMEDOUT if it is still in SYN_SENT.
+    fn connect_expire(&self, attempt: u64) {
+        let _ = attempt;
+    }
 
     fn domain(&self) -> Domain;
     fn kind(&self) -> SocketKind;

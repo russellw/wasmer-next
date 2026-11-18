@@ -8,7 +8,12 @@
 //! they are used and address arithmetic that would leave the address space is `EFAULT`, so no
 //! guest input can make the host panic.
 
-use std::{cell::RefCell, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    cell::RefCell,
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use wasixv2_abi::{
     AddressFamily, Buf, ConstSockaddrPtr, ConstUserMsghdrPtr, FdPair, GroupFilter, GuestLayout,
@@ -180,6 +185,22 @@ impl Kernel {
                 } else {
                     timer.cancel();
                 }
+            }));
+            let weak = Arc::downgrade(&socket);
+            let timers = self.timers.clone();
+            let host = self.host.clone();
+            let armed = Mutex::new(None);
+            socket.set_connect_timer(Box::new(move |expiry| {
+                let mut armed = armed.lock_or_recover();
+                *armed = expiry.map(|(duration, attempt)| {
+                    let weak = weak.clone();
+                    let timer = timers.timer(Box::new(move || {
+                        weak.upgrade()?.connect_expire(attempt);
+                        None
+                    }));
+                    timer.start(host.monotonic() + duration);
+                    timer
+                });
             }));
         }
         let object = Arc::new(SocketFile::new(socket, net, self.host.clone()));

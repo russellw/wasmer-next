@@ -34,8 +34,8 @@ mod tests;
 
 pub use api::{
     Accepted, Answer, Backend, BackendDatagram, BackendFrames, BackendStream, BindAdmission,
-    Control, DatagramReadback, DatagramReadbackAdmission, DatagramReadbackValue, Domain,
-    EchoIgnore, Found, FrameKind, GroupSources, IcmpEntry, InboundSink, Interface, Lookup,
+    ConnectTimer, Control, DatagramReadback, DatagramReadbackAdmission, DatagramReadbackValue,
+    Domain, EchoIgnore, Found, FrameKind, GroupSources, IcmpEntry, InboundSink, Interface, Lookup,
     LookupContext, LookupDone, LookupError, Network, NetworkPolicy, NewLink, NewLinkKind,
     OptionAdmission, PolicyDirection, PortEntry, Publication, PublishedDatagram, QueuedError,
     RecvMsg, Room, SctpAssocEntry, SctpEndpoint, SctpOps, SendMsg, Shutdown, Socket, SocketKind,

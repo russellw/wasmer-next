@@ -8,14 +8,15 @@ use std::{
         Arc, Mutex, MutexGuard, Weak,
         atomic::{AtomicU8, AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
 use wasixv2_abi::{Errno, MsgFlags, SocketLevel, SocketOption, TcpOption};
 use wasixv2_wait::{PollMask, PollTable, Pollable, WaitQueue, poll_wait};
 
 use crate::{
-    Accepted, BackendStream, Domain, NetResult, OptionAdmission, PortEntry, Publication, RecvMsg,
-    Room, SendMsg, Shutdown, Socket, SocketKind, StreamState,
+    Accepted, BackendStream, ConnectTimer, Domain, NetResult, OptionAdmission, PortEntry,
+    Publication, RecvMsg, Room, SendMsg, Shutdown, Socket, SocketKind, StreamState,
     addr::{canonical, connect_target, present, unbound},
     endpoint::{
         AttemptGate, EndpointBindPurpose, EndpointBindRequest, EndpointBound, EndpointChoice,
@@ -27,6 +28,34 @@ use crate::{
     ports::{BindSpec, SockId},
     stream::{Buffers, Conn},
 };
+
+const TCP_SYN_LINEAR_TIMEOUTS: i32 = 4;
+
+/// Deadline on Linux's SYN retransmit schedule (tcp_retransmit_timer and tcp_write_timeout).
+/// retransmits_timed_out checks tcp_model_timeout or the user's deadline at each timer tick.
+fn syn_sent_timeout(syncnt: i32, user_timeout_ms: i32) -> Duration {
+    let intervals = (0..=syncnt).scan(1, |rto, _| {
+        let interval = *rto;
+        *rto = (interval * 2).min(120);
+        Some(interval)
+    });
+    if user_timeout_ms != 0 {
+        let count_limit = TCP_SYN_LINEAR_TIMEOUTS as u64 + intervals.sum::<u64>();
+        // The first SYN timer is unclamped, and the user deadline is checked after a
+        // retransmission. Model the minimum without Linux's extra scheduler tick.
+        return Duration::from_millis((user_timeout_ms as u64).max(1000))
+            .min(Duration::from_secs(count_limit));
+    }
+    let model = intervals.clone().sum::<u64>();
+    let mut elapsed = 0;
+    for interval in (0..TCP_SYN_LINEAR_TIMEOUTS).map(|_| 1).chain(intervals) {
+        elapsed += interval;
+        if elapsed >= model {
+            break;
+        }
+    }
+    Duration::from_secs(elapsed)
+}
 
 /// What carries a connected socket's bytes.
 #[derive(Clone)]
@@ -209,6 +238,8 @@ struct Inner {
     opts: SockOpts,
     cork_timer: Option<Box<dyn Fn(bool) + Send + Sync>>,
     cork_armed: bool,
+    connect_timer: Option<ConnectTimer>,
+    connect_attempt: u64,
     /// One accepted physical option operation; waiting syscalls own their own requests.
     option_active: Option<Arc<OptionTxn>>,
     option_startup: bool,
@@ -453,6 +484,8 @@ impl TcpSocket {
             inner: Mutex::new(Inner {
                 opts,
                 cork_timer: None,
+                connect_timer: None,
+                connect_attempt: 0,
                 cork_armed: false,
                 option_active: None,
                 option_startup: false,
@@ -1066,27 +1099,45 @@ impl TcpSocket {
                 }
             }
         }
-        if failure.is_none() {
-            match t.phase() {
+        let failure = match failure {
+            Some(error) => error,
+            None => match t.phase() {
                 Phase::Pending => return,
                 Phase::Established => {
                     g.state = State::Connected(t, peer);
                     return;
                 }
-                Phase::Failed => failure = t.take_error().or(Some(Errno::ECONNREFUSED)),
-            }
-        }
+                Phase::Failed => t.take_error().unwrap_or(Errno::ECONNREFUSED),
+            },
+        };
         // No alternate address or replay after provider acceptance or an adoption conflict.
         if let Transport::Remote(stream) = &t {
             let _ = stream.shutdown(Shutdown::Both);
         }
-        g.err = failure;
+        self.fail_connect(g, failure);
+    }
+
+    fn fail_connect(&self, g: &mut Inner, error: Errno) {
+        g.err = Some(error);
         g.failed = true;
         g.rd_shut = true;
         g.wr_shut = true;
         g.state = State::Closed;
         g.endpoint_selected = false;
         self.put_port(g);
+    }
+
+    fn start_connect(g: &mut Inner, transport: Transport, peer: SocketAddr) {
+        g.state = State::Connecting(transport, peer);
+        g.connect_attempt = g.connect_attempt.wrapping_add(1);
+        if let Some(arm) = &g.connect_timer {
+            let tcp = SocketLevel::SOL_TCP.0;
+            let timeout = syn_sent_timeout(
+                g.opts.int(tcp, TcpOption::TCP_SYNCNT.0),
+                g.opts.int(tcp, TcpOption::TCP_USER_TIMEOUT.0),
+            );
+            arm(Some((timeout, g.connect_attempt)));
+        }
     }
 
     /// `inet_put_port` unless the user bound the port.
@@ -1439,10 +1490,11 @@ impl TcpSocket {
         let t = Transport::Local(conn.clone(), 0);
         if li.full() {
             li.syn.push_back((child, conn, local));
-            g.state = State::Connecting(t, dst);
+            Self::start_connect(g, t, dst);
             return Err(Errno::EINPROGRESS);
         }
-        conn.establish();
+        let established = conn.establish();
+        debug_assert!(established);
         li.ready.push_back((child, local));
         drop(li);
         l.wq.wake(PollMask::IN | PollMask::RDNORM);
@@ -1465,12 +1517,11 @@ impl Listener {
             let Some((child, conn, peer)) = li.syn.pop_front() else {
                 break;
             };
-            if conn.is_closed(0) {
+            if conn.establish() {
+                li.ready.push_back((child, peer));
+            } else {
                 drop_list.push(child);
-                continue;
             }
-            conn.establish();
-            li.ready.push_back((child, peer));
         }
         drop(li);
         for child in drop_list {
@@ -1553,6 +1604,49 @@ impl Socket for TcpSocket {
         if let Some(t) = transport {
             t.push();
         }
+    }
+
+    fn set_connect_timer(&self, arm: ConnectTimer) {
+        self.lock().connect_timer = Some(arm);
+    }
+
+    fn connect_expire(&self, attempt: u64) {
+        let mut g = self.inner.lock().unwrap();
+        if g.connect_attempt != attempt {
+            return;
+        }
+        self.refresh(&mut g);
+        let State::Connecting(transport, _) = &g.state else {
+            return;
+        };
+        let mut close = match transport {
+            Transport::Local(conn, side) => {
+                if !conn.expire_syn(*side) {
+                    self.refresh(&mut g);
+                    return;
+                }
+                None
+            }
+            Transport::Remote(_) => Some(transport.clone()),
+        };
+        let defer_close =
+            g.option_startup || Self::remote(&g).is_some_and(|stream| stream.async_options());
+        let option = Self::cancel_options(&mut g);
+        if let Some(namespace) = self.net.endpoints() {
+            self.endpoint.renew(&namespace);
+        }
+        self.fail_connect(&mut g, Errno::ETIMEDOUT);
+        if !defer_close && let Some(transport) = close.take() {
+            transport.close(true);
+        }
+        drop(g);
+        if let Some(transport) = close {
+            transport.close(true);
+        }
+        if let Some(option) = option {
+            option.wake();
+        }
+        self.wq.wake(PollMask::empty());
     }
 
     fn domain(&self) -> Domain {
@@ -1928,7 +2022,8 @@ impl Socket for TcpSocket {
                 let local = g.local.unwrap();
                 let pending = PendingStream::new(dst, self.wq.clone());
                 let reserved: Arc<dyn BackendStream> = pending.clone();
-                g.state = State::Connecting(Transport::Remote(reserved.clone()), dst);
+                Self::start_connect(&mut g, Transport::Remote(reserved.clone()), dst);
+                let attempt = g.connect_attempt;
                 g.option_factory = true;
                 drop(g);
                 let result = namespace.provider.connect(
@@ -1951,8 +2046,8 @@ impl Socket for TcpSocket {
                             } else {
                                 let startup = self.prepare_options(&mut g, &stream, Weak::new());
                                 if let Some((txn, batch)) = startup {
-                                    drop(g);
                                     pending.complete(Ok(stream.clone()));
+                                    drop(g);
                                     Self::dispatch_options(txn, stream, batch);
                                     return Err(Errno::EINPROGRESS);
                                 }
@@ -1969,10 +2064,16 @@ impl Socket for TcpSocket {
                         return Err(error);
                     }
                 } else {
+                    let error = if g.connect_attempt == attempt && g.err == Some(Errno::ETIMEDOUT) {
+                        g.failed = false;
+                        g.err.take().unwrap()
+                    } else {
+                        Errno::ECANCELED
+                    };
                     drop(g);
                     drop(result);
-                    pending.complete(Err(Errno::ECANCELED));
-                    return Err(Errno::ECANCELED);
+                    pending.complete(Err(error));
+                    return Err(error);
                 }
                 return Err(Errno::EINPROGRESS);
             }
@@ -1985,7 +2086,7 @@ impl Socket for TcpSocket {
             Path::Nowhere { .. } => unreachable!("refused above"),
             Path::Dns { .. } => {
                 let stream = self.net.dns_connect(dst, self.wq.clone());
-                g.state = State::Connecting(Transport::Remote(stream), dst);
+                Self::start_connect(&mut g, Transport::Remote(stream), dst);
                 Err(Errno::EINPROGRESS)
             }
             Path::Backend { host_dst, .. } => {
@@ -1993,7 +2094,7 @@ impl Socket for TcpSocket {
                 match backend.connect(host_dst, self.wq.clone()) {
                     Ok(stream) => {
                         if stream.async_options() {
-                            g.state = State::Connecting(Transport::Remote(stream.clone()), dst);
+                            Self::start_connect(&mut g, Transport::Remote(stream.clone()), dst);
                             let (txn, batch) =
                                 self.prepare_options(&mut g, &stream, Weak::new()).unwrap();
                             drop(g);
@@ -2001,7 +2102,7 @@ impl Socket for TcpSocket {
                             return Err(Errno::EINPROGRESS);
                         }
                         replay_options(&*stream, &g.opts);
-                        g.state = State::Connecting(Transport::Remote(stream), dst);
+                        Self::start_connect(&mut g, Transport::Remote(stream), dst);
                         Err(Errno::EINPROGRESS)
                     }
                     Err(e) => {
@@ -2375,6 +2476,25 @@ impl Drop for TcpSocket {
     /// The kernel dropped its last reference: `close`.
     fn drop(&mut self) {
         self.release_inner(false);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn syn_sent_timeout_matches_linux_retransmit_schedule() {
+    for (syncnt, user_timeout_ms, expected_ms) in [
+        (6, 0, 131_000),
+        (1, 0, 3_000),
+        (127, 0, 14_651_000),
+        (6, 1_500, 1_500),
+        (6, 500, 1_000),
+        (1, 10_000, 7_000),
+    ] {
+        assert_eq!(
+            syn_sent_timeout(syncnt, user_timeout_ms),
+            Duration::from_millis(expected_ms),
+            "TCP_SYNCNT={syncnt} TCP_USER_TIMEOUT={user_timeout_ms}",
+        );
     }
 }
 
@@ -2917,6 +3037,28 @@ mod option_tests {
         assert!(matches!(g.state, State::Closed));
         assert!(g.option_active.is_none());
         assert!(!g.option_startup);
+    }
+
+    #[test]
+    fn connecting_expiry_closes_deferred_stream_outside_socket_lock() {
+        let stream = DeferredStream::new();
+        let net = Net::new(
+            NetConfig::host_default(),
+            Some(Arc::new(TestBackend(stream.clone()))),
+        );
+        let socket = TcpSocket::new(net, Domain::Inet, 1);
+        let addr = addr("192.0.2.1:80");
+        assert_eq!(socket.connect(addr), Err(Errno::EINPROGRESS));
+        let attempt = socket.inner.lock().unwrap().connect_attempt;
+        let update = admission(&socket, 1);
+        let reentrant = socket.clone();
+        *stream.on_close.lock().unwrap() = Some(Box::new(move || {
+            assert!(reentrant.inner.try_lock().is_ok());
+        }));
+        socket.connect_expire(attempt);
+        assert!(stream.pending.lock().unwrap().is_empty());
+        assert_eq!(update.complete_result(), Some(Err(Errno::ECANCELED)));
+        assert_eq!(socket.connect(addr), Err(Errno::ETIMEDOUT));
     }
 
     fn profiled(policy: Option<crate::TcpOptionPolicy>) -> Arc<DeferredStream> {

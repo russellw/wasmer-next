@@ -99,9 +99,15 @@ impl Conn {
     }
 
     /// Moves a connection out of the SYN queue: the connecting side becomes writable.
-    pub fn establish(&self) {
-        self.lock().established = true;
+    pub fn establish(&self) -> bool {
+        let mut g = self.lock();
+        if g.side[0].closed {
+            return false;
+        }
+        g.established = true;
+        drop(g);
         self.wq[0].wake(PollMask::OUT | PollMask::WRNORM);
+        true
     }
 
     pub fn is_established(&self) -> bool {
@@ -120,10 +126,6 @@ impl Conn {
     /// Whether `side` is finished with the connection (reset, refused, or aborted).
     pub fn is_done(&self, side: usize) -> bool {
         self.lock().side[side].done
-    }
-
-    pub fn is_closed(&self, side: usize) -> bool {
-        self.lock().side[side].closed
     }
 
     /// A connection that never got out of the SYN queue is refused: the client's next SYN
@@ -405,7 +407,19 @@ impl Conn {
     /// `tcp_close`. Unread data or `abort` (`SO_LINGER` with zero timeout, `tcp_disconnect`)
     /// resets the peer instead of sending FIN.
     pub fn close(&self, side: usize, abort: bool) {
+        self.close_inner(side, abort, false);
+    }
+
+    /// Claims expiry before the listener can promote this SYN.
+    pub fn expire_syn(&self, side: usize) -> bool {
+        self.close_inner(side, true, true)
+    }
+
+    fn close_inner(&self, side: usize, abort: bool, syn_only: bool) -> bool {
         let mut g = self.lock();
+        if syn_only && (g.established || g.side[side].done) {
+            return false;
+        }
         let unread = !g.rx[side].is_empty();
         if abort || unread {
             g.tx[side].clear();
@@ -436,6 +450,7 @@ impl Conn {
         s.done = true;
         drop(g);
         self.wq[peer].wake(ALL);
+        true
     }
 
     pub fn take_error(&self, side: usize) -> Option<Errno> {
