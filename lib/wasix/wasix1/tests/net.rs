@@ -177,7 +177,9 @@ fn tcp_loopback_echo() {
     (call $ok (call $sock_accept_v2 (i32.load (i32.const 0)) (i32.const 0) (i32.const 8) (i32.const 1400)) (i32.const 7))
     (call $assert (i32.eq (i32.load8_u (i32.const 1400)) (i32.const 1)) (i32.const 8))
     (call $assert (i32.eq (i32.load (i32.const 1404)) (i32.const 0x0100007f)) (i32.const 9))
+    (i32.store (i32.const 2420) (i32.const 0x12345678))
     (call $ok (call $sock_addr_peer (i32.load (i32.const 4)) (i32.const 2400)) (i32.const 10))
+    (call $assert (i32.eq (i32.load (i32.const 2420)) (i32.const 0x12345678)) (i32.const 43))
     (call $assert (i32.eq (i32.load16_u (i32.const 2402)) (i32.load16_u (i32.const 1202))) (i32.const 11))
     (call $ok (call $sock_status (i32.load (i32.const 4)) (i32.const 60)) (i32.const 12))
     (call $assert (i32.eq (i32.load8_u (i32.const 60)) (i32.const 1)) (i32.const 13))
@@ -234,12 +236,16 @@ fn udp_send_to_recv_from() {
     (call $assert (i32.eq (i32.load8_u (i32.const 1400)) (i32.const 1)) (i32.const 11))
     (call $assert (i32.eq (i32.load16_u (i32.const 1402)) (i32.load16_u (i32.const 2402))) (i32.const 12))
     (call $assert (i32.eq (i32.load (i32.const 1404)) (i32.const 0x0100007f)) (i32.const 13))
-    ;; a datagram that does not fit is truncated, and says so with MSG_TRUNC
-    (call $ok (call $sock_send_to (i32.load (i32.const 4)) (i32.const 1600) (i32.const 1) (i32.const 0) (i32.const 1200) (i32.const 8)) (i32.const 14))
+    ;; A compact send_to input fits at the end of memory.
+    (memory.copy (i32.const 65516) (i32.const 1200) (i32.const 20))
+    (call $ok (call $sock_send_to (i32.load (i32.const 4)) (i32.const 1600) (i32.const 1) (i32.const 0) (i32.const 65516) (i32.const 8)) (i32.const 14))
+    ;; A datagram that does not fit is truncated, and says so with MSG_TRUNC.
+    (i32.store (i32.const 1420) (i32.const 0x12345678))
     (i32.store (i32.const 1614) (i32.const 2))
     (call $ok (call $sock_recv_from (i32.load (i32.const 0)) (i32.const 1610) (i32.const 1) (i32.const 0) (i32.const 12) (i32.const 16) (i32.const 1400)) (i32.const 15))
     (call $assert (i32.eq (i32.load (i32.const 12)) (i32.const 2)) (i32.const 16))
     (call $assert (i32.eq (i32.load16_u (i32.const 16)) (i32.const 1)) (i32.const 17))
+    (call $assert (i32.eq (i32.load (i32.const 1420)) (i32.const 0x12345678)) (i32.const 27))
     (call $print (i32.const 2100) (i32.const 2))
     ;; a datagram to a closed port: poll reports an error, and the next receive still gets
     ;; the refusal (CONNREFUSED, 14), as on Linux
@@ -523,8 +529,8 @@ fn resolve_hosts_and_numeric() {
     (call $assert (i32.eq (i32.load (i32.const 1002)) (i32.const 0x0100007f)) (i32.const 4))
     (call $assert (i32.eq (i32.load8_u (i32.const 1018)) (i32.const 2)) (i32.const 5))
     (call $assert (i32.eq (i32.load8_u (i32.const 1035)) (i32.const 1)) (i32.const 6))
-    ;; room for one address only
-    (call $ok (call $resolve (i32.const 100) (i32.const 9) (i32.const 0) (i32.const 1000) (i32.const 1) (i32.const 8)) (i32.const 7))
+    ;; One 18-byte address fits at the end of memory.
+    (call $ok (call $resolve (i32.const 100) (i32.const 9) (i32.const 0) (i32.const 65518) (i32.const 1) (i32.const 8)) (i32.const 7))
     (call $assert (i32.eq (i32.load (i32.const 8)) (i32.const 1)) (i32.const 8))
     (call $ok (call $resolve (i32.const 200) (i32.const 8) (i32.const 0) (i32.const 1000) (i32.const 4) (i32.const 8)) (i32.const 9))
     (call $assert (i32.eq (i32.load (i32.const 8)) (i32.const 1)) (i32.const 10))

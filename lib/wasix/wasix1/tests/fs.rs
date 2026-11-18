@@ -845,17 +845,22 @@ fn sock_addr_local_writes_legacy_ip_address() {
     "#;
     let body = r#"
     (call $ok (i32.const 1) (call $open (i32.const 1) (i32.const 1) (i32.const 6) (i32.const 0)))
-    (call $ok (i32.const 2) (call $bind (i32.load (i32.const 0)) (i32.const 1024)))
+    (memory.copy (i32.const 65516) (i32.const 1024) (i32.const 20))
+    (call $ok (i32.const 2) (call $bind (i32.load (i32.const 0)) (i32.const 65516)))
     ;; The 20-byte result fits at the end of the page. Port bytes are 1f 90.
     (call $ok (i32.const 3) (call $local (i32.load (i32.const 0)) (i32.const 65516)))
     (call $eq (i32.const 4) (i32.load (i32.const 65516)) (i32.const 0x901f0001))
     (call $eq (i32.const 5) (i32.load (i32.const 65520)) (i32.const 0x0100007f))
     (call $ok (i32.const 6) (call $open (i32.const 2) (i32.const 1) (i32.const 6) (i32.const 4)))
-    (call $ok (i32.const 7) (call $bind (i32.load (i32.const 4)) (i32.const 1152)))
+    (memory.copy (i32.const 65516) (i32.const 1152) (i32.const 20))
+    (call $ok (i32.const 7) (call $bind (i32.load (i32.const 4)) (i32.const 65516)))
     (call $ok (i32.const 8) (call $local (i32.load (i32.const 4)) (i32.const 65516)))
     (call $eq (i32.const 9) (i32.load (i32.const 65516)) (i32.const 0x901f0002))
     (call $eq64 (i32.const 10) (i64.load (i32.const 65520)) (i64.const 0))
     (call $eq64 (i32.const 11) (i64.load (i32.const 65528)) (i64.const 0x0100000000000000))
+    (i32.store (i32.const 148) (i32.const 0x12345678))
+    (call $ok (i32.const 12) (call $local (i32.load (i32.const 4)) (i32.const 128)))
+    (call $eq (i32.const 13) (i32.load (i32.const 148)) (i32.const 0x12345678))
     "#;
     assert_eq!(run(&guest("wasix_32v1", data, body)).0, 0);
 }
@@ -874,11 +879,13 @@ fn sock_accept_v2_preserves_fd_beside_legacy_peer_address() {
     let body = r#"
     (local $fd i32)
     (call $ok (i32.const 1) (call $open (i32.const 1) (i32.const 1) (i32.const 6) (i32.const 0)))
-    (call $ok (i32.const 2) (call $bind (i32.load (i32.const 0)) (i32.const 1024)))
+    (memory.copy (i32.const 65516) (i32.const 1024) (i32.const 20))
+    (call $ok (i32.const 2) (call $bind (i32.load (i32.const 0)) (i32.const 65516)))
     (call $ok (i32.const 3) (call $listen (i32.load (i32.const 0)) (i32.const 1)))
     (call $ok (i32.const 4) (call $open (i32.const 1) (i32.const 1) (i32.const 6) (i32.const 4)))
-    (call $ok (i32.const 5) (call $connect (i32.load (i32.const 4)) (i32.const 1024)))
-    ;; The accepted fd immediately follows the 20-byte peer address.
+    (call $ok (i32.const 5) (call $connect (i32.load (i32.const 4)) (i32.const 65516)))
+    ;; The accepted fd and a guard immediately follow the 20-byte peer address.
+    (i32.store (i32.const 152) (i32.const 0x12345678))
     (call $ok (i32.const 6) (call $accept (i32.load (i32.const 0)) (i32.const 0) (i32.const 148) (i32.const 128)))
     (call $eq (i32.const 7) (i32.load16_u (i32.const 128)) (i32.const 1))
     (call $eq (i32.const 8) (i32.load (i32.const 132)) (i32.const 0x0100007f))
@@ -888,6 +895,7 @@ fn sock_accept_v2_preserves_fd_beside_legacy_peer_address() {
     (call $eq (i32.const 10) (i32.load8_u (i32.const 32)) (i32.const 6))
     (call $ok (i32.const 11) (call $status (local.get $fd) (i32.const 64)))
     (call $eq (i32.const 12) (i32.load8_u (i32.const 64)) (i32.const 1))
+    (call $eq (i32.const 13) (i32.load (i32.const 152)) (i32.const 0x12345678))
     "#;
     assert_eq!(run(&guest("wasix_32v1", data, body)).0, 0);
 }

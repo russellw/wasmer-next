@@ -15,7 +15,7 @@ use crate::{
     abi::{
         Errno, GuestLayout,
         proc::{OptionTag, OptionTimestamp},
-        sock::{Addr, AddrCidr, Addressfamily, HardwareAddress, Route},
+        sock::{Addr, AddrCidr, AddrIp, Addressfamily, HardwareAddress, Route},
     },
     errno::V1Result,
     shim::{self, Env, Frame},
@@ -597,8 +597,8 @@ pub(crate) async fn port_addr_remove<S: Syscalls + Control + 'static>(
     addr: i32,
 ) -> Result<i32, RuntimeError> {
     shim::errno(&env, async |frame| {
-        let addr: Addr = frame.read(addr as u32).await?;
-        let ip = v1_ip(addr.tag, &addr.payload)?;
+        let addr: AddrIp = frame.read(addr as u32).await?;
+        let ip = v1_ip(addr.tag, &addr.octets)?;
         if let Some(reply) = provider(frame, ProviderRequest::RemoveAddress(ip)).await? {
             return provider_none(reply);
         }
@@ -667,8 +667,8 @@ pub(crate) async fn port_route_add<S: Syscalls + Control + 'static>(
 ) -> Result<i32, RuntimeError> {
     shim::errno(&env, async |frame| {
         let (dst, prefix) = cidr(&frame.read(addr as u32).await?)?;
-        let via: Addr = frame.read(via as u32).await?;
-        let gateway = v1_ip(via.tag, &via.payload)?;
+        let via: AddrIp = frame.read(via as u32).await?;
+        let gateway = v1_ip(via.tag, &via.octets)?;
         let preferred_until = lifetime(frame.read(preferred as u32).await?)?;
         let expires_at = lifetime(frame.read(expires as u32).await?)?;
         if let Some(reply) = provider(
@@ -697,8 +697,8 @@ pub(crate) async fn port_gateway_set<S: Syscalls + Control + 'static>(
     addr: i32,
 ) -> Result<i32, RuntimeError> {
     shim::errno(&env, async |frame| {
-        let addr: Addr = frame.read(addr as u32).await?;
-        let gateway = v1_ip(addr.tag, &addr.payload)?;
+        let addr: AddrIp = frame.read(addr as u32).await?;
+        let gateway = v1_ip(addr.tag, &addr.octets)?;
         if let Some(reply) = provider(frame, ProviderRequest::Gateway(gateway)).await? {
             return provider_none(reply);
         }
@@ -732,8 +732,8 @@ pub(crate) async fn port_route_remove<S: Syscalls + Control + 'static>(
     addr: i32,
 ) -> Result<i32, RuntimeError> {
     shim::errno(&env, async |frame| {
-        let addr: Addr = frame.read(addr as u32).await?;
-        let ip = v1_ip(addr.tag, &addr.payload)?;
+        let addr: AddrIp = frame.read(addr as u32).await?;
+        let ip = v1_ip(addr.tag, &addr.octets)?;
         if let Some(reply) = provider(frame, ProviderRequest::RemoveRoute(ip)).await? {
             return provider_none(reply);
         }

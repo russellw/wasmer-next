@@ -22,7 +22,7 @@ use crate::{
         fs::Fdflags,
         sock::{
             AddrPort, Addressfamily, RiFlags, RoFlags, Sdflags, SiFlags, SockAddr, SockStatus,
-            Socktype,
+            Socktype, UnixAddrPort,
         },
     },
     errno::V1Result,
@@ -52,8 +52,6 @@ impl State {
 
 /// Room for any `sockaddr` the kernel returns (`sockaddr_un` is the largest, 110 bytes).
 const SOCKADDR_ROOM: u32 = 128;
-
-const LEGACY_IP_ADDR_PORT_SIZE: usize = 20;
 
 /// The Linux address family for a v1 one.
 pub(crate) fn family(af: Addressfamily) -> V1Result<AddressFamily> {
@@ -175,14 +173,21 @@ pub(crate) fn from_linux(bytes: &[u8]) -> SockAddr {
     }
 }
 
-/// The guest's [`AddrPort`] at `ptr` as a Linux `sockaddr` in scratch.
+/// The guest address at `ptr` as a Linux `sockaddr` in scratch.
 async fn sockaddr_in<S: Syscalls + Control + 'static>(
     frame: &Frame<'_, S>,
     ptr: i32,
 ) -> V1Result<(ConstSockaddrPtr, u32)> {
-    let addr: AddrPort = frame.read(ptr as u32).await?;
-    let Some(addr) = addr.decode() else {
-        return shim::fail(Errno::INVAL);
+    let addr = match frame.read(ptr as u32).await? {
+        Addressfamily::UNIX => {
+            let addr: UnixAddrPort = frame.read(ptr as u32).await?;
+            SockAddr::Unix(addr.path().to_vec())
+        }
+        Addressfamily::UNSPEC => return shim::fail(Errno::AFNOSUPPORT),
+        _ => {
+            let addr: AddrPort = frame.read(ptr as u32).await?;
+            SockAddr::Inet(addr.decode().ok_or(Errno::INVAL)?)
+        }
     };
     let bytes = to_linux(&addr)?;
     let slice = frame.mem.alloc_bytes(&bytes)?;
@@ -195,18 +200,12 @@ async fn write_addr_port<S: Syscalls + Control + 'static>(
     ptr: i32,
     addr: &SockAddr,
 ) -> V1Result<()> {
-    let mut out = AddrPort::encode(addr);
-    let len = match addr {
-        SockAddr::Inet(addr) => {
-            out.payload[..2].copy_from_slice(&addr.port().to_be_bytes());
-            LEGACY_IP_ADDR_PORT_SIZE
-        }
-        SockAddr::Unspec => LEGACY_IP_ADDR_PORT_SIZE,
-        SockAddr::Unix(_) => AddrPort::SIZE,
-    };
-    let mut bytes = [0; AddrPort::SIZE];
-    out.write_to(&mut bytes);
-    frame.write_bytes(ptr as u32, &bytes[..len]).await
+    let ptr = ptr as u32;
+    match addr {
+        SockAddr::Inet(addr) => frame.write(ptr, &AddrPort::encode(*addr)).await,
+        SockAddr::Unix(path) => frame.write(ptr, &UnixAddrPort::new(path)).await,
+        SockAddr::Unspec => frame.write(ptr, &AddrPort::ZERO).await,
+    }
 }
 
 /// Scratch room for a `sockaddr` the kernel writes, and its length in and out.
@@ -467,7 +466,6 @@ async fn recv<S: Syscalls + Control + 'static>(
     want_peer: bool,
 ) -> V1Result<(u32, RoFlags, SockAddr)> {
     let iovs = if let Some(max) = frame.instance().limits.max_sock_recv_size {
-        use crate::abi::GuestLayout;
         // Match recvmsg's UIO_MAXIOV before walking any guest-selected array.
         let count = iovs_len as u32;
         if count > 1024 {
@@ -889,8 +887,6 @@ pub(crate) async fn sock_send_file<S: Syscalls + Control + 'static>(
 
 #[cfg(test)]
 mod tests {
-    use crate::abi::GuestLayout;
-
     use super::*;
 
     #[test]
@@ -915,22 +911,13 @@ mod tests {
     /// wasix-libc zero-fills after it) and through Linux's `sockaddr_un` (no NUL appended).
     #[test]
     fn abstract_unix_addresses() {
-        let mut v1 = AddrPort::ZERO;
-        v1.tag = crate::abi::sock::Addressfamily::UNIX;
-        v1.payload[..5].copy_from_slice(b"\0a\0bc");
-        assert_eq!(v1.decode(), Some(SockAddr::Unix(b"\0a\0bc".to_vec())));
-        assert_eq!(AddrPort::encode(&SockAddr::Unix(b"\0a\0bc".to_vec())), v1);
+        let v1 = UnixAddrPort::new(b"\0a\0bc");
+        assert_eq!(v1.tag, Addressfamily::UNIX);
+        assert_eq!(&v1.payload[..6], b"\0a\0bc\0");
+        assert_eq!(v1.path(), b"\0a\0bc");
         let linux = to_linux(&SockAddr::Unix(b"\0a\0bc".to_vec())).unwrap();
         assert_eq!(linux, [1, 0, 0, b'a', 0, b'b', b'c']);
-        // Unnamed and path addresses are as before.
-        assert_eq!(
-            AddrPort {
-                payload: [0; 108],
-                ..v1
-            }
-            .decode(),
-            Some(SockAddr::Unix(Vec::new()))
-        );
+        assert!(UnixAddrPort::new(b"").path().is_empty());
         assert_eq!(from_linux(b"\x01\0/p\0\0"), SockAddr::Unix(b"/p".to_vec()));
     }
 

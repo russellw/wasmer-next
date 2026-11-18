@@ -7,7 +7,7 @@ use std::mem::{align_of, offset_of, size_of};
 use wasixv2_abi::GuestLayout;
 use wasixv2_wasix1::abi::{fs, poll, proc, sock};
 use wasmer::Memory32;
-use wasmer_wasix_types::wasi as legacy;
+use wasmer_wasix_types::{types::net as legacy_net, wasi as legacy};
 
 /// Asserts that `$v1` has the size and alignment of `$legacy` and each listed field sits at the
 /// same offset (`v1_field => legacy_field`).
@@ -139,10 +139,20 @@ fn sock_layouts() {
     same_layout!(sock::EpollEvent, legacy::EpollEvent<Memory32>, {
         events => events, data => data,
     });
-    // wasix-libc's `__wasi_addr_port_t` and `__wasi_addr_t` hold the unix variant (108 bytes
-    // of path); the legacy host only declared the inet ones.
-    assert_eq!(sock::AddrPort::SIZE, 110);
-    assert_eq!(sock::Addr::SIZE, 110);
+    assert_eq!(
+        sock::AddrPort::SIZE,
+        size_of::<legacy_net::__wasi_addr_port_t>()
+    );
+    assert_eq!(
+        offset(sock::AddrPort::OFFSETS, "port"),
+        offset_of!(legacy_net::__wasi_addr_port_t, u)
+    );
+    assert_eq!(sock::AddrIp::SIZE, size_of::<legacy_net::__wasi_addr_t>());
+    assert_eq!(
+        offset(sock::AddrIp::OFFSETS, "octets"),
+        offset_of!(legacy_net::__wasi_addr_t, u)
+    );
+    assert_eq!(sock::UnixAddrPort::SIZE, 110);
     assert_eq!(sock::AddrCidr::SIZE, 28);
 }
 

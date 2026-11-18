@@ -172,18 +172,25 @@ newtype_layout!(
 );
 
 layout! {
-    /// `addr_port`: a tagged union of an address family and an address with a port. The
-    /// payload starts at 2: for inet4 and inet6 the port as a host-order `u16`, then the address
-    /// in network order (inet6 then also has its flow info and scope id); for unix the path.
-    /// Decode it with [`AddrPort::decode`].
-    pub struct AddrPort (size 110, align 2) {
+    /// Legacy `__wasi_addr_port_t`: IP input ports are host-order and output ports are
+    /// network-order. IPv6 has no flow info or scope id in this layout.
+    pub struct AddrPort (size 20, align 2) {
+        pub tag: Addressfamily = 0,
+        pub port: [u8; 2] = 2,
+        pub octets: [u8; 16] = 4,
+    }
+}
+
+layout! {
+    /// wasix-libc's longer Unix-address variant.
+    pub struct UnixAddrPort (size 110, align 2) {
         pub tag: Addressfamily = 0,
         pub payload: [u8; 108] = 2,
     }
 }
 
 layout! {
-    /// `addr`: an address without a port, laid out as [`AddrPort`] without the port.
+    /// Extended address storage inside the wasix-libc route record.
     pub struct Addr (size 110, align 2) {
         pub tag: Addressfamily = 0,
         pub payload: [u8; 108] = 2,
@@ -200,7 +207,7 @@ layout! {
 }
 
 layout! {
-    /// `addr_cidr`: the address as in [`Addr`], then the prefix length (at 6 for inet4, at 26
+    /// `addr_cidr`: a tagged IP address followed by the prefix length (at 6 for inet4, at 26
     /// for inet6).
     pub struct AddrCidr (size 28, align 2) {
         pub tag: Addressfamily = 0,
@@ -255,7 +262,7 @@ layout! {
     }
 }
 
-/// A decoded [`AddrPort`].
+/// An address decoded from a guest address union or a Linux `sockaddr`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SockAddr {
     Inet(SocketAddr),
@@ -265,29 +272,7 @@ pub enum SockAddr {
     Unspec,
 }
 
-/// Offsets in the payload of the inet variants of [`AddrPort`]. inet6's flow info and scope id
-/// are `u32`s stored as two host-order `u16` halves, high half first.
-mod inet {
-    pub const PORT: usize = 0;
-    pub const ADDR: usize = 2;
-    pub const FLOW_INFO: usize = 18;
-    pub const SCOPE_ID: usize = 22;
-}
-
-fn u16_at(bytes: &[u8], at: usize) -> u16 {
-    u16::from_le_bytes([bytes[at], bytes[at + 1]])
-}
-
-fn halves_at(bytes: &[u8], at: usize) -> u32 {
-    (u32::from(u16_at(bytes, at)) << 16) | u32::from(u16_at(bytes, at + 2))
-}
-
-fn put_halves(bytes: &mut [u8], at: usize, value: u32) {
-    bytes[at..at + 2].copy_from_slice(&((value >> 16) as u16).to_le_bytes());
-    bytes[at + 2..at + 4].copy_from_slice(&(value as u16).to_le_bytes());
-}
-
-/// The `sun_path` bytes in the payload of a Unix [`AddrPort`]: a path up to its NUL, or an
+/// The `sun_path` bytes in the payload of a [`UnixAddrPort`]: a path up to its NUL, or an
 /// abstract name (a leading NUL) up to its last non-NUL byte. wasix-libc copies `sun_path` into
 /// a zeroed payload and keeps no length, so an abstract name's trailing NULs are lost; one of
 /// only NULs is unnamed.
@@ -299,56 +284,43 @@ fn unix_payload(p: &[u8]) -> &[u8] {
 }
 
 impl AddrPort {
-    /// The address, or `None` for a tag v1 does not define.
-    pub fn decode(&self) -> Option<SockAddr> {
-        let p = &self.payload;
-        Some(match self.tag {
+    pub fn decode(&self) -> Option<SocketAddr> {
+        let port = u16::from_le_bytes(self.port);
+        match self.tag {
             Addressfamily::INET4 => {
-                let ip: [u8; 4] = p[inet::ADDR..inet::ADDR + 4].try_into().unwrap();
-                SockAddr::Inet(SocketAddr::V4(SocketAddrV4::new(
-                    Ipv4Addr::from(ip),
-                    u16_at(p, inet::PORT),
-                )))
+                let ip: [u8; 4] = self.octets[..4].try_into().unwrap();
+                Some(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(ip), port)))
             }
-            Addressfamily::INET6 => {
-                let ip: [u8; 16] = p[inet::ADDR..inet::ADDR + 16].try_into().unwrap();
-                SockAddr::Inet(SocketAddr::V6(SocketAddrV6::new(
-                    Ipv6Addr::from(ip),
-                    u16_at(p, inet::PORT),
-                    halves_at(p, inet::FLOW_INFO),
-                    halves_at(p, inet::SCOPE_ID),
-                )))
-            }
-            Addressfamily::UNIX => SockAddr::Unix(unix_payload(p).to_vec()),
-            Addressfamily::UNSPEC => SockAddr::Unspec,
-            _ => return None,
-        })
+            Addressfamily::INET6 => Some(SocketAddr::V6(SocketAddrV6::new(
+                Ipv6Addr::from(self.octets),
+                port,
+                0,
+                0,
+            ))),
+            _ => None,
+        }
     }
 
-    /// `addr` in the extended layout. IP syscall results use the legacy layout instead.
-    pub fn encode(addr: &SockAddr) -> Self {
-        let mut out = Self::ZERO;
-        let p = &mut out.payload;
-        match addr {
-            SockAddr::Inet(SocketAddr::V4(v4)) => {
-                out.tag = Addressfamily::INET4;
-                p[inet::PORT..inet::PORT + 2].copy_from_slice(&v4.port().to_le_bytes());
-                p[inet::ADDR..inet::ADDR + 4].copy_from_slice(&v4.ip().octets());
-            }
-            SockAddr::Inet(SocketAddr::V6(v6)) => {
-                out.tag = Addressfamily::INET6;
-                p[inet::PORT..inet::PORT + 2].copy_from_slice(&v6.port().to_le_bytes());
-                p[inet::ADDR..inet::ADDR + 16].copy_from_slice(&v6.ip().octets());
-                put_halves(p, inet::FLOW_INFO, v6.flowinfo());
-                put_halves(p, inet::SCOPE_ID, v6.scope_id());
-            }
-            SockAddr::Unix(path) => {
-                out.tag = Addressfamily::UNIX;
-                let len = path.len().min(p.len() - 1);
-                p[..len].copy_from_slice(&path[..len]);
-            }
-            SockAddr::Unspec => out.tag = Addressfamily::UNSPEC,
+    pub fn encode(addr: SocketAddr) -> Self {
+        let ip = AddrIp::new(addr.ip());
+        Self {
+            tag: ip.tag,
+            port: addr.port().to_be_bytes(),
+            octets: ip.octets,
         }
+    }
+}
+
+impl UnixAddrPort {
+    pub(crate) fn path(&self) -> &[u8] {
+        unix_payload(&self.payload)
+    }
+
+    pub(crate) fn new(path: &[u8]) -> Self {
+        let mut out = Self::ZERO;
+        out.tag = Addressfamily::UNIX;
+        let len = path.len().min(out.payload.len() - 1);
+        out.payload[..len].copy_from_slice(&path[..len]);
         out
     }
 }
@@ -393,24 +365,6 @@ impl AddrCidr {
 mod tests {
     use super::*;
 
-    #[test]
-    fn addr_port_round_trips() {
-        let addrs = [
-            SockAddr::Inet("127.0.0.1:8080".parse().unwrap()),
-            SockAddr::Inet(SocketAddr::V6(SocketAddrV6::new(
-                "fe80::1".parse().unwrap(),
-                443,
-                0x0001_0002,
-                0x0003_0004,
-            ))),
-            SockAddr::Unix(b"/tmp/sock".to_vec()),
-            SockAddr::Unspec,
-        ];
-        for addr in addrs {
-            assert_eq!(AddrPort::encode(&addr).decode(), Some(addr));
-        }
-    }
-
     /// The bytes wasix-libc's `sockaddr_to_wasi` produces for `127.0.0.1:9000`.
     #[test]
     fn addr_port_matches_libc_bytes() {
@@ -419,10 +373,7 @@ mod tests {
         bytes[2..4].copy_from_slice(&9000u16.to_le_bytes());
         bytes[4..8].copy_from_slice(&[127, 0, 0, 1]);
         let addr = AddrPort::read_from(&bytes).unwrap();
-        assert_eq!(
-            addr.decode(),
-            Some(SockAddr::Inet("127.0.0.1:9000".parse().unwrap()))
-        );
+        assert_eq!(addr.decode(), Some("127.0.0.1:9000".parse().unwrap()));
         let mut out = [0u8; AddrPort::SIZE];
         addr.write_to(&mut out);
         assert_eq!(out, bytes);
