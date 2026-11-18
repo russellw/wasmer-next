@@ -1543,6 +1543,98 @@ fn void_proc_exec_exits_with_the_v1_errno() {
     }
 }
 
+#[test]
+fn fallback_preopens_survive_exec_with_live_names_and_flags() {
+    use wasixv2_wasix1::abi::fs::Rights;
+
+    let module = |body: &str| {
+        format!(
+            r#"
+(module
+  (import "wasix_32v1" "proc_exec3" (func $exec (param i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+  (import "wasix_32v1" "chdir" (func $chdir (param i32 i32) (result i32)))
+  (import "wasix_32v1" "getcwd" (func $cwd (param i32 i32) (result i32)))
+  (import "wasix_32v1" "path_open2" (func $open (param i32 i32 i32 i32 i32 i64 i64 i32 i32 i32) (result i32)))
+  (import "wasix_32v1" "fd_fdflags_set" (func $setflags (param i32 i32) (result i32)))
+  (import "wasix_32v1" "fd_fdflags_get" (func $getflags (param i32 i32) (result i32)))
+  (import "wasix_32v1" "fd_filestat_get" (func $stat (param i32 i32) (result i32)))
+  (import "wasix_32v1" "fd_prestat_get" (func $prestat (param i32 i32) (result i32)))
+  (import "wasix_32v1" "fd_prestat_dir_name" (func $name (param i32 i32 i32) (result i32)))
+  (import "wasix_32v1" "fd_write" (func $write (param i32 i32 i32 i32) (result i32)))
+  (import "wasix_32v1" "args_get" (func $argv (param i32 i32) (result i32)))
+  (import "wasix_32v1" "environ_get" (func $env (param i32 i32) (result i32)))
+  (import "wasix_32v1" "proc_exit2" (func $exit (param i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 1000) "/prog/child.wasm")
+  (data (i32.const 1032) "new\n")
+  (data (i32.const 1040) "X=y\n")
+  (data (i32.const 1050) "/tmp/file")
+  (func $check (param $step i32) (param $actual i32) (param $expected i32)
+    (if (i32.ne (local.get $actual) (local.get $expected))
+      (then (call $exit (local.get $step)))))
+  (func $dot (result i32) (local $fd i32)
+    (local.set $fd (i32.const 3))
+    (loop $next
+      (call $check (i32.const 1) (call $prestat (local.get $fd) (i32.const 64)) (i32.const 0))
+      (if (i32.eq (i32.load (i32.const 68)) (i32.const 1))
+        (then
+          (call $check (i32.const 2) (call $name (local.get $fd) (i32.const 72) (i32.const 1)) (i32.const 0))
+          (if (i32.eq (i32.load8_u (i32.const 72)) (i32.const 46))
+            (then (return (local.get $fd))))))
+      (local.set $fd (i32.add (local.get $fd) (i32.const 1)))
+      (br $next))
+    (unreachable))
+  (func $report (param $fd i32)
+    (call $check (i32.const 3) (call $stat (local.get $fd) (i32.const 128)) (i32.const 0))
+    ;; Send the inode and fd number together for comparison across images.
+    (i32.store (i32.const 144) (local.get $fd))
+    (i32.store (i32.const 0) (i32.const 136))
+    (i32.store (i32.const 4) (i32.const 12))
+    (call $check (i32.const 4) (call $write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 8)) (i32.const 0)))
+  (func (export "_start") (local $fd i32)
+    (local.set $fd (call $dot))
+    (call $report (local.get $fd))
+    {body}
+    (call $exit (i32.const 0))))
+"#
+        )
+    };
+    let parent = module(&format!(
+        r#"
+    (call $check (i32.const 5) (call $setflags (local.get $fd) (i32.const 1)) (i32.const 0))
+    (call $check (i32.const 6) (call $open (local.get $fd) (i32.const 1) (i32.const 1050) (i32.const 9)
+      (i32.const 1) (i64.const {write}) (i64.const 0) (i32.const 0) (i32.const 1) (i32.const 16)) (i32.const 0))
+    (call $check (i32.const 7) (i32.load (i32.const 16)) (i32.const 6))
+    (call $check (i32.const 8) (call $chdir (i32.const 1000) (i32.const 5)) (i32.const 0))
+    (drop (call $exec (i32.const 1000) (i32.const 16) (i32.const 1032) (i32.const 4)
+      (i32.const 1040) (i32.const 4) (i32.const 0) (i32.const 0) (i32.const 0)))
+    (call $exit (i32.const 9))
+"#,
+        write = Rights::FD_WRITE.0,
+    ));
+    let child = module(
+        r#"
+    (call $check (i32.const 10) (call $getflags (local.get $fd) (i32.const 16)) (i32.const 0))
+    (call $check (i32.const 11) (i32.load16_u (i32.const 16)) (i32.const 1))
+    (call $check (i32.const 12) (call $stat (i32.const 6) (i32.const 128)) (i32.const 8))
+    (i32.store (i32.const 16) (i32.const 32))
+    (call $check (i32.const 13) (call $cwd (i32.const 64) (i32.const 16)) (i32.const 0))
+    (call $check (i32.const 14) (i32.load (i32.const 16)) (i32.const 5))
+    (call $check (i32.const 15) (i32.load (i32.const 64)) (i32.const 0x6f72702f))
+    (call $check (i32.const 16) (i32.load16_u (i32.const 68)) (i32.const 103))
+    (call $check (i32.const 17) (call $argv (i32.const 0) (i32.const 64)) (i32.const 0))
+    (call $check (i32.const 18) (i32.load (i32.load (i32.const 0))) (i32.const 0x0077656e))
+    (call $check (i32.const 19) (call $env (i32.const 0) (i32.const 64)) (i32.const 0))
+    (call $check (i32.const 20) (i32.load (i32.load (i32.const 4))) (i32.const 0x00793d58))
+"#,
+    );
+    let programs = Programs::new("fallback-exec", &[("child.wasm", &child)]);
+    let (status, stdout) = run(&parent, Some(&programs.0));
+    assert_eq!(status, 0);
+    assert_eq!(stdout.len(), 24);
+    assert_eq!(&stdout[..12], &stdout[12..]);
+}
+
 /// Preparing a host namespace needs no guest memory. Its live descriptor metadata,
 /// rather than the original bootstrap fd list, survives the runner's actual exec handoff.
 #[test]

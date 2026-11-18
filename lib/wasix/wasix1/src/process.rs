@@ -220,17 +220,17 @@ impl ProcState {
 
     fn next_image(&self) -> Self {
         let policy = self.startup_input.lock().unwrap();
+        let startup = self.startup.get();
         Self {
             lineage: self.lineage.clone(),
-            inherited_root: self
-                .startup
-                .get()
+            inherited_root: startup
                 .and_then(|startup| startup.root.clone())
                 .or_else(|| self.inherited_root.clone()),
             startup_input: Mutex::new(StartupPolicy {
                 configured: None,
                 sealed: policy.sealed,
-                preserve_preopens: policy.preserve_preopens,
+                preserve_preopens: policy.preserve_preopens
+                    || startup.is_some_and(|startup| !startup.preopens.is_empty()),
             }),
             ..Self::default()
         }

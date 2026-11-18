@@ -313,7 +313,7 @@ async fn open_preopens<S: Syscalls + Control + 'static>(
     let mut preopens = Vec::new();
     for (index, &(path, name)) in paths.iter().enumerate() {
         let rights = rights.map_or(PreopenRights::ALL, |rights| rights[index]);
-        match open_dir(frame, path, rights).await {
+        match open_dir(frame, path, name, rights).await {
             Ok((fd, binding)) => preopens.push((
                 Preopen {
                     fd,
@@ -346,19 +346,13 @@ async fn close_preopens<S: Syscalls + Control + 'static>(
 async fn open_dir<S: Syscalls + Control + 'static>(
     frame: &Frame<'_, S>,
     path: &[u8],
+    name: &[u8],
     rights: PreopenRights,
 ) -> SysResult<(Fd, DescriptorSet)> {
     frame.syscalls.snapshot_descriptors(frame.task, &[])?;
-    let record = crate::rights::Record {
-        base: crate::abi::fs::Rights(rights.base),
-        inheriting: crate::abi::fs::Rights(rights.inheriting),
-        preopen: true,
-        socket: false,
-        legacy: None,
-        cloexec: false,
-    };
-    let plan = DescriptorInstallations::new(vec![record.clone().attachment()]);
-    let flags = OpenFlags::O_RDONLY | OpenFlags::O_DIRECTORY | OpenFlags::O_CLOEXEC;
+    let attachment = rights.named_attachment(name)?;
+    let plan = DescriptorInstallations::new(vec![Some(attachment.clone())]);
+    let flags = OpenFlags::O_RDONLY | OpenFlags::O_DIRECTORY;
     let path = frame.mem.alloc_cstr(path)?;
     // Trusted bootstrap uses its own cwd rather than a guest-supplied descriptor operand.
     let caller = Caller::new(frame.task, &frame.mem).with_descriptor_installations(&plan);
@@ -370,15 +364,14 @@ async fn open_dir<S: Syscalls + Control + 'static>(
     if fd.0 >= 3 {
         return Ok((fd, binding));
     }
-    // Preopens must not fill closed stdio slots. F_DUPFD_CLOEXEC preserves the
-    // minimum descriptor and close-on-exec flag (Linux fs/fcntl.c, do_fcntl).
-    let duplicate = DescriptorInstallations::new(vec![record.attachment()]);
+    // Preopens must not fill closed stdio slots.
+    let duplicate = DescriptorInstallations::new(vec![Some(attachment)]);
     let caller = Caller::new(frame.task, &frame.mem)
         .with_descriptors(&binding)
         .with_descriptor_installations(&duplicate);
     let moved = frame
         .syscalls
-        .fcntl64(&caller, fd, FcntlCmd::F_DUPFD_CLOEXEC, 3)
+        .fcntl64(&caller, fd, FcntlCmd::F_DUPFD, 3)
         .await;
     let caller = Caller::new(frame.task, &frame.mem).with_descriptors(&binding);
     let closed = frame.syscalls.close(&caller, fd).await;
