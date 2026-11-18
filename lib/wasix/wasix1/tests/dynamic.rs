@@ -398,6 +398,32 @@ fn main_image_with(
     )
 }
 
+#[test]
+fn dlsym_returns_null_for_hidden_wasix1_exports() {
+    let main = main_image(
+        r#"(local.set $handle (call $load (i32.const 0)))
+        (if (i32.eqz (call $sym (local.get $handle) (call $at (i32.const 28)) (i32.const 5)
+          (call $at (i32.const 256)) (i32.const 64) (call $at (i32.const 196))))
+          (then (call $exit (i32.const 1))))
+        (call $check (i32.load (call $at (i32.const 196))) (i32.const 0) (i32.const 2))"#,
+        "",
+        &[],
+    );
+    let side = pic_with_symbol_flags(
+        r#"(module
+          (import "env" "memory" (memory 1 65536 shared))
+          (import "env" "__indirect_function_table" (table 0 funcref))
+          (import "env" "__memory_base" (global i32))
+          (import "env" "__table_base" (global i32))
+          (func (export "value") (result i32) (i32.const 42)))"#,
+        &[],
+        0,
+        &[("value", wasmparser::SymbolFlags::VISIBILITY_HIDDEN)],
+        &[],
+    );
+    assert_eq!(run("hidden-export", &main, &[("side.so", side)]), 0);
+}
+
 fn closure_main(body: &str, extra_code: &str, thread_body: &str) -> Vec<u8> {
     main_image_with(
         body,

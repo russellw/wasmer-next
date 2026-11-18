@@ -463,6 +463,7 @@ fn find<'a>(
 ) -> Option<(usize, &'a Export)> {
     let private = SymbolFlags::VISIBILITY_HIDDEN | SymbolFlags::BINDING_LOCAL;
     if let Some(export) = modules[caller].exports.get(&import.name)
+        && modules[caller].honor_export_visibility
         && export.flags.intersects(private)
     {
         return Some((caller, export));
@@ -476,7 +477,9 @@ fn find<'a>(
     }
     scope.iter().find_map(|&module| {
         let export = modules[module].exports.get(&import.name)?;
-        (!export.flags.intersects(private)).then_some((module, export))
+        // WASIX v1 binds imports against actual Wasm exports regardless of these flags.
+        (!modules[module].honor_export_visibility || !export.flags.intersects(private))
+            .then_some((module, export))
     })
 }
 
