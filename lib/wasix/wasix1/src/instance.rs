@@ -16,6 +16,7 @@ use wasixv2_exec::{
 };
 use wasixv2_syscalls::{Caller, Control, LocalFuture, SignalFrame, Syscalls, TaskId};
 use wasmer::{AsyncFunctionEnvMut, Exports, Function, Instance, RuntimeError, Value};
+use wasmer_types::TrapCode;
 
 use crate::process::{Commands, HostOwner, ProcState, Procs};
 
@@ -585,8 +586,10 @@ impl<S: Syscalls + Control + Send + Sync + 'static> AbiInstance<S> for Wasix1Ins
                 )));
             };
             if let Err(error) = call_guest(env, &callback, &[Value::I32(frame.signo())]).await {
-                // V1 mapped an engine trap in the callback to WasiError::Exit(Errno::Intr).
-                if error.clone().to_trap().is_some() {
+                // Keep the legacy status for guest traps. Host interrupts use the runner's
+                // signal status.
+                if matches!(error.clone().to_trap(), Some(code) if code != TrapCode::HostInterrupt)
+                {
                     let (syscalls, task) = caller_parts(env).await;
                     let memory = GuestMemory::new(env);
                     let caller = Caller::new(task, &memory);

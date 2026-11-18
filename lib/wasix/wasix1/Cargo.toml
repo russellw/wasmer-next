@@ -20,6 +20,7 @@ wasixv2-exec = { path = "../exec", default-features = false }
 wasmer = { workspace = true, default-features = false, features = [
   "experimental-async",
 ] }
+wasmer-types.workspace = true
 tracing.workspace = true
 wasmparser.workspace = true
 serde = { workspace = true, features = ["derive"], optional = true }

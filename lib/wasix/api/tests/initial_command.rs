@@ -439,20 +439,45 @@ async fn check_atomic_wait_interrupt() {
             (drop (memory.atomic.wait32 $wait_mem (i32.const 0) (i32.const 0) (i64.const 5000000000)))
             unreachable))"#;
 
+    let callback_wait = WAIT
+        .replace(
+            "(memory (export",
+            r#"(import "wasix_32v1" "callback_signal" (func $callback (param i32 i32)))
+               (import "wasi_snapshot_preview1" "proc_raise" (func $raise (param i32) (result i32)))
+               (memory (export"#,
+        )
+        .replace(
+            r#"(func (export "_start")"#,
+            r#"(data (i32.const 64) "__wasm_signal")
+               (func (export "_start")
+                 (call $callback (i32.const 64) (i32.const 13))
+                 (drop (call $raise (i32.const 15)))
+                 unreachable)
+               (func (export "__wasm_signal") (param i32)"#,
+        );
     let interrupter = Arc::new(Mutex::new(None));
     let mut machine = Machine::builder()
         .instantiation_hook(Arc::new(InterruptHook(interrupter.clone())))
         .build();
     machine
-        .install_commands([(
-            "wait".into(),
-            OwnedBuffer::from(wat::parse_str(WAIT).unwrap()),
-        )])
+        .install_commands([("wait", WAIT), ("callback-wait", &callback_wait)].map(
+            |(name, source)| {
+                (
+                    name.into(),
+                    OwnedBuffer::from(wat::parse_str(source).unwrap()),
+                )
+            },
+        ))
         .await
         .unwrap();
     let engine = Engine::default();
     let timeout = Duration::from_secs(10);
-    for (signal, expected) in [(Some(9), 128 + 9), (Some(15), 128 + 15), (None, 128 + 9)] {
+    for (path, signal, expected) in [
+        ("/bin/wait", Some(9), 137),
+        ("/bin/wait", Some(15), 143),
+        ("/bin/wait", None, 137),
+        ("/bin/callback-wait", None, 137),
+    ] {
         let stdout = Arc::new(Capture::default());
         let signaller = machine.signaller();
         let interrupt = tokio::task::spawn_blocking({
@@ -469,11 +494,11 @@ async fn check_atomic_wait_interrupt() {
                 interrupter.lock().unwrap().take().unwrap().interrupt();
             }
         });
-        let status = Box::pin(machine.run_file(&engine, "/bin/wait", config(stdout)))
+        let status = Box::pin(machine.run_file(&engine, path, config(stdout)))
             .await
             .unwrap();
         interrupt.await.unwrap();
-        assert_eq!(status, expected, "pending signal: {signal:?}");
+        assert_eq!(status, expected, "{path}, pending signal: {signal:?}");
     }
     machine.shutdown().await;
 }

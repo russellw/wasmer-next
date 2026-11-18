@@ -6755,6 +6755,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-test",
  "wasmer",
+ "wasmer-types",
  "wasmer-wasix-types",
  "wasmparser 0.263.0",
  "wat",
