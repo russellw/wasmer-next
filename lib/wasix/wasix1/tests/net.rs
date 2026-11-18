@@ -77,6 +77,7 @@ const PRELUDE: &str = r#"
   (import "wasix_32v1" "port_route_list" (func $port_route_list (param i32 i32) (result i32)))
   (import "wasix_32v1" "port_gateway_set" (func $port_gateway_set (param i32) (result i32)))
   (import "wasix_32v1" "sock_open" (func $sock_open (param i32 i32 i32 i32) (result i32)))
+  (import "wasix_32v1" "sock_pair" (func $sock_pair (param i32 i32 i32 i32 i32) (result i32)))
   (import "wasix_32v1" "sock_bind" (func $sock_bind (param i32 i32) (result i32)))
   (import "wasix_32v1" "sock_listen" (func $sock_listen (param i32 i32) (result i32)))
   (import "wasix_32v1" "sock_connect" (func $sock_connect (param i32 i32) (result i32)))
@@ -144,6 +145,33 @@ fn run(data: &str, body: &str) -> (i32, String) {
 
 /// `127.0.0.1:0` as an `addr_port`, at 1024.
 const LOOPBACK_ADDR: &str = r#"(data (i32.const 1024) "\01\00\00\00\7f\00\00\01")"#;
+
+#[test]
+fn legacy_inet_socketpair_wakes_epoll() {
+    let data = r#"
+      (data (i32.const 1000) "x")
+      (data (i32.const 1200) "\e8\03\00\00\01\00\00\00")
+      (data (i32.const 1210) "\e9\03\00\00\01\00\00\00")
+    "#;
+    let body = r#"
+      ;; AF_INET, SOCK_STREAM with a default protocol, as used by asyncio.
+      (call $ok (call $sock_pair (i32.const 1) (i32.const 1) (i32.const 0)
+        (i32.const 0) (i32.const 4)) (i32.const 1))
+      (call $ok (call $epoll_create (i32.const 8)) (i32.const 2))
+      (i32.store (i32.const 2000) (i32.const 1)) ;; EPOLLIN
+      (call $ok (call $epoll_ctl (i32.load (i32.const 8)) (i32.const 0)
+        (i32.load (i32.const 0)) (i32.const 2000)) (i32.const 3))
+      (call $ok (call $sock_send (i32.load (i32.const 4)) (i32.const 1200)
+        (i32.const 1) (i32.const 0) (i32.const 12)) (i32.const 4))
+      (call $ok (call $epoll_wait (i32.load (i32.const 8)) (i32.const 2100)
+        (i32.const 1) (i64.const 0) (i32.const 16)) (i32.const 5))
+      (call $assert (i32.eq (i32.load (i32.const 16)) (i32.const 1)) (i32.const 6))
+      (call $ok (call $sock_recv (i32.load (i32.const 0)) (i32.const 1210)
+        (i32.const 1) (i32.const 0) (i32.const 20) (i32.const 24)) (i32.const 7))
+      (call $assert (i32.eq (i32.load8_u (i32.const 1001)) (i32.const 120)) (i32.const 8))
+    "#;
+    assert_eq!(run(data, body).0, 0);
+}
 
 /// A TCP echo over the loopback network: listen, connect, accept, send, `poll_oneoff` for
 /// the data, receive and send it back.

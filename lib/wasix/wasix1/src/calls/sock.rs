@@ -9,8 +9,8 @@ use crate::abi::fs::Rights;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
 use wasixv2_abi::{
-    AddressFamily, ConstIovecArray, ConstSockaddrPtr, Fd, GuestPtr, GuestPtrMut, Loff, MsgFlags,
-    PollEvents, Pollfd, SeekWhence, ShutdownHow, SocketFlags, SocketLevel, SocketOption,
+    AddressFamily, ConstIovecArray, ConstSockaddrPtr, Fd, GuestPtr, GuestPtrMut, IpProtocol, Loff,
+    MsgFlags, PollEvents, Pollfd, SeekWhence, ShutdownHow, SocketFlags, SocketLevel, SocketOption,
     SocketType, UserMsghdr, VoidPtr,
 };
 use wasixv2_syscalls::{Control, SysErr, SysResult, Syscalls};
@@ -269,7 +269,22 @@ pub(crate) async fn sock_pair<S: Syscalls + Control + 'static>(
             crate::rights::socket().attachment(),
         ])?;
         let family = family(Addressfamily(af as u8))?;
+        let kind = Socktype(ty as u8);
         let ty = socket_type(ty)?;
+        let family = if matches!(family, AddressFamily::AF_INET | AddressFamily::AF_INET6)
+            && matches!(kind, Socktype::STREAM | Socktype::DGRAM)
+        {
+            // V1 implements IP socket pairs as local duplex channels.
+            match (IpProtocol(proto), kind) {
+                (IpProtocol::IPPROTO_TCP, Socktype::DGRAM)
+                | (IpProtocol::IPPROTO_UDP, Socktype::STREAM) => {
+                    return shim::fail(Errno::NOTSUP);
+                }
+                _ => AddressFamily::AF_UNIX,
+            }
+        } else {
+            family
+        };
         let fds = frame.mem.alloc_mut::<[i32; 2]>()?;
         frame
             .syscalls
