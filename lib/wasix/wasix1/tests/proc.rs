@@ -212,6 +212,40 @@ fn fresh_thread_does_not_run_an_unregistered_signal_callback() {
     );
 }
 
+#[test]
+fn process_signal_waits_for_the_registered_thread() {
+    assert_eq!(
+        status(
+            r#"(module
+      (import "env" "memory" (memory 1 1 shared))
+      (import "wasix_32v1" "callback_signal" (func $callback (param i32 i32)))
+      (import "wasix_32v1" "thread_spawn_v2" (func $spawn (param i32 i32) (result i32)))
+      (import "wasix_32v1" "proc_signal" (func $send (param i32 i32) (result i32)))
+      (import "wasix_32v1" "proc_id" (func $pid (param i32) (result i32)))
+      (import "wasix_32v1" "proc_exit2" (func $exit (param i32)))
+      (data (i32.const 16) "__wasm_signal")
+      (data (i32.const 48) "__wasm_signal_blocked")
+      (func (export "__wasm_signal") (param i32)
+        (drop (i32.atomic.rmw.add (i32.const 200) (i32.const 1))))
+      (func (export "wasi_thread_start") (param i32 i32)
+        (loop $wait (br_if $wait (i32.eqz (i32.atomic.load (i32.const 204)))))
+        (if (call $send (i32.load (i32.const 4)) (i32.const 15))
+          (then (call $exit (i32.const 2))))
+        (i32.atomic.store (i32.const 208) (i32.const 1)))
+      (func (export "_start")
+        (drop (call $pid (i32.const 4)))
+        (call $callback (i32.const 16) (i32.const 13))
+        (if (call $spawn (i32.const 100) (i32.const 104)) (then (call $exit (i32.const 1))))
+        (call $callback (i32.const 48) (i32.const 21))
+        (i32.atomic.store (i32.const 204) (i32.const 1))
+        (loop $sent (br_if $sent (i32.eqz (i32.atomic.load (i32.const 208)))))
+        (call $callback (i32.const 16) (i32.const 13))
+        (call $exit (i32.ne (i32.atomic.load (i32.const 200)) (i32.const 1)))))"#
+        ),
+        0
+    );
+}
+
 /// wasix-libc before v2026-07-30.1 holds signals back in `pthread_create` and never ends the
 /// hold (its `__restore_sigs` is compiled out). The spawn ends it, for the creating thread and
 /// the new one: both still take signals afterwards.

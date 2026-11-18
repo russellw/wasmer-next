@@ -4745,6 +4745,10 @@ impl Control for Kernel {
         Kernel::signal_return(self, task, mask)
     }
 
+    fn register_v1_signal_callback(&self, task: TaskId) {
+        self.task_signals(task).register_v1_callback();
+    }
+
     fn fault(&self, task: TaskId, signal: i32) -> bool {
         self.force_fatal_signal(task, signal)
     }

@@ -287,6 +287,11 @@ pub trait Control:
         let _ = (task, mask);
     }
 
+    /// Marks a thread as eligible to handle process-directed WASIX v1 callbacks.
+    fn register_v1_signal_callback(&self, task: TaskId) {
+        let _ = task;
+    }
+
     /// The image `task`'s pending [`GuestAction::Exec`] runs, which `execve` loaded.
     fn take_image(&self, task: TaskId) -> Option<Image>;
 

@@ -571,9 +571,8 @@ impl<S: Syscalls + Control + Send + Sync + 'static> AbiInstance<S> for Wasix1Ins
         restart: bool,
     ) -> LocalFuture<'a, Result<Sigreturn, RuntimeError>> {
         Box::pin(async move {
-            // V1 process signals were queued to siblings, but only instances
-            // that registered a callback ran guest handlers. A fresh pthread's
-            // exported __wasm_signal alone is not a registration.
+            // A directed signal can reach an unregistered pthread. Its
+            // exported __wasm_signal alone does not register a callback.
             if !self.signal_registered.load(Ordering::Relaxed) {
                 return Ok(Sigreturn {
                     mask: Some(frame.mask),
