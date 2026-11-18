@@ -292,6 +292,50 @@ fn udp_send_to_recv_from() {
     assert_eq!(run(&data, body), (0, "he".to_string()));
 }
 
+#[test]
+fn unix_socket_addresses_fit_legacy_buffers() {
+    let data = r#"
+      (data (i32.const 1000) "ping")
+      (data (i32.const 1200) "\e8\03\00\00\04\00\00\00")
+      (data (i32.const 1210) "\ec\03\00\00\04\00\00\00")
+      (func $check_bytes (param $ptr i32) (param $end i32) (param $byte i32) (param $code i32)
+        (loop $next
+          (call $assert (i32.eq (i32.load8_u (local.get $ptr)) (local.get $byte)) (local.get $code))
+          (local.set $ptr (i32.add (local.get $ptr) (i32.const 1)))
+          (br_if $next (i32.lt_u (local.get $ptr) (local.get $end)))))
+      (func $check_names (param $fd i32) (param $ptr i32)
+        (call $assert (i32.eq (call $sock_addr_local (local.get $fd) (local.get $ptr))
+          (i32.const 57)) (i32.const 2))
+        (call $assert (i32.eq (call $sock_addr_peer (local.get $fd) (local.get $ptr))
+          (i32.const 57)) (i32.const 3)))
+    "#;
+    let body = r#"
+      ;; An unnamed AF_UNIX stream pair reports NOTSOCK without writing the name.
+      (call $ok (call $sock_pair (i32.const 3) (i32.const 1) (i32.const 0)
+        (i32.const 0) (i32.const 4)) (i32.const 1))
+      (memory.fill (i32.const 1400) (i32.const 0xa5) (i32.const 21))
+      (call $check_names (i32.load (i32.const 0)) (i32.const 1400))
+      (call $check_names (i32.load (i32.const 4)) (i32.const 1400))
+      (call $check_bytes (i32.const 1400) (i32.const 1421) (i32.const 0xa5) (i32.const 4))
+      (memory.copy (i32.const 65516) (i32.const 1400) (i32.const 20))
+      (call $check_names (i32.load (i32.const 0)) (i32.const 65516))
+      (call $check_names (i32.load (i32.const 4)) (i32.const 65516))
+      (call $check_bytes (i32.const 65516) (i32.const 65536) (i32.const 0xa5) (i32.const 5))
+      ;; recv_from on a datagram pair succeeds with a 20-byte UNSPEC name.
+      (call $ok (call $sock_pair (i32.const 3) (i32.const 2) (i32.const 0)
+        (i32.const 0) (i32.const 4)) (i32.const 6))
+      (call $ok (call $sock_send (i32.load (i32.const 0)) (i32.const 1200)
+        (i32.const 1) (i32.const 0) (i32.const 8)) (i32.const 7))
+      (call $ok (call $sock_recv_from (i32.load (i32.const 4)) (i32.const 1210)
+        (i32.const 1) (i32.const 0) (i32.const 8) (i32.const 12) (i32.const 1400)) (i32.const 8))
+      (call $assert (i32.eq (i32.load (i32.const 8)) (i32.const 4)) (i32.const 9))
+      (call $check_bytes (i32.const 1400) (i32.const 1420) (i32.const 0) (i32.const 10))
+      (call $assert (i32.eq (i32.load8_u (i32.const 1420)) (i32.const 0xa5)) (i32.const 11))
+      (call $print (i32.const 1004) (i32.load (i32.const 8)))
+    "#;
+    assert_eq!(run(data, body), (0, "ping".to_string()));
+}
+
 /// Clock subscriptions: a timeout of 0 never fires (v1), a short one does; a descriptor that
 /// is not open is reported with `BADF`; `wasi_unstable`'s layout works the same.
 #[test]

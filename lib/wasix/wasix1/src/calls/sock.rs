@@ -194,7 +194,7 @@ async fn sockaddr_in<S: Syscalls + Control + 'static>(
     Ok((GuestPtr::new(slice.addr), slice.len))
 }
 
-/// v1's IP outputs fit the original 20-byte address union, with a network-order port.
+/// Legacy callers may reserve only 20 bytes, so unrepresentable peers use UNSPEC.
 async fn write_addr_port<S: Syscalls + Control + 'static>(
     frame: &Frame<'_, S>,
     ptr: i32,
@@ -203,8 +203,7 @@ async fn write_addr_port<S: Syscalls + Control + 'static>(
     let ptr = ptr as u32;
     match addr {
         SockAddr::Inet(addr) => frame.write(ptr, &AddrPort::encode(*addr)).await,
-        SockAddr::Unix(path) => frame.write(ptr, &UnixAddrPort::new(path)).await,
-        SockAddr::Unspec => frame.write(ptr, &AddrPort::ZERO).await,
+        SockAddr::Unix(_) | SockAddr::Unspec => frame.write(ptr, &AddrPort::ZERO).await,
     }
 }
 
@@ -728,6 +727,19 @@ pub(crate) async fn sock_shutdown<S: Syscalls + Control + 'static>(
     .await
 }
 
+async fn write_socket_name<S: Syscalls + Control + 'static>(
+    frame: &Frame<'_, S>,
+    ptr: i32,
+    addr: &SockAddr,
+) -> V1Result<()> {
+    match addr {
+        // Libc recognizes NOTSOCK as the AF_LOCAL fallback for getsockname.
+        SockAddr::Unix(path) if path.is_empty() => shim::fail(Errno::NOTSOCK),
+        SockAddr::Unix(_) => shim::fail(Errno::INVAL),
+        _ => write_addr_port(frame, ptr, addr).await,
+    }
+}
+
 pub(crate) async fn sock_addr_local<S: Syscalls + Control + 'static>(
     env: Env<S>,
     fd: i32,
@@ -740,7 +752,7 @@ pub(crate) async fn sock_addr_local<S: Syscalls + Control + 'static>(
             .syscalls
             .getsockname(&frame.caller(), Fd(fd), out.addr, out.len)
             .await?;
-        write_addr_port(frame, ro_addr, &out.take(frame)).await
+        write_socket_name(frame, ro_addr, &out.take(frame)).await
     })
     .await
 }
@@ -753,7 +765,7 @@ pub(crate) async fn sock_addr_peer<S: Syscalls + Control + 'static>(
     shim::errno(&env, async |frame| {
         crate::rights::require(frame, &[(wasixv2_abi::Fd(fd), Rights::empty())]).await?;
         let peer = peer_name(frame, Fd(fd)).await?;
-        write_addr_port(frame, ro_addr, &peer).await
+        write_socket_name(frame, ro_addr, &peer).await
     })
     .await
 }

@@ -316,6 +316,7 @@ impl UnixAddrPort {
         unix_payload(&self.payload)
     }
 
+    #[cfg(test)]
     pub(crate) fn new(path: &[u8]) -> Self {
         let mut out = Self::ZERO;
         out.tag = Addressfamily::UNIX;
