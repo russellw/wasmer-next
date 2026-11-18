@@ -779,7 +779,15 @@ impl Compile<'_> {
             locals: 0,
             ops: Vec::new(),
         };
-        self.append(root, first, params, &mut BTreeSet::new(), &mut program)?;
+        let mut remaining = 1_048_576;
+        self.append(
+            root,
+            first,
+            params,
+            &mut BTreeSet::new(),
+            &mut program,
+            &mut remaining,
+        )?;
         Ok(program)
     }
 
@@ -790,7 +798,9 @@ impl Compile<'_> {
         params: usize,
         visiting: &mut BTreeSet<u32>,
         out: &mut Program,
+        remaining: &mut usize,
     ) -> Result<(), PlanError> {
+        *remaining = remaining.checked_sub(1).ok_or_else(invalid)?;
         if visiting.len() >= 64 || Some(root) == self.constructors || !visiting.insert(root) {
             return Err(invalid());
         }
@@ -802,17 +812,15 @@ impl Compile<'_> {
             .checked_sub(self.imported_functions)
             .ok_or_else(invalid)? as usize;
         let body = self.bodies.get(index).ok_or_else(invalid)?;
-        let locals = body
-            .get_locals_reader()?
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()?;
-        if locals.iter().any(|(_, ty)| *ty != ValType::I32) {
-            return Err(invalid());
+        let mut count = 0usize;
+        for entry in body.get_locals_reader()? {
+            *remaining = remaining.checked_sub(1).ok_or_else(invalid)?;
+            let (locals, ty) = entry?;
+            if ty != ValType::I32 {
+                return Err(invalid());
+            }
+            count = count.checked_add(locals as usize).ok_or_else(invalid)?;
         }
-        let count = locals
-            .iter()
-            .try_fold(0usize, |n, (count, _)| n.checked_add(*count as usize))
-            .ok_or_else(invalid)?;
         // Relocation helpers may cache hundreds of addresses. Bound the entire
         // flattened helper graph rather than assuming only the once-helper locals.
         let local_base = out.locals;
@@ -824,6 +832,7 @@ impl Compile<'_> {
         let mut reader = body.get_operators_reader()?;
         let mut ops = Vec::new();
         while !reader.eof() {
+            *remaining = remaining.checked_sub(1).ok_or_else(invalid)?;
             ops.push(reader.read()?);
         }
         let ops = once_body(&ops, first)?;
@@ -869,15 +878,12 @@ impl Compile<'_> {
                 Operator::Call { function_index } => {
                     // lld synthetic callees take no parameters/results. TLS root alone takes
                     // its new block pointer, and ordinary user functions are never roots.
-                    self.append(function_index, first, 0, visiting, out)?;
+                    self.append(function_index, first, 0, visiting, out, remaining)?;
                     continue;
                 }
                 Operator::End | Operator::Nop => continue,
                 _ => return Err(invalid()),
             };
-            if out.ops.len() >= 1_048_576 {
-                return Err(invalid());
-            }
             out.ops.push(op);
         }
         visiting.remove(&root);
@@ -1203,5 +1209,43 @@ impl wasm_encoder::reencode::Reencode for Sanitize<'_> {
             wasm_encoder::reencode::utils::parse_element(self, elements, element)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn initializer_budget_charges_calls_and_instructions() {
+        let wasm = wat::parse_str("(module (func call 1) (func nop))").unwrap();
+        let bodies: Vec<_> = Parser::new(0)
+            .parse_all(&wasm)
+            .filter_map(|payload| match payload.unwrap() {
+                Payload::CodeSectionEntry(body) => Some(body),
+                _ => None,
+            })
+            .collect();
+        let functions = [
+            wasmparser::FuncType::new([], []),
+            wasmparser::FuncType::new([], []),
+        ];
+        let compiler = Compile {
+            bodies: &bodies,
+            imported_functions: 0,
+            mutable_globals: &BTreeSet::new(),
+            constructors: None,
+            functions: &functions,
+        };
+        for (mut budget, accepted) in [(6, true), (5, false)] {
+            let mut program = Program {
+                params: 0,
+                locals: 0,
+                ops: Vec::new(),
+            };
+            let result =
+                compiler.append(0, false, 0, &mut BTreeSet::new(), &mut program, &mut budget);
+            assert_eq!(result.is_ok(), accepted);
+        }
     }
 }
