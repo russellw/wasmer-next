@@ -347,6 +347,120 @@ mod loader_tests {
         wasmer::wat2wasm(source.as_bytes()).unwrap().into_owned()
     }
 
+    #[cfg(all(feature = "singlepass", feature = "cranelift"))]
+    #[test]
+    fn cached_loader_exec_can_switch_backends() {
+        // The native debug build needs a larger host stack for exec admission.
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                tokio::task::LocalSet::new().block_on(&runtime, check_exec_backends());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[cfg(all(feature = "singlepass", feature = "cranelift"))]
+    async fn check_exec_backends() {
+        #[derive(Default)]
+        struct StoreEngines(Mutex<Vec<String>>);
+
+        impl wasixv2::InstantiationHook<wasixv2::MachineSyscalls> for StoreEngines {
+            fn prepare_imports(
+                &self,
+                _: &Module,
+                store: &mut wasmer::StoreMut<'_>,
+                _: &wasmer::FunctionEnv<wasixv2::ExecEnv<wasixv2::MachineSyscalls>>,
+                _: &mut wasmer::Imports,
+            ) -> Result<Option<Box<dyn wasixv2::InstanceAttachment>>, wasmer::RuntimeError>
+            {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(store.engine().deterministic_id());
+                Ok(None)
+            }
+        }
+
+        let options = RuntimeOptions::default();
+        let target = Target::default();
+        // Start with a precompiled Singlepass root. Auto selection prefers Cranelift
+        // for ordinary modules, and this child needs exception handling.
+        let backend = BackendType::Singlepass;
+        let engine = backend.get_engine(&target, &options).unwrap();
+        let compiler = Arc::new(RecordingCompiler::default());
+        let loader = Arc::new(CachedLoader::new(
+            compiler.clone(),
+            options,
+            (backend, engine.clone()),
+            false,
+        ));
+        let root = wasm(
+            r#"(module
+              (import "wasixv2" "execve" (func $exec (param i32 i32 i32) (result i32)))
+              (import "wasixv2" "exit_group" (func $exit (param i32)))
+              (memory (export "memory") 1)
+              (data (i32.const 16) "/bin/child\00")
+              (data (i32.const 32) "\10\00\00\00\00\00\00\00")
+              (func (export "_start")
+                (drop (call $exec (i32.const 16) (i32.const 32) (i32.const 0)))
+                (call $exit (i32.const 99))
+                unreachable))"#,
+        );
+        let module = wasixv2::load(&engine, &root).unwrap();
+        let child = wasm(
+            r#"(module
+              (import "wasixv2" "exit_group" (func $exit (param i32)))
+              (memory (export "memory") 1)
+              (tag $child)
+              (func (export "_start")
+                (block $done (try_table (catch $child $done) (throw $child)))
+                (call $exit (i32.const 42))
+                unreachable))"#,
+        );
+        let features = RuntimeOptions::default()
+            .detect_features_from_wasm(&child)
+            .unwrap();
+        assert!(!backend.supports_features(&features, &target));
+
+        let store_engines = Arc::new(StoreEngines::default());
+        let mut machine = Machine::builder()
+            .loader(loader)
+            .instantiation_hook(store_engines.clone())
+            .build();
+        machine
+            .install_commands([("child".into(), OwnedBuffer::from(child))])
+            .await
+            .unwrap();
+        let status = machine
+            .run_module(
+                &engine,
+                &module,
+                ProcessConfig {
+                    args: vec!["root".into()],
+                    env: vec![],
+                    stdio: Stdio::from_fns(|_| {}, |_| {}),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(status, 42);
+        assert_eq!(compiler.requests.lock().unwrap().len(), 1);
+        let expected = BackendType::Cranelift
+            .get_engine(&target, &RuntimeOptions::default())
+            .unwrap();
+        assert_eq!(
+            store_engines.0.lock().unwrap().as_slice(),
+            [engine.deterministic_id(), expected.deterministic_id()]
+        );
+        machine.shutdown().await;
+    }
+
     fn custom_section(bytes: &mut Vec<u8>, name: &str, data: &[u8]) {
         fn leb(mut value: usize, output: &mut Vec<u8>) {
             loop {
