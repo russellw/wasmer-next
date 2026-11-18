@@ -552,8 +552,8 @@ impl<L, S: crate::Control> crate::Control for Layered<L, S> {
         self.inner.signal_return(task, mask)
     }
 
-    fn register_v1_signal_callback(&self, task: crate::TaskId) {
-        self.inner.register_v1_signal_callback(task)
+    fn register_signal_callback_task(&self, task: crate::TaskId) {
+        self.inner.register_signal_callback_task(task)
     }
 
     fn take_image(&self, task: crate::TaskId) -> Option<crate::Image> {

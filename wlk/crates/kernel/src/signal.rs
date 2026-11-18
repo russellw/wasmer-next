@@ -167,7 +167,8 @@ struct GroupState {
     sighand: Arc<Sighand>,
     /// The guest's trampoline (`signal-callback-register`).
     trampoline: Option<u32>,
-    v1_callbacks: bool,
+    /// Whether caught process-directed signals are routed to registered callback tasks.
+    prefer_callback_tasks: bool,
     shared: Pending,
     tasks: HashMap<TaskId, TaskState>,
     /// The task a signal for the whole group is offered first: the leader, which `kill` and
@@ -358,7 +359,8 @@ struct TaskState {
     sigpending: bool,
     /// The task is on its way out and takes no more signals (`PF_EXITING`).
     exiting: bool,
-    v1_callback: bool,
+    /// Whether this task registered a signal callback.
+    callback_task: bool,
     blocked: u64,
     /// The mask to restore once a `sigsuspend` or `ppoll` mask has served its signal
     /// (`TIF_RESTORE_SIGMASK` and `saved_sigmask`).
@@ -400,7 +402,7 @@ impl TaskState {
             uring_notify: false,
             sigpending: false,
             exiting: false,
-            v1_callback: inherited.v1_callback,
+            callback_task: inherited.callback_task,
             cred: None,
             blocked: inherited.blocked,
             saved: None,
@@ -428,7 +430,7 @@ impl TaskState {
 /// What a new task takes over from the task that creates it (`copy_process`).
 pub(crate) struct Inherited {
     blocked: u64,
-    v1_callback: bool,
+    callback_task: bool,
     altstack: AltStack,
 }
 
@@ -437,7 +439,7 @@ impl Inherited {
     pub(crate) fn none() -> Self {
         Self {
             blocked: 0,
-            v1_callback: false,
+            callback_task: false,
             altstack: AltStack::default(),
         }
     }
@@ -630,7 +632,7 @@ impl Signals {
                 false => state.sighand.copy(),
             };
             copy.trampoline = state.trampoline;
-            copy.v1_callbacks = state.v1_callbacks;
+            copy.prefer_callback_tasks = state.prefer_callback_tasks;
         }
         new
     }
@@ -666,9 +668,9 @@ impl Signals {
         self.flush_handlers();
         let mut state = self.state.lock_or_recover();
         state.trampoline = None;
-        state.v1_callbacks = false;
+        state.prefer_callback_tasks = false;
         for task in state.tasks.values_mut() {
-            task.v1_callback = false;
+            task.callback_task = false;
             task.altstack = AltStack::default();
             task.frames.clear();
             task.saved = None;
@@ -1223,7 +1225,7 @@ impl GroupState {
     fn pick(&mut self, sig: i32) -> Option<TaskId> {
         let needs_callback = self.callback_signals(bit(sig)) != 0;
         let eligible = |task| {
-            self.wants_signal(task, sig) && (!needs_callback || self.tasks[&task].v1_callback)
+            self.wants_signal(task, sig) && (!needs_callback || self.tasks[&task].callback_task)
         };
         if let Some(leader) = self.leader.filter(|&leader| eligible(leader)) {
             return Some(leader);
@@ -1287,7 +1289,7 @@ impl GroupState {
             if retarget == 0 {
                 break;
             }
-            let eligible = if t.v1_callback {
+            let eligible = if t.callback_task {
                 retarget
             } else {
                 retarget & !needs_callback
@@ -1382,9 +1384,9 @@ impl GroupState {
             .expect("signal state of an unknown task")
     }
 
-    /// Only caught process signals in the v1 adapter require a registered callback.
+    /// Selects the caught process-directed signals that require a registered callback task.
     fn callback_signals(&self, mut signals: u64) -> u64 {
-        if !self.v1_callbacks || signals == 0 {
+        if !self.prefer_callback_tasks || signals == 0 {
             return 0;
         }
         let actions = self.sighand.0.lock_or_recover();
@@ -1402,7 +1404,7 @@ impl GroupState {
 
     fn shared_for(&self, task: TaskId, wanted: u64) -> u64 {
         let shared = self.shared.set & wanted;
-        if self.tasks[&task].v1_callback {
+        if self.tasks[&task].callback_task {
             shared
         } else {
             shared & !self.callback_signals(shared)
@@ -1780,10 +1782,10 @@ pub(crate) struct TaskSignals {
 }
 
 impl TaskSignals {
-    pub(crate) fn register_v1_callback(&self) {
+    pub(crate) fn mark_callback_task(&self) {
         let mut state = self.group.state.lock_or_recover();
-        state.v1_callbacks = true;
-        state.task(self.task).v1_callback = true;
+        state.prefer_callback_tasks = true;
+        state.task(self.task).callback_task = true;
         state.recalc_sigpending(self.task);
     }
 
@@ -1876,7 +1878,7 @@ impl TaskSignals {
             flags.contains(CloneFlags::CLONE_VM) && !flags.contains(CloneFlags::CLONE_VFORK);
         self.with(|task| Inherited {
             blocked: task.blocked,
-            v1_callback: !flags.contains(CloneFlags::CLONE_THREAD) && task.v1_callback,
+            callback_task: !flags.contains(CloneFlags::CLONE_THREAD) && task.callback_task,
             altstack: match thread {
                 true => AltStack::default(),
                 false => task.altstack,

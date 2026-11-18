@@ -228,7 +228,7 @@ pub(crate) async fn callback_signal<S: Syscalls + Control + 'static>(
         }
         frame
             .syscalls
-            .register_v1_signal_callback(frame.caller().task());
+            .register_signal_callback_task(frame.caller().task());
         install(frame).await?;
         set_mask(frame, deliver).await
     })

@@ -287,8 +287,8 @@ pub trait Control:
         let _ = (task, mask);
     }
 
-    /// Marks a thread as eligible to handle process-directed WASIX v1 callbacks.
-    fn register_v1_signal_callback(&self, task: TaskId) {
+    /// Marks a callback task for preferred delivery of caught process-directed signals.
+    fn register_signal_callback_task(&self, task: TaskId) {
         let _ = task;
     }
 
