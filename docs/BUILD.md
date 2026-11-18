@@ -266,25 +266,9 @@ and optionally the fork (`WASIXV2_LLVM_TAG` repository variable).
 
 ## Wasm start and custom bindings
 
-`wasixv2_exec::load` and `prepare_for_compile` defer the module's Wasm start section.
-Exec applies data segments, freezes the image, binds the ABI and attaches its
-actual memory to the kernel, then calls `InstanceAttachment::configure` before
-invoking the original start. Start uses the normal asynchronous invocation and
-cleanup custody; a start failure remains `ExecError::Instantiate(Start(..))`.
-ABI explicit initializers and process/thread entry follow start. No separate
-post-start attachment method is needed.
-
-Custom compilers/loaders use `prepare_for_compile` before compiling, and cache
-the returned bytes. It returns a warning alongside a deferred-start-only
-fallback if preemption rewriting fails. Use `instrument` for strict preparation
-that requires preemption. Invalidate cached artifacts created with the old
-start behavior. Native compiled modules
-with an engine start are rejected before hook preparation; backends without
-module metadata require the source transform's deferred-start profile. External
-instantiation through `embedding` remains the embedder's lifecycle responsibility.
-Fork restore rewinds the already-started image without rerunning start; new
-thread instances run start after configuration against their inherited memory.
-Dynamic side modules retain their existing validated no-auto-start initialization
-protocol. Start must preserve the ABI stack/layout/guard metadata used for
-binding; changing it fails startup, because protected leases may already depend
-on that exact address-space layout.
+Custom compilers and loaders must use `wasixv2_exec::prepare_for_compile`
+before compiling and invalidate artifacts from before start deferral. Cache by
+the returned prepared bytes. Those bytes retain start deferral if preemption
+instrumentation falls back. Use `instrument` when strict preemption is required.
+See the [execution contract](../lib/wasix/DESIGN.md#execution) for start ordering,
+hook configuration and failure handling.

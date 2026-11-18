@@ -1,7 +1,7 @@
 # NAPI source ownership
 
 `lib/napi` is a submodule of public [wasmerio/napi](https://github.com/wasmerio/napi),
-branch `next`. The gitlink pins the exact revision; initialize it and its nested
+branch `edge-wasixv2`. The gitlink pins the exact revision; initialize it and its nested
 QuickJS dependency with `git submodule update --init --recursive -- lib/napi`.
 
 The branch starts from upstream `82b328f50ddaac78de388b67b4707f21864b9245` and
@@ -19,5 +19,4 @@ Relative path dependencies such as `../wasix/*` continue to resolve in-tree.
 
 CI checkouts must use recursive submodules to fetch NAPI and QuickJS. NAPI is
 public and needs no additional private-repository credentials. The runtime is
-public too; CI retains its separate GitHub App authentication setup. Cargo.lock is unchanged by the extraction. Local builds
-and tests were intentionally deferred to CI by owner instruction.
+public too. CI retains its separate GitHub App authentication setup.

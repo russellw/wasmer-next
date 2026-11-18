@@ -91,8 +91,7 @@ The selected engine revision is
 graph after removal, with 23 root workspace packages and one Git source identity
 for the engine. No registry engine patches were required by this graph.
 
-At the owner's request, no local builds, tests, lint or CI-selector tests ran.
-Only Cargo metadata/targeted updates were used to regenerate the lock. Attempts
+Cargo metadata and targeted updates regenerated the lock. Attempts
 to preserve old libc, rustls, webpki-roots, sharded-offset-map and
 wasmtime-internal-core versions failed on new engine dependency constraints
 (parking_lot_core, ureq, libwild and Cranelift respectively); their lock changes
@@ -104,6 +103,6 @@ checks. The changed area-selector tests are retained for CI, not claimed passed.
 Existing backend/platform restrictions, V8 concurrency limitations and guest-suite
 setup gaps still apply. No public-registry distribution policy is established.
 
-NAPI is mounted at lib/napi from wasmerio/napi, branch next, preserving the
+NAPI is mounted at lib/napi from wasmerio/napi, branch `edge-wasixv2`, preserving the
 product's WASIX v2 adaptations rather than reverting to runtime's upstream pin.
 See [NAPI-UPSTREAM-DIFF.md](NAPI-UPSTREAM-DIFF.md).
