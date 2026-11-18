@@ -8,7 +8,11 @@
 
 use crate::abi::fs::Rights;
 
-use std::{collections::HashMap, sync::Mutex, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap, VecDeque},
+    sync::Mutex,
+    time::Duration,
+};
 
 use wasixv2_abi::{
     EpollCreateFlags, EpollCtlOp, EpollData as LinuxData, EpollEvent as LinuxEvent, EpollEvents,
@@ -82,6 +86,53 @@ struct Registrations {
     data: HashMap<Handle, EpollData>,
     index: HashMap<(Fd, Fd), Handle>,
     next: u32,
+    /// Records retired so far: replaced by `EPOLL_CTL_MOD`, dropped by `DEL` or with their set.
+    retirements: u64,
+    /// The `epoll_wait` calls in flight, by the count of retirements when each began.
+    waits: BTreeMap<u64, usize>,
+    /// Retired records, by retirement number, that a wait in flight may still need: as on
+    /// Linux, an event harvested before a MOD or DEL carries the data it fired with, and tokio
+    /// keeps a deregistered source alive for it until its next driver turn.
+    retired: VecDeque<(u64, Handle)>,
+}
+
+impl Registrations {
+    /// Drops `handle`'s record once no wait that began before now is in flight.
+    fn retire(&mut self, handle: Handle) {
+        self.retirements += 1;
+        self.retired.push_back((self.retirements, handle));
+        self.reclaim();
+    }
+
+    /// Drops the retired records that no wait in flight can still map.
+    fn reclaim(&mut self) {
+        let oldest = self.waits.keys().next().copied().unwrap_or(u64::MAX);
+        while let Some(&(retirement, handle)) = self.retired.front()
+            && retirement <= oldest
+        {
+            self.retired.pop_front();
+            self.data.remove(&handle);
+        }
+    }
+}
+
+/// An `epoll_wait` in flight, from before its kernel call until its events are mapped.
+struct Waiting<'a> {
+    table: &'a Table,
+    began: u64,
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        let mut regs = self.table.0.lock().unwrap();
+        if let Some(count) = regs.waits.get_mut(&self.began) {
+            *count -= 1;
+            if *count == 0 {
+                regs.waits.remove(&self.began);
+            }
+        }
+        regs.reclaim();
+    }
 }
 
 struct Staged<'a> {
@@ -115,6 +166,7 @@ impl Table {
                 .collect(),
             index: regs.index.clone(),
             next: regs.next,
+            ..Registrations::default()
         }))
     }
 
@@ -142,32 +194,44 @@ impl Table {
     }
 
     /// The kernel's item for (`epfd`, `fd`) now carries the staged `handle`; the record
-    /// registered before goes.
+    /// registered before retires.
     fn commit(&self, epfd: Fd, fd: Fd, handle: Handle) {
         let mut regs = self.0.lock().unwrap();
         if let Some(old) = regs.index.insert((epfd, fd), handle) {
-            regs.data.remove(&old);
+            regs.retire(old);
         }
     }
 
     fn remove(&self, epfd: Fd, fd: Fd) {
         let mut regs = self.0.lock().unwrap();
         if let Some(old) = regs.index.remove(&(epfd, fd)) {
-            regs.data.remove(&old);
+            regs.retire(old);
         }
+    }
+
+    /// Marks an `epoll_wait` in flight: what retires meanwhile stays until it ends.
+    fn wait(&self) -> Waiting<'_> {
+        let mut regs = self.0.lock().unwrap();
+        let began = regs.retirements;
+        *regs.waits.entry(began).or_default() += 1;
+        Waiting { table: self, began }
     }
 
     /// Forgets everything registered through `epfd`, a descriptor that was closed or now names
     /// another file, such as a new epoll set.
     fn forget(&self, epfd: Fd) {
         let regs = &mut *self.0.lock().unwrap();
+        let mut gone = Vec::new();
         regs.index.retain(|(set, _), handle| {
             let keep = *set != epfd;
             if !keep {
-                regs.data.remove(handle);
+                gone.push(*handle);
             }
             keep
         });
+        for handle in gone {
+            regs.retire(handle);
+        }
     }
 
     /// The data registered under `handle`; just the descriptor if there is none (an item
@@ -294,6 +358,9 @@ pub(crate) async fn epoll_wait<S: Syscalls + Control + 'static>(
                 frame.mem.alloc(&ts)?
             }
         };
+        // Before the kernel call: a MOD or DEL after it harvests must leave the data.
+        let table = &frame.proc().await?.net.epoll;
+        let _waiting = table.wait();
         let n = frame
             .syscalls
             .epoll_pwait2(
@@ -306,7 +373,6 @@ pub(crate) async fn epoll_wait<S: Syscalls + Control + 'static>(
                 8,
             )
             .await?;
-        let table = &frame.proc().await?.net.epoll;
         for i in 0..n.max(0) as u32 {
             let linux: LinuxEvent = frame
                 .mem
@@ -394,5 +460,43 @@ mod tests {
         assert_eq!(table.get(third).data2, 0);
         let regs = table.0.lock().unwrap();
         assert!(regs.data.is_empty() && regs.index.is_empty());
+    }
+
+    /// A record a MOD, DEL or closed set retires stays for the waits that began before, which
+    /// may have harvested an event carrying it, and goes when the last of them ends.
+    #[test]
+    fn retired_data_outlives_the_waits_in_flight() {
+        let table = Table::default();
+        let (set, fd) = (Fd(4), Fd(5));
+        let first = table.handle(fd);
+        table.stage(first, data(1)).commit(set, fd);
+
+        let early = table.wait();
+        // MOD: the old record stays for `early`, the new one is there for everyone.
+        let second = table.handle(fd);
+        table.stage(second, data(2)).commit(set, fd);
+        let late = table.wait();
+        assert_eq!(table.get(first), data(1));
+        // DEL: likewise.
+        table.remove(set, fd);
+        assert_eq!(table.get(second), data(2));
+
+        drop(early);
+        // `late` began after the MOD, so `first` goes; it may still need `second`.
+        assert_eq!(table.get(first).data2, 0);
+        assert_eq!(table.get(second), data(2));
+        drop(late);
+        assert_eq!(table.get(second).data2, 0);
+
+        // A closed set retires its records the same way.
+        let third = table.handle(fd);
+        table.stage(third, data(3)).commit(set, fd);
+        let waiting = table.wait();
+        table.forget(set);
+        assert_eq!(table.get(third), data(3));
+        drop(waiting);
+        let regs = table.0.lock().unwrap();
+        assert!(regs.data.is_empty() && regs.index.is_empty());
+        assert!(regs.retired.is_empty() && regs.waits.is_empty());
     }
 }

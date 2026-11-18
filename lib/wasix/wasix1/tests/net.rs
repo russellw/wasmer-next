@@ -469,6 +469,75 @@ fn epoll_data_is_there_when_a_new_item_fires() {
     assert_eq!(status, 0, "stderr: {err}");
 }
 
+/// An event the waiter harvested just before another thread's `EPOLL_CTL_MOD` or `DEL` still
+/// carries the data registered when it fired, as on Linux; tokio relies on that, keeping a
+/// deregistered source alive until its next driver turn. Without it the late event came back
+/// with zero data: the record had gone with the MOD or DEL while the waiter was still mapping
+/// the event. Each iteration adds, modifies and deletes a ready eventfd without waiting, so the
+/// waiter's harvests race all three.
+#[test]
+fn epoll_data_outlives_a_concurrent_mod_or_del() {
+    let wat = r#"(module
+      (import "env" "memory" (memory 1 1 shared))
+      (import "wasix_32v1" "thread_spawn_v2" (func $spawn (param i32 i32) (result i32)))
+      (import "wasix_32v1" "fd_event" (func $fd_event (param i64 i32 i32) (result i32)))
+      (import "wasix_32v1" "fd_close" (func $fd_close (param i32) (result i32)))
+      (import "wasix_32v1" "epoll_create" (func $epoll_create (param i32) (result i32)))
+      (import "wasix_32v1" "epoll_ctl" (func $epoll_ctl (param i32 i32 i32 i32) (result i32)))
+      (import "wasix_32v1" "epoll_wait" (func $epoll_wait (param i32 i32 i32 i64 i32) (result i32)))
+      (import "wasix_32v1" "proc_exit2" (func $exit (param i32)))
+      ;; eventfd [0], epoll set [4], an event with zero data seen [300], stop [320], stopped [324]
+      (func (export "wasi_thread_start") (param i32 i32)
+        (local $j i32)
+        (loop $again
+          ;; up to 4 events at 2000, their count at 2200, 100 ms at a time
+          (if (call $epoll_wait (i32.load (i32.const 4)) (i32.const 2000) (i32.const 4)
+                                (i64.const 100000000) (i32.const 2200))
+            (then (call $exit (i32.const 2))))
+          (local.set $j (i32.const 0))
+          (block $done
+            (loop $each
+              (br_if $done (i32.ge_u (local.get $j) (i32.load (i32.const 2200))))
+              (if (i64.eqz (i64.load offset=2024 (i32.mul (local.get $j) (i32.const 32))))
+                (then (i32.atomic.store (i32.const 300) (i32.const 1))))
+              (local.set $j (i32.add (local.get $j) (i32.const 1)))
+              (br $each)))
+          (br_if $again (i32.eqz (i32.atomic.load (i32.const 320)))))
+        (i32.atomic.store (i32.const 324) (i32.const 1))
+        (drop (memory.atomic.notify (i32.const 324) (i32.const 1))))
+      (func (export "_start")
+        (local $i i32)
+        (if (call $epoll_create (i32.const 4)) (then (call $exit (i32.const 1))))
+        (if (call $spawn (i32.const 100) (i32.const 104)) (then (call $exit (i32.const 1))))
+        (local.set $i (i32.const 1))
+        (loop $iter
+          ;; a ready eventfd: ADD EPOLLIN | EPOLLET with data2 = 2i, MOD to 2i + 1, DEL
+          (if (call $fd_event (i64.const 1) (i32.const 0) (i32.const 0)) (then (call $exit (i32.const 1))))
+          (i32.store (i32.const 1000) (i32.const 65))
+          (i32.store (i32.const 1012) (i32.load (i32.const 0)))
+          (i64.store (i32.const 1024) (i64.extend_i32_u (i32.shl (local.get $i) (i32.const 1))))
+          (if (call $epoll_ctl (i32.load (i32.const 4)) (i32.const 0) (i32.load (i32.const 0)) (i32.const 1000))
+            (then (call $exit (i32.const 1))))
+          (i64.store (i32.const 1024)
+            (i64.extend_i32_u (i32.add (i32.shl (local.get $i) (i32.const 1)) (i32.const 1))))
+          (if (call $epoll_ctl (i32.load (i32.const 4)) (i32.const 3) (i32.load (i32.const 0)) (i32.const 1000))
+            (then (call $exit (i32.const 1))))
+          (if (call $epoll_ctl (i32.load (i32.const 4)) (i32.const 2) (i32.load (i32.const 0)) (i32.const 0))
+            (then (call $exit (i32.const 1))))
+          (drop (call $fd_close (i32.load (i32.const 0))))
+          (local.set $i (i32.add (local.get $i) (i32.const 1)))
+          (br_if $iter (i32.le_u (local.get $i) (i32.const 20000))))
+        (i32.atomic.store (i32.const 320) (i32.const 1))
+        (loop $stopping
+          (if (i32.eqz (i32.atomic.load (i32.const 324)))
+            (then (drop (memory.atomic.wait32 (i32.const 324) (i32.const 0) (i64.const 1000000000)))
+                  (br $stopping))))
+        (if (i32.atomic.load (i32.const 300)) (then (call $exit (i32.const 4))))
+        (call $exit (i32.const 0))))"#;
+    let (status, _, err) = run_wasm(&wat::parse_str(wat).unwrap(), &["net"]);
+    assert_eq!(status, 0, "stderr: {err}");
+}
+
 /// A set used through two descriptors, as mio does (it registers through a `dup` of the set
 /// and waits on the original): events carry the data registered through either.
 #[test]
