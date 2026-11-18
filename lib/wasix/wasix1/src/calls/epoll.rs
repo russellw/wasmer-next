@@ -72,25 +72,50 @@ impl Handle {
 /// The guest's data of every registration, by handle.
 ///
 /// The index by (epoll descriptor, watched descriptor) serves `EPOLL_CTL_MOD`/`DEL`, which
-/// replace or drop the data registered before. Like the descriptors it is keyed by, a record
-/// goes when its epoll descriptor is closed or comes to name another file (see [`forgotten`]). Every record belongs to exactly one index
-/// entry, so the table holds at most one record per pair the guest has used, also for items
-/// the kernel dropped on its own (the watched file's last close) or changed through another
-/// descriptor of the set.
+/// replace or drop the data registered before. Committed records are indexed by their
+/// descriptor pair and go when the epoll descriptor is closed or reused (see [`forgotten`]).
 #[derive(Debug, Default)]
 pub struct Table(Mutex<Registrations>);
 
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 struct Registrations {
     data: HashMap<Handle, EpollData>,
     index: HashMap<(Fd, Fd), Handle>,
     next: u32,
 }
 
+struct Staged<'a> {
+    table: &'a Table,
+    handle: Option<Handle>,
+}
+
+impl Staged<'_> {
+    fn commit(mut self, epfd: Fd, fd: Fd) {
+        self.table.commit(epfd, fd, self.handle.take().unwrap());
+    }
+}
+
+impl Drop for Staged<'_> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle {
+            self.table.discard(handle);
+        }
+    }
+}
+
 impl Table {
     /// A copy for a fork child, whose epoll sets carry the same handles.
     pub(crate) fn fork(&self) -> Self {
-        Self(Mutex::new(self.0.lock().unwrap().clone()))
+        let regs = self.0.lock().unwrap();
+        Self(Mutex::new(Registrations {
+            data: regs
+                .index
+                .values()
+                .map(|handle| (*handle, regs.data[handle]))
+                .collect(),
+            index: regs.index.clone(),
+            next: regs.next,
+        }))
     }
 
     /// A fresh handle for `fd`.
@@ -100,13 +125,29 @@ impl Table {
         Handle(u64::from(fd.0 as u32) << 32 | u64::from(regs.next))
     }
 
-    /// Records `data` under `handle`, which the kernel's item for (`epfd`, `fd`) now carries.
-    fn set(&self, epfd: Fd, fd: Fd, handle: Handle, data: EpollData) {
+    /// Records `data` under the fresh `handle` before the kernel's item carries it: the item
+    /// can fire on another thread as soon as it exists, and an event whose data is missing
+    /// reads as mio's `Token(0)`, which tokio drops as its own wakeup.
+    fn stage(&self, handle: Handle, data: EpollData) -> Staged<'_> {
+        self.0.lock().unwrap().data.insert(handle, data);
+        Staged {
+            table: self,
+            handle: Some(handle),
+        }
+    }
+
+    /// Drops an uncommitted handle.
+    fn discard(&self, handle: Handle) {
+        self.0.lock().unwrap().data.remove(&handle);
+    }
+
+    /// The kernel's item for (`epfd`, `fd`) now carries the staged `handle`; the record
+    /// registered before goes.
+    fn commit(&self, epfd: Fd, fd: Fd, handle: Handle) {
         let mut regs = self.0.lock().unwrap();
         if let Some(old) = regs.index.insert((epfd, fd), handle) {
             regs.data.remove(&old);
         }
-        regs.data.insert(handle, data);
     }
 
     fn remove(&self, epfd: Fd, fd: Fd) {
@@ -207,14 +248,14 @@ pub(crate) async fn epoll_ctl<S: Syscalls + Control + 'static>(
                 data: LinuxData(handle.0.to_le_bytes()),
             };
             ptr = frame.mem.alloc(&linux)?;
-            registered = Some((handle, v1.data));
+            registered = Some(table.stage(handle, v1.data));
         }
         frame
             .syscalls
             .epoll_ctl(&frame.caller(), epfd, op, fd, ptr)
             .await?;
         match registered {
-            Some((handle, data)) => table.set(epfd, fd, handle, data),
+            Some(staged) => staged.commit(epfd, fd),
             None => table.remove(epfd, fd),
         }
         Ok(())
@@ -316,13 +357,20 @@ mod tests {
         let (set, dup, fd) = (Fd(4), Fd(8), Fd(5));
         let first = table.handle(fd);
         assert_eq!(first.fd(), fd);
-        table.set(dup, fd, first, data(1));
+        // Staged data is there before the kernel item that carries the handle exists.
+        let staged = table.stage(first, data(1));
+        assert_eq!(table.get(first), data(1));
+        assert_eq!(table.fork().get(first).data2, 0);
+        staged.commit(dup, fd);
+        let rejected = table.handle(fd);
+        drop(table.stage(rejected, data(2)));
+        assert_eq!(table.get(rejected).data2, 0);
         assert_eq!(table.get(first), data(1));
 
         // A MOD replaces the record: the old handle is gone, the new one has the new data.
         let second = table.handle(fd);
         assert_ne!(first, second);
-        table.set(dup, fd, second, data(2));
+        table.stage(second, data(2)).commit(dup, fd);
         assert_eq!(table.get(second), data(2));
         assert_eq!(
             table.get(first),
@@ -338,7 +386,7 @@ mod tests {
 
         // Registrations through another descriptor are separate index entries.
         let third = table.handle(fd);
-        table.set(set, fd, third, data(3));
+        table.stage(third, data(3)).commit(set, fd);
         table.remove(dup, fd);
         assert_eq!(table.get(second).data2, 0);
         assert_eq!(table.get(third), data(3));

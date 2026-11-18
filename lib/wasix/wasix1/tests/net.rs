@@ -402,6 +402,73 @@ fn epoll_keeps_v1_data() {
     assert_eq!(run("", body).0, 0);
 }
 
+/// A new item fires on the thread waiting in `epoll_wait` as soon as the kernel has it, before
+/// `epoll_ctl` returns: its v1 data must already be there. Without it the event came back with
+/// zero data (mio's `Token(0)`, which tokio drops as its own wakeup) and, edge-triggered, never
+/// again: a request already buffered on a freshly accepted socket was never read.
+#[test]
+fn epoll_data_is_there_when_a_new_item_fires() {
+    let wat = r#"(module
+      (import "env" "memory" (memory 1 1 shared))
+      (import "wasix_32v1" "thread_spawn_v2" (func $spawn (param i32 i32) (result i32)))
+      (import "wasix_32v1" "fd_event" (func $fd_event (param i64 i32 i32) (result i32)))
+      (import "wasix_32v1" "fd_close" (func $fd_close (param i32) (result i32)))
+      (import "wasix_32v1" "epoll_create" (func $epoll_create (param i32) (result i32)))
+      (import "wasix_32v1" "epoll_ctl" (func $epoll_ctl (param i32 i32 i32 i32) (result i32)))
+      (import "wasix_32v1" "epoll_wait" (func $epoll_wait (param i32 i32 i32 i64 i32) (result i32)))
+      (import "wasix_32v1" "proc_exit2" (func $exit (param i32)))
+      (import "wasi_snapshot_preview1" "sched_yield" (func $yield (result i32)))
+      ;; eventfd [0], epoll set [4], events with zero data [300], last data2 seen [304]
+      (func (export "wasi_thread_start") (param i32 i32)
+        (loop $again
+          (if (call $epoll_wait (i32.load (i32.const 4)) (i32.const 2000) (i32.const 1)
+                                (i64.const -1) (i32.const 2100))
+            (then (call $exit (i32.const 2))))
+          (if (i32.load (i32.const 2100))
+            (then
+              (if (i64.eqz (i64.load (i32.const 2024)))
+                (then (i32.atomic.store (i32.const 300) (i32.const 1))))
+              (i32.atomic.store (i32.const 304) (i32.wrap_i64 (i64.load (i32.const 2024))))
+              (drop (memory.atomic.notify (i32.const 304) (i32.const 1)))))
+          (br $again)))
+      (func (export "_start")
+        (local $i i32)
+        (local $observed i32)
+        (if (call $epoll_create (i32.const 4)) (then (call $exit (i32.const 1))))
+        (if (call $spawn (i32.const 100) (i32.const 104)) (then (call $exit (i32.const 1))))
+        (local.set $i (i32.const 1))
+        (loop $iter
+          ;; the waiter parks in epoll_wait
+          (drop (call $yield))
+          (drop (call $yield))
+          ;; a ready eventfd, added EPOLLIN | EPOLLET with data2 = i, as mio adds an accepted
+          ;; socket whose request is already buffered
+          (if (call $fd_event (i64.const 1) (i32.const 0) (i32.const 0)) (then (call $exit (i32.const 1))))
+          (i32.store (i32.const 1000) (i32.const 65))
+          (i32.store (i32.const 1012) (i32.load (i32.const 0)))
+          (i64.store (i32.const 1024) (i64.extend_i32_u (local.get $i)))
+          (if (call $epoll_ctl (i32.load (i32.const 4)) (i32.const 0) (i32.load (i32.const 0)) (i32.const 1000))
+            (then (call $exit (i32.const 1))))
+          ;; the waiter sees it with its data, within 5 seconds
+          (block $seen
+            (loop $wait
+              (local.set $observed (i32.atomic.load (i32.const 304)))
+              (br_if $seen (i32.eq (local.get $observed) (local.get $i)))
+              (if (i32.eq (memory.atomic.wait32 (i32.const 304) (local.get $observed)
+                                                (i64.const 5000000000)) (i32.const 2))
+                (then (br_if $seen (i32.eq (i32.atomic.load (i32.const 304)) (local.get $i)))
+                      (call $exit (i32.const 3))))
+              (br $wait)))
+          (if (i32.atomic.load (i32.const 300)) (then (call $exit (i32.const 4))))
+          (drop (call $epoll_ctl (i32.load (i32.const 4)) (i32.const 2) (i32.load (i32.const 0)) (i32.const 0)))
+          (drop (call $fd_close (i32.load (i32.const 0))))
+          (local.set $i (i32.add (local.get $i) (i32.const 1)))
+          (br_if $iter (i32.le_u (local.get $i) (i32.const 10000))))
+        (call $exit (i32.const 0))))"#;
+    let (status, _, err) = run_wasm(&wat::parse_str(wat).unwrap(), &["net"]);
+    assert_eq!(status, 0, "stderr: {err}");
+}
+
 /// A set used through two descriptors, as mio does (it registers through a `dup` of the set
 /// and waits on the original): events carry the data registered through either.
 #[test]
