@@ -619,6 +619,42 @@ fn atomic_waits() {
     assert_eq!(status(ATOMIC_WAITS), 0);
 }
 
+#[test]
+fn timed_futex_wait_reports_signal_as_spurious_wake() {
+    let wat = r#"
+(module
+  (import "env" "memory" (memory 1 1 shared))
+  (import "wasix_32v1" "callback_signal" (func $callback (param i32 i32)))
+  (import "wasix_32v1" "proc_raise_interval" (func $interval (param i32 i64 i32) (result i32)))
+  (import "wasix_32v1" "futex_wait" (func $wait (param i32 i32 i32 i32) (result i32)))
+  (import "wasix_32v1" "proc_exit2" (func $exit (param i32)))
+  (data (i32.const 16) "__wasm_signal")
+  (global $last (mut i32) (i32.const 0))
+  (func (export "__wasm_signal") (param $sig i32) (global.set $last (local.get $sig)))
+  (func (export "_start")
+    (call $callback (i32.const 16) (i32.const 13))
+    ;; SOME(10 seconds) and a sentinel next to the one-byte Bool.
+    (i32.store8 (i32.const 200) (i32.const 1))
+    (i64.store (i32.const 208) (i64.const 10000000000))
+    (i32.store16 (i32.const 300) (i32.const 0xa5ff))
+    (if (call $interval (i32.const 14) (i64.const 10000000) (i32.const 0))
+      (then (call $exit (i32.const 1))))
+    (if (call $wait (i32.const 400) (i32.const 0) (i32.const 200) (i32.const 300))
+      (then (call $exit (i32.const 2))))
+    (if (i32.ne (global.get $last) (i32.const 14)) (then (call $exit (i32.const 3))))
+    (if (i32.ne (i32.load16_u (i32.const 300)) (i32.const 0xa501))
+      (then (call $exit (i32.const 4))))
+    ;; With the one-shot alarm consumed, a 1 ms wait times out.
+    (i64.store (i32.const 208) (i64.const 1000000))
+    (if (call $wait (i32.const 400) (i32.const 0) (i32.const 200) (i32.const 300))
+      (then (call $exit (i32.const 5))))
+    (if (i32.ne (i32.load16_u (i32.const 300)) (i32.const 0xa500))
+      (then (call $exit (i32.const 6))))
+    (call $exit (i32.const 0))))
+"#;
+    assert_eq!(status(wat), 0);
+}
+
 /// A thread blocked in `memory.atomic.wait32` ends with its group: by `proc_exit2`, by the
 /// leader's `thread_exit`, or by a signal whose default action kills the process.
 #[test]

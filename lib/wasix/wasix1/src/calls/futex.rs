@@ -59,7 +59,12 @@ pub(crate) async fn futex_wait<S: Syscalls + Control + 'static>(
         {
             Ok(_) => true,
             Err(SysErr::Errno(Errno::ETIMEDOUT)) => false,
-            Err(SysErr::Errno(Errno::EAGAIN) | SysErr::Restart | SysErr::RestartNoHand) => true,
+            Err(
+                SysErr::Errno(Errno::EAGAIN)
+                | SysErr::Restart
+                | SysErr::RestartNoHand
+                | SysErr::RestartBlock,
+            ) => true,
             Err(err) => return Err(err.into()),
         };
         write_bool(frame, woken_out, woken).await
