@@ -226,11 +226,17 @@ impl PacketSocket {
         if state.pending.is_some() {
             return Ok(());
         }
+        let (protocol, _) = state.bound;
+        if protocol == 0 {
+            return Err(Errno::EAGAIN);
+        }
         let frames = match self.endpoint(state) {
             Err(Errno::EOPNOTSUPP) => return Err(Errno::EAGAIN),
             result => result?,
         };
-        let (protocol, _) = state.bound;
+        if !frames.poll(None).contains(PollMask::READABLE) {
+            return Err(Errno::EAGAIN);
+        }
         let index = self.net.network.as_ref().map_or(0, |n| n.packet_uplink());
         let mut buffer = vec![0; MAX_FRAME];
         loop {
@@ -240,7 +246,7 @@ impl PacketSocket {
             }
             let data = &buffer[..len];
             let ether = u16::from_be_bytes([data[12], data[13]]);
-            if protocol == 0 || (u16::from_be(protocol) != 3 && u16::from_be(protocol) != ether) {
+            if u16::from_be(protocol) != 3 && u16::from_be(protocol) != ether {
                 continue;
             }
             let pkttype = match kind {

@@ -616,7 +616,7 @@ build-capi-headless-ios:
 
 .PHONY: test-fixtures
 test-fixtures:
-	@test -f wasmer-test-files/examples/qjs.wasm || git submodule update --init --recursive --checkout -- wasmer-test-files
+	git submodule update --init --recursive --checkout -- wasmer-test-files
 
 # intentionally not using nextest as it runs tests in separate processes
 test-all: test-fixtures
