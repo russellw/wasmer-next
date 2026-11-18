@@ -10,7 +10,7 @@
 use wasixv2_abi::{
     CloneFlags, ConstKernelTimespecPtr, KernelTimespec, KernelTimespecPtr, S32Ptr, UlongArray,
 };
-use wasixv2_syscalls::{Control, Syscalls};
+use wasixv2_syscalls::{Control, SysErr, Syscalls};
 use wasmer::RuntimeError;
 
 use crate::{
@@ -135,7 +135,11 @@ pub(crate) async fn thread_join<S: Syscalls + Control + 'static>(
             frame
                 .syscalls
                 .wait_thread_completion(&frame.caller(), completion)
-                .await?;
+                .await
+                .map_err(|err| match err {
+                    SysErr::RestartNoHand => SysErr::RestartNoIntr,
+                    err => err,
+                })?;
         }
         Ok(())
     })

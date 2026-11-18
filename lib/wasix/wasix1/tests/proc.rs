@@ -331,6 +331,42 @@ fn thread_join_waits_for_the_spawned_thread_and_allows_unknown_tids() {
     );
 }
 
+#[test]
+fn thread_join_repolls_after_a_handled_signal() {
+    assert_eq!(
+        status(
+            r#"
+(module
+  (import "env" "memory" (memory 1 1 shared))
+  (import "wasix_32v1" "callback_signal" (func $callback (param i32 i32)))
+  (import "wasix_32v1" "thread_spawn_v2" (func $spawn (param i32 i32) (result i32)))
+  (import "wasix_32v1" "thread_signal" (func $signal (param i32 i32) (result i32)))
+  (import "wasix_32v1" "thread_join" (func $join (param i32) (result i32)))
+  (import "wasix_32v1" "thread_sleep" (func $sleep (param i64) (result i32)))
+  (import "wasix_32v1" "proc_exit2" (func $exit (param i32)))
+  (data (i32.const 16) "__wasm_signal")
+  (func (export "__wasm_signal") (param $sig i32)
+    (if (i32.ne (local.get $sig) (i32.const 10)) (then (call $exit (i32.const 1))))
+    (i32.atomic.store (i32.const 200) (i32.const 1))
+    (drop (memory.atomic.notify (i32.const 200) (i32.const 1))))
+  (func (export "wasi_thread_start") (param i32 i32)
+    ;; Give main time to enter the join, then wait for its callback before completing.
+    (drop (call $sleep (i64.const 10000000)))
+    (if (call $signal (i32.const 1073741823) (i32.const 10)) (then (call $exit (i32.const 2))))
+    (drop (memory.atomic.wait32 (i32.const 200) (i32.const 0) (i64.const 2000000000)))
+    (if (i32.eqz (i32.atomic.load (i32.const 200))) (then (call $exit (i32.const 3))))
+    (i32.atomic.store (i32.const 204) (i32.const 37)))
+  (func (export "_start")
+    (call $callback (i32.const 16) (i32.const 13))
+    (if (call $spawn (i32.const 100) (i32.const 104)) (then (call $exit (i32.const 4))))
+    (if (call $join (i32.load (i32.const 104))) (then (call $exit (i32.const 5))))
+    (if (i32.ne (i32.atomic.load (i32.const 204)) (i32.const 37)) (then (call $exit (i32.const 6))))))
+"#
+        ),
+        0
+    );
+}
+
 /// Before libc names its callback, signals take their default action.
 #[test]
 fn signals_before_the_callback_terminate() {
