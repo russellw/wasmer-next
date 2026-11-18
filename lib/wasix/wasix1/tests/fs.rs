@@ -301,10 +301,9 @@ fn descriptor_rights_reduce_independently_and_deny_path_effects_before_creation(
     (call $check (i32.const 16) (call $open (local.get $dir) (i32.const 1) (i32.const 1032) (i32.const 7) (i32.const 1) (i64.const {read}) (i64.const 0) (i32.const 0) (i32.const 32)) (i32.const 2))
     (call $check (i32.const 17) (call $stat (i32.const 3) (i32.const 1) (i32.const 1028) (i32.const 11) (i32.const 256)) (i32.const 44))
     (call $check (i32.const 18) (call $open (local.get $dir) (i32.const 1) (i32.const 1039) (i32.const 2) (i32.const 0) (i64.const {write}) (i64.const 0) (i32.const 0) (i32.const 32)) (i32.const 76))
-    ;; Replacing an actual preopen with an ordinary file must clear its close exemption.
-    (call $check (i32.const 19) (call $renumber (i32.const 20) (i32.const 3)) (i32.const 0))
-    (call $check (i32.const 20) (call $close (i32.const 3)) (i32.const 0))
-    (call $check (i32.const 21) (call $get (i32.const 3) (i32.const 128)) (i32.const 8))
+    (call $check (i32.const 19) (call $renumber (i32.const 20) (local.get $fd)) (i32.const 0))
+    (call $check (i32.const 20) (call $close (local.get $fd)) (i32.const 0))
+    (call $check (i32.const 21) (call $get (local.get $fd) (i32.const 128)) (i32.const 8))
     (call $exit (i32.const 0))))
 "#,
         file = read | write,
@@ -789,11 +788,11 @@ fn snapshot0_layouts() {
     assert_eq!(run(&guest("wasi_unstable", data, &body)).0, 0);
 }
 
-/// `fd_renumber` copies (v1's `dup2`). Closing a preopen succeeds and leaves it open, as
-/// under v1, until another file is renumbered onto it.
+/// `fd_renumber` copies (v1's `dup2`). Preopens survive both close and attempted replacement.
 #[test]
 fn renumber_and_preopens() {
     let data = r#"
+  (import "wasi_snapshot_preview1" "fd_prestat_dir_name" (func $name (param i32 i32 i32) (result i32)))
   (data (i32.const 1024) "tmp")
 "#;
     let body = r#"
@@ -812,11 +811,17 @@ fn renumber_and_preopens() {
     (call $ok (i32.const 10) (call $path_filestat_get (i32.const 3) (i32.const 1) (i32.const 1024) (i32.const 3) (i32.const 64)))
     (call $eq (i32.const 11) (i32.load8_u (i32.const 80)) (i32.const 3))
     (call $ok (i32.const 12) (call $fd_prestat_get (i32.const 5) (i32.const 64)))
-    ;; stdout renumbered onto 5: no preopen any more, and closing it closes it
-    (call $ok (i32.const 13) (call $fd_renumber (i32.const 1) (i32.const 5)))
-    (call $eq (i32.const 14) (call $fd_prestat_get (i32.const 5) (i32.const 64)) (i32.const 8))
-    (call $ok (i32.const 15) (call $fd_close (i32.const 5)))
-    (call $eq (i32.const 16) (call $fd_close (i32.const 5)) (i32.const 8))
+    (call $ok (i32.const 13) (call $name (i32.const 5) (i32.const 96) (i32.const 1)))
+    (call $eq (i32.const 14) (i32.load8_u (i32.const 96)) (i32.const 47))
+    (call $ok (i32.const 15) (call $fd_renumber (i32.const 5) (i32.const 5)))
+    (call $eq (i32.const 16) (call $fd_renumber (i32.const 1) (i32.const 5)) (i32.const 58))
+    (call $ok (i32.const 17) (call $name (i32.const 5) (i32.const 97) (i32.const 1)))
+    (call $eq (i32.const 18) (i32.load8_u (i32.const 97)) (i32.load8_u (i32.const 96)))
+    (call $ok (i32.const 19) (call $path_filestat_get (i32.const 5) (i32.const 1) (i32.const 1024) (i32.const 3) (i32.const 64)))
+    ;; Replacing and closing an ordinary slot still works.
+    (call $ok (i32.const 20) (call $fd_renumber (i32.const 0) (i32.const 10)))
+    (call $ok (i32.const 21) (call $fd_close (i32.const 10)))
+    (call $eq (i32.const 22) (call $fd_close (i32.const 10)) (i32.const 8))
 "#;
     assert_eq!(run(&guest(PREVIEW1, data, body)).0, 0);
 }

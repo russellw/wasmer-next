@@ -808,8 +808,12 @@ pub(crate) async fn fd_renumber<S: Syscalls + Control + 'static>(
                 .get(Fd(to))
                 .and_then(|entry| entry.attachment.as_ref())
                 .and_then(|attachment| attachment.downcast_ref::<crate::rights::Record>())
-                .and_then(|record| record.legacy.as_ref())
-                .is_some_and(|object| !object.stdio)
+                .is_some_and(|record| {
+                    record
+                        .legacy
+                        .as_ref()
+                        .map_or(record.preopen, |object| !object.stdio)
+                })
         {
             return shim::fail(Errno::NOTSUP);
         }
