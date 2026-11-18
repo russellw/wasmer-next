@@ -53,7 +53,7 @@ fn run(wasm: &[u8]) -> (i32, Vec<u8>, Vec<u8>) {
 }
 
 /// The imports, memory and helpers every WAT guest here shares; `body` is the `_start` body
-/// and `data` its data segments (strings from 1024 up).
+/// and `data` supplies extra imports and data segments (strings from 1024 up).
 fn guest(module: &str, data: &str, body: &str) -> Vec<u8> {
     let wat = format!(
         r#"
@@ -89,8 +89,8 @@ fn guest(module: &str, data: &str, body: &str) -> Vec<u8> {
   (import "{module}" "path_readlink" (func $path_readlink (param i32 i32 i32 i32 i32 i32) (result i32)))
   (import "{module}" "fd_prestat_get" (func $fd_prestat_get (param i32 i32) (result i32)))
   (import "{module}" "proc_exit" (func $proc_exit (param i32)))
-  (memory (export "memory") 1)
   {data}
+  (memory (export "memory") 1)
   ;; Exits with `step` unless `errno` is 0.
   (func $ok (param $step i32) (param $errno i32)
     (if (local.get $errno) (then (call $proc_exit (local.get $step)))))
@@ -831,6 +831,65 @@ fn stdio_and_pipe_stat_types() {
         .join()
         .unwrap();
     assert_eq!(status, 0);
+}
+
+#[test]
+fn sock_addr_local_writes_legacy_ip_address() {
+    let data = r#"
+    (import "wasix_32v1" "sock_open" (func $open (param i32 i32 i32 i32) (result i32)))
+    (import "wasix_32v1" "sock_bind" (func $bind (param i32 i32) (result i32)))
+    (import "wasix_32v1" "sock_addr_local" (func $local (param i32 i32) (result i32)))
+    ;; 127.0.0.1 and ::1, port 8080 in host order.
+    (data (i32.const 1024) "\01\00\90\1f\7f\00\00\01")
+    (data (i32.const 1152) "\02\00\90\1f\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\01")
+    "#;
+    let body = r#"
+    (call $ok (i32.const 1) (call $open (i32.const 1) (i32.const 1) (i32.const 6) (i32.const 0)))
+    (call $ok (i32.const 2) (call $bind (i32.load (i32.const 0)) (i32.const 1024)))
+    ;; The 20-byte result fits at the end of the page. Port bytes are 1f 90.
+    (call $ok (i32.const 3) (call $local (i32.load (i32.const 0)) (i32.const 65516)))
+    (call $eq (i32.const 4) (i32.load (i32.const 65516)) (i32.const 0x901f0001))
+    (call $eq (i32.const 5) (i32.load (i32.const 65520)) (i32.const 0x0100007f))
+    (call $ok (i32.const 6) (call $open (i32.const 2) (i32.const 1) (i32.const 6) (i32.const 4)))
+    (call $ok (i32.const 7) (call $bind (i32.load (i32.const 4)) (i32.const 1152)))
+    (call $ok (i32.const 8) (call $local (i32.load (i32.const 4)) (i32.const 65516)))
+    (call $eq (i32.const 9) (i32.load (i32.const 65516)) (i32.const 0x901f0002))
+    (call $eq64 (i32.const 10) (i64.load (i32.const 65520)) (i64.const 0))
+    (call $eq64 (i32.const 11) (i64.load (i32.const 65528)) (i64.const 0x0100000000000000))
+    "#;
+    assert_eq!(run(&guest("wasix_32v1", data, body)).0, 0);
+}
+
+#[test]
+fn sock_accept_v2_preserves_fd_beside_legacy_peer_address() {
+    let data = r#"
+    (import "wasix_32v1" "sock_open" (func $open (param i32 i32 i32 i32) (result i32)))
+    (import "wasix_32v1" "sock_bind" (func $bind (param i32 i32) (result i32)))
+    (import "wasix_32v1" "sock_listen" (func $listen (param i32 i32) (result i32)))
+    (import "wasix_32v1" "sock_connect" (func $connect (param i32 i32) (result i32)))
+    (import "wasix_32v1" "sock_accept_v2" (func $accept (param i32 i32 i32 i32) (result i32)))
+    (import "wasix_32v1" "sock_status" (func $status (param i32 i32) (result i32)))
+    (data (i32.const 1024) "\01\00\90\1f\7f\00\00\01")
+    "#;
+    let body = r#"
+    (local $fd i32)
+    (call $ok (i32.const 1) (call $open (i32.const 1) (i32.const 1) (i32.const 6) (i32.const 0)))
+    (call $ok (i32.const 2) (call $bind (i32.load (i32.const 0)) (i32.const 1024)))
+    (call $ok (i32.const 3) (call $listen (i32.load (i32.const 0)) (i32.const 1)))
+    (call $ok (i32.const 4) (call $open (i32.const 1) (i32.const 1) (i32.const 6) (i32.const 4)))
+    (call $ok (i32.const 5) (call $connect (i32.load (i32.const 4)) (i32.const 1024)))
+    ;; The accepted fd immediately follows the 20-byte peer address.
+    (call $ok (i32.const 6) (call $accept (i32.load (i32.const 0)) (i32.const 0) (i32.const 148) (i32.const 128)))
+    (call $eq (i32.const 7) (i32.load16_u (i32.const 128)) (i32.const 1))
+    (call $eq (i32.const 8) (i32.load (i32.const 132)) (i32.const 0x0100007f))
+    (local.set $fd (i32.load (i32.const 148)))
+    ;; Frozen libc uses fdstat for SO_TYPE when Python wraps the accepted fd.
+    (call $ok (i32.const 9) (call $fd_fdstat_get (local.get $fd) (i32.const 32)))
+    (call $eq (i32.const 10) (i32.load8_u (i32.const 32)) (i32.const 6))
+    (call $ok (i32.const 11) (call $status (local.get $fd) (i32.const 64)))
+    (call $eq (i32.const 12) (i32.load8_u (i32.const 64)) (i32.const 1))
+    "#;
+    assert_eq!(run(&guest("wasix_32v1", data, body)).0, 0);
 }
 
 /// The `wasix_32v1` descriptor calls: pipes, dup, descriptor flags, `path_open2`, cwd.

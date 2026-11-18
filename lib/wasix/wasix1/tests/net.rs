@@ -117,6 +117,10 @@ const PRELUDE: &str = r#"
   ;; Exits with `code` unless `cond` holds.
   (func $assert (param $cond i32) (param $code i32)
     (if (i32.eqz (local.get $cond)) (then (call $exit (local.get $code)))))
+  ;; Reuse an IP address result as input by converting the port to host order.
+  (func $input_port (param $addr i32) (result i32)
+    (i32.or (i32.shl (i32.load8_u offset=2 (local.get $addr)) (i32.const 8))
+            (i32.load8_u offset=3 (local.get $addr))))
   ;; Writes `len` bytes at `ptr` to stdout, through the iovec at 4080.
   (func $print (param $ptr i32) (param $len i32)
     (i32.store (i32.const 4080) (local.get $ptr))
@@ -166,7 +170,7 @@ fn tcp_loopback_echo() {
     (call $assert (i32.ne (i32.load16_u (i32.const 1202)) (i32.const 0)) (i32.const 41))
     (call $assert (i32.eq (i32.load (i32.const 1204)) (i32.const 0x0100007f)) (i32.const 42))
     ;; client at [4] connects to the listener's port
-    (i32.store16 (i32.const 1026) (i32.load16_u (i32.const 1202)))
+    (i32.store16 (i32.const 1026) (call $input_port (i32.const 1200)))
     (call $ok (call $sock_open (i32.const 1) (i32.const 1) (i32.const 6) (i32.const 4)) (i32.const 5))
     (call $ok (call $sock_connect (i32.load (i32.const 4)) (i32.const 1024)) (i32.const 6))
     ;; the connection at [8]; its peer is the client
@@ -219,6 +223,7 @@ fn udp_send_to_recv_from() {
     (call $ok (call $sock_open (i32.const 1) (i32.const 2) (i32.const 17) (i32.const 0)) (i32.const 1))
     (call $ok (call $sock_bind (i32.load (i32.const 0)) (i32.const 1024)) (i32.const 2))
     (call $ok (call $sock_addr_local (i32.load (i32.const 0)) (i32.const 1200)) (i32.const 3))
+    (i32.store16 (i32.const 1202) (call $input_port (i32.const 1200)))
     (call $ok (call $sock_open (i32.const 1) (i32.const 2) (i32.const 17) (i32.const 4)) (i32.const 4))
     (call $ok (call $sock_bind (i32.load (i32.const 4)) (i32.const 1024)) (i32.const 5))
     (call $ok (call $sock_addr_local (i32.load (i32.const 4)) (i32.const 2400)) (i32.const 6))
@@ -241,6 +246,7 @@ fn udp_send_to_recv_from() {
     (call $ok (call $sock_open (i32.const 1) (i32.const 2) (i32.const 17) (i32.const 20)) (i32.const 18))
     (call $ok (call $sock_bind (i32.load (i32.const 20)) (i32.const 1024)) (i32.const 19))
     (call $ok (call $sock_addr_local (i32.load (i32.const 20)) (i32.const 2600)) (i32.const 20))
+    (i32.store16 (i32.const 2602) (call $input_port (i32.const 2600)))
     (call $ok (call $fd_close (i32.load (i32.const 20))) (i32.const 21))
     (call $ok (call $sock_connect (i32.load (i32.const 4)) (i32.const 2600)) (i32.const 22))
     (call $ok (call $sock_send (i32.load (i32.const 4)) (i32.const 1600) (i32.const 1) (i32.const 0) (i32.const 8)) (i32.const 23))
@@ -418,6 +424,7 @@ fn compat_timeouts() {
     (call $ok (call $sock_open (i32.const 1) (i32.const 1) (i32.const 6) (i32.const 0)) (i32.const 1))
     (call $ok (call $sock_bind (i32.load (i32.const 0)) (i32.const 1024)) (i32.const 2))
     (call $ok (call $sock_addr_local (i32.load (i32.const 0)) (i32.const 1200)) (i32.const 3))
+    (i32.store16 (i32.const 1202) (call $input_port (i32.const 1200)))
     (call $ok (call $fd_close (i32.load (i32.const 0))) (i32.const 4))
     (call $ok (call $sock_open (i32.const 1) (i32.const 1) (i32.const 6) (i32.const 4)) (i32.const 5))
     (call $ok (call $set_time (i32.load (i32.const 4)) (i32.const 21) (i32.const 1000)) (i32.const 6))

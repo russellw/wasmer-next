@@ -18,7 +18,7 @@ use wasmer::RuntimeError;
 
 use crate::{
     abi::{
-        Errno,
+        Errno, GuestLayout,
         fs::Fdflags,
         sock::{
             AddrPort, Addressfamily, RiFlags, RoFlags, Sdflags, SiFlags, SockAddr, SockStatus,
@@ -52,6 +52,8 @@ impl State {
 
 /// Room for any `sockaddr` the kernel returns (`sockaddr_un` is the largest, 110 bytes).
 const SOCKADDR_ROOM: u32 = 128;
+
+const LEGACY_IP_ADDR_PORT_SIZE: usize = 20;
 
 /// The Linux address family for a v1 one.
 pub(crate) fn family(af: Addressfamily) -> V1Result<AddressFamily> {
@@ -185,6 +187,26 @@ async fn sockaddr_in<S: Syscalls + Control + 'static>(
     let bytes = to_linux(&addr)?;
     let slice = frame.mem.alloc_bytes(&bytes)?;
     Ok((GuestPtr::new(slice.addr), slice.len))
+}
+
+/// v1's IP outputs fit the original 20-byte address union, with a network-order port.
+async fn write_addr_port<S: Syscalls + Control + 'static>(
+    frame: &Frame<'_, S>,
+    ptr: i32,
+    addr: &SockAddr,
+) -> V1Result<()> {
+    let mut out = AddrPort::encode(addr);
+    let len = match addr {
+        SockAddr::Inet(addr) => {
+            out.payload[..2].copy_from_slice(&addr.port().to_be_bytes());
+            LEGACY_IP_ADDR_PORT_SIZE
+        }
+        SockAddr::Unspec => LEGACY_IP_ADDR_PORT_SIZE,
+        SockAddr::Unix(_) => AddrPort::SIZE,
+    };
+    let mut bytes = [0; AddrPort::SIZE];
+    out.write_to(&mut bytes);
+    frame.write_bytes(ptr as u32, &bytes[..len]).await
 }
 
 /// Scratch room for a `sockaddr` the kernel writes, and its length in and out.
@@ -383,7 +405,7 @@ pub(crate) async fn sock_accept_v2<S: Syscalls + Control + 'static>(
     shim::errno(&env, async |frame| {
         let (new, peer) = accept(frame, fd, fdflags).await?;
         frame.write(ro_fd as u32, &(new.0 as u32)).await?;
-        frame.write(ro_addr as u32, &AddrPort::encode(&peer)).await
+        write_addr_port(frame, ro_addr, &peer).await
     })
     .await
 }
@@ -581,7 +603,7 @@ pub(crate) async fn sock_recv_from<S: Syscalls + Control + 'static>(
         let (n, flags, peer) = recv(frame, fd, iovs, iovs_len, ri_flags, true).await?;
         frame.write(ro_datalen as u32, &n).await?;
         frame.write(ro_flags as u32, &flags).await?;
-        frame.write(ro_addr as u32, &AddrPort::encode(&peer)).await
+        write_addr_port(frame, ro_addr, &peer).await
     })
     .await
 }
@@ -705,9 +727,7 @@ pub(crate) async fn sock_addr_local<S: Syscalls + Control + 'static>(
             .syscalls
             .getsockname(&frame.caller(), Fd(fd), out.addr, out.len)
             .await?;
-        frame
-            .write(ro_addr as u32, &AddrPort::encode(&out.take(frame)))
-            .await
+        write_addr_port(frame, ro_addr, &out.take(frame)).await
     })
     .await
 }
@@ -720,7 +740,7 @@ pub(crate) async fn sock_addr_peer<S: Syscalls + Control + 'static>(
     shim::errno(&env, async |frame| {
         crate::rights::require(frame, &[(wasixv2_abi::Fd(fd), Rights::empty())]).await?;
         let peer = peer_name(frame, Fd(fd)).await?;
-        frame.write(ro_addr as u32, &AddrPort::encode(&peer)).await
+        write_addr_port(frame, ro_addr, &peer).await
     })
     .await
 }

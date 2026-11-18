@@ -325,7 +325,7 @@ impl AddrPort {
         })
     }
 
-    /// `addr` as v1 reports it. A unix path keeps a NUL after it, as wasix-libc expects.
+    /// `addr` in the extended layout. IP syscall results use the legacy layout instead.
     pub fn encode(addr: &SockAddr) -> Self {
         let mut out = Self::ZERO;
         let p = &mut out.payload;
