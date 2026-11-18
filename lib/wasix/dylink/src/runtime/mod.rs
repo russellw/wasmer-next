@@ -1868,7 +1868,8 @@ impl<S: Syscalls + Control + Send + Sync + 'static> AbiInstance<S> for StoreImag
 
     fn function_cacheable(&self, function: u32) -> bool {
         !self.root.graph().closures.slots.contains_key(&function)
-            && self.inner.function_cacheable(function)
+            && (self.root.policy.cache_library_signatures()
+                || self.inner.function_cacheable(function))
     }
 
     fn closure_allocate<'a>(

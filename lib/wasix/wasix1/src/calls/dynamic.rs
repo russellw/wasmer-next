@@ -121,6 +121,9 @@ impl wasixv2_dylink::LoadPolicy for Policy {
     fn resident_handles(&self) -> bool {
         true
     }
+    fn cache_library_signatures(&self) -> bool {
+        true
+    }
     fn mapped_memory(&self) -> bool {
         false
     }

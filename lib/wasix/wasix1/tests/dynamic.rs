@@ -611,6 +611,33 @@ fn dynamic_function_capabilities_use_the_composed_instances_actual_table() {
 }
 
 #[test]
+fn legacy_pic_reflection_cache_flags() {
+    let body = r#"
+      (local $closure i32)
+      ;; CPython reflects with empty type buffers to get the counts and cache flag.
+      (call $check (call $reflect (global.get $table_base)
+        (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (call $at (i32.const 240)))
+        (i32.const 61) (i32.const 1)) ;; Overflow
+      (call $check (i32.load8_u (call $at (i32.const 240))) (i32.const 1) (i32.const 2))
+      (call $check (i32.load16_u (call $at (i32.const 242))) (i32.const 3) (i32.const 3))
+      (call $check (i32.load16_u (call $at (i32.const 244))) (i32.const 0) (i32.const 4))
+      (call $check (call $allocate (call $at (i32.const 224))) (i32.const 0) (i32.const 5))
+      (local.set $closure (i32.load (call $at (i32.const 224))))
+      (call $put_multi_types)
+      (call $check (call $prepare (global.get $table_base) (local.get $closure)
+        (call $at (i32.const 128)) (i32.const 1)
+        (call $at (i32.const 136)) (i32.const 1) (i32.const 1))
+        (i32.const 0) (i32.const 6))
+      (call $check (call $reflect (local.get $closure)
+        (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (call $at (i32.const 240)))
+        (i32.const 61) (i32.const 7))
+      (call $check (i32.load8_u (call $at (i32.const 240))) (i32.const 0) (i32.const 8))
+    "#;
+    let main = closure_main(body, CLOSURE_BACKING, "");
+    assert_eq!(run("reflection-cache", &main, &[]), 0);
+}
+
+#[test]
 fn startup_and_recursive_side_constructor_batches_run_once_in_dependency_order() {
     let main = main_image(
         r#"

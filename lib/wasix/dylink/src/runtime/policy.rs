@@ -47,6 +47,10 @@ pub trait LoadPolicy: Send + Sync + 'static {
     fn resident_handles(&self) -> bool {
         false
     }
+    /// Use the v1 reflection contract for slots outside the closure pool.
+    fn cache_library_signatures(&self) -> bool {
+        false
+    }
     /// Whether a request's exact guest name, rather than inode identity, is its
     /// resident-library key. Independent from native global/local scopes.
     fn reuse_by_name(&self) -> bool {
