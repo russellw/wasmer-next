@@ -1984,6 +1984,7 @@ mod tests {
                 imports: wasmer::Imports::new(),
                 abi_imports: None,
                 hooks: None,
+                loader: Arc::new(crate::Compile),
                 cleanup: None,
                 task: TaskId(1),
                 work: Arc::new(wasixv2_syscalls::WorkFlag::always()),

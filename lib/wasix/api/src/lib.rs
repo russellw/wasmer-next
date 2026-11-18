@@ -2971,6 +2971,31 @@ mod tests {
         #[cfg(not(target_os = "windows"))]
         #[tokio::test]
         async fn dylink_cache_reuses_preparation_across_machines_and_isolates_engines() {
+            #[derive(Default)]
+            struct CountingLoader(Mutex<Vec<wasmer::EngineId>>);
+
+            impl Loader for CountingLoader {
+                fn load<'a>(
+                    &'a self,
+                    _: &'a Engine,
+                    _: &'a Image,
+                ) -> LocalFuture<'a, Result<(Engine, Module), LoadError>> {
+                    panic!("the executable was already compiled")
+                }
+
+                fn load_side_module<'a>(
+                    &'a self,
+                    host: &'a dyn Host,
+                    engine: &'a Engine,
+                    key: wasmer_types::ModuleHash,
+                    bytes: Vec<u8>,
+                ) -> LocalFuture<'a, Result<Module, LoadError>> {
+                    self.0.lock().unwrap().push(engine.id());
+                    Compile.load_side_module(host, engine, key, bytes)
+                }
+            }
+
+            let loader = Arc::new(CountingLoader::default());
             let engine = Engine::default();
             let other_engine = wasmer::sys::EngineBuilder::new(wasmer::sys::Cranelift::default())
                 .set_features(Some(wasmer::sys::Features::all()))
@@ -3005,7 +3030,7 @@ mod tests {
             }));
             let disabled = Arc::new(DylinkCache::new(DylinkCacheConfig::default()));
             let run = async |cache: Option<Arc<DylinkCache>>, engine: &Engine, module: &Module| {
-                let mut builder = Machine::builder();
+                let mut builder = Machine::builder().loader(loader.clone());
                 if let Some(cache) = cache {
                     builder = builder.dylink_cache(cache);
                 }
@@ -3038,6 +3063,10 @@ mod tests {
             run(Some(shared.clone()), &other_engine, &two).await;
             let different = shared.stats();
             assert_eq!((different.hits, different.misses), (3, 6));
+            assert_eq!(
+                *loader.0.lock().unwrap(),
+                [engine.id(), engine.id(), engine.id(), other_engine.id()]
+            );
         }
 
         #[tokio::test]

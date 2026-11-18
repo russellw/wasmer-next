@@ -269,6 +269,24 @@ impl Loader for CachedLoader {
             Ok((engine, module))
         })
     }
+
+    fn load_side_module<'a>(
+        &'a self,
+        host: &'a dyn wasixv2::Host,
+        engine: &'a Engine,
+        key: ModuleHash,
+        wasm: Vec<u8>,
+    ) -> LocalFuture<'a, Result<Module, LoadError>> {
+        Box::pin(async move {
+            let compiler = self.compiler.clone();
+            let engine = engine.clone();
+            let data = HashedModuleData::from_parts(key, wasm);
+            host.executor()
+                .run_blocking(move || futures::executor::block_on(compiler.compile(data, &engine)))
+                .await
+                .map_err(LoadError::other)
+        })
+    }
 }
 
 #[cfg(all(

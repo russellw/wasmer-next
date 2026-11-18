@@ -21,15 +21,7 @@ impl PreparedArtifact {
         engine: &impl AsEngineRef,
         initialization: Arc<Initialization>,
     ) -> Result<Self, RuntimeError> {
-        Self::compile_main_tls(engine, initialization, &BTreeMap::new())
-    }
-
-    pub(crate) fn compile_main_tls(
-        engine: &impl AsEngineRef,
-        initialization: Arc<Initialization>,
-        main_tls: &BTreeMap<u32, u32>,
-    ) -> Result<Self, RuntimeError> {
-        let bytes = Self::compiler_input(&initialization, main_tls)?;
+        let bytes = Self::compiler_input(&initialization, &BTreeMap::new())?;
         let module = Module::new(engine, bytes).map_err(error)?;
         Ok(Self::new(initialization, module))
     }

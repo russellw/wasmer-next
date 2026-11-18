@@ -25,7 +25,6 @@ tracing = { workspace = true, optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 async-lock = { version = "3.4.2", optional = true }
-wasmer-cache = { path = "../../cache", default-features = false, features = ["module-cache"], optional = true }
 loupe = { workspace = true, optional = true }
 # The persistent key reads compiler feature settings even in builds with no backend.
 wasmer-compiler = { workspace = true, features = ["artifact-size", "compiler"], optional = true }
@@ -48,7 +47,6 @@ js-sys.workspace = true
 default = ["sys"]
 sys = [
   "dep:async-lock",
-  "dep:wasmer-cache",
   "dep:loupe",
   "dep:wasmer-compiler",
   "dep:wasmer-vm",

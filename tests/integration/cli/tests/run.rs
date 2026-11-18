@@ -324,6 +324,72 @@ fn run_wasi_works_non_existent() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn run_side_module_hits_disk_cache_on_second_run() {
+    let files = TempDir::new().unwrap();
+    let cache = TempDir::new().unwrap();
+    let main = files.path().join("main.wasm");
+    let side = files.path().join("side.so");
+    std::fs::write(
+        &main,
+        wat::parse_str(
+            r#"(module
+                (@custom "dylink.0" "\01\05\80\04\00\00\00")
+                (import "env" "memory" (memory 1 65536 shared))
+                (import "env" "__indirect_function_table" (table 3 funcref))
+                (import "env" "__memory_base" (global $base i32))
+                (import "wasixv2" "dl_open" (func $open (param i32 i32 i32 i32 i32 i32 i32) (result i32)))
+                (import "wasixv2" "exit_group" (func $exit (param i32)))
+                (global (export "__stack_pointer") (mut i32) (i32.const 131072))
+                (export "__indirect_function_table" (table 0))
+                (data (global.get $base) "/lib/side.so\00")
+                (func (export "_start")
+                    (call $exit
+                        (call $open
+                            (global.get $base)
+                            (i32.const 2) ;; RTLD_NOW
+                            (i32.add (global.get $base) (i32.const 16))
+                            (i32.const 0)
+                            (i32.add (global.get $base) (i32.const 24))
+                            (i32.add (global.get $base) (i32.const 32))
+                            (i32.const 100)))))"#,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        &side,
+        wat::parse_str(
+            r#"(module
+                (@custom "dylink.0" "\01\05\80\04\00\00\00")
+                (import "env" "memory" (memory 1 65536 shared))
+                (func (export "side_value") (result i32) i32.const 17))"#,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+
+    let run = || {
+        wasmer_command()
+            .arg("run")
+            .arg(format!("--volume={}:/lib", files.path().display()))
+            .arg(&main)
+            .env("WASMER_CACHE_DIR", cache.path())
+            .env(
+                "RUST_LOG",
+                "wasmer_wasix::runtime::module_cache::filesystem=debug",
+            )
+            .assert()
+            .success()
+    };
+    // One cache entry each for the executable and the library.
+    run().stderr(contains("Saved to disk").count(2));
+    run()
+        .stderr(contains("Cache hit!").count(2))
+        .stderr(contains("Saved to disk").count(0));
+}
+
 const PYTHON_PACKAGE_WITH_VERSION: &str = "python/python@3.13.5";
 
 // The test would be very slow on Windows or macOS

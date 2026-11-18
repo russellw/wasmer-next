@@ -354,10 +354,18 @@ impl<S: Syscalls + Control + Send + Sync + 'static> StoreImage<S> {
                 lib.base = lease.address();
                 lock(&work.leases).push(lease);
             }
-            let engine = Context::Import(env)
-                .with(|_, store| store.engine().clone())
+            let (engine, loader, host) = Context::Import(env)
+                .with(|data, store| {
+                    (
+                        store.engine().clone(),
+                        data.loader().clone(),
+                        data.host().clone(),
+                    )
+                })
                 .await;
-            self.root.prepare_code(&engine, &mut graph).await?;
+            self.root
+                .prepare_code(host.as_ref(), loader.as_ref(), &engine, &mut graph)
+                .await?;
             let graph = Arc::new(graph);
             let mut references = lock(&self.root.state).references.clone();
             let count = references.entry(requested).or_default();

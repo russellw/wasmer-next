@@ -25,9 +25,8 @@ impl HashedModuleData {
 
     /// Retain immutable bytes with their trusted precomputed cache key.
     ///
-    /// The caller must supply the hash of these exact bytes. This constructor
-    /// does not hash or validate them, so it also supports signed package atom
-    /// digests without reading the atom again.
+    /// The key must identify these exact bytes and may include compilation settings.
+    /// This constructor does not hash or validate the bytes.
     pub fn from_parts(hash: ModuleHash, wasm: impl Into<OwnedBuffer>) -> Self {
         Self {
             hash,

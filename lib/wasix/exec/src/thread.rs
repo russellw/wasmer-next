@@ -479,7 +479,7 @@ where
             ),
         );
         env.as_mut(&mut store).cleanup = Some(cleanup.shared().clone());
-        self.abis.install_hooks(&mut store.as_store_mut(), &env);
+        self.abis.configure_env(&mut store.as_store_mut(), &env);
         let mut imports = crate::imports(&*self.abi, &mut store.as_store_mut(), &env, &self.module);
         let memory = self.memory.clone().try_attach(&mut store)?;
         if let Some(import) = self.module.imports().memories().next() {

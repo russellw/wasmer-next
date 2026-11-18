@@ -9,7 +9,7 @@ use wasmer_types::{CompilationProgressCallback, ModuleHash};
 #[derive(Debug, thiserror::Error)]
 #[error("compile error: {error:?}")]
 pub struct ModuleCompileError {
-    /// Hash of the bytes passed to the compiler.
+    /// Cache key for the bytes passed to the compiler.
     pub module_hash: ModuleHash,
     /// Original compiler failure.
     pub error: wasmer::CompileError,
@@ -18,7 +18,8 @@ pub struct ModuleCompileError {
 /// Load or compile immutable module bytes through the configured module cache.
 ///
 /// `wasm_hash` must identify these exact compiler-input bytes, including any
-/// preparation and instrumentation. The supplied key is trusted, not recomputed.
+/// preparation and instrumentation, and may include compilation settings. The
+/// supplied key is trusted without recomputing it.
 #[tracing::instrument(target = "wasmer_wasix::runtime", level = "debug", skip_all)]
 pub async fn load_module(
     engine: &Engine,

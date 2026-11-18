@@ -7,9 +7,10 @@ use std::{
 };
 
 use async_lock::OnceCell;
+use wasixv2_exec::Loader;
+use wasixv2_host::Host;
 use wasixv2_syscalls::{Image, ImageId};
 use wasmer::{Engine, EngineId, MemoryStyle, Module};
-use wasmer_cache::module_cache::{ModuleCache, load_module};
 use wasmer_compiler::ArtifactCreate;
 use wasmer_types::ModuleHash;
 
@@ -121,43 +122,58 @@ struct Shared {
     changed: Condvar,
 }
 
-struct Persistent {
-    cache: Arc<dyn ModuleCache + Send + Sync>,
-    namespace: String,
+pub(super) fn side_key(
+    engine: &Engine,
+    input: ModuleHash,
+    memories: Option<&[MemoryStyle]>,
+    main_tls: &BTreeMap<u32, u32>,
+) -> ModuleHash {
+    let sys = engine.as_sys();
+    let target = sys.target();
+    let features = sys.inner().features().clone();
+    // Include compile settings outside the module cache's engine/format partition.
+    let configuration = (
+        engine.deterministic_id(),
+        engine.artifact_format(),
+        wasmer_types::MetadataHeader::CURRENT_VERSION,
+        target.triple(),
+        target.cpu_features(),
+        features,
+        memories,
+        main_tls,
+    );
+    ModuleHash::new(format!("wasixv2-side-v2 {input} {configuration:?}").as_bytes())
 }
 
-impl Persistent {
-    fn prepare(
-        &self,
-        engine: &Engine,
-        library: &Library,
-        memories: &[MemoryStyle],
-        main_tls: &BTreeMap<u32, u32>,
-    ) -> Result<(ModuleHash, Vec<u8>)> {
-        let bytes = PreparedArtifact::compiler_input(&library.initialization, main_tls)?;
-        let input = ModuleHash::new(&bytes);
-        let sys = engine.as_sys();
-        let target = sys.target();
-        let features = sys.inner().features().clone();
-        // Use the actual instrumented input, plus compile settings not captured by
-        // the cache's engine/format partition. The namespace covers custom middleware.
-        let configuration = (
-            &self.namespace,
-            engine.deterministic_id(),
-            engine.artifact_format(),
-            wasmer_types::MetadataHeader::CURRENT_VERSION,
-            target.triple(),
-            target.cpu_features(),
-            features,
-            memories,
-            main_tls,
-        );
-        let key = ModuleHash::new(format!("wasixv2-side-v1 {input} {configuration:?}").as_bytes());
-        Ok((key, bytes))
+/// Return the loader cache key and compiler input for a side-only image whose main TLS
+/// bindings are independent of the loaded graph. Call only for images classified by
+/// [`crate::is_side_only`]. Returns `None` if the engine is not native, a memory style
+/// cannot be determined, or an import could require main TLS relocation.
+pub fn prepare_side_for_prewarm(
+    engine: &Engine,
+    source: &[u8],
+) -> Result<Option<(ModuleHash, Vec<u8>)>> {
+    if !engine.is_sys() {
+        return Ok(None);
     }
+    let library = Library::new(source.to_vec(), None)?;
+    if library.metadata.imports().iter().any(|import| {
+        import.module == "GOT.mem" && matches!(import.ty, crate::ExternType::Global(_))
+    }) {
+        return Ok(None);
+    }
+    let Some(memories) = memory_styles(engine, &library) else {
+        return Ok(None);
+    };
+    let main_tls = BTreeMap::new();
+    let bytes = PreparedArtifact::compiler_input(&library.initialization, &main_tls)?;
+    Ok(Some((
+        side_key(engine, ModuleHash::new(&bytes), Some(&memories), &main_tls),
+        bytes,
+    )))
 }
 
-fn memory_styles(engine: &Engine, library: &Library) -> Option<Vec<MemoryStyle>> {
+pub(super) fn memory_styles(engine: &Engine, library: &Library) -> Option<Vec<MemoryStyle>> {
     let tunables = engine.as_sys().tunables();
     library
         .metadata
@@ -182,7 +198,6 @@ fn memory_styles(engine: &Engine, library: &Library) -> Option<Vec<MemoryStyle>>
 /// still use their own references to the parsed state.
 pub struct DylinkCache {
     shared: Arc<Shared>,
-    persistent: Option<Persistent>,
 }
 
 impl std::fmt::Debug for DylinkCache {
@@ -203,7 +218,6 @@ impl DylinkCache {
                 state: Mutex::default(),
                 changed: Condvar::new(),
             }),
-            persistent: None,
         };
         if cache.enabled()
             && let Some(idle) = config.time_to_idle.filter(|idle| !idle.is_zero())
@@ -214,60 +228,12 @@ impl DylinkCache {
         cache
     }
 
-    /// Use an embedder's trusted compiled-module cache for native side modules.
-    ///
-    /// The namespace must distinguish compiler and middleware settings that affect
-    /// artifacts but are not reflected in the engine's deterministic ID. Use the
-    /// same namespace on every node sharing compatible artifacts. Cache failures
-    /// fall back to local compilation. This works with a zero in-memory budget.
-    pub fn with_module_cache(
-        mut self,
-        cache: Arc<dyn ModuleCache + Send + Sync>,
-        namespace: impl Into<String>,
-    ) -> Self {
-        self.persistent = Some(Persistent {
-            cache,
-            namespace: namespace.into(),
-        });
-        self
-    }
-
-    /// Return the persistent key and compiler input for a side-only image whose
-    /// main TLS bindings are independent of the loaded graph. Call only for
-    /// images classified by [`crate::is_side_only`]. Returns `None` if the engine
-    /// has no cache configured or an import could require main TLS relocation.
-    pub fn prepare_side_for_prewarm(
-        &self,
-        engine: &Engine,
-        source: &[u8],
-    ) -> Result<Option<(ModuleHash, Vec<u8>)>> {
-        let Some(persistent) = self.persistent.as_ref().filter(|_| engine.is_sys()) else {
-            return Ok(None);
-        };
-        let library = Library::new(source.to_vec(), None)?;
-        if library.metadata.imports().iter().any(|import| {
-            import.module == "GOT.mem" && matches!(import.ty, crate::ExternType::Global(_))
-        }) {
-            return Ok(None);
-        }
-        let Some(memories) = memory_styles(engine, &library) else {
-            return Ok(None);
-        };
-        persistent
-            .prepare(engine, &library, &memories, &BTreeMap::new())
-            .map(Some)
-    }
-
     /// Takes a snapshot of preparation counters and current resident entries.
     pub fn stats(&self) -> DylinkCacheStats {
         lock(&self.shared.state).stats
     }
 
-    pub(super) fn active(&self) -> bool {
-        self.enabled() || self.persistent.is_some()
-    }
-
-    fn enabled(&self) -> bool {
+    pub(super) fn enabled(&self) -> bool {
         self.shared.config.max_bytes != 0 && self.shared.config.max_entries != Some(0)
     }
 
@@ -322,22 +288,17 @@ impl DylinkCache {
 
     pub(super) async fn prepare_code(
         &self,
+        host: &dyn Host,
+        loader: &dyn Loader,
         engine: &Engine,
         library: &Library,
         main_tls: &BTreeMap<u32, u32>,
     ) -> Result<Arc<PreparedArtifact>> {
-        let Some(memories) = memory_styles(engine, library) else {
-            return PreparedArtifact::compile_main_tls(
-                engine,
-                library.initialization.clone(),
-                main_tls,
-            )
-            .map(Arc::new);
-        };
-        let compile = || self.compile(engine, library, main_tls, &memories);
-        if !self.enabled() {
+        let memories = memory_styles(engine, library);
+        let compile = || super::compile_side(host, loader, engine, library, main_tls);
+        let Some(memories) = memories.filter(|_| self.enabled()) else {
             return compile().await;
-        }
+        };
         let (source, owner) = match library.backing.as_ref() {
             Some(image) if image.identity().is_some() => SourceKey::of(image),
             _ => (SourceKey::Copied(library.code_hash), None),
@@ -388,25 +349,6 @@ impl DylinkCache {
             unreachable!("only compiled modules use this cache key");
         };
         Ok(artifact.clone())
-    }
-
-    async fn compile(
-        &self,
-        engine: &Engine,
-        library: &Library,
-        main_tls: &BTreeMap<u32, u32>,
-        memories: &[MemoryStyle],
-    ) -> Result<Arc<PreparedArtifact>> {
-        let initialization = library.initialization.clone();
-        let Some(persistent) = &self.persistent else {
-            return PreparedArtifact::compile_main_tls(engine, initialization, main_tls)
-                .map(Arc::new);
-        };
-        let (key, bytes) = persistent.prepare(engine, library, memories, main_tls)?;
-        let module = load_module(engine, persistent.cache.as_ref(), key, &bytes, None)
-            .await
-            .map_err(super::failure)?;
-        Ok(Arc::new(PreparedArtifact::new(initialization, module)))
     }
 
     fn get_or_prepare(
@@ -651,24 +593,67 @@ mod tests {
     }
 
     #[cfg(feature = "engine-tests")]
+    struct DiskLoader {
+        cache: wasmer_cache::module_cache::FileSystemCache,
+        requests: AtomicUsize,
+    }
+
+    #[cfg(feature = "engine-tests")]
+    impl DiskLoader {
+        fn new(path: &std::path::Path) -> Self {
+            Self {
+                cache: wasmer_cache::module_cache::FileSystemCache::new(
+                    path,
+                    tokio::runtime::Handle::current(),
+                ),
+                requests: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[cfg(feature = "engine-tests")]
+    impl Loader for DiskLoader {
+        fn load<'a>(
+            &'a self,
+            _: &'a Engine,
+            _: &'a Image,
+        ) -> wasixv2_syscalls::LocalFuture<
+            'a,
+            std::result::Result<(Engine, Module), wasixv2_exec::LoadError>,
+        > {
+            panic!("prepared side input must not be loaded as an executable")
+        }
+
+        fn load_side_module<'a>(
+            &'a self,
+            _: &'a dyn Host,
+            engine: &'a Engine,
+            key: ModuleHash,
+            bytes: Vec<u8>,
+        ) -> wasixv2_syscalls::LocalFuture<'a, std::result::Result<Module, wasixv2_exec::LoadError>>
+        {
+            self.requests.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async move {
+                wasmer_cache::module_cache::load_module(engine, &self.cache, key, &bytes, None)
+                    .await
+                    .map_err(wasixv2_exec::LoadError::other)
+            })
+        }
+    }
+
+    #[cfg(feature = "engine-tests")]
     #[tokio::test]
     async fn persistent_side_module_survives_fresh_caches_and_engines() {
         use crate::artifact::tests::counting_engine;
-        use wasmer_cache::module_cache::FileSystemCache;
+        use crate::runtime::lease_cancellation_tests::QueueHost;
+        use wasmer_cache::module_cache::ModuleCache;
 
         let dir = tempfile::tempdir().unwrap();
-        let cache = |namespace| {
+        let cache = || {
             DylinkCache::new(DylinkCacheConfig {
                 max_bytes: 1024 * 1024,
                 ..Default::default()
             })
-            .with_module_cache(
-                Arc::new(FileSystemCache::new(
-                    dir.path(),
-                    tokio::runtime::Handle::current(),
-                )),
-                namespace,
-            )
         };
         let wasm = crate::tests::bytes(
             r#"(module
@@ -684,60 +669,50 @@ mod tests {
         let (engine, count) = counting_engine(None);
         let tls = BTreeMap::new();
 
-        let first = cache("compiler-v1");
-        let (key, bytes) = first
-            .prepare_side_for_prewarm(&engine, &wasm)
-            .unwrap()
-            .unwrap();
-        first.prepare_code(&engine, &library, &tls).await.unwrap();
+        let first = cache();
+        let loader = DiskLoader::new(dir.path());
+        let (key, bytes) = prepare_side_for_prewarm(&engine, &wasm).unwrap().unwrap();
+        for _ in 0..2 {
+            first
+                .prepare_code(&QueueHost, &loader, &engine, &library, &tls)
+                .await
+                .unwrap();
+        }
+        assert_eq!(loader.requests.load(Ordering::Relaxed), 1);
         assert_eq!(count.load(Ordering::Relaxed), 1);
-        let stored = first
-            .persistent
-            .as_ref()
-            .unwrap()
-            .cache
-            .load(key, &engine)
-            .await
-            .unwrap();
+        let stored = loader.cache.load(key, &engine).await.unwrap();
         assert_eq!(stored.info().hash, Some(ModuleHash::new(&bytes)));
-        drop((stored, first, engine));
+        drop((stored, first, engine, loader));
 
         let (engine, count) = counting_engine(None);
-        cache("compiler-v1")
-            .prepare_code(&engine, &library, &tls)
+        let loader = DiskLoader::new(dir.path());
+        cache()
+            .prepare_code(&QueueHost, &loader, &engine, &library, &tls)
             .await
             .unwrap();
+        assert_eq!(loader.requests.load(Ordering::Relaxed), 1);
         assert_eq!(count.load(Ordering::Relaxed), 0);
 
-        let features = engine.as_sys().inner().features().clone();
-        let mut other_features = features;
+        let mut other_features = engine.as_sys().inner().features().clone();
         other_features.multi_value = !other_features.multi_value;
         let (other_engine, other_count) = counting_engine(Some(other_features));
         assert_eq!(engine.deterministic_id(), other_engine.deterministic_id());
-        cache("compiler-v1")
-            .prepare_code(&other_engine, &library, &tls)
+        cache()
+            .prepare_code(&QueueHost, &loader, &other_engine, &library, &tls)
             .await
             .unwrap();
         assert_eq!(other_count.load(Ordering::Relaxed), 1);
-
-        let changed = cache("compiler-v2");
-        changed.prepare_code(&engine, &library, &tls).await.unwrap();
-        assert_eq!(count.load(Ordering::Relaxed), 1);
     }
 
     #[cfg(feature = "engine-tests")]
     #[tokio::test]
     async fn graph_dependent_tls_variants_cache_separately_and_skip_prewarm() {
         use crate::artifact::tests::counting_engine;
+        use crate::runtime::lease_cancellation_tests::QueueHost;
 
         let dir = tempfile::tempdir().unwrap();
-        let cache = DylinkCache::new(Default::default()).with_module_cache(
-            Arc::new(wasmer_cache::module_cache::FileSystemCache::new(
-                dir.path(),
-                tokio::runtime::Handle::current(),
-            )),
-            "test",
-        );
+        let loader = DiskLoader::new(dir.path());
+        let cache = DylinkCache::new(Default::default());
         let wasm = crate::tests::bytes(
             r#"(module
                 (import "env" "memory" (memory 1 4 shared))
@@ -750,19 +725,21 @@ mod tests {
         );
         assert!(crate::is_side_only(&wasm).unwrap());
         let (engine, count) = counting_engine(None);
-        assert!(
-            cache
-                .prepare_side_for_prewarm(&engine, &wasm)
-                .unwrap()
-                .is_none()
-        );
+        assert!(prepare_side_for_prewarm(&engine, &wasm).unwrap().is_none());
         let library = Library::new(wasm, None).unwrap();
         for offset in [4, 8, 4] {
             cache
-                .prepare_code(&engine, &library, &[(0, offset)].into())
+                .prepare_code(
+                    &QueueHost,
+                    &loader,
+                    &engine,
+                    &library,
+                    &[(0, offset)].into(),
+                )
                 .await
                 .unwrap();
         }
+        assert_eq!(loader.requests.load(Ordering::Relaxed), 3);
         assert_eq!(count.load(Ordering::Relaxed), 2);
     }
 

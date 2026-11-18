@@ -159,4 +159,29 @@ impl Loader for NativeLoader {
             Ok((engine, module))
         })
     }
+
+    fn load_side_module<'a>(
+        &'a self,
+        host: &'a dyn wasixv2::Host,
+        engine: &'a Engine,
+        key: ModuleHash,
+        wasm: Vec<u8>,
+    ) -> LocalFuture<'a, Result<Module, LoadError>> {
+        Box::pin(async move {
+            let cache = self.owner.cache.clone();
+            let engine = engine.clone();
+            host.executor()
+                .run_blocking(move || {
+                    futures::executor::block_on(load_module(
+                        &engine,
+                        cache.as_ref(),
+                        key,
+                        &wasm,
+                        None,
+                    ))
+                })
+                .await
+                .map_err(LoadError::other)
+        })
+    }
 }

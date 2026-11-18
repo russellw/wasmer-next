@@ -149,6 +149,7 @@ pub struct ExecEnv<S> {
     imports: Imports,
     abi_imports: Option<Imports>,
     hooks: Option<InstanceHooks>,
+    loader: Arc<dyn Loader>,
     cleanup: Option<Arc<wasixv2_host::LoaderCleanup>>,
     task: TaskId,
     /// `task`'s work flag, read on every return to the guest.
@@ -207,6 +208,7 @@ impl<S: Control> ExecEnv<S> {
             imports: Imports::new(),
             abi_imports: None,
             hooks: None,
+            loader: Arc::new(Compile),
             cleanup: None,
             page_access: syscalls.page_access(task),
             syscalls,
@@ -252,6 +254,11 @@ impl<S> ExecEnv<S> {
     /// The ordered custom binding hooks for this exact Store.
     pub fn instance_hooks(&self) -> Option<&InstanceHooks> {
         self.hooks.as_ref()
+    }
+
+    /// The machine's loader for executable images and prepared side modules.
+    pub fn loader(&self) -> &Arc<dyn Loader> {
+        &self.loader
     }
 
     pub fn loader_cleanup(&self) -> Option<&Arc<wasixv2_host::LoaderCleanup>> {

@@ -2,7 +2,7 @@
 #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
 mod cache;
 #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
-pub use cache::{DylinkCache, DylinkCacheConfig, DylinkCacheStats};
+pub use cache::{DylinkCache, DylinkCacheConfig, DylinkCacheStats, prepare_side_for_prewarm};
 #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
 pub use policy::compose_with_cache;
 mod closures;
@@ -28,8 +28,8 @@ use std::{
 };
 use wasixv2_abi::{Cstr, DlFlags, DlHandle, DlHandlePtr, Uptr, UptrPtr};
 use wasixv2_exec::{
-    Abi, AbiInstance, Entry, EntryReturn, ExecEnv, ExecError, PreparedImage, Role, Sigreturn,
-    VforkResume, Wasixv2,
+    Abi, AbiInstance, Entry, EntryReturn, ExecEnv, ExecError, Loader, PreparedImage, Role,
+    Sigreturn, VforkResume, Wasixv2,
 };
 use wasixv2_syscalls::{
     Caller, Control, Errno, LoaderAdmission, LoaderGate, LoaderPhase, LoaderReservation,
@@ -218,7 +218,49 @@ pub(crate) fn verify_compiled_source(module: &Module) -> Result<Vec<u8>> {
         Err(failure("dynamic image requires sys or js backend"))
     }
 }
-type ArtifactKey = (wasmer_types::ModuleHash, Vec<(u32, u32)>, String, String);
+async fn compile_side(
+    host: &dyn wasixv2_host::Host,
+    loader: &dyn Loader,
+    engine: &wasmer::Engine,
+    library: &Library,
+    main_tls: &BTreeMap<u32, u32>,
+) -> Result<Arc<crate::artifact::PreparedArtifact>> {
+    use crate::artifact::PreparedArtifact;
+    use wasmer_types::ModuleHash;
+
+    let initialization = library.initialization.clone();
+    let bytes = PreparedArtifact::compiler_input(&initialization, main_tls)?;
+    let hash = ModuleHash::new(&bytes);
+    #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+    let key = if engine.is_sys() {
+        let memories = cache::memory_styles(engine, library);
+        cache::side_key(engine, hash, memories.as_deref(), main_tls)
+    } else {
+        hash
+    };
+    #[cfg(not(all(feature = "sys", not(target_arch = "wasm32"))))]
+    let key = hash;
+    let module = loader
+        .load_side_module(host, engine, key, bytes)
+        .await
+        .map_err(failure)?;
+    #[cfg(feature = "sys")]
+    if engine.is_sys() && (module.sys_artifact().is_none() || module.info().hash != Some(hash)) {
+        return Err(failure(
+            "loader returned code for different side module input",
+        ));
+    }
+    Ok(Arc::new(PreparedArtifact::new(initialization, module)))
+}
+
+type ArtifactKey = (
+    wasmer_types::ModuleHash,
+    Vec<(u32, u32)>,
+    String,
+    String,
+    Option<wasmer::EngineId>,
+);
+
 struct Root {
     policy: Arc<dyn LoadPolicy>,
     #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
@@ -352,11 +394,15 @@ impl Root {
             }),
         })
     }
-    // V1's engine/format key keeps compiled code reusable across compatible stores.
-    // Source and validated plans are loader-owned; peers never reparse or compare bytes.
-    async fn prepare_code(&self, engine: &wasmer::Engine, graph: &mut Graph) -> Result<()> {
-        use crate::artifact::PreparedArtifact;
-
+    // Keep compiled code on the native engine that owns the main instance.
+    // JS peers load realm-local copies of the same validated compiler input.
+    async fn prepare_code(
+        &self,
+        host: &dyn wasixv2_host::Host,
+        loader: &dyn Loader,
+        engine: &wasmer::Engine,
+        graph: &mut Graph,
+    ) -> Result<()> {
         let main_tls = (1..graph.libraries.len())
             .map(|index| graph.main_tls_imports(index))
             .collect::<Result<Vec<_>>>()?;
@@ -369,37 +415,36 @@ impl Root {
                     .collect(),
                 engine.deterministic_id(),
                 engine.artifact_format(),
+                #[cfg(feature = "sys")]
+                engine.is_sys().then(|| engine.id()),
+                #[cfg(not(feature = "sys"))]
+                None,
             );
-            #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
-            if let Some(cache) = self.cache.as_deref().filter(|_| engine.is_sys()) {
-                let cached = lock(&self.artifacts).get(&key).cloned();
-                let artifact = match cached {
-                    Some(artifact) => artifact,
-                    None => {
-                        let artifact = cache.prepare_code(engine, library, &main_tls).await?;
-                        let mut artifacts = lock(&self.artifacts);
-                        if self.retired.load(Ordering::Acquire) {
-                            return Err(failure("loader retired during side module preparation"));
+            let cached = lock(&self.artifacts).get(&key).cloned();
+            let artifact = match cached {
+                Some(artifact) => artifact,
+                None => {
+                    #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+                    let cache = self.cache.as_deref().filter(|_| engine.is_sys());
+                    #[cfg(not(all(feature = "sys", not(target_arch = "wasm32"))))]
+                    let cache: Option<&()> = None;
+                    let artifact = match cache {
+                        #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+                        Some(cache) => {
+                            cache
+                                .prepare_code(host, loader, engine, library, &main_tls)
+                                .await?
                         }
-                        artifacts.entry(key).or_insert(artifact).clone()
+                        _ => compile_side(host, loader, engine, library, &main_tls).await?,
+                    };
+                    let mut artifacts = lock(&self.artifacts);
+                    if self.retired.load(Ordering::Acquire) {
+                        return Err(failure("loader retired during side module preparation"));
                     }
-                };
-                library.prepared = Some(artifact);
-                continue;
-            }
-
-            let mut artifacts = lock(&self.artifacts);
-            let artifact = match artifacts.entry(key) {
-                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
-                std::collections::btree_map::Entry::Vacant(entry) => {
-                    entry.insert(Arc::new(PreparedArtifact::compile_main_tls(
-                        engine,
-                        library.initialization.clone(),
-                        &main_tls,
-                    )?))
+                    artifacts.entry(key).or_insert(artifact).clone()
                 }
             };
-            library.prepared = Some(artifact.clone());
+            library.prepared = Some(artifact);
         }
         Ok(())
     }
@@ -407,9 +452,14 @@ impl Root {
     #[cfg(test)]
     fn prepare_test_code(&self, store: &Store, graph: &mut Graph) -> Result<()> {
         use futures::FutureExt;
-        self.prepare_code(store.engine(), graph)
-            .now_or_never()
-            .unwrap()
+        self.prepare_code(
+            &lease_cancellation_tests::QueueHost,
+            &crate::Compile,
+            store.engine(),
+            graph,
+        )
+        .now_or_never()
+        .unwrap()
     }
 
     fn open_library(
@@ -2411,7 +2461,7 @@ mod lease_cancellation_tests {
         static JOBS: RefCell<Vec<LocalFuture<'static, ()>>> = RefCell::new(Vec::new());
     }
     // The existing exec NoThreads test host shape, with a manually driven local queue.
-    struct QueueHost;
+    pub(super) struct QueueHost;
     impl Host for QueueHost {
         fn realtime(&self) -> Duration {
             Duration::ZERO
@@ -3278,7 +3328,7 @@ mod main_tls_tests {
         let root = Root::new(graph.libraries[0].source.to_vec());
         root.prepare_test_code(&store, &mut graph).unwrap();
         let original = graph.libraries[1].prepared.clone().unwrap();
-        let (_, _, peer, _) = fixture(8);
+        let peer = Store::new(store.engine().clone());
         root.prepare_test_code(&peer, &mut graph).unwrap();
         assert!(Arc::ptr_eq(
             &original,

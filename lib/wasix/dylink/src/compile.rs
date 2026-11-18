@@ -1,7 +1,9 @@
 //! Source preparation at initial/exec compilation; custom embedders can call this too.
 use wasixv2_exec::{Image, LoadError, Loader};
+use wasixv2_host::Host;
 use wasixv2_syscalls::LocalFuture;
 use wasmer::{CompileError, Engine, Module};
+use wasmer_types::ModuleHash;
 pub fn load(engine: &Engine, source: &[u8]) -> Result<Module, CompileError> {
     let prepared =
         crate::prepare_image(source).map_err(|error| CompileError::Validate(error.to_string()))?;
@@ -20,5 +22,15 @@ impl Loader for Compile {
         image: &'a Image,
     ) -> LocalFuture<'a, Result<(Engine, Module), LoadError>> {
         Box::pin(async move { Ok((engine.clone(), load(engine, image.bytes())?)) })
+    }
+
+    fn load_side_module<'a>(
+        &'a self,
+        host: &'a dyn Host,
+        engine: &'a Engine,
+        key: ModuleHash,
+        wasm: Vec<u8>,
+    ) -> LocalFuture<'a, Result<Module, LoadError>> {
+        wasixv2_exec::Compile.load_side_module(host, engine, key, wasm)
     }
 }

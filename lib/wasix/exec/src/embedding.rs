@@ -388,7 +388,7 @@ pub(crate) fn environment<S: Syscalls + Control + Send + Sync + 'static>(
     let proc = process::ProcExports::new(spawner, handoff);
     let env = FunctionEnv::new(store, ExecEnv::new(syscalls, task, proc, host));
     env.as_mut(store).cleanup = Some(cleanup);
-    abis.install_hooks(store, &env);
+    abis.configure_env(store, &env);
     env
 }
 

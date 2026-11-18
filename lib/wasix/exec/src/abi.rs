@@ -565,10 +565,11 @@ where
         self.owning_thread
     }
 
-    pub(crate) fn install_hooks(&self, store: &mut StoreMut<'_>, env: &FunctionEnv<ExecEnv<S>>) {
+    pub(crate) fn configure_env(&self, store: &mut StoreMut<'_>, env: &FunctionEnv<ExecEnv<S>>) {
+        let data = env.as_mut(store);
+        data.loader = self.loader.clone();
         if !self.hooks.is_empty() {
-            env.as_mut(store).hooks =
-                Some(crate::InstanceHooks::new(self.hooks.clone(), env.clone()));
+            data.hooks = Some(crate::InstanceHooks::new(self.hooks.clone(), env.clone()));
         }
     }
 
@@ -598,12 +599,12 @@ where
         Ok(())
     }
 
-    /// Makes `loader` compile the images `execve` loads.
+    /// Makes `loader` compile executables and prepared side modules.
     pub fn set_loader(&mut self, loader: Arc<dyn Loader>) {
         self.loader = loader;
     }
 
-    /// What compiles the images `execve` loads.
+    /// What compiles executables and prepared side modules.
     pub fn loader(&self) -> &dyn Loader {
         &*self.loader
     }

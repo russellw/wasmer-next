@@ -79,11 +79,12 @@ or a SHA-256 content key for copied files. Side code adds the concrete
 engine identity, memory styles and verified main TLS offsets to its source key. The
 side instrumenter uses one fixed preemption profile.
 
-Embedders can attach a trusted `wasmer_cache::module_cache::ModuleCache` with
-`DylinkCache::with_module_cache`. Persistent keys hash the instrumented,
-TLS-rewritten compiler input and include the compilation target, compiler ID,
-artifact format, Wasm features, memory styles and main TLS offsets. The
-embedder supplies a namespace for any additional compiler or middleware
+Side-module misses call the machine's `Loader::load_side_module` with the
+main instance's engine and final compiler input. Custom loaders implement that
+method to use their compiler dispatch and module cache. Persistent keys hash
+the instrumented, TLS-rewritten input and include the compilation target,
+compiler ID, artifact format, Wasm features, memory styles and main TLS offsets.
+A loader can namespace these keys for additional compiler or middleware
 configuration. `prepare_side_for_prewarm` yields the same key and input for
 side-only files with no possible main TLS binding.
 
