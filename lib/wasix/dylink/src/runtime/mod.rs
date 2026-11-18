@@ -943,6 +943,26 @@ impl<S: Syscalls + Control + Send + Sync + 'static> Image<S> {
         }))
     }
 }
+/// A main that imports a shared tag (e.g. `env.__cpp_exception`) rather than
+/// exporting it reaches it through its rewritten `__wasix_dylink_tag_N` alias:
+/// side modules must bind that same object so exceptions cross module bounds.
+fn main_imported_tag(
+    main: &BoundModule,
+    library: &Library,
+    import: &crate::Import,
+) -> Option<Extern> {
+    let index = library
+        .metadata
+        .imports()
+        .iter()
+        .filter(|i| matches!(i.ty, ExternType::Tag(_)))
+        .position(|i| i.module == import.module && i.name == import.name)?;
+    main.exports
+        .get::<Extern>(&format!("__wasix_dylink_tag_{index}"))
+        .ok()
+        .filter(|export| matches!(export, Extern::Tag(_)))
+        .cloned()
+}
 struct Local {
     forward_code: Arc<forward::Cache>,
     instances: Vec<BoundModule>,
@@ -1153,15 +1173,18 @@ impl Local {
                         }
                     }
                     ExternType::Tag(_) => {
-                        let mut found = None;
-                        for provider in &local.instances {
-                            if let Ok(export) = provider.exports.get::<Extern>(&import.name)
-                                && matches!(export, Extern::Tag(_))
-                            {
-                                found = Some(export.clone());
-                                break;
-                            }
-                        }
+                        let found =
+                            main_imported_tag(&local.instances[0], &graph.libraries[0], import)
+                                .or_else(|| {
+                                    local.instances.iter().find_map(|provider| {
+                                        provider
+                                            .exports
+                                            .get::<Extern>(&import.name)
+                                            .ok()
+                                            .filter(|export| matches!(export, Extern::Tag(_)))
+                                            .cloned()
+                                    })
+                                });
                         Some(found.ok_or_else(|| failure("missing main exception tag"))?)
                     }
                     _ => None,
@@ -3818,6 +3841,136 @@ mod cyclic_tests {
                 &[(targets[1].0.clone(), 2)]
             )
             .is_err()
+        );
+    }
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn side_module_shares_exception_tag_imported_by_main() {
+        let mut store = Store::default();
+        let memory = Memory::new(&mut store, MemoryType::new(1, Some(4), true)).unwrap();
+        let table = Table::new(
+            &mut store,
+            TableType::new(Type::FuncRef, 3, Some(64)),
+            Value::FuncRef(None),
+        )
+        .unwrap();
+        // Main imports the tag; only the rewrite's alias export reaches it.
+        let main_source = Library::new(
+            crate::tests::bytes(
+                r#"(module
+            (import "env" "__indirect_function_table" (table 3 funcref))
+            (import "env" "__cpp_exception" (tag $e (param i32)))
+            (func (export "catch") (param $slot i32) (param $value i32) (result i32)
+                (block $caught (result i32)
+                    (try_table (catch $e $caught)
+                        local.get $value local.get $slot call_indirect (param i32))
+                    i32.const -1)))"#,
+                [0; 4],
+                &[],
+                &[],
+                &[],
+            ),
+            None,
+        )
+        .unwrap();
+        let main = Module::new(
+            &store,
+            main_source.initialization.instantiate_bytes().unwrap(),
+        )
+        .unwrap();
+        let mut main_imports = Imports::new();
+        main_imports.define("env", "__indirect_function_table", table.clone());
+        main_imports.define(
+            "env",
+            "__cpp_exception",
+            wasmer::Tag::new(&mut store, [Type::I32]),
+        );
+        let main = Instance::new(&mut store, &main, &main_imports).unwrap();
+        let side = Library::new(
+            crate::tests::bytes(
+                r#"(module
+                (import "env" "memory" (memory 1 4 shared))
+                (import "env" "__indirect_function_table" (table 3 funcref))
+                (import "env" "__table_base" (global $base i32))
+                (import "env" "__cpp_exception" (tag $e (param i32)))
+                (elem (global.get $base) func $raise)
+                (func $raise (export "raise") (param i32) local.get 0 throw $e))"#,
+                [0, 0, 1, 0],
+                &[],
+                &[],
+                &[],
+            ),
+            None,
+        )
+        .unwrap();
+        let mut graph = Graph {
+            closures: Default::default(),
+            host_imports: None,
+            libraries: vec![main_source, side],
+            global: vec![0],
+            cursor: 3,
+            initialization: vec![0],
+        };
+        graph.libraries[1].table = graph.cursor;
+        graph.cursor += 1;
+        graph.assign_slots(1).unwrap();
+        graph.seal(1, 1).unwrap();
+        let mut imports = Imports::new();
+        imports.define("env", "memory", memory.clone());
+        imports.define("env", "__indirect_function_table", table.clone());
+        let instrumented = wasixv2_exec::instrument(
+            &graph.libraries[1]
+                .initialization
+                .instantiate_bytes()
+                .unwrap(),
+        )
+        .unwrap();
+        let module = Module::new(&store, instrumented).unwrap();
+        for import in module
+            .imports()
+            .functions()
+            .filter(|i| i.module() == "wasixv2-exec")
+        {
+            let function = Function::new(&mut store, import.ty(), |_| Ok(vec![Value::I32(65536)]));
+            imports.define(import.module(), import.name(), function);
+        }
+        let mut local = Local {
+            forward_code: Arc::default(),
+            instances: vec![BoundModule::new(&main)],
+            forwarders: Vec::new(),
+            memory,
+            table,
+            tls: vec![0],
+            stage: None,
+            leases: Vec::new(),
+            generation: 0,
+            lazy_targets: BTreeMap::new(),
+            closure_pools: Vec::new(),
+            closure_slots: Default::default(),
+        };
+        let work = work(graph, &store);
+        local
+            .stage_modules(
+                &mut store.as_store_mut(),
+                &imports,
+                &work,
+                vec![0; 2],
+                Vec::new(),
+                TaskId(1),
+            )
+            .unwrap();
+        let stage = local.stage.take().unwrap();
+        for mut module in stage.modules.into_values() {
+            module.apply(&mut store).unwrap();
+            local.instances.push(module.publish().unwrap());
+        }
+        assert_eq!(
+            main.exports
+                .get_typed_function::<(i32, i32), i32>(&store, "catch")
+                .unwrap()
+                .call(&mut store, 3, 73)
+                .unwrap(),
+            73
         );
     }
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
