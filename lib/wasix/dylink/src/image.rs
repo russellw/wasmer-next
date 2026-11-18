@@ -11,6 +11,7 @@ struct Profile {
     native: bool,
     legacy: bool,
     prepared: bool,
+    entry: bool,
 }
 
 fn profile(bytes: &[u8]) -> Result<Profile, PlanError> {
@@ -37,6 +38,11 @@ fn profile(bytes: &[u8]) -> Result<Profile, PlanError> {
                     );
                 }
             }
+            Payload::ExportSection(section) => {
+                for export in section {
+                    profile.entry |= matches!(export?.name, "_start" | "_initialize");
+                }
+            }
             _ => {}
         }
     }
@@ -49,6 +55,13 @@ fn profile(bytes: &[u8]) -> Result<Profile, PlanError> {
 pub fn needs_preparation(bytes: &[u8]) -> Result<bool, PlanError> {
     let profile = profile(bytes)?;
     Ok(profile.dynamic && (profile.native || profile.legacy) && !profile.prepared)
+}
+
+/// Whether a raw dylink image lacks a command or reactor entry export.
+/// A Wasm start section can initialize a shared library and does not count.
+pub fn is_side_only(bytes: &[u8]) -> Result<bool, PlanError> {
+    let profile = profile(bytes)?;
+    Ok(profile.dynamic && !profile.prepared && !profile.entry)
 }
 
 /// Static images pass through byte-for-byte. A supported dynamic main is rewritten before

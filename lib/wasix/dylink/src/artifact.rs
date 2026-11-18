@@ -29,6 +29,15 @@ impl PreparedArtifact {
         initialization: Arc<Initialization>,
         main_tls: &BTreeMap<u32, u32>,
     ) -> Result<Self, RuntimeError> {
+        let bytes = Self::compiler_input(&initialization, main_tls)?;
+        let module = Module::new(engine, bytes).map_err(error)?;
+        Ok(Self::new(initialization, module))
+    }
+
+    pub(crate) fn compiler_input(
+        initialization: &Initialization,
+        main_tls: &BTreeMap<u32, u32>,
+    ) -> Result<Vec<u8>, RuntimeError> {
         for payload in wasmparser::Parser::new(0).parse_all(initialization.original_source()) {
             if let wasmparser::Payload::TableSection(section) = payload.map_err(error)?
                 && section.count() > 0
@@ -39,12 +48,14 @@ impl PreparedArtifact {
         let bytes = initialization.main_tls_bytes(main_tls).map_err(error)?;
         // Do not inherit load()'s unpreemptible fallback. Every side-module loop
         // reaches the ordinary return-to-guest boundary on every store/realm.
-        let bytes = wasixv2_exec::instrument(&bytes).map_err(error)?;
-        let module = Module::new(engine, bytes).map_err(error)?;
-        Ok(Self {
+        wasixv2_exec::instrument(&bytes).map_err(error)
+    }
+
+    pub(crate) fn new(initialization: Arc<Initialization>, module: Module) -> Self {
+        Self {
             initialization,
             module,
-        })
+        }
     }
 
     pub(crate) fn initialization(&self) -> &Initialization {
@@ -160,7 +171,7 @@ mod test_fixture {
 }
 
 #[cfg(all(test, feature = "engine-tests"))]
-mod tests {
+pub(crate) mod tests {
     use super::test_fixture::{fixture, initialization};
     use super::*;
     use crate::store::{BoundModule, StagedExports};
@@ -188,11 +199,19 @@ mod tests {
             Ok(())
         }
     }
-    fn engine() -> (Engine, Arc<AtomicUsize>) {
+    pub(crate) fn counting_engine(
+        features: Option<wasmer_types::Features>,
+    ) -> (Engine, Arc<AtomicUsize>) {
         let count = Arc::new(AtomicUsize::new(0));
         let mut compiler = Cranelift::default();
         compiler.push_middleware(Arc::new(CountModules(count.clone())));
-        (EngineBuilder::new(compiler).engine().into(), count)
+        (
+            EngineBuilder::new(compiler)
+                .set_features(features)
+                .engine()
+                .into(),
+            count,
+        )
     }
     #[test]
     fn one_compilation_replays_store_specific_effects_and_retains_code_after_artifact_drop() {
@@ -200,7 +219,7 @@ mod tests {
         fn send<T: Send>() {}
         send_sync::<BoundModule>();
         send::<StagedExports>();
-        let (engine, compilations) = engine();
+        let (engine, compilations) = counting_engine(None);
         let plan = initialization();
         let artifact = Arc::new(PreparedArtifact::compile(&engine, plan.clone()).unwrap());
         assert!(std::ptr::eq(artifact.initialization(), &*plan));
@@ -284,7 +303,7 @@ mod tests {
     }
     #[test]
     fn cached_artifact_still_checks_each_store_reservations_identity_and_rollback() {
-        let (engine, compilations) = engine();
+        let (engine, compilations) = counting_engine(None);
         let artifact = PreparedArtifact::compile(&engine, initialization()).unwrap();
         let (mut store, memory, table, imports) = fixture(&engine, 128, 3);
         assert!(
@@ -338,7 +357,7 @@ mod tests {
     }
     #[test]
     fn private_table_is_rejected_before_compilation() {
-        let (engine, compilations) = engine();
+        let (engine, compilations) = counting_engine(None);
         let initialization = Arc::new(
             Initialization::parse(&crate::tests::bytes(
                 "(module (table 3 funcref))",

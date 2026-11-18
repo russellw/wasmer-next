@@ -72,12 +72,20 @@ instances retain their normal code ownership.
 
 Native embedders can opt into reuse across loader roots by passing the same
 `Arc<DylinkCache>` to `wasixv2::MachineBuilder::dylink_cache`. The default
-disables cross-root reuse, as does a zero byte budget. This works with custom
-loaders that reuse the same compiled main artifact. Verification is keyed by
+disables in-memory cross-root reuse, as does a zero byte budget. This works
+with custom loaders that reuse the same compiled main artifact. Verification is keyed by
 that artifact's identity. Side-file parsing uses live shared image identities
 or a SHA-256 content key for copied files. Side code adds the concrete
 engine identity, memory styles and verified main TLS offsets to its source key. The
 side instrumenter uses one fixed preemption profile.
+
+Embedders can attach a trusted `wasmer_cache::module_cache::ModuleCache` with
+`DylinkCache::with_module_cache`. Persistent keys hash the instrumented,
+TLS-rewritten compiler input and include the compilation target, compiler ID,
+artifact format, Wasm features, memory styles and main TLS offsets. The
+embedder supplies a namespace for any additional compiler or middleware
+configuration. `prepare_side_for_prewarm` yields the same key and input for
+side-only files with no possible main TLS binding.
 
 The byte and optional entry limits evict least-recently-used entries. An
 optional time-to-idle evicts entries on a host thread even without further

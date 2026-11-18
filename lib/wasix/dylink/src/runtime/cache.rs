@@ -2,22 +2,24 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
-    sync::{Arc, Condvar, Mutex, OnceLock, Weak},
+    sync::{Arc, Condvar, Mutex, Weak},
     time::{Duration, Instant},
 };
 
+use async_lock::OnceCell;
 use wasixv2_syscalls::{Image, ImageId};
 use wasmer::{Engine, EngineId, MemoryStyle, Module};
+use wasmer_cache::module_cache::{ModuleCache, load_module};
 use wasmer_compiler::ArtifactCreate;
 use wasmer_types::ModuleHash;
 
 use super::{LoadPolicy, Result, graph::Library, lock, verify_compiled_source};
 use crate::artifact::PreparedArtifact;
 
-/// Retention limits for one shared dylink cache. A zero byte budget disables it.
+/// In-memory retention limits for one shared dylink cache.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DylinkCacheConfig {
-    /// Maximum bytes charged to resident entries.
+    /// Maximum bytes charged to resident entries. Zero disables in-memory retention.
     pub max_bytes: usize,
     /// Optional additional entry limit. Zero disables the cache.
     pub max_entries: Option<usize>,
@@ -92,7 +94,7 @@ struct Resident {
     order: u64,
 }
 
-type Flight = OnceLock<Result<Arc<Payload>>>;
+type Flight = OnceCell<Result<Arc<Payload>>>;
 
 #[derive(Default)]
 struct State {
@@ -119,6 +121,59 @@ struct Shared {
     changed: Condvar,
 }
 
+struct Persistent {
+    cache: Arc<dyn ModuleCache + Send + Sync>,
+    namespace: String,
+}
+
+impl Persistent {
+    fn prepare(
+        &self,
+        engine: &Engine,
+        library: &Library,
+        memories: &[MemoryStyle],
+        main_tls: &BTreeMap<u32, u32>,
+    ) -> Result<(ModuleHash, Vec<u8>)> {
+        let bytes = PreparedArtifact::compiler_input(&library.initialization, main_tls)?;
+        let input = ModuleHash::new(&bytes);
+        let sys = engine.as_sys();
+        let target = sys.target();
+        let features = sys.inner().features().clone();
+        // Use the actual instrumented input, plus compile settings not captured by
+        // the cache's engine/format partition. The namespace covers custom middleware.
+        let configuration = (
+            &self.namespace,
+            engine.deterministic_id(),
+            engine.artifact_format(),
+            wasmer_types::MetadataHeader::CURRENT_VERSION,
+            target.triple(),
+            target.cpu_features(),
+            features,
+            memories,
+            main_tls,
+        );
+        let key = ModuleHash::new(format!("wasixv2-side-v1 {input} {configuration:?}").as_bytes());
+        Ok((key, bytes))
+    }
+}
+
+fn memory_styles(engine: &Engine, library: &Library) -> Option<Vec<MemoryStyle>> {
+    let tunables = engine.as_sys().tunables();
+    library
+        .metadata
+        .memory_types
+        .iter()
+        .map(|ty| {
+            let min = u32::try_from(ty.initial).ok()?;
+            let max = match ty.maximum {
+                Some(max) => Some(u32::try_from(max).ok()?),
+                None => None,
+            };
+            Some(tunables.memory_style(&wasmer::MemoryType::new(min, max, ty.shared)))
+        })
+        .collect()
+}
+
 /// Bounded, in-memory dylink preparation for machines that share this object.
 ///
 /// Cached state owns its parsed and compiled outputs. Its image identity keys
@@ -127,6 +182,7 @@ struct Shared {
 /// still use their own references to the parsed state.
 pub struct DylinkCache {
     shared: Arc<Shared>,
+    persistent: Option<Persistent>,
 }
 
 impl std::fmt::Debug for DylinkCache {
@@ -147,6 +203,7 @@ impl DylinkCache {
                 state: Mutex::default(),
                 changed: Condvar::new(),
             }),
+            persistent: None,
         };
         if cache.enabled()
             && let Some(idle) = config.time_to_idle.filter(|idle| !idle.is_zero())
@@ -157,12 +214,60 @@ impl DylinkCache {
         cache
     }
 
+    /// Use an embedder's trusted compiled-module cache for native side modules.
+    ///
+    /// The namespace must distinguish compiler and middleware settings that affect
+    /// artifacts but are not reflected in the engine's deterministic ID. Use the
+    /// same namespace on every node sharing compatible artifacts. Cache failures
+    /// fall back to local compilation. This works with a zero in-memory budget.
+    pub fn with_module_cache(
+        mut self,
+        cache: Arc<dyn ModuleCache + Send + Sync>,
+        namespace: impl Into<String>,
+    ) -> Self {
+        self.persistent = Some(Persistent {
+            cache,
+            namespace: namespace.into(),
+        });
+        self
+    }
+
+    /// Return the persistent key and compiler input for a side-only image whose
+    /// main TLS bindings are independent of the loaded graph. Call only for
+    /// images classified by [`crate::is_side_only`]. Returns `None` if the engine
+    /// has no cache configured or an import could require main TLS relocation.
+    pub fn prepare_side_for_prewarm(
+        &self,
+        engine: &Engine,
+        source: &[u8],
+    ) -> Result<Option<(ModuleHash, Vec<u8>)>> {
+        let Some(persistent) = self.persistent.as_ref().filter(|_| engine.is_sys()) else {
+            return Ok(None);
+        };
+        let library = Library::new(source.to_vec(), None)?;
+        if library.metadata.imports().iter().any(|import| {
+            import.module == "GOT.mem" && matches!(import.ty, crate::ExternType::Global(_))
+        }) {
+            return Ok(None);
+        }
+        let Some(memories) = memory_styles(engine, &library) else {
+            return Ok(None);
+        };
+        persistent
+            .prepare(engine, &library, &memories, &BTreeMap::new())
+            .map(Some)
+    }
+
     /// Takes a snapshot of preparation counters and current resident entries.
     pub fn stats(&self) -> DylinkCacheStats {
         lock(&self.shared.state).stats
     }
 
-    pub(super) fn enabled(&self) -> bool {
+    pub(super) fn active(&self) -> bool {
+        self.enabled() || self.persistent.is_some()
+    }
+
+    fn enabled(&self) -> bool {
         self.shared.config.max_bytes != 0 && self.shared.config.max_entries != Some(0)
     }
 
@@ -199,8 +304,11 @@ impl DylinkCache {
         &self,
         key: Key,
         owner: Option<SourceOwner>,
-        prepare: impl FnOnce() -> Result<Library>,
+        prepare: impl FnOnce() -> Result<Library> + Unpin,
     ) -> Result<Library> {
+        if !self.enabled() {
+            return prepare();
+        }
         let value = self.get_or_prepare(key, owner, || {
             let library = prepare()?;
             let bytes = library.retained_bytes();
@@ -212,33 +320,24 @@ impl DylinkCache {
         Ok((**library).clone())
     }
 
-    pub(super) fn prepare_code(
+    pub(super) async fn prepare_code(
         &self,
         engine: &Engine,
         library: &Library,
         main_tls: &BTreeMap<u32, u32>,
     ) -> Result<Arc<PreparedArtifact>> {
-        let compile = || {
-            PreparedArtifact::compile_main_tls(engine, library.initialization.clone(), main_tls)
-                .map(Arc::new)
+        let Some(memories) = memory_styles(engine, library) else {
+            return PreparedArtifact::compile_main_tls(
+                engine,
+                library.initialization.clone(),
+                main_tls,
+            )
+            .map(Arc::new);
         };
-        let tunables = engine.as_sys().tunables();
-        let Some(memories) = library
-            .metadata
-            .memory_types
-            .iter()
-            .map(|ty| {
-                let min = u32::try_from(ty.initial).ok()?;
-                let max = match ty.maximum {
-                    Some(max) => Some(u32::try_from(max).ok()?),
-                    None => None,
-                };
-                Some(tunables.memory_style(&wasmer::MemoryType::new(min, max, ty.shared)))
-            })
-            .collect::<Option<Vec<_>>>()
-        else {
-            return compile();
-        };
+        let compile = || self.compile(engine, library, main_tls, &memories);
+        if !self.enabled() {
+            return compile().await;
+        }
         let (source, owner) = match library.backing.as_ref() {
             Some(image) if image.identity().is_some() => SourceKey::of(image),
             _ => (SourceKey::Copied(library.code_hash), None),
@@ -252,8 +351,8 @@ impl DylinkCache {
                 .map(|(&index, &offset)| (index, offset))
                 .collect(),
         };
-        let value = self.get_or_prepare(key, owner, || {
-            let artifact = compile()?;
+        let prepare = || async {
+            let artifact = compile().await?;
             let compiled = artifact
                 .module()
                 .sys_artifact()
@@ -274,99 +373,138 @@ impl DylinkCache {
                 Some(heap)
             };
             Ok((Payload::Code(artifact), bytes))
-        })?;
+        };
+        let value = match self.begin(&key) {
+            Ok(value) => value,
+            Err(flight) => flight
+                .get_or_init(|| async {
+                    let output = prepare().await;
+                    self.finish(key, owner, output)
+                })
+                .await
+                .clone()?,
+        };
         let Payload::Code(artifact) = value.as_ref() else {
             unreachable!("only compiled modules use this cache key");
         };
         Ok(artifact.clone())
     }
 
-    pub(super) fn get_or_prepare(
+    async fn compile(
+        &self,
+        engine: &Engine,
+        library: &Library,
+        main_tls: &BTreeMap<u32, u32>,
+        memories: &[MemoryStyle],
+    ) -> Result<Arc<PreparedArtifact>> {
+        let initialization = library.initialization.clone();
+        let Some(persistent) = &self.persistent else {
+            return PreparedArtifact::compile_main_tls(engine, initialization, main_tls)
+                .map(Arc::new);
+        };
+        let (key, bytes) = persistent.prepare(engine, library, memories, main_tls)?;
+        let module = load_module(engine, persistent.cache.as_ref(), key, &bytes, None)
+            .await
+            .map_err(super::failure)?;
+        Ok(Arc::new(PreparedArtifact::new(initialization, module)))
+    }
+
+    fn get_or_prepare(
         &self,
         key: Key,
         source: Option<SourceOwner>,
-        prepare: impl FnOnce() -> Result<(Payload, Option<usize>)>,
+        prepare: impl FnOnce() -> Result<(Payload, Option<usize>)> + Unpin,
     ) -> Result<Arc<Payload>> {
+        match self.begin(&key) {
+            Ok(value) => Ok(value),
+            Err(flight) => flight
+                .get_or_init_blocking(|| self.finish(key, source, prepare()))
+                .clone(),
+        }
+    }
+
+    fn begin(&self, key: &Key) -> std::result::Result<Arc<Payload>, Arc<Flight>> {
         debug_assert!(self.enabled());
         let config = self.shared.config;
-        let flight = {
-            let mut state = lock(&self.shared.state);
+        let mut state = lock(&self.shared.state);
+        let order = state.order;
+        state.order += 1;
+        let now = Instant::now();
+        if let Some(entry) = state.entries.get_mut(key) {
+            if entry
+                .source
+                .as_ref()
+                .is_none_or(|owner| owner.upgrade().is_some())
+                && config
+                    .time_to_idle
+                    .is_none_or(|idle| now.duration_since(entry.last_use) < idle)
+            {
+                entry.last_use = now;
+                entry.order = order;
+                let value = entry.value.clone();
+                state.stats.hits += 1;
+                return Ok(value);
+            }
+            state.remove(key);
+        }
+        if let Some(flight) = state.flights.get(key).and_then(Weak::upgrade) {
+            state.stats.hits += 1;
+            Err(flight)
+        } else {
+            state.stats.misses += 1;
+            state.flights.retain(|_, flight| flight.strong_count() != 0);
+            let flight = Arc::new(OnceCell::new());
+            state.flights.insert(key.clone(), Arc::downgrade(&flight));
+            Err(flight)
+        }
+    }
+
+    fn finish(
+        &self,
+        key: Key,
+        source: Option<SourceOwner>,
+        output: Result<(Payload, Option<usize>)>,
+    ) -> Result<Arc<Payload>> {
+        let config = self.shared.config;
+        let mut state = lock(&self.shared.state);
+        state.flights.remove(&key);
+        let (value, bytes) = output?;
+        let value = Arc::new(value);
+        if let Some(bytes) = bytes.map(|bytes| {
+            bytes.saturating_add(size_of::<(Key, Resident, Payload)>() + key.heap_bytes())
+        }) && bytes <= config.max_bytes
+            && config.time_to_idle != Some(Duration::ZERO)
+        {
+            while state.stats.bytes > config.max_bytes - bytes
+                || config
+                    .max_entries
+                    .is_some_and(|max| state.entries.len() >= max)
+            {
+                let oldest = state
+                    .entries
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.order)
+                    .map(|(key, _)| key.clone())
+                    .expect("a resident entry exceeds the cache budget");
+                state.remove(&oldest);
+            }
             let order = state.order;
             state.order += 1;
-            let now = Instant::now();
-            if let Some(entry) = state.entries.get_mut(&key) {
-                if entry
-                    .source
-                    .as_ref()
-                    .is_none_or(|owner| owner.upgrade().is_some())
-                    && config
-                        .time_to_idle
-                        .is_none_or(|idle| now.duration_since(entry.last_use) < idle)
-                {
-                    entry.last_use = now;
-                    entry.order = order;
-                    let value = entry.value.clone();
-                    state.stats.hits += 1;
-                    return Ok(value);
-                }
-                state.remove(&key);
-            }
-            if let Some(flight) = state.flights.get(&key).and_then(Weak::upgrade) {
-                state.stats.hits += 1;
-                flight
-            } else {
-                state.stats.misses += 1;
-                state.flights.retain(|_, flight| flight.strong_count() != 0);
-                let flight = Arc::new(OnceLock::new());
-                state.flights.insert(key.clone(), Arc::downgrade(&flight));
-                flight
-            }
-        };
-
-        flight
-            .get_or_init(|| {
-                let output = prepare();
-                let mut state = lock(&self.shared.state);
-                state.flights.remove(&key);
-                let (value, bytes) = output?;
-                let value = Arc::new(value);
-                if let Some(bytes) = bytes.map(|bytes| {
-                    bytes.saturating_add(size_of::<(Key, Resident, Payload)>() + key.heap_bytes())
-                }) && bytes <= config.max_bytes
-                    && config.time_to_idle != Some(Duration::ZERO)
-                {
-                    while state.stats.bytes > config.max_bytes - bytes
-                        || config
-                            .max_entries
-                            .is_some_and(|max| state.entries.len() >= max)
-                    {
-                        let oldest = state
-                            .entries
-                            .iter()
-                            .min_by_key(|(_, entry)| entry.order)
-                            .map(|(key, _)| key.clone())
-                            .expect("a resident entry exceeds the cache budget");
-                        state.remove(&oldest);
-                    }
-                    let order = state.order;
-                    state.order += 1;
-                    state.entries.insert(
-                        key,
-                        Resident {
-                            source,
-                            value: value.clone(),
-                            bytes,
-                            last_use: Instant::now(),
-                            order,
-                        },
-                    );
-                    state.stats.bytes += bytes;
-                    state.stats.entries += 1;
-                    self.shared.changed.notify_one();
-                }
-                Ok(value)
-            })
-            .clone()
+            state.entries.insert(
+                key,
+                Resident {
+                    source,
+                    value: value.clone(),
+                    bytes,
+                    last_use: Instant::now(),
+                    order,
+                },
+            );
+            state.stats.bytes += bytes;
+            state.stats.entries += 1;
+            self.shared.changed.notify_one();
+        }
+        Ok(value)
     }
 }
 
@@ -510,6 +648,122 @@ mod tests {
         assert!(observer.upgrade().is_none());
         assert_eq!(cache.stats().bytes, 0);
         assert_eq!(cache.stats().evictions, 1);
+    }
+
+    #[cfg(feature = "engine-tests")]
+    #[tokio::test]
+    async fn persistent_side_module_survives_fresh_caches_and_engines() {
+        use crate::artifact::tests::counting_engine;
+        use wasmer_cache::module_cache::FileSystemCache;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = |namespace| {
+            DylinkCache::new(DylinkCacheConfig {
+                max_bytes: 1024 * 1024,
+                ..Default::default()
+            })
+            .with_module_cache(
+                Arc::new(FileSystemCache::new(
+                    dir.path(),
+                    tokio::runtime::Handle::current(),
+                )),
+                namespace,
+            )
+        };
+        let wasm = crate::tests::bytes(
+            r#"(module
+                (import "env" "memory" (memory 1 4 shared))
+                (func (export "run") (result i32) i32.const 42))"#,
+            [0; 4],
+            &[],
+            &[],
+            &[],
+        );
+        assert!(crate::is_side_only(&wasm).unwrap());
+        let library = Library::new(wasm.clone(), None).unwrap();
+        let (engine, count) = counting_engine(None);
+        let tls = BTreeMap::new();
+
+        let first = cache("compiler-v1");
+        let (key, bytes) = first
+            .prepare_side_for_prewarm(&engine, &wasm)
+            .unwrap()
+            .unwrap();
+        first.prepare_code(&engine, &library, &tls).await.unwrap();
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+        let stored = first
+            .persistent
+            .as_ref()
+            .unwrap()
+            .cache
+            .load(key, &engine)
+            .await
+            .unwrap();
+        assert_eq!(stored.info().hash, Some(ModuleHash::new(&bytes)));
+        drop((stored, first, engine));
+
+        let (engine, count) = counting_engine(None);
+        cache("compiler-v1")
+            .prepare_code(&engine, &library, &tls)
+            .await
+            .unwrap();
+        assert_eq!(count.load(Ordering::Relaxed), 0);
+
+        let features = engine.as_sys().inner().features().clone();
+        let mut other_features = features;
+        other_features.multi_value = !other_features.multi_value;
+        let (other_engine, other_count) = counting_engine(Some(other_features));
+        assert_eq!(engine.deterministic_id(), other_engine.deterministic_id());
+        cache("compiler-v1")
+            .prepare_code(&other_engine, &library, &tls)
+            .await
+            .unwrap();
+        assert_eq!(other_count.load(Ordering::Relaxed), 1);
+
+        let changed = cache("compiler-v2");
+        changed.prepare_code(&engine, &library, &tls).await.unwrap();
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+    }
+
+    #[cfg(feature = "engine-tests")]
+    #[tokio::test]
+    async fn graph_dependent_tls_variants_cache_separately_and_skip_prewarm() {
+        use crate::artifact::tests::counting_engine;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DylinkCache::new(Default::default()).with_module_cache(
+            Arc::new(wasmer_cache::module_cache::FileSystemCache::new(
+                dir.path(),
+                tokio::runtime::Handle::current(),
+            )),
+            "test",
+        );
+        let wasm = crate::tests::bytes(
+            r#"(module
+                (import "env" "memory" (memory 1 4 shared))
+                (import "GOT.mem" "tls_value" (global (mut i32)))
+                (func (export "get") (result i32) global.get 0))"#,
+            [0; 4],
+            &[],
+            &[],
+            &[],
+        );
+        assert!(crate::is_side_only(&wasm).unwrap());
+        let (engine, count) = counting_engine(None);
+        assert!(
+            cache
+                .prepare_side_for_prewarm(&engine, &wasm)
+                .unwrap()
+                .is_none()
+        );
+        let library = Library::new(wasm, None).unwrap();
+        for offset in [4, 8, 4] {
+            cache
+                .prepare_code(&engine, &library, &[(0, offset)].into())
+                .await
+                .unwrap();
+        }
+        assert_eq!(count.load(Ordering::Relaxed), 2);
     }
 
     #[test]

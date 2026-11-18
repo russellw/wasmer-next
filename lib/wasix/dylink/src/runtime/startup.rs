@@ -332,7 +332,9 @@ impl<S: Syscalls + Control + Send + Sync + 'static> Image<S> {
             }
         }
         // Bases are now final; function slots/frozen fixups were prepared before reservations.
-        cx.with_store(|_, store| self.root.prepare_code(store, &mut graph))
+        let engine = cx.with_store(|_, store| store.engine().clone()).await;
+        self.root
+            .prepare_code(&engine, &mut graph)
             .await
             .map_err(load_error)?;
         let graph = Arc::new(graph);

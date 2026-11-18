@@ -147,7 +147,7 @@ fn compose_root<S: Syscalls + Control + Send + Sync + 'static>(
     #[cfg(all(feature = "sys", not(target_arch = "wasm32")))] cache: Option<Arc<DylinkCache>>,
 ) -> Option<Arc<dyn Abi<S>>> {
     #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
-    if let Some(cache) = cache.filter(|cache| cache.enabled())
+    if let Some(cache) = cache.filter(|cache| cache.active())
         && let Some(compiled) = module.sys_artifact()
     {
         let main = cache.verified_main(compiled, module, policy.as_ref())?;

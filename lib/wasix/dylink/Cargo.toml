@@ -24,12 +24,20 @@ thiserror.workspace = true
 tracing = { workspace = true, optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+async-lock = { version = "3.4.2", optional = true }
+wasmer-cache = { path = "../../cache", default-features = false, features = ["module-cache"], optional = true }
 loupe = { workspace = true, optional = true }
 wasmer-compiler = { workspace = true, features = ["artifact-size"], optional = true }
 wasmer-vm = { workspace = true, default-features = false, features = ["artifact-size"], optional = true }
 
 [dev-dependencies]
+futures.workspace = true
 wat.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }
+wasmer-cache = { path = "../../cache", default-features = false, features = ["module-cache-filesystem"] }
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test.workspace = true
@@ -38,6 +46,8 @@ js-sys.workspace = true
 [features]
 default = ["sys"]
 sys = [
+  "dep:async-lock",
+  "dep:wasmer-cache",
   "dep:loupe",
   "dep:wasmer-compiler",
   "dep:wasmer-vm",

@@ -354,9 +354,10 @@ impl<S: Syscalls + Control + Send + Sync + 'static> StoreImage<S> {
                 lib.base = lease.address();
                 lock(&work.leases).push(lease);
             }
-            Context::Import(env)
-                .with(|_, store| self.root.prepare_code(store, &mut graph))
-                .await?;
+            let engine = Context::Import(env)
+                .with(|_, store| store.engine().clone())
+                .await;
+            self.root.prepare_code(&engine, &mut graph).await?;
             let graph = Arc::new(graph);
             let mut references = lock(&self.root.state).references.clone();
             let count = references.entry(requested).or_default();

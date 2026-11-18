@@ -39,8 +39,8 @@ use wasixv2_syscalls::{
 #[cfg(test)]
 use wasmer::Store;
 use wasmer::{
-    AsEngineRef, AsStoreAsync, AsStoreMut, AsyncFunctionEnvMut, Extern, FunctionEnv, Global,
-    Imports, Instance, Memory, Module, Mutability, RuntimeError, StoreMut, Table, Type, Value,
+    AsStoreAsync, AsStoreMut, AsyncFunctionEnvMut, Extern, FunctionEnv, Global, Imports, Instance,
+    Memory, Module, Mutability, RuntimeError, StoreMut, Table, Type, Value,
 };
 
 type Result<T> = std::result::Result<T, RuntimeError>;
@@ -354,13 +354,12 @@ impl Root {
     }
     // V1's engine/format key keeps compiled code reusable across compatible stores.
     // Source and validated plans are loader-owned; peers never reparse or compare bytes.
-    fn prepare_code(&self, engine: &impl AsEngineRef, graph: &mut Graph) -> Result<()> {
-        let engine_ref = engine.as_engine_ref();
-        let engine = engine_ref.engine();
+    async fn prepare_code(&self, engine: &wasmer::Engine, graph: &mut Graph) -> Result<()> {
+        use crate::artifact::PreparedArtifact;
+
         let main_tls = (1..graph.libraries.len())
             .map(|index| graph.main_tls_imports(index))
             .collect::<Result<Vec<_>>>()?;
-        let mut artifacts = lock(&self.artifacts);
         for (library, main_tls) in graph.libraries.iter_mut().skip(1).zip(main_tls) {
             let key = (
                 library.code_hash,
@@ -371,43 +370,46 @@ impl Root {
                 engine.deterministic_id(),
                 engine.artifact_format(),
             );
+            #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
+            if let Some(cache) = self.cache.as_deref().filter(|_| engine.is_sys()) {
+                let cached = lock(&self.artifacts).get(&key).cloned();
+                let artifact = match cached {
+                    Some(artifact) => artifact,
+                    None => {
+                        let artifact = cache.prepare_code(engine, library, &main_tls).await?;
+                        let mut artifacts = lock(&self.artifacts);
+                        if self.retired.load(Ordering::Acquire) {
+                            return Err(failure("loader retired during side module preparation"));
+                        }
+                        artifacts.entry(key).or_insert(artifact).clone()
+                    }
+                };
+                library.prepared = Some(artifact);
+                continue;
+            }
+
+            let mut artifacts = lock(&self.artifacts);
             let artifact = match artifacts.entry(key) {
                 std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
                 std::collections::btree_map::Entry::Vacant(entry) => {
-                    #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
-                    let shared = self.cache.as_deref().filter(|_| engine.is_sys());
-                    let artifact = self.prepare_side_code(
+                    entry.insert(Arc::new(PreparedArtifact::compile_main_tls(
                         engine,
-                        library,
+                        library.initialization.clone(),
                         &main_tls,
-                        #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
-                        shared,
-                    )?;
-                    entry.insert(artifact)
+                    )?))
                 }
             };
             library.prepared = Some(artifact.clone());
         }
         Ok(())
     }
-    fn prepare_side_code(
-        &self,
-        engine: &wasmer::Engine,
-        library: &Library,
-        main_tls: &BTreeMap<u32, u32>,
-        #[cfg(all(feature = "sys", not(target_arch = "wasm32")))] cache: Option<&DylinkCache>,
-    ) -> Result<Arc<crate::artifact::PreparedArtifact>> {
-        use crate::artifact::PreparedArtifact;
 
-        #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
-        if let Some(cache) = cache {
-            return cache.prepare_code(engine, library, main_tls);
-        }
-        Ok(Arc::new(PreparedArtifact::compile_main_tls(
-            engine,
-            library.initialization.clone(),
-            main_tls,
-        )?))
+    #[cfg(test)]
+    fn prepare_test_code(&self, store: &Store, graph: &mut Graph) -> Result<()> {
+        use futures::FutureExt;
+        self.prepare_code(store.engine(), graph)
+            .now_or_never()
+            .unwrap()
     }
 
     fn open_library(
@@ -2516,7 +2518,7 @@ mod lease_cancellation_tests {
             graph.libraries.push(
                 Library::new(crate::tests::bytes("(module)", [0; 4], &[], &[], &[]), None).unwrap(),
             );
-            root.prepare_code(&store, &mut graph).unwrap();
+            root.prepare_test_code(&store, &mut graph).unwrap();
             let weak = Arc::downgrade(graph.libraries[1].prepared.as_ref().unwrap());
             lock(&root.state).graph = Arc::new(graph);
             weak
@@ -3274,16 +3276,16 @@ mod main_tls_tests {
     fn cache_distinguishes_checked_offset_variants_without_keying_on_store_bases() {
         let (mut graph, _, store, _) = fixture(8);
         let root = Root::new(graph.libraries[0].source.to_vec());
-        root.prepare_code(&store, &mut graph).unwrap();
+        root.prepare_test_code(&store, &mut graph).unwrap();
         let original = graph.libraries[1].prepared.clone().unwrap();
         let (_, _, peer, _) = fixture(8);
-        root.prepare_code(&peer, &mut graph).unwrap();
+        root.prepare_test_code(&peer, &mut graph).unwrap();
         assert!(Arc::ptr_eq(
             &original,
             graph.libraries[1].prepared.as_ref().unwrap()
         ));
         let (mut other, _, _, _) = fixture(12);
-        root.prepare_code(&store, &mut other).unwrap();
+        root.prepare_test_code(&store, &mut other).unwrap();
         assert!(!Arc::ptr_eq(
             &original,
             other.libraries[1].prepared.as_ref().unwrap()
@@ -3490,7 +3492,7 @@ mod cyclic_tests {
     }
     pub(super) fn work(mut graph: Graph, store: &Store) -> Work {
         Root::new(graph.libraries[0].source.to_vec())
-            .prepare_code(store, &mut graph)
+            .prepare_test_code(store, &mut graph)
             .unwrap();
         Work {
             publication: Mutex::new(Some(Publication {
@@ -3510,11 +3512,11 @@ mod cyclic_tests {
     fn image_code_cache_reuses_artifacts_and_distinguishes_replaced_sources() {
         let (mut graph, _, store, _) = fixture();
         let root = Root::new(graph.libraries[0].source.to_vec());
-        root.prepare_code(&store, &mut graph).unwrap();
+        root.prepare_test_code(&store, &mut graph).unwrap();
         let old = graph.libraries[1].prepared.clone().unwrap();
         let mut replay = graph.clone();
         replay.libraries[1].prepared = None;
-        root.prepare_code(&Store::new(store.engine().clone()), &mut replay)
+        root.prepare_test_code(&Store::new(store.engine().clone()), &mut replay)
             .unwrap();
         assert!(Arc::ptr_eq(
             &old,
@@ -3526,7 +3528,7 @@ mod cyclic_tests {
             None,
         )
         .unwrap();
-        root.prepare_code(&store, &mut replay).unwrap();
+        root.prepare_test_code(&store, &mut replay).unwrap();
         assert!(!Arc::ptr_eq(
             &old,
             replay.libraries[1].prepared.as_ref().unwrap()
