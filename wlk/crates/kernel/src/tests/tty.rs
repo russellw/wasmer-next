@@ -9,8 +9,8 @@ use std::{
 
 use futures::FutureExt as _;
 use wasixv2_abi::{
-    Idtype, IoctlRequest, OpenFlags, Pid, RusagePtr, SiginfoPtr, Signal, Termios, TermiosCcIndex,
-    TermiosLflag, TermiosOflag, WaitOptions, Winsize,
+    FcntlCmd, FileMode, Idtype, IoctlRequest, OpenFlags, Pid, RusagePtr, SiginfoPtr, Signal, Statx,
+    StatxMask, Termios, TermiosCcIndex, TermiosLflag, TermiosOflag, WaitOptions, Winsize,
 };
 use wasixv2_host::WindowSize;
 use wasixv2_syscalls::{read_value, write_value};
@@ -334,6 +334,27 @@ fn the_console_is_the_first_process_controlling_terminal() {
     assert_eq!((winsize.ws_row, winsize.ws_col), (ROWS, COLS));
     // `TIOCGDEV`: hvc0, 229:0.
     assert_eq!(c.ioctl_int(&caller, IoctlRequest::TIOCGDEV), Ok(229 << 8));
+    assert_eq!(
+        block_on(c.kernel.statx(
+            &caller,
+            Fd(0),
+            GuestPtr::NULL,
+            AtFlags::AT_EMPTY_PATH,
+            StatxMask::STATX_TYPE,
+            GuestPtrMut::new(0x100),
+        )),
+        Ok(0)
+    );
+    let stat: Statx = block_on(read_value(&memory, GuestPtr::new(0x100))).unwrap();
+    assert_eq!(
+        FileMode(stat.stx_mode as u32) & FileMode::S_IFMT,
+        FileMode::S_IFCHR
+    );
+    let flags = block_on(c.kernel.fcntl64(&caller, Fd(0), FcntlCmd::F_GETFL, 0)).unwrap();
+    assert_eq!(
+        OpenFlags(flags as u32) & OpenFlags::O_ACCMODE,
+        OpenFlags::O_RDWR
+    );
     let files = c.kernel.files(c.leader);
     let files = files.lock_or_recover();
     let file = files.get(Fd(0)).unwrap();

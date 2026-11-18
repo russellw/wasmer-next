@@ -459,11 +459,26 @@ fn stream_connect_accept_and_transfer() {
             flags,
         ))
     };
-    let first = accept(SocketFlags(0)).unwrap();
-    let server = accept(SocketFlags::SOCK_NONBLOCK).unwrap();
+    accept(SocketFlags(0)).unwrap();
     assert_eq!(read_sockaddr(&memory, 0x300).ip().to_string(), "127.0.0.1");
+    put(&memory, 0x300, &[0xee; 16]);
+    put(&memory, 0x2f0, &2u32.to_le_bytes());
+    let server = accept(SocketFlags::SOCK_NONBLOCK).unwrap();
+    assert_eq!(get(&memory, 0x2f0, 4), 16u32.to_le_bytes());
+    assert_eq!(get(&memory, 0x300, 4), [2, 0, 0xee, 0xee]);
     assert_eq!(errno(accept(SocketFlags(1))), Errno::EINVAL);
-    let _ = first;
+
+    put(&memory, 0x300, &[0xee; 16]);
+    put(&memory, 0x2f0, &4u32.to_le_bytes());
+    let peer = block_on(kernel.getpeername(
+        &caller,
+        client,
+        GuestPtrMut::new(0x300),
+        GuestPtrMut::new(0x2f0),
+    ));
+    assert_eq!(peer, Ok(0));
+    assert_eq!(get(&memory, 0x2f0, 4), 16u32.to_le_bytes());
+    assert_eq!(get(&memory, 0x300, 6), [2, 0, 0x17, 0x70, 0xee, 0xee]);
 
     put(&memory, 0x400, b"ping");
     let sent = block_on(kernel.sendto(
@@ -519,8 +534,9 @@ fn datagrams_report_sender_truncation_and_control_messages() {
     assert_eq!(send(), Ok(11));
     assert_eq!(send(), Ok(11));
 
-    // recvfrom with MSG_TRUNC returns the datagram's real length.
-    put(&memory, 0x2f0, &16u32.to_le_bytes());
+    // MSG_TRUNC returns the real payload length independently of address truncation.
+    put(&memory, 0x300, &[0xee; 16]);
+    put(&memory, 0x2f0, &4u32.to_le_bytes());
     let n = block_on(kernel.recvfrom(
         &caller,
         receiver,
@@ -531,7 +547,8 @@ fn datagrams_report_sender_truncation_and_control_messages() {
     ));
     assert_eq!(n, Ok(11));
     assert_eq!(get(&memory, 0x500, 5), b"hello");
-    assert_eq!(read_sockaddr(&memory, 0x300).port(), 40000);
+    assert_eq!(get(&memory, 0x2f0, 4), 16u32.to_le_bytes());
+    assert_eq!(get(&memory, 0x300, 6), [2, 0, 0x9c, 0x40, 0xee, 0xee]);
 
     // recvmsg: one iovec of 5 bytes, a name buffer and room for 14 control bytes, so the
     // 16-byte control message is cut.
@@ -2058,6 +2075,7 @@ fn socketpair_validates_the_protocol_before_pair_support() {
         (DGRAM, 6, Errno::EPROTONOSUPPORT),
         (STREAM, 1, Errno::EPROTONOSUPPORT),
         (DGRAM, 0, Errno::EOPNOTSUPP),
+        (STREAM, 0, Errno::EOPNOTSUPP),
     ] {
         assert_eq!(
             errno(block_on(kernel.socketpair(

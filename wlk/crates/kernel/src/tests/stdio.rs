@@ -2,7 +2,7 @@
 
 use std::task::{Context, Poll, Waker};
 
-use wasixv2_abi::FcntlCmd;
+use wasixv2_abi::{FcntlCmd, FileMode, Statx, StatxMask};
 use wasixv2_wait::{PollMask, Pollable};
 
 use super::*;
@@ -67,6 +67,38 @@ fn machine_with_feed() -> (Kernel, TaskId, FlatMemory, Arc<Feed>) {
 fn readable(kernel: &Kernel, task: TaskId) -> bool {
     let stdin = kernel.file(task, Fd(0)).unwrap();
     stdin.poll(None).contains(PollMask::IN)
+}
+
+#[test]
+fn host_stdio_has_fifo_modes_and_pipe_access_flags() {
+    let (kernel, task, memory, _) = machine_with_feed();
+    let caller = Caller::new(task, &memory);
+    for (fd, access) in [
+        (Fd(0), OpenFlags::O_RDONLY),
+        (Fd(1), OpenFlags::O_WRONLY),
+        (Fd(2), OpenFlags::O_WRONLY),
+    ] {
+        let stat = GuestPtrMut::new(0x100);
+        assert_eq!(
+            block_on(kernel.statx(
+                &caller,
+                fd,
+                GuestPtr::NULL,
+                AtFlags::AT_EMPTY_PATH,
+                StatxMask::STATX_TYPE,
+                stat,
+            )),
+            Ok(0)
+        );
+        let stat: Statx =
+            block_on(wasixv2_syscalls::read_value(&memory, GuestPtr::new(0x100))).unwrap();
+        assert_eq!(
+            FileMode(stat.stx_mode as u32) & FileMode::S_IFMT,
+            FileMode::S_IFIFO
+        );
+        let flags = block_on(kernel.fcntl64(&caller, fd, FcntlCmd::F_GETFL, 0)).unwrap();
+        assert_eq!(OpenFlags(flags as u32) & OpenFlags::O_ACCMODE, access);
+    }
 }
 
 #[test]
