@@ -10,7 +10,10 @@
 
 use std::sync::Arc;
 
-use wasixv2_abi::{AtFd, AtFlags, FcntlCmd, Fd, OpenFlags, Statx, StatxMask};
+use wasixv2_abi::{
+    AtFd, AtFlags, FcntlCmd, Fd, GuestPtr, GuestPtrMut, OpenFlags, Pid, Rlimit64, RlimitResource,
+    Statx, StatxMask,
+};
 use wasixv2_syscalls::{
     Caller, Control, DescriptorInstallations, DescriptorSet, SysResult, Syscalls,
 };
@@ -141,6 +144,7 @@ pub(crate) async fn load<S: Syscalls + Control + 'static>(
     if let Some(startup) = proc.startup.get() {
         return Ok(startup.clone());
     }
+    let _ = raise_nofile(frame).await;
     let input = proc.seal_startup_input();
     let (args, env) = match &input {
         Some(configured) => (configured.input.args.clone(), configured.input.env.clone()),
@@ -234,6 +238,26 @@ pub(crate) async fn load<S: Syscalls + Control + 'static>(
     // Another thread of the process won the race; its preopens are the ones the guest sees.
     close_preopens(frame, &opened).await;
     Ok(proc.startup.get().expect("set by the winner").clone())
+}
+
+async fn raise_nofile<S: Syscalls + Control + 'static>(frame: &Frame<'_, S>) -> SysResult<()> {
+    let caller = frame.caller();
+    let resource = RlimitResource::RLIMIT_NOFILE;
+    let out = frame.mem.alloc_mut::<Rlimit64>()?;
+    frame
+        .syscalls
+        .prlimit64(&caller, Pid(0), resource, GuestPtr::NULL, out)
+        .await?;
+    let mut limit = frame.mem.take(out);
+    if limit.rlim_cur < limit.rlim_max {
+        limit.rlim_cur = limit.rlim_max;
+        let limit = frame.mem.alloc(&limit)?;
+        frame
+            .syscalls
+            .prlimit64(&caller, Pid(0), resource, limit, GuestPtrMut::NULL)
+            .await?;
+    }
+    Ok(())
 }
 
 async fn ready_file_id<S: Syscalls + Control + 'static>(

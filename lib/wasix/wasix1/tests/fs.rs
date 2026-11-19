@@ -834,6 +834,20 @@ fn renumber_and_preopens() {
 }
 
 #[test]
+fn descriptor_allocation_reaches_v1_soft_limit() {
+    let data = r#"
+  (import "wasix_32v1" "fd_dup" (func $dup (param i32 i32) (result i32)))
+"#;
+    let body = r#"
+    (loop $fill
+      (call $ok (i32.const 1) (call $dup (i32.const 3) (i32.const 64)))
+      (br_if $fill (i32.lt_u (i32.load (i32.const 64)) (i32.const 4095))))
+    (call $eq (i32.const 2) (call $dup (i32.const 3) (i32.const 64)) (i32.const 33))
+"#;
+    assert_eq!(run(&guest(PREVIEW1, data, body)).0, 0);
+}
+
+#[test]
 fn stdio_and_pipe_stat_types() {
     let wat = r#"
 (module
