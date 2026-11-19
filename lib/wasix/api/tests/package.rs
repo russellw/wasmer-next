@@ -6,6 +6,7 @@ use std::{
     collections::BTreeMap,
     io,
     sync::{Arc, Mutex},
+    time::{Duration, SystemTime},
 };
 
 use wasixv2::{ByteSink, EmptySource, LocalFuture, Machine, Stdio};
@@ -59,8 +60,14 @@ fn package() -> OwnedReader {
         "msg.txt".parse().unwrap(),
         DirEntry::File(FileEntry::borrowed(
             b"from the package\n",
-            Timestamps::default(),
+            Timestamps {
+                modified: SystemTime::UNIX_EPOCH + Duration::from_secs(946_684_800),
+            },
         )),
+    );
+    children.insert(
+        "epoch.txt".parse().unwrap(),
+        DirEntry::File(FileEntry::borrowed(b"", Timestamps::default())),
     );
     let volume = Directory::new(children, Timestamps::default());
     let mut writer = Writer::new(ChecksumAlgorithm::Sha256)
@@ -105,6 +112,59 @@ async fn read_only_volume_refuses_writes() {
     assert_eq!(stdout, b"from the package\n");
     // EROFS
     assert_eq!(status, 30);
+}
+
+#[tokio::test]
+async fn webc_mtime_is_visible_by_path_and_descriptor() {
+    let wasm = wat::parse_str(
+        r#"
+(module
+  (import "wasixv2" "statx" (func $statx (param i32 i32 i32 i32 i32) (result i32)))
+  (import "wasixv2" "openat" (func $openat (param i32 i32 i32 i32) (result i32)))
+  (import "wasixv2" "exit_group" (func $exit_group (param i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 16) "/data/msg.txt\00")
+  (data (i32.const 48) "/data/epoch.txt\00")
+  (func $mtime (param $fd i32) (param $path i32) (param $flags i32) (param $expected i64)
+    ;; STATX_MTIME and stx_mtime.tv_sec/tv_nsec at 112/120.
+    (if (call $statx (local.get $fd) (local.get $path) (local.get $flags) (i32.const 0x40) (i32.const 256))
+      (then (call $exit_group (i32.const 1)) unreachable))
+    (if (i32.eqz (i32.and (i32.load (i32.const 256)) (i32.const 0x40)))
+      (then (call $exit_group (i32.const 2)) unreachable))
+    (if (i64.ne (i64.load offset=112 (i32.const 256)) (local.get $expected))
+      (then (call $exit_group (i32.const 3)) unreachable))
+    (if (i32.load offset=120 (i32.const 256))
+      (then (call $exit_group (i32.const 4)) unreachable)))
+  (func $check (param $path i32) (param $expected i64) (local $fd i32)
+    (call $mtime (i32.const -100) (local.get $path) (i32.const 0) (local.get $expected))
+    (local.set $fd (call $openat (i32.const -100) (local.get $path) (i32.const 0) (i32.const 0)))
+    (if (i32.lt_s (local.get $fd) (i32.const 0))
+      (then (call $exit_group (i32.const 5)) unreachable))
+    ;; AT_EMPTY_PATH, using the open descriptor and an empty string.
+    (call $mtime (local.get $fd) (i32.const 0) (i32.const 0x1000) (local.get $expected)))
+  (func (export "_start")
+    (call $check (i32.const 16) (i64.const 946684800))
+    (call $check (i32.const 48) (i64.const 1))
+    (call $exit_group (i32.const 0))))
+"#,
+    )
+    .unwrap();
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let machine = Machine::new();
+            machine
+                .mount_package_volume("/data", &package(), "/data", true)
+                .await
+                .unwrap();
+            assert_eq!(
+                machine
+                    .run(&wasm, Stdio::from_fns(|_| {}, |_| {}))
+                    .await
+                    .unwrap(),
+                0
+            );
+        })
+        .await;
 }
 
 /// Prints `/msg.txt`, from the package volume under the root, then opens `/etc/hosts`, from

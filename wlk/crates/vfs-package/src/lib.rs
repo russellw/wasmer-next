@@ -9,8 +9,9 @@
 //!
 //! What the image does not record is fixed: every object belongs to root (uid and gid 0) unless
 //! the embedder picks another owner, files and directories are `0755`, symlinks `0777`. Files are executable because v3 stores no mode
-//! bits and packages carry programs and scripts; nothing can be written anyway. All timestamps
-//! are the epoch, since the v3 reader does not expose the stored modification time. Inode
+//! bits and packages carry programs and scripts; nothing can be written anyway. WebC modification
+//! times use a legacy-compatible one-second fallback. Other timestamps, and those of trees built
+//! directly from buffers, are the epoch where reported. Inode
 //! numbers are handed out from a per-volume counter when a directory is first parsed (the root
 //! is 1, its entries take the next consecutive numbers), so every object has exactly one
 //! number for the mount's lifetime and no two objects share one.
@@ -34,6 +35,7 @@ use std::{
         Arc, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
+    time::SystemTime,
 };
 
 use async_trait::async_trait;
@@ -48,6 +50,7 @@ use webc::v3::read::{
     DirEntry as WebcEntry, Directory, OwnedReader, OwnedReaderError, VolumeHeaderError,
     VolumeSection,
 };
+use webc::{Metadata, PathSegments};
 
 #[cfg(test)]
 mod tests;
@@ -56,6 +59,8 @@ mod tests;
 pub const WEBC_MAGIC: u32 = 0x7765_6263;
 const BLOCK: u64 = 4096;
 const ROOT_INO: u64 = 1;
+const NANOS_PER_SECOND: u64 = 1_000_000_000;
+const WEBC_MTIME_FALLBACK: Timestamp = Timestamp::new(1, 0);
 const FILE_MODE: u32 = 0o755;
 const DIR_MODE: u32 = 0o755;
 const SYMLINK_MODE: u32 = 0o777;
@@ -85,6 +90,7 @@ pub enum PackageFsError {
 /// One volume of a webc package, mounted read-only.
 pub struct PackageFs {
     root: Arc<DirData>,
+    root_mtime: Timestamp,
     vol: Arc<Volume>,
     owner: (u32, u32),
 }
@@ -132,6 +138,9 @@ impl PackageFs {
         // this crate.
         let root = unsafe { std::mem::transmute::<Directory<'_>, Directory<'static>>(root) };
         validate(&root, size)?;
+        let root_mtime = v3_mtime(root.timestamps()).ok_or(PackageFsError::Malformed(
+            "the root's modification time cannot be represented",
+        ))?;
         let vol = Arc::new(Volume {
             _section: Some(section),
             size,
@@ -140,6 +149,7 @@ impl PackageFs {
         let root = Arc::new(DirData::new(root, vol.clone()));
         Ok(Self {
             root,
+            root_mtime,
             vol,
             owner: (uid, gid),
         })
@@ -150,6 +160,7 @@ impl PackageFs {
     pub fn for_owner(&self, uid: u32, gid: u32) -> Self {
         Self {
             root: self.root.clone(),
+            root_mtime: self.root_mtime,
             vol: self.vol.clone(),
             owner: (uid, gid),
         }
@@ -185,9 +196,9 @@ impl PackageFs {
         let mut size = 0;
         for (path, data) in files {
             size += data.len() as u64;
-            tree.insert(&path, TreeEntry::File(data))?;
+            tree.insert(&path, TreeEntry::File(data), Timestamp::default())?;
         }
-        Self::from_tree(tree, size, uid, gid)
+        Self::from_tree(tree, Timestamp::default(), size, uid, gid)
     }
 
     /// Mounts the entries exposed by any WebC volume, including in-memory and v2 volumes.
@@ -198,12 +209,9 @@ impl PackageFs {
     /// internally cannot be detected through this interface.
     pub fn from_volume(volume: &webc::Volume, uid: u32, gid: u32) -> Result<Self, PackageFsError> {
         std::panic::catch_unwind(AssertUnwindSafe(|| {
-            if !matches!(
-                volume.metadata(webc::PathSegments::ROOT),
-                Some(webc::Metadata::Dir { .. })
-            ) {
+            let Some(root @ Metadata::Dir { .. }) = volume.metadata(PathSegments::ROOT) else {
                 return Err(PackageFsError::Malformed("the root is not a directory"));
-            }
+            };
             let mut tree = Tree::default();
             let mut size = 0u64;
             let mut pending = vec![(String::new(), webc::PathSegments::ROOT)];
@@ -263,18 +271,24 @@ impl PackageFs {
                             TreeEntry::Symlink(target)
                         }
                     };
-                    tree.insert(&relative, entry)?;
+                    tree.insert(&relative, entry, webc_mtime(metadata))?;
                     if metadata.is_dir() {
                         pending.push((relative, path));
                     }
                 }
             }
-            Self::from_tree(tree, size, uid, gid)
+            Self::from_tree(tree, webc_mtime(root), size, uid, gid)
         }))
         .map_err(|_| PackageFsError::Malformed("a volume operation panicked"))?
     }
 
-    fn from_tree(tree: Tree, size: u64, uid: u32, gid: u32) -> Result<Self, PackageFsError> {
+    fn from_tree(
+        tree: Tree,
+        root_mtime: Timestamp,
+        size: u64,
+        uid: u32,
+        gid: u32,
+    ) -> Result<Self, PackageFsError> {
         let vol = Arc::new(Volume {
             _section: None,
             size,
@@ -283,6 +297,7 @@ impl PackageFs {
         let root = tree.build(&vol)?;
         Ok(Self {
             root,
+            root_mtime,
             vol,
             owner: (uid, gid),
         })
@@ -291,7 +306,7 @@ impl PackageFs {
 
 /// A tree's entries while they are collected.
 #[derive(Default)]
-struct Tree(BTreeMap<String, TreeEntry>);
+struct Tree(BTreeMap<String, (TreeEntry, Timestamp)>);
 
 enum TreeEntry {
     Dir(Tree),
@@ -300,7 +315,12 @@ enum TreeEntry {
 }
 
 impl Tree {
-    fn insert(&mut self, path: &str, item: TreeEntry) -> Result<(), PackageFsError> {
+    fn insert(
+        &mut self,
+        path: &str,
+        item: TreeEntry,
+        mtime: Timestamp,
+    ) -> Result<(), PackageFsError> {
         // The bound on the length bounds the depth, which building and dropping the tree
         // recurse through.
         if path.len() >= PATH_MAX {
@@ -318,15 +338,15 @@ impl Tree {
             let entry = dir
                 .0
                 .entry(name.to_string())
-                .or_insert_with(|| TreeEntry::Dir(Tree::default()));
-            dir = match entry {
+                .or_insert_with(|| (TreeEntry::Dir(Tree::default()), Timestamp::default()));
+            dir = match &mut entry.0 {
                 TreeEntry::Dir(tree) => tree,
                 TreeEntry::File(_) | TreeEntry::Symlink(_) => return Err(conflict()),
             };
         }
         match dir.0.entry(file.to_string()) {
             btree_map::Entry::Vacant(entry) => {
-                entry.insert(item);
+                entry.insert((item, mtime));
                 Ok(())
             }
             btree_map::Entry::Occupied(_) => Err(conflict()),
@@ -344,7 +364,7 @@ impl Tree {
             /// The index of the subdirectory's table in `tables`.
             Dir(usize),
         }
-        let mut tables: Vec<Vec<(String, u64, Slot)>> = Vec::new();
+        let mut tables: Vec<Vec<(String, u64, Slot, Timestamp)>> = Vec::new();
         // A directory to number, and where its parent's table names it.
         let mut pending = vec![(self, None::<(usize, usize)>)];
         while let Some((tree, parent)) = pending.pop() {
@@ -360,12 +380,14 @@ impl Tree {
                 .fetch_add(tree.0.len() as u64, Ordering::Relaxed);
             let mut entries = Vec::with_capacity(tree.0.len());
             let mut subdirs = Vec::new();
-            for (i, (ino, (name, entry))) in (first..).zip(tree.0).enumerate() {
+            for (i, (ino, (name, (entry, mtime)))) in (first..).zip(tree.0).enumerate() {
                 match entry {
-                    TreeEntry::File(data) => entries.push((name, ino, Slot::File(data))),
-                    TreeEntry::Symlink(target) => entries.push((name, ino, Slot::Symlink(target))),
+                    TreeEntry::File(data) => entries.push((name, ino, Slot::File(data), mtime)),
+                    TreeEntry::Symlink(target) => {
+                        entries.push((name, ino, Slot::Symlink(target), mtime))
+                    }
                     TreeEntry::Dir(sub) => {
-                        entries.push((name, ino, Slot::Dir(usize::MAX)));
+                        entries.push((name, ino, Slot::Dir(usize::MAX), mtime));
                         subdirs.push((sub, Some((table, i))));
                     }
                 }
@@ -381,7 +403,7 @@ impl Tree {
             let mut subdirs = 0;
             let entries = entries
                 .into_iter()
-                .map(|(name, ino, slot)| {
+                .map(|(name, ino, slot, mtime)| {
                     let kind = match slot {
                         Slot::File(data) => Kind::File(data),
                         Slot::Symlink(target) => Kind::Symlink(Cow::Owned(target)),
@@ -393,6 +415,7 @@ impl Tree {
                     Child {
                         name: Cow::Owned(name),
                         ino,
+                        mtime,
                         kind,
                     }
                 })
@@ -429,6 +452,7 @@ impl Filesystem for PackageFs {
         Arc::new(PackageNode {
             kind: Kind::Dir(self.root.clone()),
             ino: ROOT_INO,
+            mtime: self.root_mtime,
             vol: self.vol.clone(),
             owner: self.owner,
         })
@@ -468,6 +492,7 @@ struct Child {
     /// Borrowed from the volume header, or owned for a built tree.
     name: Cow<'static, str>,
     ino: u64,
+    mtime: Timestamp,
     kind: Kind,
 }
 
@@ -511,12 +536,13 @@ impl DirData {
         // mounting decoded every one of them already, so this cannot fail on the same bytes.
         let dir = self.source.as_ref().ok_or(Errno::EIO)?;
         let parsed = decode(dir).map_err(|_| Errno::EIO)?;
-        // `children` runs this once per directory, so each entry gets its number exactly once.
+        // Each entry gets its number exactly once.
         let first = self
             .vol
             .next_ino
             .fetch_add(parsed.len() as u64, Ordering::Relaxed);
         for (ino, (name, entry)) in (first..).zip(parsed) {
+            let mtime = v3_mtime(entry.timestamps()).ok_or(Errno::EIO)?;
             let kind = match entry {
                 WebcEntry::Dir(dir) => {
                     subdirs += 1;
@@ -528,6 +554,7 @@ impl DirData {
             entries.push(Child {
                 name: Cow::Borrowed(name),
                 ino,
+                mtime,
                 kind,
             });
         }
@@ -600,10 +627,38 @@ fn validate(root: &Directory<'static>, volume_size: u64) -> Result<(), PackageFs
     Ok(())
 }
 
+fn v3_mtime(timestamps: webc::v3::Timestamps) -> Option<Timestamp> {
+    let modified = timestamps
+        .modified
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()?;
+    if modified.is_zero() {
+        return Some(WEBC_MTIME_FALLBACK);
+    }
+    Some(Timestamp::new(
+        modified.as_secs().try_into().ok()?,
+        modified.subsec_nanos(),
+    ))
+}
+
+/// Legacy path metadata and the initial cached descriptor stat used one second for
+/// missing or epoch WebC mtimes.
+fn webc_mtime(metadata: Metadata) -> Timestamp {
+    let mtime = metadata.timestamps().map_or(0, |times| times.modified());
+    if mtime == 0 {
+        return WEBC_MTIME_FALLBACK;
+    }
+    Timestamp::new(
+        (mtime / NANOS_PER_SECOND) as i64,
+        (mtime % NANOS_PER_SECOND) as u32,
+    )
+}
+
 /// A file, directory or symlink of the volume.
 pub struct PackageNode {
     kind: Kind,
     ino: u64,
+    mtime: Timestamp,
     vol: Arc<Volume>,
     owner: (u32, u32),
 }
@@ -650,7 +705,7 @@ impl Node for PackageNode {
             blocks: size.div_ceil(512),
             blksize: BLOCK as u32,
             atime: epoch,
-            mtime: epoch,
+            mtime: self.mtime,
             ctime: epoch,
             btime: None,
             dev: None,
@@ -671,6 +726,7 @@ impl Node for PackageNode {
         Ok(Arc::new(PackageNode {
             kind: child.kind.clone(),
             ino: child.ino,
+            mtime: child.mtime,
             vol: self.vol.clone(),
             owner: self.owner,
         }))

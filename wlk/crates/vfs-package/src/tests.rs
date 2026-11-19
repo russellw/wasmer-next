@@ -9,11 +9,18 @@ use webc::v3::{
 use super::*;
 
 fn dir(children: Vec<(&str, WEntry<'static>)>) -> WDir<'static> {
+    dir_with_timestamps(children, Timestamps::default())
+}
+
+fn dir_with_timestamps(
+    children: Vec<(&str, WEntry<'static>)>,
+    timestamps: Timestamps,
+) -> WDir<'static> {
     let children: BTreeMap<_, _> = children
         .into_iter()
         .map(|(name, entry)| (name.parse().unwrap(), entry))
         .collect();
-    WDir::new(children, Timestamps::default())
+    WDir::new(children, timestamps)
 }
 
 fn file(data: &'static [u8]) -> WEntry<'static> {
@@ -203,12 +210,16 @@ fn mutations_fail_with_erofs() {
 
 /// The bytes of a package whose volume `atom` holds `children`.
 fn webc_bytes(children: Vec<(&str, WEntry<'static>)>) -> Vec<u8> {
+    volume_bytes(dir(children))
+}
+
+fn volume_bytes(volume: WDir<'static>) -> Vec<u8> {
     let mut writer = Writer::new(ChecksumAlgorithm::Sha256)
         .write_manifest(&Default::default())
         .unwrap()
         .write_atoms(BTreeMap::new())
         .unwrap();
-    writer.write_volume("atom", dir(children)).unwrap();
+    writer.write_volume("atom", volume).unwrap();
     writer.finish(SignatureAlgorithm::None).unwrap().to_vec()
 }
 
@@ -284,6 +295,10 @@ fn from_files_builds_the_directories_the_paths_imply() {
         ("x", b""),
     ])
     .unwrap();
+    assert_eq!(
+        block_on(fs.root().getattr()).unwrap().mtime,
+        Timestamp::default()
+    );
     let names: Vec<_> = read_dir(&*fs.root(), 0, usize::MAX)
         .into_iter()
         .map(|e| (e.0, e.2))
@@ -380,6 +395,68 @@ fn from_files_bounds_the_depth() {
 }
 
 #[test]
+fn mounted_v3_retains_mtime_across_reader_paths() {
+    use std::time::{Duration, SystemTime};
+
+    let modified = Timestamps {
+        modified: SystemTime::UNIX_EPOCH + Duration::from_secs(946_684_800),
+    };
+    let bytes = volume_bytes(dir_with_timestamps(
+        vec![
+            ("plain", file(b"")),
+            ("stamped", WEntry::File(FileEntry::borrowed(b"", modified))),
+            (
+                "link",
+                WEntry::Symlink(SymlinkEntry::borrowed("stamped", modified)),
+            ),
+            ("sub", WEntry::Dir(WDir::new(BTreeMap::new(), modified))),
+        ],
+        modified,
+    ));
+    let reader = OwnedReader::parse(bytes).unwrap();
+    let fast = PackageFs::new(&reader, "atom").unwrap();
+    let abstract_volume = webc::Container::from(reader).get_volume("atom").unwrap();
+    let collected = PackageFs::from_volume(&abstract_volume, 0, 0).unwrap();
+    for fs in [fast, collected] {
+        for (path, seconds) in [
+            ("", 946_684_800),
+            ("plain", 1),
+            ("link", 946_684_800),
+            ("stamped", 946_684_800),
+            ("sub", 946_684_800),
+        ] {
+            let attr = block_on(lookup(&fs, path).getattr()).unwrap();
+            assert_eq!(attr.mtime, Timestamp::new(seconds, 0), "{path}");
+            assert_eq!(attr.atime, Timestamp::default());
+            assert_eq!(attr.ctime, Timestamp::default());
+            assert_eq!(attr.btime, None);
+        }
+    }
+}
+
+#[test]
+fn v3_mtime_preserves_seconds_beyond_u64_nanosecond_range() {
+    use std::time::{Duration, SystemTime};
+
+    let seconds = 22_000_000_000;
+    let modified = Timestamps {
+        modified: SystemTime::UNIX_EPOCH + Duration::from_secs(seconds),
+    };
+    let reader = OwnedReader::parse(volume_bytes(dir_with_timestamps(vec![], modified))).unwrap();
+    let fs = PackageFs::new(&reader, "atom").unwrap();
+    let attr = block_on(fs.root().getattr()).unwrap();
+    assert_eq!(attr.mtime, Timestamp::new(seconds as i64, 0));
+}
+
+#[test]
+fn abstract_webc_mtime_keeps_fractional_values() {
+    let metadata = Metadata::Dir {
+        timestamps: Some(webc::Timestamps::from_modified(500_000_123)),
+    };
+    assert_eq!(webc_mtime(metadata), Timestamp::new(0, 500_000_123));
+}
+
+#[test]
 fn from_volume_preserves_v3_directories_symlinks_and_buffers_after_source_drop() {
     let container = webc::Container::from(reader());
     let volume = container.get_volume("atom").unwrap();
@@ -452,7 +529,12 @@ fn from_volume_preserves_v2_nested_and_empty_directories() {
     );
     assert_eq!(read_dir(&*nested, entries[0].3, usize::MAX), entries[1..]);
     assert!(read_dir(&*lookup(&fs, "nested/empty"), 0, usize::MAX).is_empty());
-    let handle = block_on(lookup(&fs, "nested/data").open(OpenOptions::default())).unwrap();
+    let data = lookup(&fs, "nested/data");
+    assert_eq!(
+        block_on(data.getattr()).unwrap().mtime,
+        Timestamp::new(1, 0)
+    );
+    let handle = block_on(data.open(OpenOptions::default())).unwrap();
     let mut buf = [0; 2];
     assert_eq!(block_on(handle.read_at(&mut buf, 0)), Ok(2));
     assert_eq!(&buf, b"v2");
