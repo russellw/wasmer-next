@@ -6,7 +6,7 @@ use crate::{
     errno::V1Result,
     shim::{self, Frame},
 };
-use wasixv2_abi::Fd;
+use wasixv2_abi::{FcntlCmd, Fd};
 use wasixv2_syscalls::{Control, DescriptorAttachment, DescriptorUpdate, SysErr, Syscalls};
 
 #[derive(Clone)]
@@ -139,20 +139,34 @@ pub(crate) async fn set_legacy_cloexec<S: Syscalls + Control + 'static>(
     fd: Fd,
     cloexec: bool,
 ) -> V1Result<()> {
-    let set = frame.bind_descriptors(&[fd])?;
-    let old = record(frame, fd).await?;
-    if !old.base.contains(Rights::FD_FDSTAT_SET_FLAGS) {
-        return shim::fail(Errno::ACCES);
-    }
-    let new = Record { cloexec, ..old };
-    match frame
-        .syscalls
-        .replace_descriptor_attachment(frame.task, &set, fd, new.attachment())
-        .map_err(SysErr::from)?
-    {
-        DescriptorUpdate::Replaced => Ok(()),
-        DescriptorUpdate::Conflict => Err(wasixv2_abi::Errno::EAGAIN.into()),
-        DescriptorUpdate::Stale => shim::fail(Errno::BADF),
+    let mut set = frame.bind_descriptors(&[fd])?;
+    let original = frame.caller();
+    loop {
+        let old = record(frame, fd).await?;
+        if !old.base.contains(Rights::FD_FDSTAT_SET_FLAGS) {
+            return shim::fail(Errno::ACCES);
+        }
+        let new = Record { cloexec, ..old };
+        match frame
+            .syscalls
+            .replace_descriptor_attachment(frame.task, &set, fd, new.attachment())
+            .map_err(SysErr::from)?
+        {
+            DescriptorUpdate::Replaced => return Ok(()),
+            DescriptorUpdate::Stale => return shim::fail(Errno::BADF),
+            DescriptorUpdate::Conflict => {
+                set = frame
+                    .syscalls
+                    .snapshot_descriptors(frame.task, &[fd])
+                    .map_err(SysErr::from)?;
+                // Validate the original slot after taking the fresh snapshot.
+                frame
+                    .syscalls
+                    .fcntl64(&original, fd, FcntlCmd::F_SETFD, 0)
+                    .await?;
+                frame.replace_descriptors(set.clone());
+            }
+        }
     }
 }
 

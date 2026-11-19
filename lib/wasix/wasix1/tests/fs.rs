@@ -619,6 +619,111 @@ async fn descriptor_renumber_does_not_overwrite_a_named_target_installed_while_p
     );
 }
 
+#[tokio::test]
+async fn named_cloexec_retries_attachment_conflict() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use wasixv2_abi::{FcntlCmd, Fd, OpenFlags};
+    use wasixv2_kernel::{Dispatch, HostClock, Kernel, SyscallEntry};
+    use wasixv2_syscalls::{
+        Caller, Control, DescriptorUpdate, Layer, Layered, MaybeFuture, SysResult, Syscall,
+        SyscallRet, Syscalls,
+    };
+    use wasixv2_wasix1::{PreopenRights, abi::fs::Rights};
+
+    struct Reduce(AtomicUsize, bool);
+    impl Layer<Kernel> for Reduce {
+        fn call<'a>(
+            &'a self,
+            caller: &'a Caller<'_>,
+            call: Syscall,
+            next: &'a Kernel,
+        ) -> MaybeFuture<'a, SysResult<SyscallRet>> {
+            MaybeFuture::Future(Box::pin(async move {
+                if let Syscall::Fcntl64 {
+                    fd: Fd(3),
+                    cmd: FcntlCmd::F_SETFD,
+                    ..
+                } = call
+                {
+                    match self.0.fetch_add(1, Ordering::Relaxed) {
+                        0 => {
+                            let reduced = PreopenRights {
+                                base: Rights::FD_FDSTAT_SET_FLAGS.0,
+                                inheriting: 0,
+                            };
+                            assert_eq!(
+                                next.replace_descriptor_attachment(
+                                    caller.task(),
+                                    caller.descriptors().unwrap(),
+                                    Fd(3),
+                                    Some(reduced.named_attachment(b"/").unwrap()),
+                                ),
+                                Ok(DescriptorUpdate::Replaced)
+                            );
+                        }
+                        1 if self.1 => {
+                            let unbound = Caller::new(caller.task(), caller.memory());
+                            next.dup3(&unbound, Fd(1), Fd(3), OpenFlags::O_CLOEXEC)
+                                .await?;
+                        }
+                        _ => (),
+                    }
+                }
+                Dispatch.call(caller, call, next).await
+            }))
+        }
+    }
+    for replace_slot in [false, true] {
+        let host: Arc<dyn wasixv2::Host> = Arc::new(wasixv2::TokioHost::default());
+        let root = Arc::new(wasixv2_vfs_mem::MemFs::new(
+            Arc::new(HostClock(host.clone())),
+            0o777,
+            1,
+            1,
+        ));
+        let mut abis = wasixv2_exec::Abis::new();
+        abis.push(Arc::new(wasixv2_wasix1::Wasix1::new()));
+        let abis = Arc::new(abis);
+        let kernel = Kernel::new(host.clone(), root).with_binfmt(abis.clone());
+        let task = kernel
+            .spawn(ProcessConfig {
+                args: vec!["named-cloexec".into()],
+                env: vec![],
+                stdio: Stdio::from_fns(|_| {}, |_| {}),
+            })
+            .unwrap();
+        let syscalls = Arc::new(Layered::new(
+            SyscallEntry(Reduce(AtomicUsize::new(0), replace_slot)),
+            kernel,
+        ));
+        let data = r#"
+  (import "wasix_32v1" "fd_fdflags_set" (func $set (param i32 i32) (result i32)))
+  (import "wasix_32v1" "fd_fdflags_get" (func $get (param i32 i32) (result i32)))
+"#;
+        let errno = if replace_slot { 8 } else { 0 };
+        let rights = Rights::FD_FDSTAT_SET_FLAGS.0;
+        let body = format!(
+            r#"
+    (call $eq (i32.const 1) (call $set (i32.const 3) (i32.const 1)) (i32.const {errno}))
+    (call $ok (i32.const 2) (call $get (i32.const 3) (i32.const 64)))
+    (call $eq (i32.const 3) (i32.load16_u (i32.const 64)) (i32.const 1))
+    (if (i32.eqz (i32.const {errno}))
+      (then
+        (call $ok (i32.const 4) (call $fd_fdstat_get (i32.const 3) (i32.const 128)))
+        (call $eq64 (i32.const 5) (i64.load (i32.const 136)) (i64.const {rights}))))
+"#
+        );
+        let store = wasmer::Store::default();
+        let module = wasixv2_exec::load(store.engine(), &guest(PREVIEW1, data, &body)).unwrap();
+        assert_eq!(
+            wasixv2_exec::run_with_abis(store, &module, syscalls, task, host, abis)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+}
+
 /// Create, write, seek, read, pread, pwrite, stat and truncate a file under `/tmp` through the
 /// root preopen.
 #[test]
