@@ -11,8 +11,8 @@
 use std::sync::Arc;
 
 use wasixv2_abi::{
-    AtFd, AtFlags, FcntlCmd, Fd, GuestPtr, GuestPtrMut, OpenFlags, Pid, Rlimit64, RlimitResource,
-    Statx, StatxMask,
+    AtFd, AtFlags, FcntlCmd, Fd, GuestPtr, GuestPtrMut, OpenFlags, Rlimit64, RlimitResource, Statx,
+    StatxMask,
 };
 use wasixv2_syscalls::{
     Caller, Control, DescriptorInstallations, DescriptorSet, SysResult, Syscalls,
@@ -246,7 +246,7 @@ async fn raise_nofile<S: Syscalls + Control + 'static>(frame: &Frame<'_, S>) -> 
     let out = frame.mem.alloc_mut::<Rlimit64>()?;
     frame
         .syscalls
-        .prlimit64(&caller, Pid(0), resource, GuestPtr::NULL, out)
+        .prlimit64(&caller, 0, resource, GuestPtr::NULL, out)
         .await?;
     let mut limit = frame.mem.take(out);
     if limit.rlim_cur < limit.rlim_max {
@@ -254,7 +254,7 @@ async fn raise_nofile<S: Syscalls + Control + 'static>(frame: &Frame<'_, S>) -> 
         let limit = frame.mem.alloc(&limit)?;
         frame
             .syscalls
-            .prlimit64(&caller, Pid(0), resource, limit, GuestPtrMut::NULL)
+            .prlimit64(&caller, 0, resource, limit, GuestPtrMut::NULL)
             .await?;
     }
     Ok(())
