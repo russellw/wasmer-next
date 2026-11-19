@@ -795,6 +795,48 @@ fn snapshot0_layouts() {
     assert_eq!(run(&guest("wasi_unstable", data, &body)).0, 0);
 }
 
+#[test]
+fn path_set_times_with_both_omitted_preserves_metadata() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    tokio::task::LocalSet::new().block_on(&runtime, async {
+        let machine = Machine::new();
+        machine
+            .mount_host_dir("/readonly", Path::new(env!("CARGO_MANIFEST_DIR")), true)
+            .await
+            .unwrap();
+        let body = r#"
+    (call $ok (i32.const 1) (call $path_filestat_get (i32.const 3) (i32.const 1) (i32.const 1024) (i32.const 19) (i32.const 64)))
+    (call $ok (i32.const 2) (call $path_filestat_set_times (i32.const 3) (i32.const 1) (i32.const 1024) (i32.const 19) (i64.const 0) (i64.const 0) (i32.const 0)))
+    (call $ok (i32.const 3) (call $path_filestat_get (i32.const 3) (i32.const 1) (i32.const 1024) (i32.const 19) (i32.const 128)))
+    (call $eq64 (i32.const 4) (i64.load (i32.const 104)) (i64.load (i32.const 168)))
+    (call $eq64 (i32.const 5) (i64.load (i32.const 112)) (i64.load (i32.const 176)))
+    (call $eq64 (i32.const 6) (i64.load (i32.const 120)) (i64.load (i32.const 184)))
+    (call $eq (i32.const 7) (call $path_filestat_set_times (i32.const 3) (i32.const 1) (i32.const 1044) (i32.const 17) (i64.const 0) (i64.const 0) (i32.const 0)) (i32.const 44))
+    (call $ok (i32.const 8) (call $fd_fdstat_set_rights (i32.const 3) (i64.const 0) (i64.const 0)))
+    (call $eq (i32.const 9) (call $path_filestat_set_times (i32.const 3) (i32.const 1) (i32.const 1024) (i32.const 19) (i64.const 0) (i64.const 0) (i32.const 0)) (i32.const 2))
+"#;
+        let data = r#"
+    (data (i32.const 1024) "readonly/Cargo.toml")
+    (data (i32.const 1044) "readonly/no-such!")
+"#;
+        let status = machine
+            .run_process(
+                &guest(PREVIEW1, data, body),
+                ProcessConfig {
+                    args: vec!["omit-times".into()],
+                    env: vec![],
+                    stdio: Stdio::from_fns(|_| {}, |_| {}),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(status, 0);
+    });
+}
+
 /// `fd_renumber` copies (v1's `dup2`). Preopens survive both close and attempted replacement.
 #[test]
 fn renumber_and_preopens() {

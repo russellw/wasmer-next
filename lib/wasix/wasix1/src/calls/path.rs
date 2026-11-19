@@ -314,6 +314,14 @@ pub(crate) async fn path_filestat_set_times<S: Syscalls + Control + 'static>(
         .await?;
         let times = utimes(atim as u64, mtim as u64, Fstflags(fst_flags as u16))?;
         let path = path_arg(frame, path, path_len).await?;
+        let flags = nofollow(Lookupflags(lookup as u32));
+        if times
+            .iter()
+            .all(|time| time.tv_nsec == i64::from(wasixv2_abi::UtimeSpecial::UTIME_OMIT.0))
+        {
+            stat_at(frame, Fd(fd), path, flags, FILESTAT_MASK).await?;
+            return Ok(());
+        }
         let times = frame.mem.alloc(&times)?;
         frame
             .syscalls
@@ -322,7 +330,7 @@ pub(crate) async fn path_filestat_set_times<S: Syscalls + Control + 'static>(
                 Fd(fd),
                 path,
                 wasixv2_abi::GuestPtr::new(times.addr()),
-                nofollow(Lookupflags(lookup as u32)),
+                flags,
             )
             .await?;
         Ok(())
