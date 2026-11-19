@@ -135,8 +135,10 @@ impl<'a, S: 'static> CompatMemory<'a, S> {
 
     /// The window offsets `addr..addr + len`, or `None` if `addr` is below the window. Only
     /// what this call allocated is there: a range that starts past it faults, as an address
-    /// the guest's memory does not reach would. A read that starts inside an allocation and
-    /// runs past its end reads zeroes there, since the kernel reads strings in aligned chunks.
+    /// the guest's memory does not reach would. An empty range anywhere in the window is valid,
+    /// and an empty read copies nothing, as Linux's zero-length user copies never fault. A read
+    /// that starts inside an allocation and runs past its end reads zeroes there, since the
+    /// kernel reads strings in aligned chunks.
     fn scratch_range(addr: u32, len: usize, held: usize) -> Option<Result<(usize, usize), Fault>> {
         if addr < SCRATCH_BASE {
             return None;
@@ -161,6 +163,7 @@ impl<S: 'static> UserMemory for CompatMemory<'_, S> {
     fn read<'a>(&'a self, addr: u32, buf: &'a mut [u8]) -> LocalFuture<'a, Result<(), Fault>> {
         let held = self.scratch.borrow().len();
         match Self::scratch_range(addr, buf.len(), held) {
+            Some(Ok(_)) if buf.is_empty() => copied(Ok(())),
             Some(range) => {
                 let result = range.map(|(start, end)| {
                     let scratch = self.scratch.borrow();

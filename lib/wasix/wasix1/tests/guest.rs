@@ -70,6 +70,40 @@ fn hello_world() {
     assert_eq!(status, 7);
 }
 
+/// Empty buffers are never read, even where they point into the compat layer's scratch window:
+/// Linux's `writev(fd, iov, 0)` returns 0 without looking at `iov`, and an empty iovec's base is
+/// never touched. Both used to panic the host.
+#[test]
+fn empty_iovec_array_in_scratch_window() {
+    let wat = r#"
+    (module
+      (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
+      (import "wasi_snapshot_preview1" "fd_read" (func $fd_read (param i32 i32 i32 i32) (result i32)))
+      (import "wasi_snapshot_preview1" "proc_exit" (func $proc_exit (param i32)))
+      (memory (export "memory") 1)
+      ;; One empty iovec whose buffer lies in the window.
+      (data (i32.const 8) "\00\00\80\ff\00\00\00\00")
+      (func (export "_start")
+        (i32.store (i32.const 32) (i32.const -1))
+        (if (call $fd_read (i32.const 0) (i32.const 8) (i32.const 1) (i32.const 32))
+          (then (call $proc_exit (i32.const 5))))
+        (if (i32.load (i32.const 32))
+          (then (call $proc_exit (i32.const 6))))
+        (i32.store (i32.const 32) (i32.const -1))
+        (if (call $fd_write (i32.const 1) (i32.const 0xff800000) (i32.const 0) (i32.const 32))
+          (then (call $proc_exit (i32.const 1))))
+        (if (i32.load (i32.const 32))
+          (then (call $proc_exit (i32.const 2))))
+        (i32.store (i32.const 32) (i32.const -1))
+        (if (call $fd_read (i32.const 0) (i32.const 0xff800000) (i32.const 0) (i32.const 32))
+          (then (call $proc_exit (i32.const 3))))
+        (if (i32.load (i32.const 32))
+          (then (call $proc_exit (i32.const 4))))
+        (call $proc_exit (i32.const 0))))
+    "#;
+    assert_eq!(block_on(wat, &["empty-iovecs"]).0, 0);
+}
+
 /// Returning from `_start` is `exit(0)` under WASI.
 #[test]
 fn returning_from_start_exits_zero() {
