@@ -2300,13 +2300,24 @@ fn wasmer_run_wasix_wasm_c_api_guest() {
 
     compile_wasix_source(&fixtures::wasix_wasm_c_api_smoke_c(), &wasm, false);
 
-    wasmer_command()
-        .arg("run")
-        .arg(&wasm)
-        .env("RUST_LOG", &*RUST_LOG)
-        .assert()
-        .success()
-        .stdout(contains("wasm-c-api ok"));
+    let run = || {
+        wasmer_command()
+            .arg("run")
+            .arg(&wasm)
+            .env("WASMER_CACHE_DIR", temp.path().join("cache"))
+            .env(
+                "RUST_LOG",
+                "wasmer_wasix::runtime::module_cache::filesystem=debug",
+            )
+            .assert()
+            .success()
+            .stdout(contains("wasm-c-api ok"))
+    };
+    // One cache entry each for the guest executable and its nested module.
+    run().stderr(contains("Saved to disk").count(2));
+    run()
+        .stderr(contains("Cache hit!").count(2))
+        .stderr(contains("Saved to disk").count(0));
 }
 
 #[test]

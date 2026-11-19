@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use std::{collections::HashMap, fmt::Display, mem::size_of, num::NonZeroI32, slice, sync::Arc};
 
 use wasmer_api::{
-    Extern, ExternRef, ExternType, Function, Function as WasmerFunction, FunctionEnv,
+    Engine, Extern, ExternRef, ExternType, Function, Function as WasmerFunction, FunctionEnv,
     FunctionEnvMut, FunctionType, Global, GlobalType, Imports, Instance, Memory, Memory32,
     MemoryType, Module, Mutability, Pages, RuntimeError, StoreMut, Table, TableType, Type,
     TypedFunction, Value, WasmPtr, namespace,
@@ -79,7 +79,7 @@ fn wasm_c_api_version_from_namespace(namespace: &str) -> Option<WasmCAPIVersion>
     })
 }
 
-type ResolveModuleSync = Arc<dyn Fn(Vec<u8>) -> Result<Module> + Send + Sync>;
+type ResolveModuleSync = Arc<dyn Fn(&Engine, Vec<u8>) -> Result<Module> + Send + Sync>;
 
 struct WasmCapiSession {
     version: Option<WasmCAPIVersion>,
@@ -297,8 +297,16 @@ impl WasmCapiRuntimeHooks {
 
     /// Uses an embedder-provided resolver for `wasm_module_new`.
     pub fn with_resolve_module_sync(
-        mut self,
+        self,
         resolve: impl Fn(Vec<u8>) -> Result<Module> + Send + Sync + 'static,
+    ) -> Self {
+        self.with_resolve_module_sync_with_engine(move |_, bytes| resolve(bytes))
+    }
+
+    /// Uses an embedder-provided resolver that compiles for the guest store's engine.
+    pub fn with_resolve_module_sync_with_engine(
+        mut self,
+        resolve: impl Fn(&Engine, Vec<u8>) -> Result<Module> + Send + Sync + 'static,
     ) -> Self {
         self.resolve_module_sync = Some(Arc::new(resolve));
         self
@@ -1076,10 +1084,11 @@ fn wasm_module_new(mut env: FunctionEnvMut<WasmCapiEnv>, _store: i32, bytes_ptr:
         return INVALID_HANDLE;
     };
 
-    let module = if let Some(resolve_module_sync) = env.data().resolve_module_sync.clone() {
-        resolve_module_sync(bytes)
+    let resolver = env.data().resolve_module_sync.clone();
+    let (_, store) = env.data_and_store_mut();
+    let module = if let Some(resolve) = resolver {
+        resolve(store.engine(), bytes)
     } else {
-        let (_, store) = env.data_and_store_mut();
         Module::new(&store, bytes).map_err(Into::into)
     };
 

@@ -1096,11 +1096,22 @@ impl Run {
         console: Option<(Console, [bool; 3])>,
     ) -> Result<Machine, Error> {
         let wasi = &self.wasi;
-        let mut builder = Machine::builder().loader(loader).init(!wasi.no_init);
+        let builder = Machine::builder().init(!wasi.no_init);
         #[cfg(feature = "wasm-c-api")]
-        {
-            builder = builder.instantiation_hook(Arc::new(WasmCapiRuntimeHooks::new()));
-        }
+        let builder = {
+            let compiler = loader.compiler.clone();
+            let hooks = WasmCapiRuntimeHooks::new().with_resolve_module_sync_with_engine(
+                move |engine, bytes| {
+                    // The C API instantiates these modules directly, with their original imports.
+                    let input = HashedModuleData::new(bytes);
+                    Ok(futures::executor::block_on(
+                        compiler.compile(input, engine),
+                    )?)
+                },
+            );
+            builder.instantiation_hook(Arc::new(hooks))
+        };
+        let mut builder = builder.loader(loader);
         if let Some(Some(rules)) = &wasi.networking {
             let rules = rules.parse().context("invalid --net ruleset")?;
             builder = builder.network_policy(Arc::new(NetworkRules(rules)));
