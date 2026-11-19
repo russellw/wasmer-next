@@ -15,6 +15,8 @@ fn guest(body: &str) -> Vec<u8> {
           (import "wasix_32v1" "proc_exec" (func $exec (param i32 i32 i32 i32)))
           (import "wasix_32v1" "proc_exit2" (func $exit (param i32)))
           (import "wasi_snapshot_preview1" "clock_time_get" (func $clock (param i32 i64 i32) (result i32)))
+          (import "wasi_snapshot_preview1" "poll_oneoff" (func $poll (param i32 i32 i32 i32) (result i32)))
+          (import "wasix_32v1" "fd_pipe" (func $pipe (param i32 i32) (result i32)))
           (memory (export "memory") 1)
           (data (i32.const 16) "__wasm_signal")
           (data (i32.const 200) "/prog/next.wasm")
@@ -208,6 +210,63 @@ fn exec_stops_old_signal_timers_and_starts_with_fresh_ids() {
             (call $exit (i32.const 2))
             "#,
             Some(&next)
+        ),
+        0
+    );
+}
+
+#[test]
+fn clock_only_poll_resumes_after_signal() {
+    for absolute in [0, 1] {
+        assert_eq!(
+            status(&format!(
+                r#"
+                (if (call $clock (i32.const 1) (i64.const 0) (i32.const 64))
+                  (then (call $exit (i32.const 1))))
+                (i64.store (i32.const 256) (i64.const 42))
+                (i32.store (i32.const 272) (i32.const 1))
+                (i64.store (i32.const 280)
+                  (i64.add (i64.const 300000000)
+                    (select (i64.load (i32.const 64)) (i64.const 0) (i32.const {absolute}))))
+                (i32.store16 (i32.const 296) (i32.const {absolute}))
+                (if (call $interval (i32.const 10) (i64.const 50000000) (i32.const 0))
+                  (then (call $exit (i32.const 2))))
+                (if (call $poll (i32.const 256) (i32.const 384) (i32.const 1) (i32.const 80))
+                  (then (call $exit (i32.const 3))))
+                (if (i32.ne (i32.load (i32.const 80)) (i32.const 1))
+                  (then (call $exit (i32.const 4))))
+                (if (i64.ne (i64.load (i32.const 384)) (i64.const 42))
+                  (then (call $exit (i32.const 5))))
+                (if (i32.ne (global.get $ten) (i32.const 1))
+                  (then (call $exit (i32.const 6))))
+                (if (call $clock (i32.const 1) (i64.const 0) (i32.const 72))
+                  (then (call $exit (i32.const 7))))
+                (if (i64.lt_u (i64.sub (i64.load (i32.const 72)) (i64.load (i32.const 64))) (i64.const 300000000))
+                  (then (call $exit (i32.const 8))))
+                "#
+            )),
+            0,
+            "ABSTIME={absolute}",
+        );
+    }
+}
+
+#[test]
+fn poll_with_fd_remains_interruptible() {
+    assert_eq!(
+        status(
+            r#"
+            (if (call $pipe (i32.const 64) (i32.const 68)) (then (call $exit (i32.const 1))))
+            (i32.store (i32.const 272) (i32.const 1))
+            (i64.store (i32.const 280) (i64.const 3000000000))
+            (i32.store8 (i32.const 312) (i32.const 1))
+            (i32.store (i32.const 320) (i32.load (i32.const 64)))
+            (if (call $interval (i32.const 10) (i64.const 50000000) (i32.const 0))
+              (then (call $exit (i32.const 2))))
+            (if (i32.ne (call $poll (i32.const 256) (i32.const 384) (i32.const 2) (i32.const 80)) (i32.const 27))
+              (then (call $exit (i32.const 3))))
+            (if (i32.ne (global.get $ten) (i32.const 1)) (then (call $exit (i32.const 4))))
+            "#
         ),
         0
     );

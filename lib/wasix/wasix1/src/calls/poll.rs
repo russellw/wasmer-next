@@ -11,7 +11,7 @@ use wasixv2_abi::{
     AtFlags, ClockId, Fd, GuestPtr, GuestPtrMut, IoctlRequest, KernelTimespec, PollEvents, Pollfd,
     Statx, StatxMask,
 };
-use wasixv2_syscalls::{Control, Syscalls};
+use wasixv2_syscalls::{Control, SysErr, Syscalls};
 use wasmer::RuntimeError;
 
 use crate::{
@@ -351,6 +351,7 @@ where
     S: Syscalls + Control + 'static,
     L: SubscriptionLayout,
 {
+    let saved_sleep = std::cell::OnceCell::new();
     shim::errno(&env, async |frame| {
         let nsubs = nsubs as u32;
         if nsubs == 0 {
@@ -364,22 +365,36 @@ where
         {
             return shim::fail(Errno::TOOBIG);
         }
-        let mut subs = Vec::new();
-        for i in 0..nsubs {
-            let addr = (subs_ptr as u32).wrapping_add(i * L::SIZE as u32);
-            subs.push(frame.read::<L>(addr).await?.sub());
-        }
-        let mut deadlines = Vec::with_capacity(subs.len());
-        for sub in &subs {
-            deadlines.push(match sub.wait {
-                Wait::Clock {
-                    id,
-                    timeout,
-                    abstime,
-                } => deadline(frame, id, timeout, abstime).await?,
-                _ => None,
-            });
-        }
+        let poll_input;
+        let (subs, deadlines) = if let Some(sleep) = saved_sleep.get() {
+            sleep
+        } else {
+            let mut subs = Vec::new();
+            for i in 0..nsubs {
+                let addr = (subs_ptr as u32).wrapping_add(i * L::SIZE as u32);
+                subs.push(frame.read::<L>(addr).await?.sub());
+            }
+            let mut deadlines = Vec::with_capacity(subs.len());
+            for sub in &subs {
+                deadlines.push(match sub.wait {
+                    Wait::Clock {
+                        id,
+                        timeout,
+                        abstime,
+                    } => deadline(frame, id, timeout, abstime).await?,
+                    _ => None,
+                });
+            }
+            if subs
+                .iter()
+                .all(|sub| matches!(sub.wait, Wait::Clock { .. }))
+            {
+                saved_sleep.get_or_init(|| (subs, deadlines))
+            } else {
+                poll_input = (subs, deadlines);
+                &poll_input
+            }
+        };
         let operands: Vec<_> = subs
             .iter()
             .filter_map(|sub| match sub.wait {
@@ -388,7 +403,7 @@ where
             })
             .collect();
         let captured = frame.bind_descriptors(&operands)?;
-        for sub in &subs {
+        for sub in subs {
             let (fd, access) = match sub.wait {
                 Wait::Read(fd) => (Fd(fd as i32), crate::abi::fs::Rights::FD_READ),
                 Wait::Write(fd) => (Fd(fd as i32), crate::abi::fs::Rights::FD_WRITE),
@@ -404,7 +419,7 @@ where
                 .await?;
             }
         }
-        let (mut fds, index) = pollfds(&subs);
+        let (mut fds, index) = pollfds(subs);
         // A descriptor that cannot exist is reported at once, as `poll` reports `POLLNVAL`.
         let invalid = subs
             .iter()
@@ -428,7 +443,14 @@ where
         if invalid {
             timeout = Some(Duration::ZERO);
         }
-        let ready = ppoll(frame, &mut fds, timeout).await?;
+        let ready = ppoll(frame, &mut fds, timeout)
+            .await
+            .map_err(|err| match err {
+                crate::errno::Error::Sys(SysErr::RestartNoHand) if saved_sleep.get().is_some() => {
+                    SysErr::RestartNoIntr.into()
+                }
+                err => err,
+            })?;
 
         let mut events = Vec::new();
         for (i, sub) in subs.iter().enumerate() {
