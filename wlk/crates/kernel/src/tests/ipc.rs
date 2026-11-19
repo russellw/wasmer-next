@@ -981,6 +981,85 @@ mod epoll {
     }
 
     #[test]
+    fn a_harvest_while_an_add_finishes_does_not_repeat_the_edge() {
+        use crate::file::{Backing, FileObject, Io, OpenFile};
+        use std::{
+            future::Future,
+            sync::atomic::{AtomicBool, Ordering},
+            task::{Context, Poll, Waker},
+        };
+        use wasixv2_wait::{PollTable, WaitQueue, poll_wait};
+
+        /// Always readable; its next `prepare_poll` stays pending once while `hold` is set.
+        struct Held {
+            wait: WaitQueue,
+            hold: AtomicBool,
+        }
+
+        impl Pollable for Held {
+            fn poll(&self, mut table: Option<&mut PollTable<'_>>) -> PollMask {
+                poll_wait(&mut table, &self.wait);
+                PollMask::READABLE
+            }
+        }
+
+        impl FileObject for Held {
+            fn prepare_poll(&self, _: u32) -> LocalFuture<'_, ()> {
+                Box::pin(std::future::poll_fn(|_| {
+                    match self.hold.swap(false, Ordering::AcqRel) {
+                        true => Poll::Pending,
+                        false => Poll::Ready(()),
+                    }
+                }))
+            }
+
+            fn read<'a>(&'a self, _: Io<'a>, _: &'a mut [u8]) -> LocalFuture<'a, SysResult<usize>> {
+                Box::pin(async { Err(Errno::EBADF.into()) })
+            }
+
+            fn write<'a>(&'a self, _: Io<'a>, _: &'a [u8]) -> LocalFuture<'a, SysResult<usize>> {
+                Box::pin(async { Err(Errno::EBADF.into()) })
+            }
+        }
+
+        let t = Fixture::new();
+        let held = Arc::new(Held {
+            wait: WaitQueue::new(),
+            hold: AtomicBool::new(true),
+        });
+        let file = Arc::new(OpenFile::new(
+            Backing::Stream(held, t.kernel.pseudo.anon("epoll-test")),
+            OpenFlags::O_RDWR,
+        ));
+        let fd = t
+            .kernel
+            .files(t.task)
+            .lock_or_recover()
+            .install(file, false)
+            .unwrap();
+        let ep = t.create();
+        put(&t.memory, 0x800, &(IN | ET).to_le_bytes());
+        put(&t.memory, 0x808, &(fd.0 as u64).to_le_bytes());
+        let caller = t.caller();
+        let add = t.kernel.epoll_ctl(
+            &caller,
+            ep,
+            EpollCtlOp::EPOLL_CTL_ADD,
+            fd,
+            GuestPtr::new(0x800),
+        );
+        let mut add = std::pin::pin!(add);
+        let mut cx = Context::from_waker(Waker::noop());
+        // ep_insert has queued the ready item; the ADD still waits on the file.
+        assert!(add.as_mut().poll(&mut cx).is_pending());
+        // Another thread's epoll_wait takes the edge meanwhile.
+        assert_eq!(t.wait(ep, 0), [(IN, fd.0 as u64)]);
+        assert_eq!(add.as_mut().poll(&mut cx), Poll::Ready(Ok(0)));
+        // Linux queues an item once per wakeup: finishing the ADD is no new edge.
+        assert_eq!(t.wait(ep, 0), []);
+    }
+
+    #[test]
     fn items_follow_the_open_file_not_the_descriptor() {
         let t = Fixture::new();
         let (r, w) = pipe(&t.kernel, &t.caller(), OpenFlags::O_NONBLOCK);

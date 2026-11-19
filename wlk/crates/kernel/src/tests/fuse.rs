@@ -1968,6 +1968,47 @@ fn fuse_epoll_delivers_remote_poll_notifications() {
 }
 
 #[test]
+fn fuse_epoll_add_reports_the_daemons_readiness_once() {
+    use wasixv2_abi::{EpollCreateFlags, EpollCtlOp, EpollEvents};
+    let d = Daemon::new();
+    d.init();
+    let (task, fd) = d.client_file();
+    let caller = Caller::new(task, &d.memory);
+    let ep = block_on(d.kernel.epoll_create1(&caller, EpollCreateFlags(0))).unwrap();
+    let events = EpollEvents::EPOLLIN.0 | EpollEvents::EPOLLET.0;
+    put(&d.memory, 0x800, &events.to_le_bytes());
+    put(&d.memory, 0x808, &0x1234u64.to_le_bytes());
+    // The file is unready when ep_insert polls it; the ADD's preflight brings the answer.
+    let add = d.kernel.epoll_ctl(
+        &caller,
+        ep,
+        EpollCtlOp::EPOLL_CTL_ADD,
+        fd,
+        GuestPtr::new(0x800),
+    );
+    let ready = d.exchange(as_task(task, add), 40, |_| {
+        let mut b = vec![0; 8];
+        p32(&mut b, 0, EpollEvents::EPOLLIN.0);
+        (0, b)
+    });
+    assert_eq!(ready, Ok(0));
+    let wait = || {
+        d.kernel.epoll_pwait(
+            &caller,
+            ep,
+            GuestPtrMut::new(0x900),
+            1,
+            0,
+            GuestPtr::NULL,
+            8,
+        )
+    };
+    assert_eq!(block_on(as_task(task, wait())), Ok(1));
+    assert_eq!(n64(&get(&d.memory, 0x900, 16), 8), 0x1234);
+    assert_eq!(block_on(as_task(task, wait())), Ok(0));
+}
+
+#[test]
 fn fuse_background_limits_throttle_until_reply_or_control_update() {
     let d = Daemon::new();
     let req = d.read();

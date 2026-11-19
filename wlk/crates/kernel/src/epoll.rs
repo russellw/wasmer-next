@@ -661,15 +661,13 @@ impl Kernel {
             _ => Err(Errno::EINVAL.into()),
         };
         drop(_nesting);
+        // A userspace filesystem's answer completes on the queue the item now waits on, whose
+        // callback queues the item. Polling again here would queue an edge a wait already took.
         if result.is_ok()
             && op != EpollCtlOp::EPOLL_CTL_DEL
             && let Some(item) = ep.find(key)
         {
             target.prepare_poll(item.events() & !PRIVATE_BITS).await;
-            if !Ep::item_poll(&item, false).is_empty() {
-                ep.queue_ready(&[key]);
-                ep.wake();
-            }
         }
         result
     }
