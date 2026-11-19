@@ -653,7 +653,7 @@ mod selection_tests {
             let source = format!(
                 "(module (memory (export \"memory\") {pages} 3 shared) (func (export \"_start\")))"
             );
-            let module = wasmer::Module::new(store, source.as_bytes()).unwrap();
+            let module = wasmer::Module::new(store, wat::parse_str(&source).unwrap()).unwrap();
             Instance::new(store, &module, &wasmer::Imports::new()).unwrap()
         };
         let first = make(&mut store, 1);
