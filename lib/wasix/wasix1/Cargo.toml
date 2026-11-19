@@ -33,6 +33,11 @@ futures.workspace = true
 wasixv2-kernel = { workspace = true }
 wasixv2-vfs-mem = { workspace = true }
 
+[target.'cfg(unix)'.dev-dependencies]
+anyhow.workspace = true
+tempfile.workspace = true
+walkdir.workspace = true
+
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test.workspace = true
 wasixv2 = { path = "../api", default-features = false, features = [

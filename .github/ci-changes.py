@@ -119,12 +119,13 @@ def outputs(areas):
             )
         ] if product else [],
         "test_stages": ([
+            {"description": "WASIX v1 adapter tests", "make": "test-wasix1"},
             {
                 "description": "WASIX and product tests",
                 "make": "wasix-integration",
                 "command": 'cargo test --release --locked --target "$TARGET" '
                 "-p wasixv2 -p wasixv2-exec -p wasixv2-dylink "
-                "-p wasixv2-wasix1 -p wasixv2-codegen "
+                "-p wasixv2-codegen "
                 "-p wasmer-sdk "
                 "-p wasmer-package -p wasmer-package-sdk "
                 "-p wasmer-backend-api -p wasmer-config -p wasmer-cache && "

@@ -680,6 +680,10 @@ WASMER_BIN ?= $(abspath target/debug/wasmer)
 test-real-packages: build-wasmer-debug
 	WASMER_BIN="$(WASMER_BIN)" bash tests/integration/real-packages/run.sh $(REAL_PACKAGES_ARGS)
 
+.PHONY: test-wasix1
+test-wasix1:
+	RUST_MIN_STACK=67108864 $(CARGO_BINARY) nextest run $(CARGO_TARGET_FLAG) --release --locked -p wasixv2-wasix1 --no-capture
+
 # The wasixv2 test suite in tests/wasixv2, run against this checkout's wasmer.
 # Needs wasixcc with wasm32-wasixv2 support on PATH; WASIXCC_LLVM_LOCATION and WASIXCC_SYSROOT
 # select a local LLVM fork and libc2 sysroot. Pass test filters with WASIXV2_TESTS_ARGS. See
@@ -907,9 +911,9 @@ lint-packages: RUSTFLAGS += -D dead-code -D nonstandard-style -D unused-imports 
 lint-packages:
 	RUSTFLAGS="${RUSTFLAGS}" cargo clippy --all --examples --exclude wasmer-cli --exclude wasmer-swift --locked -- -D clippy::all
 	RUSTFLAGS="${RUSTFLAGS}" cargo clippy --manifest-path lib/cli/Cargo.toml --locked $(compiler_features) -- -D clippy::all
-# The imported kernel and standalone guest suite retain their own C source style.
+# Imported kernel and guest fixtures retain their original C source style.
 lint-clang-format:
-	find . \( -path './lib/napi' -o -path './lib/wild' -o -path './target' -o -path './wlk' -o -path './tests/wasixv2' -o -path './guest/libc' \) -prune -o -type f \( -name '*.c' -o -name '*.cpp' \) -exec clang-format --dry-run --color -Werror {} +
+	find . \( -path './lib/napi' -o -path './lib/wild' -o -path './target' -o -path './wlk' -o -path './tests/wasixv2' -o -path './lib/wasix/wasix1/tests/wasm_tests' -o -path './guest/libc' \) -prune -o -type f \( -name '*.c' -o -name '*.cpp' \) -exec clang-format --dry-run --color -Werror {} +
 lint-yamlfmt:
 	yamlfmt -lint .github
 lint-taplo:

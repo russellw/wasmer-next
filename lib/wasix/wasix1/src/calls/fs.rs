@@ -833,7 +833,7 @@ pub(crate) async fn fd_renumber<S: Syscalls + Control + 'static>(
             .await?;
         // `to` names `from`'s file now.
         super::epoll::forgotten(frame, Fd(to)).await?;
-        frame.proc().await?.net.timeouts.copy(Fd(from), Fd(to));
+        frame.proc().await?.net.sockets.copy(Fd(from), Fd(to));
         Ok(())
     })
     .await
@@ -847,7 +847,7 @@ pub(crate) async fn fd_dup<S: Syscalls + Control + 'static>(
     shim::errno(&env, async |frame| {
         crate::rights::duplicate(frame, Fd(fd), false).await?;
         let new = frame.syscalls.dup(&frame.caller(), Fd(fd)).await?;
-        frame.proc().await?.net.timeouts.copy(Fd(fd), new);
+        frame.proc().await?.net.sockets.copy(Fd(fd), new);
         frame.write(out as u32, &(new.0 as u32)).await
     })
     .await
@@ -872,7 +872,7 @@ pub(crate) async fn fd_dup2<S: Syscalls + Control + 'static>(
             .syscalls
             .fcntl64(&frame.caller(), Fd(fd), cmd, min_fd as u32)
             .await?;
-        frame.proc().await?.net.timeouts.copy(Fd(fd), Fd(new));
+        frame.proc().await?.net.sockets.copy(Fd(fd), Fd(new));
         frame.write(out as u32, &(new as u32)).await
     })
     .await

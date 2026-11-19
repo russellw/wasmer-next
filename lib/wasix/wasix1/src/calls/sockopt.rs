@@ -120,13 +120,20 @@ fn target(option: i32, kind: Kind) -> V1Result<Target> {
     }
 }
 
-/// The compat-side timeouts of each socket, by descriptor. Every new socket descriptor
-/// (`sock_open`, `sock_accept`, `sock_pair`) starts without, so a reused number does not
-/// inherit them; a closed one forgets them, and a copy (`dup`, `dup2`) has its socket's.
+/// What the compat side keeps about each socket, by descriptor: its v1 timeouts, and a refused
+/// connect still to report. Every new socket descriptor (`sock_open`, `sock_accept`,
+/// `sock_pair`) starts without, so a reused number does not inherit them; a closed one forgets
+/// them, and a copy (`dup`, `dup2`) has its socket's.
 #[derive(Debug, Default)]
-pub struct Timeouts(Mutex<HashMap<Fd, [Option<Duration>; 2]>>);
+pub struct Sockets(Mutex<HashMap<Fd, Socket>>);
 
-impl Timeouts {
+#[derive(Clone, Copy, Debug, Default)]
+struct Socket {
+    timeouts: [Option<Duration>; 2],
+    refused: bool,
+}
+
+impl Sockets {
     fn index(wait: Wait) -> usize {
         match wait {
             Wait::Connect => 0,
@@ -136,16 +143,36 @@ impl Timeouts {
 
     fn get(&self, fd: Fd, wait: Wait) -> Option<Duration> {
         let map = self.0.lock().unwrap();
-        map.get(&fd).and_then(|t| t[Self::index(wait)])
+        map.get(&fd).and_then(|s| s.timeouts[Self::index(wait)])
     }
 
     fn set(&self, fd: Fd, wait: Wait, timeout: Option<Duration>) {
+        self.update(fd, |s| s.timeouts[Self::index(wait)] = timeout);
+    }
+
+    fn update(&self, fd: Fd, change: impl FnOnce(&mut Socket)) {
         let mut map = self.0.lock().unwrap();
         let entry = map.entry(fd).or_default();
-        entry[Self::index(wait)] = timeout;
-        if entry.iter().all(Option::is_none) {
+        change(entry);
+        if entry.timeouts.iter().all(Option::is_none) && !entry.refused {
             map.remove(&fd);
         }
+    }
+
+    /// Records that the kernel refused a non-blocking connect of `fd` at once. v1 reported
+    /// `INPROGRESS` and left the refusal to `SO_ERROR` and `poll`, as Linux does.
+    pub(crate) fn refuse(&self, fd: Fd) {
+        self.update(fd, |s| s.refused = true);
+    }
+
+    /// Whether `fd` has a refused connect to report; `take` clears it, as reporting it does.
+    pub(crate) fn refused(&self, fd: Fd, take: bool) -> bool {
+        let mut refused = false;
+        self.update(fd, |s| {
+            refused = s.refused;
+            s.refused &= !take;
+        });
+        refused
     }
 
     /// A copy for a fork child.
@@ -153,27 +180,27 @@ impl Timeouts {
         Self(Mutex::new(self.0.lock().unwrap().clone()))
     }
 
-    /// Gives `to`, a new copy of the descriptor `from`, `from`'s timeouts.
+    /// Gives `to`, a new copy of the descriptor `from`, what `from` has.
     pub(crate) fn copy(&self, from: Fd, to: Fd) {
         let mut map = self.0.lock().unwrap();
         match map.get(&from).copied() {
-            Some(timeouts) => map.insert(to, timeouts),
+            Some(socket) => map.insert(to, socket),
             None => map.remove(&to),
         };
     }
 
-    /// Forgets `fd`'s timeouts, for a descriptor that now names a new socket.
+    /// Forgets `fd`, for a descriptor that now names a new socket.
     pub(crate) fn forget(&self, fd: Fd) {
         self.0.lock().unwrap().remove(&fd);
     }
 }
 
-/// Forgets the timeouts of a descriptor that names a new socket now.
+/// Forgets what was kept about a descriptor that names a new socket now.
 pub(crate) async fn new_socket<S: Syscalls + Control + 'static>(
     frame: &Frame<'_, S>,
     fd: Fd,
 ) -> V1Result<()> {
-    frame.proc().await?.net.timeouts.forget(fd);
+    frame.proc().await?.net.sockets.forget(fd);
     Ok(())
 }
 
@@ -182,11 +209,11 @@ async fn timeout<S: Syscalls + Control + 'static>(
     fd: Fd,
     wait: Wait,
 ) -> V1Result<Option<Duration>> {
-    Ok(frame.proc().await?.net.timeouts.get(fd, wait))
+    Ok(frame.proc().await?.net.sockets.get(fd, wait))
 }
 
 /// Whether `fd` is non-blocking, and its status flags.
-async fn status_flags<S: Syscalls + Control + 'static>(
+pub(crate) async fn status_flags<S: Syscalls + Control + 'static>(
     frame: &Frame<'_, S>,
     fd: Fd,
 ) -> V1Result<OpenFlags> {
@@ -418,6 +445,9 @@ pub(crate) async fn sock_get_opt_size<S: Syscalls + Control + 'static>(
         } else if name == SocketOption::SO_ERROR.0 && level == SocketLevel::SOL_SOCKET {
             // A pending error, in v1 numbering.
             match value {
+                0 if frame.proc().await?.net.sockets.refused(Fd(fd), true) => {
+                    u64::from(Errno::CONNREFUSED.0)
+                }
                 0 => 0,
                 errno => u64::from(Errno::from_linux(wasixv2_abi::Errno(errno)).0),
             }
@@ -504,7 +534,7 @@ pub(crate) async fn sock_set_opt_time<S: Syscalls + Control + 'static>(
             Target::Compat(wait) => {
                 // Only a socket can carry one, as under v1.
                 int_option(frame, fd, SocketLevel::SOL_SOCKET, SocketOption::SO_TYPE.0).await?;
-                frame.proc().await?.net.timeouts.set(fd, wait, time);
+                frame.proc().await?.net.sockets.set(fd, wait, time);
                 Ok(())
             }
             Target::Noop => Ok(()),

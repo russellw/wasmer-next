@@ -761,6 +761,41 @@ fn vfork_exit_and_join() {
     assert_eq!(status(VFORK_EXIT_AND_JOIN), 0);
 }
 
+/// A vfork child killed while another of its threads lives hands its parent's instance back:
+/// the child's call returns in the parent, which reaps it as killed by `SIGKILL`, instead of
+/// the run ending with 137.
+#[test]
+fn a_vfork_child_killed_with_a_live_thread_resumes_the_parent() {
+    assert_eq!(
+        status(
+            r#"
+(module
+  (import "env" "memory" (memory 1 1 shared))
+  (import "wasix_32v1" "proc_fork_env" (func $vfork (param i32) (result i32)))
+  (import "wasix_32v1" "thread_spawn_v2" (func $spawn (param i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "proc_raise" (func $raise (param i32) (result i32)))
+  (import "wasix_32v1" "proc_join" (func $join (param i32 i32 i32) (result i32)))
+  (import "wasix_32v1" "proc_exit2" (func $exit (param i32)))
+  (func (export "wasi_thread_start") (param i32 i32)
+    (drop (memory.atomic.wait32 (i32.const 400) (i32.const 0) (i64.const -1))))
+  (func (export "_start")
+    (if (call $vfork (i32.const 100)) (then (call $exit (i32.const 1))))
+    ;; the child: a thread that waits for ever, then SIGKILL, which returns in the parent
+    (if (call $spawn (i32.const 300) (i32.const 304)) (then (call $exit (i32.const 2))))
+    (if (call $raise (i32.const 9)) (then (call $exit (i32.const 3))))
+    ;; the parent again: the child ended by SIGKILL
+    (i32.store8 (i32.const 200) (i32.const 1))
+    (i32.store (i32.const 204) (i32.load (i32.const 100)))
+    (if (call $join (i32.const 200) (i32.const 0) (i32.const 220)) (then (call $exit (i32.const 4))))
+    (if (i32.ne (i32.load8_u (i32.const 220)) (i32.const 2)) (then (call $exit (i32.const 5))))
+    (if (i32.ne (i32.load8_u (i32.const 224)) (i32.const 9)) (then (call $exit (i32.const 6))))
+    (call $exit (i32.const 0))))
+"#
+        ),
+        0
+    );
+}
+
 mod parent_pidfd {
     use super::*;
     use wasixv2_abi::{Errno, FcntlCmd, Fd, GuestPtr, IoctlRequest, PidfdInfo, PidfdInfoMask};

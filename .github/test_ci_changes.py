@@ -56,6 +56,9 @@ class AreaTests(unittest.TestCase):
         self.assertIn(
             "wasix-integration", [item["make"] for item in product["test_stages"]]
         )
+        self.assertIn(
+            "test-wasix1", [item["make"] for item in kernel["test_stages"]]
+        )
 
 
 class EventTests(unittest.TestCase):

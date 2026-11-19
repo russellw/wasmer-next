@@ -103,6 +103,7 @@ const PRELUDE: &str = r#"
   (import "wasix_32v1" "epoll_wait" (func $epoll_wait (param i32 i32 i32 i64 i32) (result i32)))
   (import "wasix_32v1" "fd_event" (func $fd_event (param i64 i32 i32) (result i32)))
   (import "wasix_32v1" "fd_dup" (func $fd_dup (param i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "fd_fdstat_set_flags" (func $set_fdflags (param i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "fd_renumber" (func $fd_renumber (param i32 i32) (result i32)))
   (import "wasix_32v1" "resolve" (func $resolve (param i32 i32 i32 i32 i32 i32) (result i32)))
   (import "wasix_32v1" "port_addr_list" (func $port_addr_list (param i32 i32) (result i32)))
@@ -653,6 +654,50 @@ fn compat_timeouts() {
     assert_eq!(run(&data, body).0, 0);
 }
 
+/// A non-blocking connect the loopback refuses at once reports `INPROGRESS` (26), as under
+/// v1: the refusal shows as a failed status and a `poll_oneoff` error until `LAST_ERROR`
+/// reports it as `CONNREFUSED` (14), once.
+#[test]
+fn a_refused_nonblocking_connect_is_in_progress() {
+    let data = format!(
+        r#"{LOOPBACK_ADDR}
+        ;; subscription at 3000: userdata 42, FD_WRITE; the fd is filled in
+        (data (i32.const 3000) "\2a\00\00\00\00\00\00\00\02")"#
+    );
+    let body = r#"
+    ;; a listener on an ephemeral port, then closed: nobody listens there any more
+    (call $ok (call $sock_open (i32.const 1) (i32.const 1) (i32.const 6) (i32.const 0)) (i32.const 1))
+    (call $ok (call $sock_bind (i32.load (i32.const 0)) (i32.const 1024)) (i32.const 2))
+    (call $ok (call $sock_addr_local (i32.load (i32.const 0)) (i32.const 1200)) (i32.const 3))
+    (i32.store16 (i32.const 1202) (call $input_port (i32.const 1200)))
+    (call $ok (call $fd_close (i32.load (i32.const 0))) (i32.const 4))
+    ;; a non-blocking client at [4]
+    (call $ok (call $sock_open (i32.const 1) (i32.const 1) (i32.const 6) (i32.const 4)) (i32.const 5))
+    (call $ok (call $set_fdflags (i32.load (i32.const 4)) (i32.const 4)) (i32.const 6))
+    (call $assert (i32.eq (call $sock_connect (i32.load (i32.const 4)) (i32.const 1200)) (i32.const 26)) (i32.const 7))
+    (call $ok (call $sock_status (i32.load (i32.const 4)) (i32.const 60)) (i32.const 8))
+    (call $assert (i32.eq (i32.load8_u (i32.const 60)) (i32.const 3)) (i32.const 9))
+    ;; writable, with an error
+    (i32.store (i32.const 3016) (i32.load (i32.const 4)))
+    (call $ok (call $poll_oneoff (i32.const 3000) (i32.const 3100) (i32.const 1) (i32.const 16)) (i32.const 10))
+    (call $assert (i32.eq (i32.load (i32.const 16)) (i32.const 1)) (i32.const 11))
+    (call $assert (i32.eq (i32.load8_u (i32.const 3110)) (i32.const 2)) (i32.const 12))
+    (call $assert (i32.ne (i32.load16_u (i32.const 3108)) (i32.const 0)) (i32.const 13))
+    ;; LAST_ERROR reports the refusal, and then nothing
+    (call $ok (call $get_size (i32.load (i32.const 4)) (i32.const 11) (i32.const 24)) (i32.const 14))
+    (call $assert (i64.eq (i64.load (i32.const 24)) (i64.const 14)) (i32.const 15))
+    (call $ok (call $get_size (i32.load (i32.const 4)) (i32.const 11) (i32.const 24)) (i32.const 16))
+    (call $assert (i64.eqz (i64.load (i32.const 24))) (i32.const 17))
+    (call $ok (call $poll_oneoff (i32.const 3000) (i32.const 3100) (i32.const 1) (i32.const 16)) (i32.const 18))
+    (call $assert (i32.eqz (i32.load16_u (i32.const 3108))) (i32.const 19))
+    ;; connecting again after the refusal is reported tries again
+    (call $assert (i32.eq (call $sock_connect (i32.load (i32.const 4)) (i32.const 1200)) (i32.const 26)) (i32.const 20))
+    ;; and a refusal still to report is what connecting again reports
+    (call $assert (i32.eq (call $sock_connect (i32.load (i32.const 4)) (i32.const 1200)) (i32.const 14)) (i32.const 21))
+    "#;
+    assert_eq!(run(&data, body).0, 0);
+}
+
 /// A pending connection gets v1's default deadline unless the guest set a timeout
 /// or opened a nonblocking socket. Observe the actual timespec and finish the wait at once.
 #[cfg(not(target_arch = "wasm32"))]
@@ -1053,7 +1098,7 @@ fn port_large_route_dump_and_clear() {
 /// `wasixcc` with a v1 sysroot); without it the test only says it was skipped.
 #[test]
 fn c_loopback() {
-    let Ok(cc) = std::env::var("WASIX1_TEST_CC") else {
+    let Some(cc) = std::env::var_os("WASIX1_TEST_CC").filter(|cc| !cc.is_empty()) else {
         eprintln!("skipped: set WASIX1_TEST_CC to a WASIX v1 C compiler");
         return;
     };
@@ -1066,7 +1111,7 @@ fn c_loopback() {
         .arg(&out)
         .status()
         .expect("run the v1 C compiler");
-    assert!(status.success(), "{cc} failed");
+    assert!(status.success(), "{cc:?} failed");
     let wasm = std::fs::read(&out).unwrap();
     let (status, stdout, stderr) = run_wasm(&wasm, &["net-loopback"]);
     assert_eq!(status, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");

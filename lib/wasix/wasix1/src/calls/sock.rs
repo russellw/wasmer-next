@@ -10,8 +10,8 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
 use wasixv2_abi::{
     AddressFamily, ConstIovecArray, ConstSockaddrPtr, Fd, GuestPtr, GuestPtrMut, IpProtocol, Loff,
-    MsgFlags, PollEvents, Pollfd, SeekWhence, ShutdownHow, SocketFlags, SocketLevel, SocketOption,
-    SocketType, UserMsghdr, VoidPtr,
+    MsgFlags, OpenFlags, PollEvents, Pollfd, SeekWhence, ShutdownHow, SocketFlags, SocketLevel,
+    SocketOption, SocketType, UserMsghdr, VoidPtr,
 };
 use wasixv2_syscalls::{Control, SysErr, SysResult, Syscalls};
 use wasmer::RuntimeError;
@@ -29,13 +29,13 @@ use crate::{
     shim::{self, Env, Frame},
 };
 
-use super::sockopt::{self, Timeouts};
+use super::sockopt::{self, Sockets};
 
 /// Per-process network compat state: what v1 keeps about sockets and epoll sets that Linux
 /// has no place for.
 #[derive(Debug, Default)]
 pub struct State {
-    pub(crate) timeouts: Timeouts,
+    pub(crate) sockets: Sockets,
     pub(crate) epoll: super::epoll::Table,
 }
 
@@ -44,7 +44,7 @@ impl State {
     /// sets, under the same numbers the tables are keyed by.
     pub(crate) fn fork(&self) -> Self {
         Self {
-            timeouts: self.timeouts.fork(),
+            sockets: self.sockets.fork(),
             epoll: self.epoll.fork(),
         }
     }
@@ -356,16 +356,36 @@ pub(crate) async fn sock_connect<S: Syscalls + Control + 'static>(
                 again = true;
                 result.await
             }
-            None => {
-                frame
-                    .syscalls
-                    .connect(&frame.caller(), Fd(fd), ptr, len)
-                    .await?;
-                Ok(())
-            }
+            None => connect_nonblocking(frame, Fd(fd), ptr, len).await,
         }
     })
     .await
+}
+
+/// A `connect` that does not wait. The kernel refuses a loopback connect at once, where v1
+/// (like Linux) reported `INPROGRESS` and the refusal later, through `SO_ERROR` and `poll`;
+/// connecting again reports it as well.
+async fn connect_nonblocking<S: Syscalls + Control + 'static>(
+    frame: &Frame<'_, S>,
+    fd: Fd,
+    addr: ConstSockaddrPtr,
+    len: u32,
+) -> V1Result<()> {
+    let sockets = &frame.proc().await?.net.sockets;
+    if sockets.refused(fd, true) {
+        return shim::fail(Errno::CONNREFUSED);
+    }
+    match frame.syscalls.connect(&frame.caller(), fd, addr, len).await {
+        Err(SysErr::Errno(wasixv2_abi::Errno::ECONNREFUSED))
+            if sockopt::status_flags(frame, fd)
+                .await?
+                .contains(OpenFlags::O_NONBLOCK) =>
+        {
+            sockets.refuse(fd);
+            shim::fail(Errno::INPROGRESS)
+        }
+        result => Ok(result.map(drop)?),
+    }
 }
 
 /// `accept4`, after waiting out an `ACCEPT_TIMEOUT` the guest set. Returns the new
@@ -844,7 +864,9 @@ pub(crate) async fn sock_status<S: Syscalls + Control + 'static>(
                 .mem
                 .take(GuestPtrMut::<Pollfd>::new(ptr.addr()))
                 .revents;
-            if revents.0 & PollEvents::POLLERR.0 != 0 {
+            if revents.0 & PollEvents::POLLERR.0 != 0
+                || frame.proc().await?.net.sockets.refused(fd, false)
+            {
                 SockStatus::FAILED
             } else {
                 SockStatus::OPENING

@@ -43,11 +43,26 @@ asyncify sysroots. The guest LLVM fork is separate from the engine's LLVM 23.
 Expected failures live in expected-failures/<suite>.txt.
 See the suite README for setup. Full guest coverage is still a CI setup item.
 
-Legacy implementation fixtures were deleted with that runtime. Retained CLI,
-C API and adapter tests exercise v1 guests on v2. Do not copy old guest tests or
-prebuilt wasm into the v2 suite. macOS/musl label gating still applies; consult
-CONTRIBUTING.md. CI has integration/product areas and one ci_success aggregate;
-engine implementation jobs are owned by runtime.
+## WASIX v1 adapter tests
+
+Add or adjust tests in `lib/wasix/wasix1/tests/` for v1 adapter fixes.
+The WAT and source-built C/C++ guests exercise the v1 imports through
+`wasixv2::Machine`. Keep these fixtures out of the native v2 suite.
+
+Run `WASIX1_TEST_CC=wasixcc make test-wasix1` with wasixcc v0.4.3 and the
+v1 sysroot pinned by `.github/ci-constants.env`. The C suite falls back to
+`wasixcc` on PATH. The networking and filesystem C smoke tests use `WASIX1_TEST_CC`.
+CI runs a dedicated WASIX v1 adapter stage on Linux x86-64 and ARM64 GNU.
+The restored C/C++ suite runs on x86-64 in that stage. The Make target and CI give
+test threads 64 MiB of stack.
+
+Use `WASIX1_TESTS_FILTER` to select C-suite cases by substring. Expected
+guest failures and exclusions are listed by case in `tests/wasm_tests/`
+under the adapter crate. An unexpected failure or pass fails the suite.
+Run with `WASIX1_TESTS_BLESS=1` to update the expected-failures list, then
+review each changed reason before committing.
+
+## Generated guest C glue
 
 Check guest C glue with
 `cargo test -p wasixv2-codegen --test guest_libc --locked`. Regenerate with

@@ -10,3 +10,9 @@ fail-fast = false
 slow-timeout = { period = "2m", terminate-after = 3 }
 # Retry a couple times in case there are flaky tests
 retries = 3
+
+# This binary builds and runs a full guest suite with per-guest deadlines.
+[[profile.ci.overrides]]
+filter = 'package(wasixv2-wasix1) & binary(c_suite)'
+slow-timeout = { period = "2m", terminate-after = 10 }
+retries = 0

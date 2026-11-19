@@ -259,6 +259,15 @@ pub trait Control:
     /// nothing.
     fn take_pending(&self, task: TaskId) -> Option<GuestAction>;
 
+    /// Whether `task`, a vfork child running in its parent's instance, has handed the instance
+    /// back ([`GuestAction::VforkReturn`]). Its exit's [`ExitMm::exit_mm`] may do so after the
+    /// exit was taken, when other threads kept the child alive; the instance then resumes the
+    /// parent instead of unwinding.
+    fn vfork_handed_back(&self, task: TaskId) -> bool {
+        let _ = task;
+        false
+    }
+
     /// Runs the caller's queued kernel task work before signal/action delivery on a syscall
     /// return or preemption point (`task_work_run`). Exec calls this only while WorkFlag is
     /// raised, with the current instance's memory, and repeats after task switches/handlers.

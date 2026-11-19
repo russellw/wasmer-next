@@ -4,8 +4,10 @@
 //! them into scratch as C strings and call the `*at` syscalls, so the kernel resolves them with
 //! Linux's rules (absolute paths ignore the descriptor, `..` stops at the root).
 
-use wasixv2_abi::{AtFlags, Fd, OpenFlags, RenameFlags};
-use wasixv2_syscalls::{Control, Syscalls};
+use wasixv2_abi::{AtFlags, Cstr, Fd, FileMode, OpenFlags, RenameFlags, StatxMask};
+use wasixv2_syscalls::{
+    Control, DescriptorInstallations, DescriptorSet, SysErr, Syscalls, UserSlice,
+};
 use wasmer::RuntimeError;
 
 use crate::{
@@ -18,7 +20,7 @@ use crate::{
         write_filestat,
     },
     errno::V1Result,
-    shim::{self, Env},
+    shim::{self, Env, Frame},
 };
 
 /// Mode bits for new files and directories; the umask applies. v1 has no mode bits and no
@@ -26,6 +28,9 @@ use crate::{
 /// script it writes (an npm `.bin` entry, a shell's here-script) runs as on v1.
 const FILE_MODE: u32 = 0o777;
 const DIR_MODE: u32 = 0o777;
+
+/// The bytes a cross-mount rename copies per read.
+const COPY_CHUNK: u32 = 64 * 1024;
 
 /// `AT_SYMLINK_NOFOLLOW` unless `lookup` follows symlinks.
 fn nofollow(lookup: Lookupflags) -> AtFlags {
@@ -395,7 +400,7 @@ pub(crate) async fn path_rename<S: Syscalls + Control + 'static>(
         .await?;
         let old = path_arg(frame, old_path, old_len).await?;
         let new = path_arg(frame, new_path, new_len).await?;
-        frame
+        match frame
             .syscalls
             .renameat2(
                 &frame.caller(),
@@ -405,10 +410,102 @@ pub(crate) async fn path_rename<S: Syscalls + Control + 'static>(
                 new,
                 RenameFlags(0),
             )
-            .await?;
-        Ok(())
+            .await
+        {
+            Err(SysErr::Errno(wasixv2_abi::Errno::EXDEV)) => {
+                move_across_mounts(frame, Fd(old_fd), old, Fd(new_fd), new).await
+            }
+            other => {
+                other?;
+                Ok(())
+            }
+        }
     })
     .await
+}
+
+/// v1 renamed a file across mounts by copying it and removing the source; a directory
+/// could not move (`INVAL`). The source stays if it cannot be removed, as on v1.
+async fn move_across_mounts<S: Syscalls + Control + 'static>(
+    frame: &Frame<'_, S>,
+    old_fd: Fd,
+    old: Cstr,
+    new_fd: Fd,
+    new: Cstr,
+) -> V1Result<()> {
+    let st = stat_at(frame, old_fd, old, AtFlags(0), StatxMask::STATX_MODE).await?;
+    let mode = u32::from(st.stx_mode);
+    if mode & FileMode::S_IFMT.0 == FileMode::S_IFDIR.0 {
+        return shim::fail(Errno::INVAL);
+    }
+    let read = OpenFlags::O_RDONLY | OpenFlags::O_CLOEXEC;
+    let source = open_internal(frame, old_fd, old, read, 0).await?;
+    let write =
+        OpenFlags::O_WRONLY | OpenFlags::O_CREAT | OpenFlags::O_TRUNC | OpenFlags::O_CLOEXEC;
+    let copied = match open_internal(frame, new_fd, new, write, mode & 0o7777).await {
+        Ok(target) => {
+            let copied = copy(frame, &source, &target).await;
+            let _ = target.close(frame).await;
+            copied
+        }
+        Err(err) => Err(err),
+    };
+    let _ = source.close(frame).await;
+    copied?;
+    let _ = frame
+        .syscalls
+        .unlinkat(&frame.caller(), old_fd, old, AtFlags(0))
+        .await;
+    Ok(())
+}
+
+/// A descriptor the adapter opened for itself, with the set that captured it.
+struct Internal(Fd, DescriptorSet);
+
+impl Internal {
+    async fn close<S: Syscalls + Control + 'static>(&self, frame: &Frame<'_, S>) -> V1Result<()> {
+        let caller = frame.caller().with_descriptors(&self.1);
+        frame.syscalls.close(&caller, self.0).await?;
+        Ok(())
+    }
+}
+
+async fn open_internal<S: Syscalls + Control + 'static>(
+    frame: &Frame<'_, S>,
+    dirfd: Fd,
+    path: Cstr,
+    flags: OpenFlags,
+    mode: u32,
+) -> V1Result<Internal> {
+    let plan = DescriptorInstallations::new(vec![None]);
+    let caller = frame.caller().with_descriptor_installations(&plan);
+    let fd = frame
+        .syscalls
+        .openat(&caller, dirfd, path, flags, mode)
+        .await?;
+    Ok(Internal(fd, plan.result(0).ok_or(Errno::IO)?.clone()))
+}
+
+/// Copies the rest of `source` to `target` through scratch memory.
+async fn copy<S: Syscalls + Control + 'static>(
+    frame: &Frame<'_, S>,
+    source: &Internal,
+    target: &Internal,
+) -> V1Result<()> {
+    let reader = frame.caller().with_descriptors(&source.1);
+    let writer = frame.caller().with_descriptors(&target.1);
+    let buf = frame.mem.alloc_zeroed(COPY_CHUNK)?;
+    loop {
+        let n = frame.syscalls.read(&reader, source.0, buf).await?;
+        if n == 0 {
+            return Ok(());
+        }
+        let mut done = 0;
+        while done < n {
+            let rest = UserSlice::new(buf.addr + done, n - done);
+            done += frame.syscalls.write(&writer, target.0, rest).await?;
+        }
+    }
 }
 
 /// `symlinkat(target, fd, path)`: the target is stored as given, never resolved.

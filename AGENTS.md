@@ -83,6 +83,12 @@ Engine WAST tests and tests/ignores.txt live in wasmerio/wasmer-runtime.
 Use that repository's TEST.md and backend-filtered runner. Product checks here
 use the Git engine pinned by Cargo.lock; see docs/RUNTIME-EXTRACTION.md.
 
+## Testing the WASIX v1 adapter
+
+Add or adjust tests in `lib/wasix/wasix1/tests/` for fixes to the v1 adapter.
+Guest C/C++ fixtures go in `lib/wasix/wasix1/tests/wasm_tests/` and build with the
+v1 wasixcc and sysroot. Run `make test-wasix1` (see [docs/TEST.md](docs/TEST.md)).
+
 ## Testing WASIX v2
 
 The WASIX v2 test suite and runner live in `tests/wasixv2/`. The
@@ -144,8 +150,7 @@ not run the suite yet.
 
 - New wasixv2 program tests go in `tests/wasixv2/suite/`, built from source
   with `wasixcc`. Never check in prebuilt wasm for them.
-- The legacy implementation and its fixtures are removed. Keep v1 adapter/product
-  compatibility tests here; never copy legacy fixtures into `tests/wasixv2/`.
+- Keep v1 adapter and product compatibility tests out of `tests/wasixv2/`.
 - ABI changes land here in one commit: canonical WIT/generator, kernel, import
   shim, libc C glue and wrappers, and tests. Downstream libc2 consumers need
   the matching ABI revision. Regenerate libc with

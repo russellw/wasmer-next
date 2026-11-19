@@ -1187,14 +1187,17 @@ fn wasix_descriptor_calls() {
     assert_eq!(run(&wat::parse_str(wat).unwrap()).0, 0);
 }
 
-/// Builds and runs the wasix-libc programs in `tests/c` when `WASIX1_WASIXCC` names a
+/// Builds and runs the wasix-libc programs in `tests/c` when `WASIX1_TEST_CC` names a
 /// `wasixcc` set up for the WASIX v1 sysroot (`WASIXCC_SYSROOT` and friends in the
 /// environment); skipped otherwise. Each program prints what it checks; the expected output
 /// is in its `//# expect: ...` lines (clang-format leaves `//#` pragmas alone).
 #[test]
 fn c_programs() {
-    let Ok(cc) = std::env::var("WASIX1_WASIXCC") else {
-        eprintln!("skipped: set WASIX1_WASIXCC to a v1 wasixcc to build the C programs");
+    let Some(cc) = std::env::var_os("WASIX1_TEST_CC")
+        .filter(|cc| !cc.is_empty())
+        .or_else(|| std::env::var_os("WASIX1_WASIXCC").filter(|cc| !cc.is_empty()))
+    else {
+        eprintln!("skipped: set WASIX1_TEST_CC to a v1 wasixcc to build the C programs");
         return;
     };
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/c");
@@ -1206,8 +1209,18 @@ fn c_programs() {
         .filter(|path| path.extension().is_some_and(|ext| ext == "c"))
         .collect();
     sources.sort();
-    assert!(!sources.is_empty());
+    let mut tested = 0;
     for source in sources {
+        let text = std::fs::read_to_string(&source).unwrap();
+        let expected: String = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("//# expect: "))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        if expected.is_empty() {
+            continue;
+        }
+        tested += 1;
         let name = source.file_stem().unwrap().to_str().unwrap().to_string();
         let wasm = out.join(format!("{name}.wasm"));
         let status = Command::new(&cc)
@@ -1218,12 +1231,6 @@ fn c_programs() {
             .status()
             .unwrap();
         assert!(status.success(), "building {name}");
-        let text = std::fs::read_to_string(&source).unwrap();
-        let expected: String = text
-            .lines()
-            .filter_map(|line| line.strip_prefix("//# expect: "))
-            .map(|line| format!("{line}\n"))
-            .collect();
         let (status, stdout, stderr) = run(&std::fs::read(&wasm).unwrap());
         let stdout = String::from_utf8_lossy(&stdout);
         assert_eq!(
@@ -1233,4 +1240,5 @@ fn c_programs() {
             String::from_utf8_lossy(&stderr)
         );
     }
+    assert!(tested > 0, "no C filesystem fixtures with expected output");
 }

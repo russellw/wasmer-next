@@ -4671,6 +4671,15 @@ impl Control for Kernel {
         self.io_uring_run_task_work(caller)
     }
 
+    fn vfork_handed_back(&self, task: TaskId) -> bool {
+        let state = self.state.read_or_recover();
+        match (state.tasks.get(&task), state.dead.get(&task)) {
+            (Some(entry), _) => entry.work.has_vfork_return(),
+            (None, Some(dead)) => dead.work.has_vfork_return(),
+            (None, None) => false,
+        }
+    }
+
     fn take_pending(&self, task: TaskId) -> Option<GuestAction> {
         self.key_session_task_work(task);
         // ---- proc ----

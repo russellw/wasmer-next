@@ -6738,11 +6738,14 @@ dependencies = [
 name = "wasixv2-wasix1"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
  "futures",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
+ "walkdir",
  "wasixv2",
  "wasixv2-abi",
  "wasixv2-dylink",

@@ -456,10 +456,21 @@ where
         for (i, sub) in subs.iter().enumerate() {
             match sub.wait {
                 Wait::Read(fd) | Wait::Write(fd) => {
-                    let revents = match index[i] {
+                    let mut revents = match index[i] {
                         Some(at) => fds[at].revents,
                         None => PollEvents::POLLNVAL,
                     };
+                    // A connect the kernel refused at once, still to report: v1 showed it
+                    // failed, as Linux shows an asynchronous refusal, until `SO_ERROR` is read.
+                    if frame
+                        .proc()
+                        .await?
+                        .net
+                        .sockets
+                        .refused(Fd(fd as i32), false)
+                    {
+                        revents.0 |= PollEvents::POLLERR.0;
+                    }
                     if let Some(event) = fd_event(frame, sub, Fd(fd as i32), revents).await {
                         events.push(event);
                     }

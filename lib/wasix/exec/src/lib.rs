@@ -1834,6 +1834,11 @@ async fn complete_inner<S: Syscalls + Control + 'static, T>(
                     // `do_exit`'s `exit_mm`, while the memory is still there.
                     let memory = GuestMemory { env };
                     syscalls.exit_mm(&Caller::new(task, &memory)).await;
+                    // A vfork child in its parent's instance, which other threads kept alive
+                    // past its exit, handed the instance back there: resume the parent.
+                    if syscalls.vfork_handed_back(task) {
+                        continue;
+                    }
                     return Outcome::Unwind(RuntimeError::user(Box::new(Exited(status))));
                 }
                 GuestAction::StartThread {

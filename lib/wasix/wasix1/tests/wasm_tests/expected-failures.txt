@@ -1,0 +1,9 @@
+# case # reason
+dynamic_library/dlclose-executes-destructors/default # v1 libc's dlclose never unloads, so the side module's atexit destructor runs at exit, out of order (legacy known issue).
+exit/abort-in-thread/default # libc's abort() falls back to _Exit(127) once its handler holds the re-raised SIGABRT (ignored in legacy, #6538).
+lifecycle/lifecycle-of-dlsymed-tls-global-in-dynamic-library/default # A startup side module's constructor uses std::cout before main's libc++ init (legacy #6595).
+lifecycle/lifecycle-of-global-in-main-module/default # A startup side module's constructor uses std::cout before main's libc++ init (legacy #6595).
+lifecycle/lifecycle-of-global-in-shared-library/default # A startup side module's constructor uses std::cout before main's libc++ init (legacy #6595).
+lifecycle/lifecycle-of-tls-global-in-dynamic-library/default # A startup side module's constructor uses std::cout before main's libc++ init (legacy #6595).
+lifecycle/lifecycle-of-tls-global-in-main-module/default # A startup side module's constructor uses std::cout before main's libc++ init (legacy #6595).
+lifecycle/lifecycle-of-tls-global-in-shared-library/default # A startup side module's constructor uses std::cout before main's libc++ init (legacy #6595).

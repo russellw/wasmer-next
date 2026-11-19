@@ -346,6 +346,51 @@ fn stdio(stdout: &Arc<Capture>) -> Stdio {
 
 /// `shutdown` kills every process and returns once they are gone; their runs end with
 /// 128 + SIGKILL, and the machine runs what comes next.
+/// A vfork child killed while another of its threads lives hands its parent's instance back:
+/// the parent resumes and reaps it as killed by `SIGKILL`, instead of the run ending with 137.
+#[tokio::test]
+async fn a_vfork_child_killed_with_a_live_thread_resumes_the_parent() {
+    let (status, _) = run(
+        Machine::new(),
+        r#"
+  (module
+    (import "env" "memory" (memory 1 2 shared))
+    (import "wasixv2" "clone" (func $clone (param i32 i32 i32 i32 i32) (result i32)))
+    (import "wasixv2" "thread_spawn" (func $spawn (param i32 i32 i32 i32 i32) (result i32)))
+    (import "wasixv2" "getpid" (func $getpid (result i32)))
+    (import "wasixv2" "kill" (func $kill (param i32 i32) (result i32)))
+    (import "wasixv2" "waitid" (func $wait (param i32 i32 i32 i32 i32) (result i32)))
+    (import "wasixv2" "exit_group" (func $exit (param i32)))
+    (export "memory" (memory 0))
+    (tag $continued (param i32))
+    (func (export "wasixv2_vfork_return") (param i32)
+      (throw $continued (local.get 0)))
+    (func (export "wasixv2_thread_start") (param i32 i32)
+      (drop (memory.atomic.wait32 (i32.const 400) (i32.const 0) (i64.const -1))))
+    (func (export "_start") (local $pid i32)
+      (block $parent (result i32)
+        (try_table (catch $continued $parent)
+          ;; CLONE_VM | CLONE_VFORK | SIGCHLD
+          (drop (call $clone (i32.const 0x4111) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)))
+          ;; the child: a thread that waits for ever, then SIGKILL
+          (if (i32.lt_s (call $spawn (i32.const 0x10f00) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)) (i32.const 0))
+            (then (call $exit (i32.const 101))))
+          (drop (call $kill (call $getpid) (i32.const 9)))
+          (call $exit (i32.const 102)))
+        unreachable)
+      (local.set $pid)
+      ;; P_PID, WEXITED: si_code (CLD_KILLED is 2) and si_status of the returned siginfo
+      (if (i32.lt_s (call $wait (i32.const 1) (local.get $pid) (i32.const 512) (i32.const 4) (i32.const 0)) (i32.const 0))
+        (then (call $exit (i32.const 103))))
+      (if (i32.ne (i32.load (i32.const 520)) (i32.const 2)) (then (call $exit (i32.const 104))))
+      (call $exit (i32.load (i32.const 532)))
+      unreachable))
+"#,
+    )
+    .await;
+    assert_eq!(status, 9);
+}
+
 #[tokio::test]
 async fn shutdown_ends_every_process() {
     tokio::task::LocalSet::new()

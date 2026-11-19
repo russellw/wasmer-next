@@ -818,6 +818,18 @@ jobs:
             exe: ""
             container: "alpine:edge"
         exclude:
+          - stage:
+              make: test-wasix1
+            metadata:
+              build: windows-x64
+          - stage:
+              make: test-wasix1
+            metadata:
+              build: macos-arm
+          - stage:
+              make: test-wasix1
+            metadata:
+              build: linux-musl
           - skip_macos: true
             metadata:
               build: macos-arm
@@ -990,10 +1002,26 @@ jobs:
           aws-endpoint: https://1541b1e8a3fc6ad155ce67ef38899700.r2.cloudflarestorage.com
           aws-s3-bucket-endpoint: false
           aws-s3-force-path-style: true
+      - name: WASIX v1 adapter tests
+        if: matrix.stage.make == 'test-wasix1'
+        shell: bash
+        run: |
+          args=()
+          if [[ "$BUILD" != linux-x64 ]]; then
+            args+=(-E '!binary(c_suite)')
+          fi
+          cargo nextest run --no-fail-fast --release --locked --target "$TARGET" -p wasixv2-wasix1 "${args[@]}"
+        env:
+          BUILD: ${{ matrix.metadata.build }}
+          TARGET: ${{ matrix.metadata.target }}
+          RUST_MIN_STACK: '67108864'
+          WASIX1_TEST_CC: wasixcc
       - name: ${{ matrix.stage.description }}
+        if: matrix.stage.make != 'test-wasix1'
         shell: bash
         run: ${{ matrix.stage.command || format('make {0}', matrix.stage.make) }}
         env:
+          RUST_MIN_STACK: '67108864'
           TARGET: ${{ matrix.metadata.target }}
           TARGET_DIR: target/${{ matrix.metadata.target }}/release
           CARGO_TARGET: ${{ matrix.metadata.target }}

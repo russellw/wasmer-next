@@ -1,0 +1,8 @@
+# case # reason
+dynamic_library/recursive-shared-lib/default # The pinned wasm-ld cannot build the fixture's circular library dependencies.
+process/atomic-wait-signal-children/forwarded # Expects legacy SIGTERM forwarding to children; with the default disposition the parent dies, as on Linux.
+process/builtin-wasmer-version/default # Machine does not supply the removed runner’s built-in wasmer command.
+process/vfork/exit_before_exec # The legacy fixture relies on undefined behavior after vfork.
+process/vfork/trap_before_exec # The legacy fixture relies on undefined behavior after vfork.
+socket/connected-udp-peer/default # Pins legacy's emulated UDP connect, which left the implicit bind at 0.0.0.0; v2 reports the routed 127.0.0.1, as Linux does.
+threadlocal/thread-getspecific-set-and-get-grid/template/default # Source template for the generated grid cases.

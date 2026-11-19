@@ -19530,6 +19530,10 @@ impl<L, S: crate::Control> crate::Control for Layered<L, S> {
         self.inner.take_pending(task)
     }
 
+    fn vfork_handed_back(&self, task: crate::TaskId) -> bool {
+        self.inner.vfork_handed_back(task)
+    }
+
     fn run_task_work<'a>(&'a self, caller: &'a crate::Caller<'_>) -> crate::LocalFuture<'a, ()> {
         self.inner.run_task_work(caller)
     }

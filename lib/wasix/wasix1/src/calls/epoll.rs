@@ -251,14 +251,14 @@ impl Table {
 }
 
 /// Forgets what the process kept about the descriptor `fd`, which was closed or now names
-/// another file: its epoll registrations as a set, and its socket timeouts.
+/// another file: its epoll registrations as a set, and what was kept about its socket.
 pub(crate) async fn forgotten<S: Syscalls + Control + 'static>(
     frame: &crate::shim::Frame<'_, S>,
     fd: Fd,
 ) -> crate::errno::V1Result<()> {
     let proc = frame.proc().await?;
     proc.net.epoll.forget(fd);
-    proc.net.timeouts.forget(fd);
+    proc.net.sockets.forget(fd);
     Ok(())
 }
 
