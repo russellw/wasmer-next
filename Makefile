@@ -284,7 +284,7 @@ compilers_engines := $(strip $(compilers_engines))
 #
 #####
 
-build_wasmer_extra_features :=
+build_wasmer_extra_features := wasm-c-api
 
 # Small trick to define a space and a comma.
 space := $() $()
@@ -479,7 +479,7 @@ build-wasmer:
 	$(CARGO_BINARY) build $(CARGO_TARGET_FLAG) --release --manifest-path lib/cli/Cargo.toml $(build_compiler_features) --bin wasmer --locked
 	
 build-wasmer-v8:
-	$(CARGO_BINARY) build $(CARGO_TARGET_FLAG) --release --manifest-path lib/cli/Cargo.toml --no-default-features --features="v8" --bin wasmer --locked
+	$(CARGO_BINARY) build $(CARGO_TARGET_FLAG) --release --manifest-path lib/cli/Cargo.toml --no-default-features --features="v8,wasm-c-api" --bin wasmer --locked
 
 
 build-wasmer-debug:

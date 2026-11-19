@@ -99,6 +99,7 @@ headless-minimal = ["headless", "disable-all-logging"]
 telemetry = []
 
 # Optional
+wasm-c-api = ["dep:wasmer-c-api-imports"]
 enable-serde = [
   "wasmer/enable-serde",
   "wasmer-vm/enable-serde",
@@ -136,6 +137,9 @@ wasmer-types = { workspace = true, default-features = true, features = [
   "detect-wasm-features",
 ] }
 # `wasmer run` runs WASIX and WASI programs on the WASIX v2 kernel.
+wasmer-c-api-imports = { path = "../c-api-imports", default-features = false, features = [
+  "wasixv2",
+], optional = true }
 wasixv2-dylink = { path = "../wasix/dylink", default-features = false }
 wasixv2 = { path = "../wasix/api", default-features = false, features = [
   "tokio",

@@ -2292,12 +2292,9 @@ fn local_package_fs_mounts_work_for_dir_and_webc() {
         .success();
 }
 
-/// The `wasm_c_api_v0` host imports were an extension of the legacy WASIX runtime, which
-/// `wasmer run` no longer uses; the WASIX v2 kernel does not provide them (yet), and says so
-/// instead of running the guest without them.
 #[cfg(target_os = "linux")]
 #[test]
-fn wasmer_run_wasix_wasm_c_api_guest_is_refused() {
+fn wasmer_run_wasix_wasm_c_api_guest() {
     let temp = TempDir::new().unwrap();
     let wasm = temp.path().join("wasix-wasm-c-api-smoke.wasm");
 
@@ -2308,8 +2305,8 @@ fn wasmer_run_wasix_wasm_c_api_guest_is_refused() {
         .arg(&wasm)
         .env("RUST_LOG", &*RUST_LOG)
         .assert()
-        .failure()
-        .stderr(contains("wasm_c_api_v0"));
+        .success()
+        .stdout(contains("wasm-c-api ok"));
 }
 
 #[test]

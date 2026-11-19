@@ -19,6 +19,8 @@ use wasixv2::{
     prepare_package_sources, wasix1_http,
 };
 use wasmer::{Engine, Module};
+#[cfg(feature = "wasm-c-api")]
+use wasmer_c_api_imports::WasmCapiRuntimeHooks;
 use wasmer_cache::module_cache::HashedModuleData;
 use wasmer_config::filesystem::MAPPED_CURRENT_DIR_DEFAULT_PATH;
 use wasmer_config::package::{PackageId, PackageSource};
@@ -1095,6 +1097,10 @@ impl Run {
     ) -> Result<Machine, Error> {
         let wasi = &self.wasi;
         let mut builder = Machine::builder().loader(loader).init(!wasi.no_init);
+        #[cfg(feature = "wasm-c-api")]
+        {
+            builder = builder.instantiation_hook(Arc::new(WasmCapiRuntimeHooks::new()));
+        }
         if let Some(Some(rules)) = &wasi.networking {
             let rules = rules.parse().context("invalid --net ruleset")?;
             builder = builder.network_policy(Arc::new(NetworkRules(rules)));
