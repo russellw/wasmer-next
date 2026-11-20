@@ -119,7 +119,7 @@ wasmer-config = { path = "./lib/config" }
 wasmer-package-sdk = { path = "./lib/package-sdk" }
 
 # Wasmer-owned crates
-webc = { version = "=12.0.1", default-features = false, features = [
+webc = { version = "=12.0.2", default-features = false, features = [
   "v2",
   "v3",
 ] }

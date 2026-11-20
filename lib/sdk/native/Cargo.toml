@@ -71,7 +71,7 @@ wasixv2-vfs-mem.workspace = true
 wasixv2-vnet.workspace = true
 wasixv2-vnet-host.workspace = true
 wasixv2-wait.workspace = true
-webc = { version = "=12.0.1", default-features = false, features = ["v3"] }
+webc = { version = "=12.0.2", default-features = false, features = ["v3"] }
 wasmparser.workspace = true
 wasmer-napi = { path = "../../napi", optional = true, default-features = false }
 
