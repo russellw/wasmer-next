@@ -249,3 +249,39 @@ async fn native_startup_exec_uses_new_environment_and_existing_failure_boundary(
         }
     }
 }
+
+/// Calls `dl_next_init`, then `dl_open(NULL)`, and exits with the step whose result was not
+/// the expected one: 0 from the first (nothing was loaded at startup), `-ENOSYS` from the second.
+const STATIC_LOADER_WAT: &str = r#"
+  (module
+    (import "wasixv2" "dl_next_init" (func $dl_next_init (param i32) (result i32)))
+    (import "wasixv2" "dl_open"
+      (func $dl_open (param i32 i32 i32 i32 i32 i32 i32) (result i32)))
+    (import "wasixv2" "exit_group" (func $exit_group (param i32)))
+    (memory (export "memory") 1)
+    (func (export "_start")
+      (if (call $dl_next_init (i32.const 16))
+        (then (call $exit_group (i32.const 1))))
+      ;; RTLD_NOW, no search path; the handle at 20, a 64-byte error buffer at 64.
+      (if (i32.ne
+            (call $dl_open (i32.const 0) (i32.const 2) (i32.const 0) (i32.const 0)
+              (i32.const 20) (i32.const 64) (i32.const 64))
+            (i32.const -38))
+        (then (call $exit_group (i32.const 2))))
+      (call $exit_group (i32.const 0))
+      unreachable))
+"#;
+
+/// libc2 drains the initializer queue before `main` in every program that links `dlopen`,
+/// and aborts if that fails. A static program loaded nothing at startup, so its queue is empty;
+/// `dlopen` itself still fails, as there is no loader.
+#[tokio::test]
+async fn a_static_program_has_an_empty_initializer_queue_and_no_loader() {
+    let wasm = wat::parse_str(STATIC_LOADER_WAT).expect("valid test module");
+    let stdio = Stdio {
+        stdin: Arc::new(EmptySource),
+        stdout: Arc::new(Capture::default()),
+        stderr: Arc::new(Capture::default()),
+    };
+    assert_eq!(Machine::new().run(&wasm, stdio).await.unwrap(), 0);
+}

@@ -312,6 +312,8 @@ pub trait AbiInstance<S: 'static>: Send + Sync {
         Box::pin(async { Err(Errno::ENOSYS.into()) })
     }
 
+    /// Without a loader nothing is ever queued, so the queue is empty: libc2 drains it before
+    /// `main` in every program that links `dlopen`, and aborts on an error.
     fn dl_next_init<'a>(
         &'a self,
         env: &'a AsyncFunctionEnvMut<ExecEnv<S>>,
@@ -319,7 +321,7 @@ pub trait AbiInstance<S: 'static>: Send + Sync {
         ctors: UptrPtr,
     ) -> LocalFuture<'a, wasixv2_syscalls::SysResult<i32>> {
         let _ = (env, caller, ctors);
-        Box::pin(async { Err(Errno::ENOSYS.into()) })
+        Box::pin(async { Ok(0) })
     }
 
     fn prepare_entry<'a>(
