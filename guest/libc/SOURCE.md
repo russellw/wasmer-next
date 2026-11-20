@@ -11,3 +11,9 @@ The canonical generator is `../../lib/wasix/codegen`, and the guest suite is
 repository root. The old standalone release workflow is retired; guest release
 publishing needs a separate policy and is not triggered by Wasmer tags.
 Build-info revision fields identify the containing Wasmer checkout after import.
+
+## Changes since the import
+
+`src/stdlib/qsort.c` carries upstream musl's three qsort fixes made after
+1.2.6: `228da39e` (CVE-2026-40200), `b3291b9a` and `5122f9f3`, so it matches
+musl master. Keep them on a re-import if the libc2 snapshot lacks them.
